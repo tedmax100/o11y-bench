@@ -109,7 +109,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 echo "Building shared Harbor main image: o11y-bench-main:latest"
 docker build -t o11y-bench-main:latest -f "$ROOT/environment/Dockerfile" "$ROOT/environment" >/dev/null
 echo "Building shared Harbor sidecar image: o11y-bench-o11y-stack:latest"
-docker build -t o11y-bench-o11y-stack:latest -f "$ROOT/docker/Dockerfile" "$ROOT/docker" >/dev/null
+TARGETARCH="$(docker version --format '{{.Server.Arch}}')"
+docker build --build-arg TARGETARCH="$TARGETARCH" -t o11y-bench-o11y-stack:latest -f "$ROOT/docker/Dockerfile" "$ROOT/docker" >/dev/null
 
 after=$(docker ps -q | wc -l | tr -d " ")
 after_projects=$(harbor_project_count)
