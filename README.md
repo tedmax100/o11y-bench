@@ -231,6 +231,24 @@ connects to the sidecar Grafana automatically.
 
 This agent can only run models available in OpenCode.
 
+### Using A Local gcx Build
+
+To test gcx changes before they are on main, you can use a locally-built binary
+instead of the published release.
+
+Set `LOCAL_GCX` to the path of a gcx executable **for Linux** when running preflight or bench runs.
+
+When set, the Docker image will use your local binary instead of downloading
+from GitHub. The `environment/gcx` file is gitignored and cleaned up after build.
+
+Use `GOARCH=amd64` if your Docker is running x86_64 images.
+
+```bash
+cd ~/workspace/gcx && GOOS=linux GOARCH=arm64 mise run build
+LOCAL_GCX=/path/to/gcx/bin/gcx-linux mise run bench:job -- --model openai/gpt-5.4-nano
+```
+
+
 ## Running Your Own Models
 
 If your model is reachable through Harbor and LiteLLM, pass it as `provider/model`.

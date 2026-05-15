@@ -264,6 +264,29 @@ def _sanitize_trial_result_payload(
     return changed
 
 
+def _extract_gcx_version(job_dir: Path) -> str | None:
+    """Read the gcx version from the first trial's agent_info, if present."""
+    for trial_dir in _iter_trial_dirs(job_dir):
+        result = _read_json_dict(trial_dir / "result.json")
+        if not isinstance(result, dict):
+            continue
+        version = (result.get("agent_info") or {}).get("version")
+        if isinstance(version, str):
+            for line in version.splitlines():
+                if line.startswith("gcx version"):
+                    return line
+    return None
+
+
+def _uses_gcx_agent(config_payload: dict[str, Any]) -> bool:
+    agents = config_payload.get("agents")
+    if not isinstance(agents, list):
+        return False
+    return any(
+        isinstance(a, dict) and "gcx_opencode_agent" in (a.get("import_path") or "") for a in agents
+    )
+
+
 def _sanitize_job_artifacts(job_dir: Path, tasks_dir: Path) -> None:
     config_path = job_dir / "config.json"
     if config_path.exists():
@@ -283,6 +306,12 @@ def _sanitize_job_artifacts(job_dir: Path, tasks_dir: Path) -> None:
                     if dataset.get("path") != portable_tasks_dir:
                         dataset["path"] = portable_tasks_dir
                         changed = True
+            # get gcx_version from one of the tasks and put it in the job-level config.json
+            if "gcx_version" not in config_payload and _uses_gcx_agent(config_payload):
+                gcx_version = _extract_gcx_version(job_dir)
+                if gcx_version:
+                    config_payload["gcx_version"] = gcx_version
+                    changed = True
             if changed:
                 _write_json_dict(config_path, config_payload)
 
@@ -539,7 +568,11 @@ def execute_job(spec: JobSpec, *, dry_run: bool = False, quiet: bool = False) ->
     rerun_harbor_exit_code: int | None = None
     if needs_harbor:
         rerun_harbor_exit_code = run_harbor(
-            build_resume_command(str(job_dir / "config.json"), quiet=quiet),
+            build_resume_command(
+                str(job_dir / "config.json"),
+                quiet=quiet,
+                harbor_args=spec.harbor_args,
+            ),
             forward_signals=False,
         )
 

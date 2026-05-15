@@ -9,7 +9,7 @@
 Connects to mcp-grafana via streamable-http, runs an agent loop using litellm
 (multi-provider: Anthropic, OpenAI, Google, etc.), and writes an ATIF trajectory.
 
-Config via env vars: MODEL, MCP_URL, REASONING_EFFORT, TEMPERATURE, provider API keys.
+Config via env vars: MODEL, MCP_URL, REASONING_EFFORT, optional TEMPERATURE, provider API keys.
 For OpenAI-compatible endpoints (local or hosted), use ``openai/<id>`` + ``OPENAI_API_BASE``
 (and ``OPENAI_API_KEY`` if required). See LiteLLM provider docs for other routes.
 Timeout is handled by Harbor's agent timeout in task.toml.
@@ -151,7 +151,7 @@ def make_atif_step(
     observation: dict[str, Any] | None = None,
     metrics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build an ATIF-v1.6 step dict."""
+    """Build an ATIF-v1.7 step dict."""
     step: dict[str, Any] = {
         "step_id": step_id,
         "timestamp": datetime.now(UTC).isoformat(),
@@ -250,6 +250,28 @@ async def completion_with_retries(
     raise RuntimeError("completion retries exhausted")
 
 
+def build_litellm_kwargs(
+    model: str,
+    tools: list[dict[str, Any]],
+    reasoning_effort: str,
+    temperature: str | None,
+) -> dict[str, Any]:
+    litellm_kwargs: dict[str, Any] = {
+        "model": model,
+        "tools": tools,
+        "drop_params": True,
+        "cache_control_injection_points": [
+            {"location": "message", "role": "system"},
+        ],
+    }
+    if reasoning_effort != "off":
+        litellm_kwargs["reasoning_effort"] = reasoning_effort
+    elif temperature is not None and "claude-opus-4-7" not in model:
+        litellm_kwargs["temperature"] = float(temperature)
+
+    return litellm_kwargs
+
+
 async def run_agent() -> None:
     import litellm
     from mcp.client.session import ClientSession
@@ -259,7 +281,7 @@ async def run_agent() -> None:
     stack_host = os.environ.get("STACK_HOST", "127.0.0.1")
     mcp_url = os.environ.get("MCP_URL", f"http://{stack_host}:8080/mcp")
     reasoning_effort = os.environ.get("REASONING_EFFORT", "off")
-    temperature = float(os.environ.get("TEMPERATURE", "0.0"))
+    temperature = os.environ.get("TEMPERATURE")
 
     statement = Path("/app/instruction.txt").read_text().strip()
 
@@ -275,6 +297,7 @@ async def run_agent() -> None:
     agent_dir.mkdir(parents=True, exist_ok=True)
 
     session_id = str(uuid.uuid4())
+    trajectory_id = str(uuid.uuid4())
     atif_steps: list[dict[str, Any]] = []
     tool_defs: list[dict[str, Any]] = []
     stats = {"input": 0, "output": 0, "cache": 0, "cost": 0.0}
@@ -285,8 +308,9 @@ async def run_agent() -> None:
     def flush_trajectory() -> None:
         """Write trajectory to disk after each step so partial work survives kills."""
         trajectory = {
-            "schema_version": "ATIF-v1.6",
+            "schema_version": "ATIF-v1.7",
             "session_id": session_id,
+            "trajectory_id": trajectory_id,
             "agent": {
                 "name": "o11y-bench",
                 "version": "1.0.0",
@@ -300,9 +324,11 @@ async def run_agent() -> None:
                 "total_cached_tokens": stats["cache"],
                 "total_cost_usd": stats["cost"],
                 "total_steps": step_id,
-                "total_tool_calls": tool_call_count,
-                "reasoning_effort": reasoning_effort,
-                "elapsed_seconds": time.time() - start,
+                "extra": {
+                    "total_tool_calls": tool_call_count,
+                    "reasoning_effort": reasoning_effort,
+                    "elapsed_seconds": time.time() - start,
+                },
             },
         }
         (agent_dir / "trajectory.json").write_text(json.dumps(trajectory, indent=2))
@@ -326,18 +352,12 @@ async def run_agent() -> None:
                     {"role": "user", "content": task_prompt},
                 ]
 
-                litellm_kwargs: dict[str, Any] = {
-                    "model": model,
-                    "tools": tools,
-                    "drop_params": True,
-                    "cache_control_injection_points": [
-                        {"location": "message", "role": "system"},
-                    ],
-                }
-                if reasoning_effort != "off":
-                    litellm_kwargs["reasoning_effort"] = reasoning_effort
-                elif "claude-opus-4-7" not in model:
-                    litellm_kwargs["temperature"] = temperature
+                litellm_kwargs = build_litellm_kwargs(
+                    model,
+                    tools,
+                    reasoning_effort,
+                    temperature,
+                )
 
                 step = 0
                 while True:

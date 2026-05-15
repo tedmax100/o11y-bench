@@ -7,16 +7,32 @@ benchmarking gcx-only interaction. Clearing mcp_servers ensures the agent can
 only reach Grafana through gcx.
 """
 
+import os
+from pathlib import Path
 from typing import Any
 
 from harbor.agents.installed.opencode import OpenCode
 from harbor.models.trajectories import Trajectory
+
+SYSTEM_PROMPT = Path(__file__).parent.joinpath("system_prompt.txt").read_text().strip()
 
 
 class GcxOpenCodeAgent(OpenCode):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.mcp_servers = []
+
+    def render_instruction(self, instruction: str) -> str:
+        """Inject the same system prompt as used in the o11y bench agent"""
+        scenario_time = os.environ.get("O11Y_SCENARIO_TIME_ISO", "").strip()
+        parts = [SYSTEM_PROMPT, ""]
+        if scenario_time:
+            parts.append(f"<context>\nCurrent time: {scenario_time}\n</context>\n")
+        parts.append(instruction)
+        return "\n".join(parts)
+
+    def get_version_command(self) -> str | None:
+        return f"{super().get_version_command()}; echo $(gcx --version)"
 
     def _convert_events_to_trajectory(self, events: list[dict[str, Any]]) -> Trajectory | None:
         """Inject a synthetic step_finish when the agent was killed mid-step.
