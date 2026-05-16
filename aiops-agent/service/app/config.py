@@ -9,6 +9,8 @@ class Settings(BaseSettings):
 
     mcp_grafana_url: str = "http://localhost:8080/mcp"
 
+    github_token: str = ""
+
     cors_allow_origins: list[str] = ["http://localhost:3000"]
 
     host: str = "0.0.0.0"

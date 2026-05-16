@@ -12,6 +12,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import ToolNode, create_react_agent
 
 from .config import settings
+from .tools import github_compare, github_get_file
 
 logger = logging.getLogger("aiops_agent")
 DEBUG_EVENTS = os.getenv("DEBUG_EVENTS", "0") == "1"
@@ -81,6 +82,8 @@ you the answer.
 | Metrics (rates, p95 latency, error ratios, gauge spikes) | `query_prometheus` with PromQL |
 | Traces (find root cause service, slow operations) | `query_tempo_traces` with TraceQL |
 | Dashboards / datasources discovery | `list_datasources`, `search_dashboards` |
+| Code diff between two deploy versions | `github_compare(repo, base, head)` |
+| Read a slice of a file at a specific ref | `github_get_file(repo, path, ref, start, end)` |
 
 Default ordering for an RCA question:
 
@@ -92,6 +95,10 @@ Default ordering for an RCA question:
 3. **Logs last** — pivot on `trace_id` or service+level to read the actual error
    message. Always aggregate first (`count_over_time` by error pattern), then drill
    into raw lines only when needed.
+4. **Deploy correlation** — if a deployment log (`event="deployment"`) sits in or
+   just before the incident window, `github_compare` the old→new version on the
+   service's repo (see catalog) and look for a suspicious change. Cite the SHA in
+   your final answer. Skip this step if there's no deploy event nearby.
 
 # Anti-patterns (don't do these)
 
@@ -133,7 +140,8 @@ async def _build_agent():
             }
         }
     )
-    tools = await _mcp_client.get_tools()
+    mcp_tools = await _mcp_client.get_tools()
+    tools = mcp_tools + [github_compare, github_get_file]
     # handle_tool_errors=True turns ToolException into a ToolMessage the LLM can
     # read and recover from, instead of bubbling up and terminating the run.
     tool_node = ToolNode(tools, handle_tool_errors=True)

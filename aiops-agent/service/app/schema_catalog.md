@@ -8,13 +8,18 @@ Use this to write correct queries instead of guessing label or field names.
 Five services run in the sidecar. `job` and `service` labels both carry the
 service name; `instance` is `<service>:<port>`.
 
-| service | instance | role |
-|---------|----------|------|
-| webapp | webapp:8080 | edge — receives all user HTTP requests |
-| api-gateway | api-gateway:8081 | routing layer between webapp and backends |
-| user-service | user-service:8082 | user / auth |
-| order-service | order-service:8083 | orders, cart, products |
-| payment-service | payment-service:8084 | payments |
+| service | instance | role | github_repo |
+|---------|----------|------|-------------|
+| webapp | webapp:8080 | edge — receives all user HTTP requests | tedmax100/o11y-bench-webapp |
+| api-gateway | api-gateway:8081 | routing layer between webapp and backends | tedmax100/o11y-bench-api-gateway |
+| user-service | user-service:8082 | user / auth | tedmax100/o11y-bench-user-service |
+| order-service | order-service:8083 | orders, cart, products | tedmax100/o11y-bench-order-service |
+| payment-service | payment-service:8084 | payments | tedmax100/o11y-bench-payment-service |
+
+The `github_repo` column maps each service to the `owner/repo` you pass to
+`github_compare` / `github_get_file`. The `version` field on a deployment log
+(e.g. `v2.5.0`) is a valid ref for those tools. **These mappings are
+placeholders** — replace with real repos before relying on diff output.
 
 Dependency edges (caller → callee):
 
@@ -194,3 +199,22 @@ to recognize:
 
 When asked an RCA question, time-box your queries around these windows rather
 than scanning the whole 24h.
+
+## Deploy correlation
+
+Two of the planted incidents (payment spike, user-service cache) are preceded
+by a deployment log a few minutes earlier. Whenever the incident window
+overlaps a `event="deployment"` log:
+
+1. Read the `version` field. The `message` usually carries `<old> -> <new>`
+   (e.g. `v2.4.1 -> v2.5.0`). If only `<new>` is present, ask Loki for the
+   previous deployment of the same service.
+2. Look up the repo for that service in the table above.
+3. Call `github_compare(repo, base=<old>, head=<new>)` to see what changed.
+4. If a suspicious file shows up in the diff, `github_get_file(repo, path, ref=<new>, start, end)`
+   on the relevant line range to read the new code.
+5. In your final answer, cite the commit SHA(s) and a one-line summary of
+   what changed, alongside the telemetry queries.
+
+Do **not** call `github_compare` for incidents where no deployment log exists
+in the window — the order-service latency incident at ~6h is one of those.
