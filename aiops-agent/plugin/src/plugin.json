@@ -1,0 +1,41 @@
+{
+  "$schema": "https://raw.githubusercontent.com/grafana/grafana/main/docs/sources/developers/plugins/plugin.schema.json",
+  "type": "app",
+  "name": "AIOps",
+  "id": "tedmax100-aiops-app",
+  "info": {
+    "keywords": ["app", "aiops", "rca", "observability"],
+    "description": "Chat-based RCA assistant powered by LangGraph + Gemini, talks to Grafana stack via MCP.",
+    "author": {
+      "name": "Tedmax100"
+    },
+    "logos": {
+      "small": "img/logo.svg",
+      "large": "img/logo.svg"
+    },
+    "screenshots": [],
+    "version": "%VERSION%",
+    "updated": "%TODAY%"
+  },
+  "includes": [
+    {
+      "type": "page",
+      "name": "Chat",
+      "path": "/a/%PLUGIN_ID%/chat",
+      "addToNav": true,
+      "defaultNav": true
+    },
+    {
+      "type": "page",
+      "icon": "cog",
+      "name": "Configuration",
+      "path": "/plugins/%PLUGIN_ID%",
+      "role": "Admin",
+      "addToNav": true
+    }
+  ],
+  "dependencies": {
+    "grafanaDependency": ">=12.3.0",
+    "plugins": []
+  }
+}

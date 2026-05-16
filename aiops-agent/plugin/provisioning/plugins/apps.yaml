@@ -1,0 +1,9 @@
+apiVersion: 1
+
+apps:
+  - type: 'tedmax100-aiops-app'
+    org_id: 1
+    org_name: 'tedmax100'
+    disabled: false
+    jsonData:
+      agentServiceUrl: http://localhost:8000
