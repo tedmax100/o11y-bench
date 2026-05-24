@@ -10,6 +10,7 @@ data:
     datasources:
       - name: Prometheus
         type: prometheus
+        uid: prometheus
         access: proxy
         url: http://prometheus.demo.svc:9090
         isDefault: true
@@ -17,6 +18,7 @@ data:
 
       - name: Loki
         type: loki
+        uid: loki
         access: proxy
         url: http://loki.demo.svc:3100
         editable: true

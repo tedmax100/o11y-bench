@@ -12,7 +12,7 @@ else
   echo "[up] cluster ${CLUSTER} already exists"
 fi
 
-echo "[up] building payment-service image"
+echo "[up] building all service images"
 "${ROOT}/scripts/build.sh"
 
 echo "[up] applying manifests"
@@ -28,4 +28,7 @@ kubectl -n demo wait --for=condition=Ready pod --all --timeout=180s || {
   exit 1
 }
 
-echo "[up] ready. grafana: http://localhost:3001  payment: http://localhost:8001"
+echo "[up] ready."
+echo "  grafana: http://localhost:3001"
+echo "  webapp:  http://localhost:8002   (public entrypoint)"
+echo "  payment: http://localhost:8001   (direct, for debugging)"

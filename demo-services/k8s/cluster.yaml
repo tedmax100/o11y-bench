@@ -2,8 +2,9 @@
 #
 # Port mappings:
 #   host 3001 → Grafana NodePort 30001
-#   host 8001 → payment-service NodePort 30002
+#   host 8001 → payment-service NodePort 30002 (direct access for debugging)
 #   host 14318 → OTel collector NodePort 30003 (so xk6 scripts on host can push)
+#   host 8002 → webapp NodePort 30004 (public entrypoint, load generator hits this)
 # (Avoiding host:4318 which is commonly held by another OTel collector.)
 #
 # Traefik is disabled — we expose via NodePort + k3d loadbalancer rather than
@@ -24,6 +25,9 @@ ports:
     nodeFilters:
       - loadbalancer
   - port: "14318:30003"
+    nodeFilters:
+      - loadbalancer
+  - port: "8002:30004"
     nodeFilters:
       - loadbalancer
 
