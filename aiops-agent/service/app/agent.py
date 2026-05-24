@@ -12,7 +12,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import ToolNode, create_react_agent
 
 from .config import settings
-from .tools import github_compare, github_get_file
+from .tools import github_compare, github_get_file, wrap_with_cap
 
 logger = logging.getLogger("aiops_agent")
 DEBUG_EVENTS = os.getenv("DEBUG_EVENTS", "0") == "1"
@@ -141,7 +141,12 @@ async def _build_agent():
         }
     )
     mcp_tools = await _mcp_client.get_tools()
-    tools = mcp_tools + [github_compare, github_get_file]
+    # v2: wrap query_loki_logs / query_tempo_traces / query_prometheus so a
+    # raw output that blows the byte cap is replaced with a schema-aware
+    # aggregation (sum by service_name/level/event/git_version) instead of
+    # being head-N truncated. See tools/wrap.py.
+    wrapped_mcp = [wrap_with_cap(t) for t in mcp_tools]
+    tools = wrapped_mcp + [github_compare, github_get_file]
     # handle_tool_errors=True turns ToolException into a ToolMessage the LLM can
     # read and recover from, instead of bubbling up and terminating the run.
     tool_node = ToolNode(tools, handle_tool_errors=True)

@@ -1,25 +1,26 @@
 # Telemetry Schema Catalog
 
-Authoritative description of what's actually in the sidecar's Prometheus / Loki / Tempo.
+Authoritative description of what's actually in the demo-services k3d cluster.
 Use this to write correct queries instead of guessing label or field names.
 
 ## Services
 
-Five services run in the sidecar. `job` and `service` labels both carry the
-service name; `instance` is `<service>:<port>`.
+Five services run in the `demo` namespace. Every service emits via OTel
+(traces / metrics / logs) through `otel-collector` → Tempo / Prometheus
+(remote-write) / Loki (native OTLP).
 
-| service | instance | role | github_repo |
-|---------|----------|------|-------------|
-| webapp | webapp:8080 | edge — receives all user HTTP requests | tedmax100/o11y-bench-webapp |
-| api-gateway | api-gateway:8081 | routing layer between webapp and backends | tedmax100/o11y-bench-api-gateway |
-| user-service | user-service:8082 | user / auth | tedmax100/o11y-bench-user-service |
-| order-service | order-service:8083 | orders, cart, products | tedmax100/o11y-bench-order-service |
-| payment-service | payment-service:8084 | payments | tedmax100/o11y-bench-payment-service |
+| service | role | github_repo | git_version |
+|---------|------|-------------|-------------|
+| webapp | public edge — receives external HTTP, forwards to api-gateway | tedmax100/o11y-bench-webapp | v5.2.0 |
+| api-gateway | thin proxy router to backend services | tedmax100/o11y-bench-api-gateway | v4.0.0 |
+| user-service | user lookup + auth check | tedmax100/o11y-bench-user-service | v1.3.0 |
+| order-service | products / cart / orders. Calls user + payment | tedmax100/o11y-bench-order-service | v3.1.2 |
+| payment-service | charges. Has the `payment_use_new_validator` flag | tedmax100/o11y-bench-payment-service | v2.4.1 |
 
 The `github_repo` column maps each service to the `owner/repo` you pass to
-`github_compare` / `github_get_file`. The `version` field on a deployment log
-(e.g. `v2.5.0`) is a valid ref for those tools. **These mappings are
-placeholders** — replace with real repos before relying on diff output.
+`github_compare` / `github_get_file`. The `git_version` field on logs and the
+`git_version` Prometheus label hold the deployed revision (a valid ref for the
+github tools).
 
 Dependency edges (caller → callee):
 
@@ -36,117 +37,136 @@ HTTP endpoints (owning service):
 | method | path | owner |
 |--------|------|-------|
 | GET | /api/users | user-service |
+| GET | /api/users/{id} | user-service |
 | GET | /api/products | order-service |
-| POST | /api/orders | order-service |
-| POST | /api/payments | payment-service |
 | GET | /api/cart | order-service |
+| POST | /api/orders | order-service |
+| POST | /api/payments | payment-service (proxied via api-gateway → `/charge`) |
 
 ## Loki
 
-**Labels** (the *only* indexable selectors):
+**Stream labels** (the *only* indexable selectors):
 
-- `job` — service name (same value as `service`)
-- `service` — service name
-- `level` — `info` | `warn` | `error`
+| label | value |
+|-------|-------|
+| `service_name` | one of: `webapp`, `api-gateway`, `user-service`, `order-service`, `payment-service` |
+| `git_repo` | e.g. `tedmax100/o11y-bench-payment-service` |
+| `git_version` | e.g. `v2.4.1` |
+| `deployment_environment` | always `demo` |
 
-Use `service` or `job` to pick a service; use `level` to filter severity.
-Do **not** use `app`, `container`, `pod`, etc — they don't exist here.
+These come from OTel resource attributes promoted by Loki's OTLP ingestion
+(see `limits_config.otlp_config.resource_attributes` in `11-loki.yaml`).
+Do **not** use `app`, `service`, `container`, `pod`, `job`, `level`, `event`
+as stream labels — they are not indexed.
 
-**Log format**: every line is JSON. Parse with `| json`.
+**Structured metadata** (label-filter only, after the selector):
 
-Common fields across all logs:
+| field | values |
+|-------|--------|
+| `level` | `INFO`, `WARN`, `ERROR` |
+| `event` | `BizEvent` enum, see below |
+| `trace_id` | 32-char hex — joins to Tempo |
+| `span_id` | 16-char hex |
 
-| field | type | notes |
-|-------|------|-------|
-| timestamp | string | ISO 8601 with millisecond |
-| level | string | info / warn / error |
-| service | string | redundant with the label |
-| message | string | human-readable summary |
+**Per-event extra fields** (also structured metadata, vary by event):
 
-Request logs (info / error level) additionally carry:
+| event | extra fields |
+|-------|--------------|
+| `payment.requested` / `payment.authorized` | `order_id`, `user_id`, `amount_cents`, `payment_id` |
+| `payment.declined` | `order_id`, `reason` (`new_validator_odd_cents` etc.) |
+| `payment.gateway_error` | `order_id` |
+| `order.created` | `order_id`, `user_id`, `amount_cents` |
+| `order.cancelled` | `user_id`, `reason` (`auth_failed` / `payment_declined` / `unknown_product`), `upstream_status` |
+| `user.logged_in` / `user.auth_failed` | `user_id`, `reason` (`not_found` / `transient`) |
+| `http.request_received` | `method`, `path` (template form, e.g. `/api/users/{id}`) |
+| `http.request_failed` | `upstream` (target URL), `status`, `reason` (`network`) |
 
-| field | type | notes |
-|-------|------|-------|
-| method | string | GET / POST |
-| path | string | `/api/users`, `/api/orders`, ... |
-| status | int | 200 on success; 500 / 502 / 503 on error |
-| duration_ms | float | request latency |
-| trace_id | string | 32-char hex, matches Tempo trace |
+**`BizEvent` enum** (low-cardinality — safe to `sum by (event)`):
 
-Warning logs come in three flavors (mutually exclusive fields):
-
-- Slow query: `table` (users / orders / products / sessions), `query_ms`
-- Retry backlog: `queue="payment-retries"`, `queue_depth`
-- Cache refresh lag: `job_name="auth-cache-refresh"`, `lag_seconds`, `stale_keys`
-
-Deployment logs:
-
-- `event="deployment"`, `version`, `message="deployment started: <svc> v2.4.1 -> v2.5.0"`
-
-Typical error `message` values:
-
-- `"request failed"`, `"internal server error"`, `"upstream service error"`, `"database connection timeout"`
+```
+payment.requested  payment.authorized  payment.declined
+payment.refunded   payment.gateway_error
+order.created      order.updated       order.cancelled
+user.logged_in     user.registered     user.auth_failed
+http.request_received  http.request_failed
+cache.miss         deployment.started
+```
 
 ### LogQL examples for this data
 
 ```logql
-# Count errors per service in the last hour — aggregate at datasource
-sum by (service) (
-  count_over_time({level="error"} [1h])
+# Errors per service in the last hour — aggregate at the datasource
+sum by (service_name) (
+  count_over_time({deployment_environment="demo"} | level="ERROR" [1h])
 )
 
-# 5xx rate on payment-service
-sum(
-  rate({service="payment-service", level="error"} | json | status >= 500 [5m])
+# Decline rate on payment-service, grouped by reason
+sum by (reason) (
+  count_over_time({service_name="payment-service"} | event="payment.declined" [10m])
 )
 
-# Slow queries warning — only project the fields we need
-{service="order-service", level="warn"}
-  | json
-  | query_ms > 1000
-  | line_format "{{.timestamp}} table={{.table}} ms={{.query_ms}}"
+# THE v2 fallback aggregation — what wrap.py auto-rewrites large outputs into
+topk(20,
+  sum by (service_name, level, event, git_version) (
+    count_over_time({service_name="payment-service"}[5m])
+  )
+)
 
-# Retry backlog depth from warning logs
-{level="warn"} | json | queue="payment-retries"
-  | line_format "{{.timestamp}} depth={{.queue_depth}}"
+# Find which git_version a spike happened on
+sum by (git_version, event) (
+  count_over_time({service_name="payment-service"} | event=~"payment\\..*" [10m])
+)
 
-# Deployment events
-{level="info"} | json | event="deployment"
+# Pivot from an error log to its trace_id
+{service_name="order-service"} | level="ERROR" | line_format "{{.message}} trace={{.trace_id}}"
 ```
 
 ## Prometheus
 
-All metrics carry `job` and `instance` labels (service name and `<svc>:<port>`).
+OTel → Prometheus via `prometheusremotewrite` with `resource_to_telemetry_conversion: true`,
+so resource attributes become metric labels.
 
-| metric | type | extra labels | notes |
+**Labels on every metric**:
+
+- `service_name` — same value as the Loki stream label
+- `git_repo`, `git_version` — promoted from OTel resource attrs
+- `deployment_environment` — `demo`
+
+**Application metrics** (created by `o11y_shared` and the service code):
+
+| metric | type | extra labels | owner |
 |--------|------|--------------|-------|
-| up | gauge | — | always 1 in this dataset |
-| process_cpu_seconds_total | counter | — | use `rate(...[5m])` |
-| process_resident_memory_bytes | gauge | — | bytes |
-| go_goroutines | gauge | — | proxy for concurrency |
-| http_requests_total | counter | status | 200 / 500 / 502 / 503 |
-| http_request_duration_seconds_{sum,count,bucket} | histogram | `le` for bucket | standard Prom buckets |
-| service_retry_queue_depth | gauge | — | non-zero only during the payment incident |
-| service_cache_refresh_lag_seconds | gauge | — | non-zero only during the user-service cache incident |
+| `payment_charges_total` | counter | `status` (`authorized` / `declined` / `error`), optional `reason` | payment-service |
+| `payment_charge_duration_seconds_{bucket,sum,count}` | histogram | `status`, `le` | payment-service |
+| `orders_total` | counter | `status` (`created` / `cancelled` / `error`), `reason` when not created | order-service |
+| `order_create_duration_seconds_{bucket,sum,count}` | histogram | `status`, `le` | order-service |
+| `user_lookups_total` | counter | `op` (`list` / `get`) | user-service |
+| `user_auth_checks_total` | counter | — | user-service |
+
+**Auto-instrumentation metrics** (from `opentelemetry-instrumentation-fastapi` / `httpx`):
+
+| metric | extra labels | notes |
+|--------|--------------|-------|
+| `http_server_duration_milliseconds_{bucket,sum,count}` | `http_method`, `http_status_code`, `http_route` | server-side |
+| `http_client_duration_milliseconds_{bucket,sum,count}` | `http_method`, `http_status_code`, `net_peer_name` | outgoing httpx calls |
 
 ### PromQL examples
 
 ```promql
-# p95 latency per service
+# p95 latency per service for the order create handler
 histogram_quantile(0.95,
-  sum by (job, le) (rate(http_request_duration_seconds_bucket[5m]))
+  sum by (service_name, le) (rate(order_create_duration_seconds_bucket[5m]))
 )
 
-# Error rate (5xx / total) per service
-sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+# Payment error rate per git_version (v2 cross-version comparison)
+sum by (git_version) (rate(payment_charges_total{status="error"}[5m]))
 /
-sum by (job) (rate(http_requests_total[5m]))
+sum by (git_version) (rate(payment_charges_total[5m]))
 
-# Retry queue depth spike (payment / order incident signal)
-max by (job) (service_retry_queue_depth) > 0
-
-# Cache refresh lag (user-service incident signal)
-max by (job) (service_cache_refresh_lag_seconds) > 0
+# HTTP 5xx rate per service (auto-instrumentation)
+sum by (service_name) (
+  rate(http_server_duration_milliseconds_count{http_status_code=~"5.."}[5m])
+)
 ```
 
 ## Tempo
@@ -154,67 +174,63 @@ max by (job) (service_cache_refresh_lag_seconds) > 0
 Trace structure per request (root → leaf):
 
 ```
-webapp     "GET /api/orders"        kind=server
-  ↳ api-gateway "route /api/orders" kind=server
-    ↳ <target service> "handle GET /api/orders" kind=server  ← origin of error
-      ↳ <dep service>  "call <dep>"             kind=client  ← also error=true
-      ↳ user-service   "refresh auth cache"     kind=internal (cache incident only)
+webapp        "GET /api/<path>"      kind=server
+  ↳ api-gateway  "GET /api/<path>"   kind=server
+    ↳ <target service> "GET /api/..." kind=server
+      ↳ <dep service>  httpx          kind=client → server (if any)
 ```
 
-**Resource attribute**: `service.name`.
+**Resource attributes** (queryable): `service.name`, `git_repo`, `git_version`,
+`deployment.environment`.
 
-**Span attributes**: `http.method`, `http.route`, `http.url`, `http.status_code`.
-
-**Span status convention** (important — this is how to find the origin):
-
-- Upstream spans (webapp, api-gateway) carry `http.status_code=500` but their
-  span status is **NOT** error.
-- The target service span and its dependency-call span are the only ones with
-  span `status=error`. So `{ span:status = error }` filters to the originating
-  service, not the whole trace.
+**Span attributes** (auto-instrumentation): `http.method`, `http.route`,
+`http.url`, `http.status_code`, `net.peer.name`.
 
 ### TraceQL examples
 
 ```traceql
-# Failures originating in payment-service in the last hour
-{ resource.service.name = "payment-service" && span:status = error }
+# All errors originating in payment-service in the window
+{ resource.service.name = "payment-service" && status = error }
 
-# Slow order requests
+# Slow order creation traces
 { resource.service.name = "order-service" && span.http.route = "/api/orders" && duration > 500ms }
 
-# Traces whose root saw a 5xx (top-level only)
-{ span.http.status_code >= 500 && span:kind = server }
+# Cross-version: traces hitting the newly deployed payment version
+{ resource.service.name = "payment-service" && resource.git_version = "v2.5.0" }
 ```
 
-## Known incident windows (relative to data end time)
+## Feature flags & incident scenarios
 
-The data generator plants three deterministic incidents. These are the patterns
-to recognize:
+Currently planted: **payment-service** has a `payment_use_new_validator` flag
+(read from `flags.json` mounted as a ConfigMap). Flipping it to `true` and
+bumping `GIT_VERSION` from `v2.4.1` to `v2.5.0` simulates a bad deploy where
+odd-cents amounts get declined.
 
-| ~time before data end | duration | signal |
-|----------------------|----------|--------|
-| 3h | 30 min | **payment-service error spike** — 70% errors at payment-service, cascading 15% to order-service and 8% to api-gateway. `service_retry_queue_depth` spikes on payment & order. Deployment log ~2 min before the spike. |
-| 6h | 45 min | **order-service latency** — p95 5x on order-service, 2x on api-gateway / webapp. `/api/orders` dominates the slow paths. |
-| 9h | 40 min | **user-service cache refresh** — 4x latency on `/api/users`. `service_cache_refresh_lag_seconds` spikes on user-service. Deployment log ~3 min before. Traces show `refresh auth cache` internal spans. |
+To trigger:
 
-When asked an RCA question, time-box your queries around these windows rather
-than scanning the whole 24h.
+```bash
+kubectl -n demo create configmap payment-flags \
+  --from-literal=flags.json='{"payment_use_new_validator": true}' \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n demo set env deploy/payment-service GIT_VERSION=v2.5.0
+```
+
+The agent should see `payment.declined` spike under `git_version="v2.5.0"`
+in both Loki (`sum by (git_version, event)`) and Prometheus
+(`payment_charges_total{status="declined"}`).
+
+Other incident scenarios (order latency, user-service cache lag) are **not
+yet implemented** — don't claim to find them.
 
 ## Deploy correlation
 
-Two of the planted incidents (payment spike, user-service cache) are preceded
-by a deployment log a few minutes earlier. Whenever the incident window
-overlaps a `event="deployment"` log:
+Whenever you find a spike correlated with a `git_version` boundary:
 
-1. Read the `version` field. The `message` usually carries `<old> -> <new>`
-   (e.g. `v2.4.1 -> v2.5.0`). If only `<new>` is present, ask Loki for the
-   previous deployment of the same service.
-2. Look up the repo for that service in the table above.
+1. Read the `git_repo` from the same logs / from this catalog.
+2. The previous version is the value of `git_version` immediately before the
+   spike (e.g. `v2.4.1` if the spike is on `v2.5.0`).
 3. Call `github_compare(repo, base=<old>, head=<new>)` to see what changed.
-4. If a suspicious file shows up in the diff, `github_get_file(repo, path, ref=<new>, start, end)`
-   on the relevant line range to read the new code.
-5. In your final answer, cite the commit SHA(s) and a one-line summary of
-   what changed, alongside the telemetry queries.
-
-Do **not** call `github_compare` for incidents where no deployment log exists
-in the window — the order-service latency incident at ~6h is one of those.
+4. If a suspicious file shows up in the diff,
+   `github_get_file(repo, path, ref=<new>, start, end)` to read the new code.
+5. Cite the commit SHA(s) and a one-line summary of what changed in your
+   final answer, alongside the telemetry queries.

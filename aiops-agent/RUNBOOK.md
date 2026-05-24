@@ -1,15 +1,18 @@
 # AIOps Agent — 啟動 Runbook
 
-要跑起來需要 **三個 terminal**。順序不嚴格，但建議照下面排——後面的步驟比較會用到前面的服務 health-check。
+從 v2 開始，agent 不再自帶 Grafana/Prom/Loki/Tempo —— data 是 demo-services
+k3d cluster。所以要跑起來需要 **四件事**（demo + mcp-grafana + agent + plugin watch）：
 
 ```
-┌─ Terminal 1 ──────────┐  ┌─ Terminal 2 ─────────┐  ┌─ Terminal 3 ────────┐
-│ Sidecar (Docker)      │  │ Agent service        │  │ Plugin dev watch    │
-│ Grafana + Prom/Loki/  │  │ FastAPI + LangGraph  │  │ webpack -w           │
-│ Tempo + mcp-grafana   │  │ + Gemini             │  │ rebuilds dist/      │
-│ :3000  :8080 ...      │  │ :8000                │  │ (no port)           │
-└───────────────────────┘  └──────────────────────┘  └─────────────────────┘
+┌─ demo-services (k3d) ─┐  ┌─ Terminal 1 ──────┐  ┌─ Terminal 2 ─────┐  ┌─ Terminal 3 ──┐
+│ Grafana + Prom/Loki/  │  │ mcp-grafana       │  │ Agent service    │  │ Plugin watch  │
+│ Tempo + 5 services    │  │ (docker compose)  │  │ FastAPI+LangGraph│  │ webpack -w    │
+│ :3001 (graf) :8002    │  │ :8080             │  │ :8000            │  │               │
+└───────────────────────┘  └───────────────────┘  └──────────────────┘  └───────────────┘
 ```
+
+**Plugin UI 注意**：plugin 目前未掛進 demo-services 的 Grafana —— 想用 UI 操作 chat
+得另外把 dist 掛進 k3d Grafana（後續 task），或直接 `curl /chat` 測 agent 行為。
 
 每個 terminal 都從 repo root (`/home/nathan/Project/o11y-bench`) 開始。
 
@@ -35,44 +38,32 @@ cp .env.example .env
 
 * * *
 
-## Terminal 1 — Sidecar (Docker)
+## Step 0 — demo-services k3d cluster
 
-跑 Grafana + Prometheus + Loki + Tempo + mcp-grafana，並把 plugin/dist 掛進 Grafana。
+```bash
+cd ../demo-services
+./scripts/up.sh                 # k3d cluster + 5 services + telemetry stack
+./scripts/load.sh &             # 持續打流量產生 telemetry
+```
+
+健康檢查：
+
+```bash
+curl -s http://localhost:3001/api/health   # Grafana
+curl -s http://localhost:8002/health       # webapp (public entry)
+```
+
+## Terminal 1 — mcp-grafana (Docker)
+
+只跑 mcp-grafana 一個 container，指到 demo-services 的 Grafana。
 
 ```bash
 cd aiops-agent
 docker compose up --build
 ```
 
-**第一次起或改過 `plugin.json` / `provisioning/` 時用** `up --build`。
-**只是改前端 code（plugin/src）** 不用重起 sidecar——Terminal 3 的 webpack 會更新 `dist/`，Grafana 載 plugin 時讀的是同一份。
-
-但如果 Grafana 啟動後 reload 還是看舊 plugin：
-
-```bash
-docker compose down && docker compose up --build
-```
-
-`restart` 不夠，因為 Grafana 的 plugin manifest 是 startup time 建的，restart 會 reuse cache。
-
-**啟動完成的訊號**：
-
-```
-aiops-agent-sidecar  | === Environment Ready ===
-aiops-agent-sidecar  |   Grafana:     http://localhost:3000
-aiops-agent-sidecar  |   MCP-Grafana: http://localhost:8080
-```
-
-### 健康檢查
-
-```bash
-# 從另一個 terminal
-curl -s http://localhost:3000/api/health           # Grafana
-curl -s http://localhost:8080/                     # mcp-grafana (404 也算正常，它服務在 /mcp)
-curl -s http://localhost:9090/-/healthy            # Prometheus
-curl -s http://localhost:3100/ready                # Loki
-curl -s http://localhost:3200/ready                # Tempo
-```
+**啟動完成的訊號**：mcp-grafana 開始 listen 在 `:8080`。
+驗證：`curl -s http://localhost:8080/` 回 404 算正常（它服務在 `/mcp`）。
 
 * * *
 
