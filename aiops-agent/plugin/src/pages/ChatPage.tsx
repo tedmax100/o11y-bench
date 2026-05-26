@@ -4,6 +4,7 @@ import { GrafanaTheme2 } from '@grafana/data';
 import { PluginPage } from '@grafana/runtime';
 import { Button, Input, Stack, useStyles2, Spinner, Collapse, Alert } from '@grafana/ui';
 import { testIds } from '../components/testIds';
+import { PromqlPanel } from '../components/PromqlPanel';
 
 type ChatEvent =
   | { type: 'thread'; thread_id: string }
@@ -161,15 +162,48 @@ function ChatPage({ agentServiceUrl }: ChatPageProps) {
 
 function MessageBubble({ message }: { message: Message }) {
   const styles = useStyles2(getStyles);
+  const segments = message.role === 'assistant' ? splitPromqlBlocks(message.text) : [{ kind: 'text' as const, value: message.text }];
   return (
     <div className={message.role === 'user' ? styles.userBubble : styles.assistantBubble}>
       <div className={styles.role}>{message.role}</div>
       {message.toolCalls.map((tc, i) => (
         <ToolCallView key={i} call={tc} />
       ))}
-      <div className={styles.text}>{message.text}</div>
+      {segments.map((seg, i) =>
+        seg.kind === 'promql' ? (
+          <PromqlPanel key={i} expr={seg.expr} />
+        ) : (
+          <div key={i} className={styles.text}>{seg.value}</div>
+        )
+      )}
     </div>
   );
+}
+
+type Segment = { kind: 'text'; value: string } | { kind: 'promql'; expr: string };
+
+// Walk the assistant's text and split out fenced ```promql blocks so we can
+// render them as live Scenes panels instead of monospace code. logql / other
+// fences fall through as plain text.
+function splitPromqlBlocks(text: string): Segment[] {
+  if (!text) {
+    return [];
+  }
+  const re = /```promql\s*\n?([\s\S]*?)```/g;
+  const out: Segment[] = [];
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) {
+      out.push({ kind: 'text', value: text.slice(last, m.index) });
+    }
+    out.push({ kind: 'promql', expr: m[1].trim() });
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) {
+    out.push({ kind: 'text', value: text.slice(last) });
+  }
+  return out;
 }
 
 function ToolCallView({ call }: { call: ToolCall }) {

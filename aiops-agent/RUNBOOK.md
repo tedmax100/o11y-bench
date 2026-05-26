@@ -11,8 +11,13 @@ k3d cluster。所以要跑起來需要 **四件事**（demo + mcp-grafana + agen
 └───────────────────────┘  └───────────────────┘  └──────────────────┘  └───────────────┘
 ```
 
-**Plugin UI 注意**：plugin 目前未掛進 demo-services 的 Grafana —— 想用 UI 操作 chat
-得另外把 dist 掛進 k3d Grafana（後續 task），或直接 `curl /chat` 測 agent 行為。
+**Plugin UI**：`demo-services/scripts/up.sh` 會把 `aiops-agent/plugin/dist/` docker-cp
+進 k3d node 的 `/aiops-plugin/`，Grafana Deployment 透過 hostPath 掛進
+`/var/lib/grafana/plugins/tedmax100-aiops-app` 並用 `aiops-plugin-provisioning`
+ConfigMap 自動 enable —— 起完 cluster 直接開 `http://localhost:3001` 進 Apps → AIOps → Chat。
+
+> 改 plugin code 時 `npm run dev` 會更新 `dist/`，但 **k3d node 內的 copy 不會自動同步**。
+> 改完跑：`docker cp aiops-agent/plugin/dist k3d-demo-services-server-0:/aiops-plugin/tedmax100-aiops-app && kubectl -n demo rollout restart deploy/grafana`。
 
 每個 terminal 都從 repo root (`/home/nathan/Project/o11y-bench`) 開始。
 

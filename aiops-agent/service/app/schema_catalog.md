@@ -126,6 +126,14 @@ sum by (git_version, event) (
 OTel → Prometheus via `prometheusremotewrite` with `resource_to_telemetry_conversion: true`,
 so resource attributes become metric labels.
 
+**There is no `up{}` metric for any application service.** Prometheus only
+generates `up` for targets it scrapes directly; here the OTel Collector pushes
+via remote_write, so `up{service_name="..."}` is **always empty** regardless of
+whether the service is healthy. To check liveness use a fresh sample on a
+counter the service actually emits, e.g.
+`rate(http_server_duration_milliseconds_count{service_name="<svc>"}[5m]) > 0`
+or, for payment specifically, `rate(payment_charges_total[5m]) > 0`.
+
 **Labels on every metric**:
 
 - `service_name` — same value as the Loki stream label

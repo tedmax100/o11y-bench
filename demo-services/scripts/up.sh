@@ -15,6 +15,23 @@ fi
 echo "[up] building all service images"
 "${ROOT}/scripts/build.sh"
 
+# Bind-mount the aiops-agent Grafana plugin dist into the k3d node so the
+# grafana Deployment's hostPath volume (see 14-grafana.yaml) can pick it up.
+# If the dist isn't built yet, lay down a placeholder so the hostPath mount
+# still resolves — the user can rebuild + re-cp without recreating the cluster.
+PLUGIN_DIST="${ROOT}/../aiops-agent/plugin/dist"
+NODE_CONTAINER="k3d-${CLUSTER}-server-0"
+if [[ -d "${PLUGIN_DIST}" ]]; then
+  echo "[up] copying aiops-agent plugin dist into ${NODE_CONTAINER}"
+  docker exec "${NODE_CONTAINER}" mkdir -p /aiops-plugin
+  docker exec "${NODE_CONTAINER}" rm -rf /aiops-plugin/tedmax100-aiops-app
+  docker cp "${PLUGIN_DIST}" "${NODE_CONTAINER}:/aiops-plugin/tedmax100-aiops-app"
+else
+  echo "[up] WARN: ${PLUGIN_DIST} not found — creating empty placeholder so grafana hostPath resolves"
+  echo "[up]       build the plugin (cd aiops-agent/plugin && npm install && npm run build), then re-run up.sh"
+  docker exec "${NODE_CONTAINER}" mkdir -p /aiops-plugin/tedmax100-aiops-app
+fi
+
 echo "[up] applying manifests"
 # Apply in numeric prefix order: 00-namespace then everything else.
 # cluster.yaml is a k3d config, not a k8s resource — skip it.

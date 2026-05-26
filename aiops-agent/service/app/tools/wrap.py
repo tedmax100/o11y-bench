@@ -17,11 +17,85 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 
 from langchain_core.tools import BaseTool, StructuredTool
 
 logger = logging.getLogger("aiops_agent.wrap")
+
+# Argument names across mcp-grafana's query tools that expect a timestamp.
+# We normalise *all* of these to RFC3339 (UTC, Z-suffixed) before forwarding.
+# Both Prom and Loki accept RFC3339 in their respective HTTP APIs, so a single
+# canonical form is safe across tools.
+_TIME_ARG_KEYS = frozenset({
+    "startTime", "endTime", "startRfc3339", "endRfc3339", "start", "end",
+})
+
+_RELATIVE_RE = re.compile(r"^\s*now\s*(?:-\s*(\d+)\s*([smhd]))?\s*$", re.IGNORECASE)
+_RFC3339_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+
+
+def _normalize_time(value: Any) -> Any:
+    """Coerce a `now` / `now-Xh|m|s|d` string to RFC3339. Pass through anything
+    that already looks like a timestamp or isn't a string. Gemini Flash-Lite
+    keeps emitting `"now-1h"` even when the system prompt tells it not to —
+    this catches it before mcp-grafana rejects the call."""
+    if not isinstance(value, str):
+        return value
+    if _RFC3339_RE.match(value):
+        return value
+    m = _RELATIVE_RE.match(value)
+    if not m:
+        return value
+    num, unit = m.group(1), m.group(2)
+    now = datetime.now(UTC)
+    if num is None:
+        ts = now
+    else:
+        delta_units = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
+        ts = now - timedelta(**{delta_units[unit.lower()]: int(num)})
+    return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _normalize_time_args(kwargs: dict) -> dict:
+    out = dict(kwargs)
+    for k in list(out):
+        if k in _TIME_ARG_KEYS:
+            new = _normalize_time(out[k])
+            if new != out[k]:
+                logger.info("normalized time arg %s: %r -> %r", k, out[k], new)
+                out[k] = new
+    return out
+
+
+def _force_datasource_uid(tool_name: str, kwargs: dict) -> dict:
+    """Overwrite `datasourceUid` with the canonical value for this tool's
+    backing datasource. Gemini Flash-Lite sometimes invents UIDs."""
+    canonical = _CANONICAL_DS_UID.get(tool_name)
+    if canonical is None:
+        return kwargs
+    out = dict(kwargs)
+    if out.get("datasourceUid") != canonical:
+        logger.info(
+            "rewrote datasourceUid for %s: %r -> %r",
+            tool_name, out.get("datasourceUid"), canonical,
+        )
+        out["datasourceUid"] = canonical
+    return out
+
+
+def _fill_prom_defaults(kwargs: dict) -> dict:
+    """mcp-grafana's `query_prometheus` rejects range queries that omit
+    `stepSeconds`. Gemini Flash-Lite forgets it ~once per 3 calls, and when
+    rejected it asks the user to specify a step instead of just picking one.
+    Inject a sane default so the request goes through."""
+    out = dict(kwargs)
+    qt = out.get("queryType", "range")
+    if qt == "range" and out.get("stepSeconds") in (None, 0):
+        out["stepSeconds"] = 60
+        logger.info("filled default stepSeconds=60 on query_prometheus call")
+    return out
 
 LOKI_CAP_BYTES = 8 * 1024
 TEMPO_CAP_BYTES = 8 * 1024
@@ -29,7 +103,18 @@ PROM_CAP_BYTES = 16 * 1024
 
 LOKI_TOOL_NAMES = {"query_loki_logs"}
 TEMPO_TOOL_NAMES = {"query_tempo_traces"}
-PROM_TOOL_NAMES = {"query_prometheus"}
+PROM_TOOL_NAMES = {"query_prometheus", "query_prometheus_histogram"}
+
+# Canonical datasource UIDs as provisioned in demo-services/k8s/14-grafana.yaml.
+# Gemini Flash-Lite sometimes hallucinates random-looking UIDs (e.g. "6o_aK6nZk")
+# which mcp-grafana rejects with an opaque error and the LLM doesn't recover.
+# Tool name uniquely picks the datasource, so just force-overwrite.
+_CANONICAL_DS_UID = {
+    "query_loki_logs": "loki",
+    "query_tempo_traces": "tempo",
+    "query_prometheus": "prometheus",
+    "query_prometheus_histogram": "prometheus",
+}
 
 # MCP-grafana uses `logql`/`traceql`/`expr`. Older or alternative servers
 # sometimes use `query`. We accept both so the wrapper survives an upstream
@@ -100,8 +185,18 @@ def _make_wrapper(
 
     `flavor` is just a string used in messages / hints (e.g. "Loki")."""
 
+    # Call the underlying tool's coroutine directly instead of `tool.ainvoke`.
+    # Going through ainvoke would emit a second on_tool_start/on_tool_end pair
+    # nested inside our wrapper's events, which the SSE stream surfaces as a
+    # duplicate tool card in the UI.
+    inner = tool.coroutine
+    if inner is None:
+        raise RuntimeError(f"wrap_with_cap: {tool.name} has no coroutine to wrap")
+
     async def _coroutine(**kwargs):
-        result = await tool.ainvoke(kwargs)
+        kwargs = _normalize_time_args(kwargs)
+        kwargs = _force_datasource_uid(tool.name, kwargs)
+        result = await inner(**kwargs)
         size = _approx_size(result)
         if size <= cap_bytes:
             return result
@@ -135,7 +230,7 @@ def _make_wrapper(
         new_args[key] = fallback_query
 
         try:
-            agg = await tool.ainvoke(new_args)
+            agg = await inner(**new_args)
         except Exception as exc:
             logger.warning("%s fallback aggregation failed: %s", flavor, exc)
             return {
@@ -175,8 +270,15 @@ def _make_prom_wrapper(tool: BaseTool) -> BaseTool:
     Tell it to fix the query rather than silently re-aggregating —
     re-aggregating raw timeseries from Prom is more work than just asking."""
 
+    inner = tool.coroutine
+    if inner is None:
+        raise RuntimeError(f"wrap_with_cap: {tool.name} has no coroutine to wrap")
+
     async def _coroutine(**kwargs):
-        result = await tool.ainvoke(kwargs)
+        kwargs = _normalize_time_args(kwargs)
+        kwargs = _force_datasource_uid(tool.name, kwargs)
+        kwargs = _fill_prom_defaults(kwargs)
+        result = await inner(**kwargs)
         size = _approx_size(result)
         if size <= PROM_CAP_BYTES:
             return result
