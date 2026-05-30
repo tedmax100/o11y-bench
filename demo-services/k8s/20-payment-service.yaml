@@ -12,13 +12,8 @@ kind: Deployment
 metadata:
   name: payment-service
   namespace: demo
-  # NOTE: git_version is duplicated on Deployment + Pod labels so that
-  # xk6-disruptor / kubectl can select by version (e.g. inject latency only
-  # into v2.5.0). When you "deploy a new version", change BOTH the env var
-  # GIT_VERSION and the label below — they must stay in sync.
   labels:
     app: payment-service
-    git_version: v2.4.1
 spec:
   replicas: 1
   selector:
@@ -28,6 +23,11 @@ spec:
     metadata:
       labels:
         app: payment-service
+        # Single source of truth for the deployed version. The GIT_VERSION env
+        # is derived from this label via the Downward API and the OTel resource
+        # attrs are composed from it. xk6-disruptor / kubectl also select pods
+        # by this label (e.g. inject latency only into v2.5.0), so a version
+        # bump — and the bad-deploy scenario — touches only this one line.
         git_version: v2.4.1
     spec:
       containers:
@@ -38,12 +38,16 @@ spec:
             - containerPort: 8000
               name: http
           env:
-            # Plain env our stdout JSON formatter reads (it can't easily
-            # parse OTEL_RESOURCE_ATTRIBUTES, so we duplicate these).
+            # GIT_REPO + GIT_VERSION are also read by our stdout JSON log
+            # formatter (it doesn't parse OTEL_RESOURCE_ATTRIBUTES). GIT_REPO is
+            # the only literal; GIT_VERSION is pulled from the pod's git_version
+            # label via the Downward API, so the version lives in one place.
             - name: GIT_REPO
-              value: tedmax100/o11y-bench-payment-service
+              value: tedmax100/o11y-bench
             - name: GIT_VERSION
-              value: v2.4.1
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['git_version']
             - name: FEATURE_FLAGS_PATH
               value: /etc/demo/flags.json
             - name: LOG_LEVEL
@@ -52,7 +56,7 @@ spec:
             - name: OTEL_SERVICE_NAME
               value: payment-service
             - name: OTEL_RESOURCE_ATTRIBUTES
-              value: "service.namespace=demo,deployment.environment=demo,git_repo=tedmax100/o11y-bench-payment-service,git_version=v2.4.1"
+              value: "service.namespace=demo,deployment.environment=demo,service.version=$(GIT_VERSION),git_repo=$(GIT_REPO),git_version=$(GIT_VERSION)"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://otel-collector.demo.svc:4318
             - name: OTEL_EXPORTER_OTLP_PROTOCOL

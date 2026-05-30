@@ -13,9 +13,17 @@ services:
       context: .
       dockerfile: services/payment/Dockerfile
     environment:
-      GIT_REPO: tedmax100/o11y-bench-payment-service
+      OTEL_SERVICE_NAME: payment-service
+      GIT_REPO: tedmax100/o11y-bench
       GIT_VERSION: v2.4.1
       DEPLOYMENT_ENV: demo
+      # Compose has no Downward API / $(VAR) trick, so the resource attrs are
+      # spelled out. Without this line traces & metrics carry NO git_repo /
+      # git_version (only the stdout JSON logs did, via GIT_* above). Keep
+      # service.version / git_version in sync with GIT_VERSION when bumping.
+      # The k8s path derives all of these from one label — see
+      # k8s/20-payment-service.yaml.
+      OTEL_RESOURCE_ATTRIBUTES: "service.namespace=demo,deployment.environment=demo,service.version=v2.4.1,git_repo=tedmax100/o11y-bench,git_version=v2.4.1"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
       FEATURE_FLAGS_PATH: /etc/demo/flags.json
       LOG_LEVEL: INFO

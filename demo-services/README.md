@@ -81,6 +81,66 @@ Tear down:
 ./scripts/down.sh
 ```
 
+## Telemetry standard (repo + version on every signal)
+
+Every service stamps the same identity onto **all three signals** (traces,
+metrics, logs) so the AIOps agent can pivot between them and correlate a spike
+to a code change. The standard is four resource attributes:
+
+| attribute | example | purpose |
+|-----------|---------|---------|
+| `service.name` | `payment-service` | OTel semconv service identity (→ Loki/Prom `service_name`) |
+| `service.version` | `v2.4.1` | **OTel semconv** version — for standard tooling that keys on `service.version` |
+| `git_version` | `v2.4.1` | same value as `service.version`; the **join key** for cross-signal + GitHub correlation |
+| `git_repo` | `tedmax100/o11y-bench` | `owner/repo` (the monorepo) for the agent's `github_compare` / `github_get_file` tools |
+
+`git_version` is a valid GitHub ref (tag), so the agent can read it off any
+signal and immediately `github_compare` the suspect deploy. `git_repo` saves it
+maintaining a service→repo table.
+
+### Single source of truth
+
+The version literal lives in **exactly one place per service**: the pod-template
+`git_version` label. Everything else is derived, so a version bump is a one-line
+change (and the bad-deploy demo below relies on this):
+
+```
+spec.template.metadata.labels.git_version          ← the only literal
+        │  Downward API (fieldRef)
+        ▼
+   env GIT_VERSION                                  ← read by the stdout JSON logger too
+        │  k8s $(VAR) interpolation
+        ▼
+   OTEL_RESOURCE_ATTRIBUTES                         ← service.version=$(GIT_VERSION),
+   = ...,git_version=$(GIT_VERSION),...                 git_version=$(GIT_VERSION), git_repo=$(GIT_REPO)
+```
+
+`GIT_REPO` is the only other literal (it never changes on deploy). See any
+manifest, e.g. [k8s/20-payment-service.yaml](k8s/20-payment-service.yaml).
+
+### Where each attribute lands
+
+| signal | mechanism | result |
+|--------|-----------|--------|
+| **Metrics** (Prometheus) | `resource_to_telemetry_conversion: true` promotes all resource attrs → labels | `git_version`, `service_version`, `git_repo` labels on every series |
+| **Traces** (Tempo) | resource attrs are queryable | `resource.git_version`, `resource.service.version`, `resource.git_repo` |
+| **Logs — OTLP** (Loki) | `11-loki.yaml` promotes a fixed list to stream labels | `git_version` / `git_repo` indexed; `service.version` flows as a non-indexed resource attr (kept out of the index to avoid cardinality dup with `git_version`) |
+| **Logs — stdout JSON** | `o11y_shared` logger reads `GIT_REPO` / `GIT_VERSION` env | `git_repo` / `git_version` fields on each line |
+
+### Bumping a version
+
+Patch the pod-template label only — the rollout carries it everywhere:
+
+```bash
+kubectl -n demo patch deployment <svc> --type=merge \
+  -p '{"spec":{"template":{"metadata":{"labels":{"git_version":"vX.Y.Z"}}}}}'
+```
+
+> **docker-compose caveat:** Compose has no Downward API / `$(VAR)`
+> interpolation, so `docker-compose.yaml` spells `OTEL_RESOURCE_ATTRIBUTES`
+> out and you must keep `service.version` / `git_version` in sync with
+> `GIT_VERSION` by hand there.
+
 ## Smoke verification (the schema is the point)
 
 In Grafana → Explore → **Loki**:
@@ -108,7 +168,13 @@ sum by (git_version) (rate(payment_charges_total[5m]))
 ```
 
 The result must have `git_version="v2.4.1"` as a label. That proves the
-resource attr made it through OTel Collector → Prometheus remote write.
+resource attr made it through OTel Collector → Prometheus remote write. The
+same series should now also carry `service_version="v2.4.1"` (the semconv
+mirror) — confirm with:
+
+```promql
+sum by (service_version) (rate(payment_charges_total[5m]))
+```
 
 ## Triggering the "bad deploy" demo
 
@@ -119,10 +185,12 @@ kubectl -n demo create configmap payment-flags \
   --from-literal=flags.json='{"payment_use_new_validator": true}' \
   --dry-run=client -o yaml | kubectl apply -f -
 
-kubectl -n demo set env deploy/payment-service GIT_VERSION=v2.5.0
-kubectl -n demo label --overwrite deploy/payment-service git_version=v2.5.0
-kubectl -n demo patch deploy/payment-service \
-  --type=json -p='[{"op":"replace","path":"/spec/template/metadata/labels/git_version","value":"v2.5.0"}]'
+# Bump the version by patching the pod-template git_version label — the single
+# source of truth. This triggers a rollout; the new pods carry the label, the
+# GIT_VERSION env is derived from it via the Downward API, and every signal
+# (logs / metrics / traces) plus disruptor pod-selection follow automatically.
+kubectl -n demo patch deployment payment-service --type=merge \
+  -p '{"spec":{"template":{"metadata":{"labels":{"git_version":"v2.5.0"}}}}}'
 ```
 
 Now odd-cents amounts get declined. Run an LogQL query grouping by

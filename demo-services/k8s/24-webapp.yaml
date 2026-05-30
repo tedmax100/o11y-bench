@@ -5,7 +5,6 @@ metadata:
   namespace: demo
   labels:
     app: webapp
-    git_version: v5.2.0
 spec:
   replicas: 1
   selector:
@@ -15,6 +14,9 @@ spec:
     metadata:
       labels:
         app: webapp
+        # Single source of truth for the deployed version. The GIT_VERSION env
+        # is derived from this label via the Downward API, and the OTel resource
+        # attrs are composed from it — so a version bump touches only this line.
         git_version: v5.2.0
     spec:
       containers:
@@ -25,10 +27,15 @@ spec:
             - containerPort: 8000
               name: http
           env:
+            # GIT_REPO is the only repo/version literal in the container spec;
+            # GIT_VERSION is pulled from the pod's git_version label so the
+            # version number is never duplicated here.
             - name: GIT_REPO
-              value: tedmax100/o11y-bench-webapp
+              value: tedmax100/o11y-bench
             - name: GIT_VERSION
-              value: v5.2.0
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['git_version']
             - name: LOG_LEVEL
               value: INFO
             - name: API_GATEWAY_URL
@@ -36,7 +43,7 @@ spec:
             - name: OTEL_SERVICE_NAME
               value: webapp
             - name: OTEL_RESOURCE_ATTRIBUTES
-              value: "service.namespace=demo,deployment.environment=demo,git_repo=tedmax100/o11y-bench-webapp,git_version=v5.2.0"
+              value: "service.namespace=demo,deployment.environment=demo,service.version=$(GIT_VERSION),git_repo=$(GIT_REPO),git_version=$(GIT_VERSION)"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://otel-collector.demo.svc:4318
             - name: OTEL_EXPORTER_OTLP_PROTOCOL
