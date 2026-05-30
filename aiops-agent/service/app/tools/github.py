@@ -53,7 +53,7 @@ async def github_compare(repo: str, base: str, head: str) -> dict[str, Any]:
     (e.g. `v2.5.0`), or branch names.
 
     Args:
-        repo: Full repo path, `owner/name` (e.g. `tedmax100/o11y-bench-payment-service`).
+        repo: Full repo path, `owner/name` (e.g. `tedmax100/o11y-bench`).
         base: The older ref (e.g. `v2.4.1`).
         head: The newer ref (e.g. `v2.5.0`).
 

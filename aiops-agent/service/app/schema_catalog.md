@@ -9,18 +9,25 @@ Five services run in the `demo` namespace. Every service emits via OTel
 (traces / metrics / logs) through `otel-collector` → Tempo / Prometheus
 (remote-write) / Loki (native OTLP).
 
-| service | role | github_repo | git_version |
-|---------|------|-------------|-------------|
-| webapp | public edge — receives external HTTP, forwards to api-gateway | tedmax100/o11y-bench-webapp | v5.2.0 |
-| api-gateway | thin proxy router to backend services | tedmax100/o11y-bench-api-gateway | v4.0.0 |
-| user-service | user lookup + auth check | tedmax100/o11y-bench-user-service | v1.3.0 |
-| order-service | products / cart / orders. Calls user + payment | tedmax100/o11y-bench-order-service | v3.1.2 |
-| payment-service | charges. Has the `payment_use_new_validator` flag | tedmax100/o11y-bench-payment-service | v2.4.1 |
+| service | role | code path (in repo) | git_version |
+|---------|------|---------------------|-------------|
+| webapp | public edge — receives external HTTP, forwards to api-gateway | `demo-services/services/webapp/` | v5.2.0 |
+| api-gateway | thin proxy router to backend services | `demo-services/services/api-gateway/` | v4.0.0 |
+| user-service | user lookup + auth check | `demo-services/services/user/` | v1.3.0 |
+| order-service | products / cart / orders. Calls user + payment | `demo-services/services/order/` | v3.1.2 |
+| payment-service | charges. Has the `payment_use_new_validator` flag | `demo-services/services/payment/` | v2.4.1 |
 
-The `github_repo` column maps each service to the `owner/repo` you pass to
-`github_compare` / `github_get_file`. The `git_version` field on logs and the
-`git_version` Prometheus label hold the deployed revision (a valid ref for the
-github tools).
+**All services live in one monorepo: `tedmax100/o11y-bench`** — that is the
+`repo` you pass to `github_compare` / `github_get_file` (it also matches the
+`git_repo` label on every signal). Each service's code is under the path above.
+
+The `git_version` field on logs and the `git_version` Prometheus label hold the
+deployed revision. **Only `payment-service` currently has real git tags** that
+bracket a meaningful change: `v2.4.1` (baseline) → `v2.5.0` (adds the
+odd-cents charge validator behind `payment_use_new_validator`). The other
+services' `git_version` values are telemetry labels only — they do **not** have
+git tags yet, so `github_compare` on them will 404. Only run deploy correlation
+for payment-service until the others get tagged.
 
 Dependency edges (caller → callee):
 
@@ -50,7 +57,7 @@ HTTP endpoints (owning service):
 | label | value |
 |-------|-------|
 | `service_name` | one of: `webapp`, `api-gateway`, `user-service`, `order-service`, `payment-service` |
-| `git_repo` | e.g. `tedmax100/o11y-bench-payment-service` |
+| `git_repo` | `tedmax100/o11y-bench` (the monorepo — same for every service) |
 | `git_version` | e.g. `v2.4.1` |
 | `deployment_environment` | always `demo` |
 
@@ -138,6 +145,9 @@ or, for payment specifically, `rate(payment_charges_total[5m]) > 0`.
 
 - `service_name` — same value as the Loki stream label
 - `git_repo`, `git_version` — promoted from OTel resource attrs
+- `service_version` — OTel-semconv mirror of `git_version` (same value). Prefer
+  `git_version` for cross-signal joins and the GitHub tools; `service_version`
+  exists for standard tooling that keys on `service.version`.
 - `deployment_environment` — `demo`
 
 **Application metrics** (created by `o11y_shared` and the service code):
@@ -188,7 +198,8 @@ webapp        "GET /api/<path>"      kind=server
       ↳ <dep service>  httpx          kind=client → server (if any)
 ```
 
-**Resource attributes** (queryable): `service.name`, `git_repo`, `git_version`,
+**Resource attributes** (queryable): `service.name`, `service.version`
+(semconv mirror of `git_version`), `git_repo`, `git_version`,
 `deployment.environment`.
 
 **Span attributes** (auto-instrumentation): `http.method`, `http.route`,
@@ -220,7 +231,11 @@ To trigger:
 kubectl -n demo create configmap payment-flags \
   --from-literal=flags.json='{"payment_use_new_validator": true}' \
   --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n demo set env deploy/payment-service GIT_VERSION=v2.5.0
+# Bump the version via the pod-template git_version label (single source of
+# truth). GIT_VERSION and the OTel resource attrs are derived from it, so every
+# signal moves to v2.5.0 together.
+kubectl -n demo patch deployment payment-service --type=merge \
+  -p '{"spec":{"template":{"metadata":{"labels":{"git_version":"v2.5.0"}}}}}'
 ```
 
 The agent should see `payment.declined` spike under `git_version="v2.5.0"`
@@ -234,11 +249,15 @@ yet implemented** — don't claim to find them.
 
 Whenever you find a spike correlated with a `git_version` boundary:
 
-1. Read the `git_repo` from the same logs / from this catalog.
+1. The repo is always `tedmax100/o11y-bench` (the monorepo; also on the
+   `git_repo` label).
 2. The previous version is the value of `git_version` immediately before the
    spike (e.g. `v2.4.1` if the spike is on `v2.5.0`).
-3. Call `github_compare(repo, base=<old>, head=<new>)` to see what changed.
+3. Call `github_compare("tedmax100/o11y-bench", base=<old>, head=<new>)` to see
+   what changed. The diff for a single-service deploy is naturally scoped to
+   that service's path (e.g. `demo-services/services/payment/`).
 4. If a suspicious file shows up in the diff,
-   `github_get_file(repo, path, ref=<new>, start, end)` to read the new code.
+   `github_get_file("tedmax100/o11y-bench", path, ref=<new>, start, end)` to
+   read the new code.
 5. Cite the commit SHA(s) and a one-line summary of what changed in your
    final answer, alongside the telemetry queries.
