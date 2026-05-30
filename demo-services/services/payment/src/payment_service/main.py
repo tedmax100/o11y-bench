@@ -79,6 +79,21 @@ async def charge(req: ChargeRequest) -> ChargeResponse:
         amount_cents=req.amount_cents,
     )
 
+    # New in v2.5.0: stricter charge validation, rolled out behind a flag so we
+    # can dark-launch it. Rejects amounts with an odd number of cents.
+    if _flags.bool("payment_use_new_validator", False):
+        if req.amount_cents % 2 == 1:
+            log_event(
+                _log,
+                BizEvent.PAYMENT_DECLINED,
+                "declined by new validator",
+                order_id=req.order_id,
+                reason="new_validator_odd_cents",
+            )
+            _charges_counter.add(1, {"status": "declined", "reason": "new_validator"})
+            _charge_latency.record(time.perf_counter() - start, {"status": "declined"})
+            raise HTTPException(status_code=402, detail="payment declined")
+
     if random.random() < 0.01:
         log_event(
             _log,
