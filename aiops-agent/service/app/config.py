@@ -7,7 +7,12 @@ class Settings(BaseSettings):
     google_api_key: str = ""
     gemini_model: str = "gemini-3.1-flash-lite"
 
-    mcp_grafana_url: str = "http://localhost:8080/mcp"
+    # Direct native-API endpoints. Defaults target localhost for host-side dev
+    # (kubectl port-forward); the in-cluster Deployment overrides these with
+    # internal DNS (prometheus.demo.svc:9090 ...) via env.
+    prometheus_url: str = "http://localhost:9090"
+    loki_url: str = "http://localhost:3100"
+    tempo_url: str = "http://localhost:3200"
 
     github_token: str = ""
 

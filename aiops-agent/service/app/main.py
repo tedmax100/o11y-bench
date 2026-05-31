@@ -23,6 +23,8 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     message: str
     thread_id: str | None = None
+    # Set when the user picked a service from the clarify menu; skips resolution.
+    service_hint: str | None = None
 
 
 @app.get("/healthz")
@@ -36,7 +38,7 @@ async def chat(req: ChatRequest):
 
     async def event_gen():
         yield {"event": "thread", "data": json.dumps({"thread_id": thread_id})}
-        async for evt in stream_chat(req.message, thread_id):
+        async for evt in stream_chat(req.message, thread_id, req.service_hint):
             yield {"event": evt["type"], "data": json.dumps(evt)}
 
     return EventSourceResponse(event_gen())

@@ -1,13 +1,19 @@
-# Telemetry Schema Catalog
+# Telemetry Schema Catalog — semantics & conventions
 
-Authoritative description of what's actually in the demo-services k3d cluster.
-Use this to write correct queries instead of guessing label or field names.
+This file describes what the signals **mean** and the **conventions** they
+follow. It deliberately does **not** list the exhaustive inventory of metrics,
+span names or log fields — those drift, and they are supplied live instead:
+
+- A **capability snapshot** is injected per question for the service(s) it's
+  about (real metric names + labels, span names, log fields, read just now).
+- The `discover_metrics` / `discover_span_names` / `discover_log_fields` tools
+  fetch the same on demand for any service.
+
+**Trust the live snapshot over this file for "what exists"** (exact metric /
+span / field names). Use this file for "what it means" and how the stack is
+wired.
 
 ## Services
-
-Five services run in the `demo` namespace. Every service emits via OTel
-(traces / metrics / logs) through `otel-collector` → Tempo / Prometheus
-(remote-write) / Loki (native OTLP).
 
 | service | role | code path (in repo) | git_version |
 |---------|------|---------------------|-------------|
@@ -18,16 +24,10 @@ Five services run in the `demo` namespace. Every service emits via OTel
 | payment-service | charges. Has the `payment_use_new_validator` flag | `demo-services/services/payment/` | v2.4.1 |
 
 **All services live in one monorepo: `tedmax100/o11y-bench`** — that is the
-`repo` you pass to `github_compare` / `github_get_file` (it also matches the
-`git_repo` label on every signal). Each service's code is under the path above.
-
-The `git_version` field on logs and the `git_version` Prometheus label hold the
-deployed revision. **Only `payment-service` currently has real git tags** that
-bracket a meaningful change: `v2.4.1` (baseline) → `v2.5.0` (adds the
-odd-cents charge validator behind `payment_use_new_validator`). The other
-services' `git_version` values are telemetry labels only — they do **not** have
-git tags yet, so `github_compare` on them will 404. Only run deploy correlation
-for payment-service until the others get tagged.
+`repo` for `github_compare` / `github_get_file` and matches the `git_repo`
+label on every signal. **Only `payment-service` currently has real git tags**
+(`v2.4.1` → `v2.5.0`); `github_compare` on the other services 404s, so only run
+deploy correlation for payment-service.
 
 Dependency edges (caller → callee):
 
@@ -35,229 +35,109 @@ Dependency edges (caller → callee):
 webapp → api-gateway
 api-gateway → {user-service, order-service, payment-service}
 order-service → {user-service, payment-service}
-user-service (leaf)
-payment-service (leaf)
+user-service (leaf)        payment-service (leaf)
 ```
 
 HTTP endpoints (owning service):
 
 | method | path | owner |
 |--------|------|-------|
-| GET | /api/users | user-service |
-| GET | /api/users/{id} | user-service |
-| GET | /api/products | order-service |
-| GET | /api/cart | order-service |
+| GET | /api/users, /api/users/{id} | user-service |
+| GET | /api/products, /api/cart | order-service |
 | POST | /api/orders | order-service |
 | POST | /api/payments | payment-service (proxied via api-gateway → `/charge`) |
 
-## Loki
+## Cross-signal conventions
 
-**Stream labels** (the *only* indexable selectors):
+- Every signal carries `service_name`, `git_version` (deployed revision),
+  `git_repo` (always `tedmax100/o11y-bench`), and `deployment_environment=demo`.
+  `service_version` mirrors `git_version` (OTel semconv); prefer `git_version`
+  for cross-signal joins and the GitHub tools.
+- **There is no `up{}` for application services.** The OTel Collector pushes via
+  remote_write (not scraped), so `up{service_name="..."}` is always empty
+  regardless of health. Check liveness with a fresh sample on a counter the
+  service emits, e.g. `rate(<some_total>[5m]) > 0`.
+- **Loki** — the *only* indexable stream-selector labels are `service_name`,
+  `git_repo`, `git_version`, `deployment_environment`. Everything else (`level`,
+  `event`, `trace_id`, business fields) is **structured metadata**: filter it
+  *after* the selector (`| level="ERROR"`), never as a `{...}` selector. Do not
+  use `app` / `container` / `pod` / `job` — they aren't indexed.
+- **Tempo** — resource/span attributes use **dotted** names
+  (`resource.service.name`, `span.http.route`, `status`). Trace structure,
+  root→leaf: `webapp → api-gateway → <target service> → <dep service>`.
+- **Prometheus** — OTel→remote_write with `resource_to_telemetry_conversion`,
+  so resource attrs become labels. Histograms are `*_bucket/_sum/_count`
+  (use `histogram_quantile` over `_bucket`); counters end `_total`. Always
+  aggregate (`sum by (...)`, `topk`) — don't fetch raw per-series.
 
-| label | value |
-|-------|-------|
-| `service_name` | one of: `webapp`, `api-gateway`, `user-service`, `order-service`, `payment-service` |
-| `git_repo` | `tedmax100/o11y-bench` (the monorepo — same for every service) |
-| `git_version` | e.g. `v2.4.1` |
-| `deployment_environment` | always `demo` |
+## BizEvent enum & per-event fields (Loki structured metadata)
 
-These come from OTel resource attributes promoted by Loki's OTLP ingestion
-(see `limits_config.otlp_config.resource_attributes` in `11-loki.yaml`).
-Do **not** use `app`, `service`, `container`, `pod`, `job`, `level`, `event`
-as stream labels — they are not indexed.
+`event` is low-cardinality (safe to `sum by (event)`). The values and the extra
+fields each carries are domain knowledge, not discoverable from labels alone:
 
-**Structured metadata** (label-filter only, after the selector):
-
-| field | values |
-|-------|--------|
-| `level` | `INFO`, `WARN`, `ERROR` |
-| `event` | `BizEvent` enum, see below |
-| `trace_id` | 32-char hex — joins to Tempo |
-| `span_id` | 16-char hex |
-
-**Per-event extra fields** (also structured metadata, vary by event):
+```
+payment.requested  payment.authorized  payment.declined  payment.refunded
+payment.gateway_error   order.created  order.updated  order.cancelled
+user.logged_in  user.registered  user.auth_failed
+http.request_received  http.request_failed   cache.miss  deployment.started
+```
 
 | event | extra fields |
 |-------|--------------|
 | `payment.requested` / `payment.authorized` | `order_id`, `user_id`, `amount_cents`, `payment_id` |
-| `payment.declined` | `order_id`, `reason` (`new_validator_odd_cents` etc.) |
+| `payment.declined` | `order_id`, `reason` (`new_validator_odd_cents` …) |
 | `payment.gateway_error` | `order_id` |
 | `order.created` | `order_id`, `user_id`, `amount_cents` |
 | `order.cancelled` | `user_id`, `reason` (`auth_failed` / `payment_declined` / `unknown_product`), `upstream_status` |
 | `user.logged_in` / `user.auth_failed` | `user_id`, `reason` (`not_found` / `transient`) |
-| `http.request_received` | `method`, `path` (template form, e.g. `/api/users/{id}`) |
-| `http.request_failed` | `upstream` (target URL), `status`, `reason` (`network`) |
+| `http.request_received` | `method`, `path` (template, e.g. `/api/users/{id}`) |
+| `http.request_failed` | `upstream`, `status`, `reason` (`network`) |
 
-**`BizEvent` enum** (low-cardinality — safe to `sum by (event)`):
-
-```
-payment.requested  payment.authorized  payment.declined
-payment.refunded   payment.gateway_error
-order.created      order.updated       order.cancelled
-user.logged_in     user.registered     user.auth_failed
-http.request_received  http.request_failed
-cache.miss         deployment.started
-```
-
-### LogQL examples for this data
-
-```logql
-# Errors per service in the last hour — aggregate at the datasource
-sum by (service_name) (
-  count_over_time({deployment_environment="demo"} | level="ERROR" [1h])
-)
-
-# Decline rate on payment-service, grouped by reason
-sum by (reason) (
-  count_over_time({service_name="payment-service"} | event="payment.declined" [10m])
-)
-
-# THE v2 fallback aggregation — what wrap.py auto-rewrites large outputs into
-topk(20,
-  sum by (service_name, level, event, git_version) (
-    count_over_time({service_name="payment-service"}[5m])
-  )
-)
-
-# Find which git_version a spike happened on
-sum by (git_version, event) (
-  count_over_time({service_name="payment-service"} | event=~"payment\\..*" [10m])
-)
-
-# Pivot from an error log to its trace_id
-{service_name="order-service"} | level="ERROR" | line_format "{{.message}} trace={{.trace_id}}"
-```
-
-## Prometheus
-
-OTel → Prometheus via `prometheusremotewrite` with `resource_to_telemetry_conversion: true`,
-so resource attributes become metric labels.
-
-**There is no `up{}` metric for any application service.** Prometheus only
-generates `up` for targets it scrapes directly; here the OTel Collector pushes
-via remote_write, so `up{service_name="..."}` is **always empty** regardless of
-whether the service is healthy. To check liveness use a fresh sample on a
-counter the service actually emits, e.g.
-`rate(http_server_duration_milliseconds_count{service_name="<svc>"}[5m]) > 0`
-or, for payment specifically, `rate(payment_charges_total[5m]) > 0`.
-
-**Labels on every metric**:
-
-- `service_name` — same value as the Loki stream label
-- `git_repo`, `git_version` — promoted from OTel resource attrs
-- `service_version` — OTel-semconv mirror of `git_version` (same value). Prefer
-  `git_version` for cross-signal joins and the GitHub tools; `service_version`
-  exists for standard tooling that keys on `service.version`.
-- `deployment_environment` — `demo`
-
-**Application metrics** (created by `o11y_shared` and the service code):
-
-| metric | type | extra labels | owner |
-|--------|------|--------------|-------|
-| `payment_charges_total` | counter | `status` (`authorized` / `declined` / `error`), optional `reason` | payment-service |
-| `payment_charge_duration_seconds_{bucket,sum,count}` | histogram | `status`, `le` | payment-service |
-| `orders_total` | counter | `status` (`created` / `cancelled` / `error`), `reason` when not created | order-service |
-| `order_create_duration_seconds_{bucket,sum,count}` | histogram | `status`, `le` | order-service |
-| `user_lookups_total` | counter | `op` (`list` / `get`) | user-service |
-| `user_auth_checks_total` | counter | — | user-service |
-
-**Auto-instrumentation metrics** (from `opentelemetry-instrumentation-fastapi` / `httpx`):
-
-| metric | extra labels | notes |
-|--------|--------------|-------|
-| `http_server_duration_milliseconds_{bucket,sum,count}` | `http_method`, `http_status_code`, `http_route` | server-side |
-| `http_client_duration_milliseconds_{bucket,sum,count}` | `http_method`, `http_status_code`, `net_peer_name` | outgoing httpx calls |
-
-### PromQL examples
+## Query style (use live names from the snapshot)
 
 ```promql
-# p95 latency per service for the order create handler
-histogram_quantile(0.95,
-  sum by (service_name, le) (rate(order_create_duration_seconds_bucket[5m]))
-)
-
-# Payment error rate per git_version (v2 cross-version comparison)
-sum by (git_version) (rate(payment_charges_total{status="error"}[5m]))
-/
-sum by (git_version) (rate(payment_charges_total[5m]))
-
-# HTTP 5xx rate per service (auto-instrumentation)
-sum by (service_name) (
-  rate(http_server_duration_milliseconds_count{http_status_code=~"5.."}[5m])
-)
+# p95 latency per service (histogram → histogram_quantile over _bucket)
+histogram_quantile(0.95, sum by (service_name, le) (rate(<duration>_bucket[5m])))
 ```
-
-## Tempo
-
-Trace structure per request (root → leaf):
-
+```logql
+# errors per service — aggregate at the source, don't pull raw lines
+sum by (service_name) (count_over_time({deployment_environment="demo"} | level="ERROR" [1h]))
 ```
-webapp        "GET /api/<path>"      kind=server
-  ↳ api-gateway  "GET /api/<path>"   kind=server
-    ↳ <target service> "GET /api/..." kind=server
-      ↳ <dep service>  httpx          kind=client → server (if any)
-```
-
-**Resource attributes** (queryable): `service.name`, `service.version`
-(semconv mirror of `git_version`), `git_repo`, `git_version`,
-`deployment.environment`.
-
-**Span attributes** (auto-instrumentation): `http.method`, `http.route`,
-`http.url`, `http.status_code`, `net.peer.name`.
-
-### TraceQL examples
-
 ```traceql
-# All errors originating in payment-service in the window
-{ resource.service.name = "payment-service" && status = error }
-
-# Slow order creation traces
-{ resource.service.name = "order-service" && span.http.route = "/api/orders" && duration > 500ms }
-
-# Cross-version: traces hitting the newly deployed payment version
-{ resource.service.name = "payment-service" && resource.git_version = "v2.5.0" }
+# errors originating in a service
+{ resource.service.name = "<service>" && status = error }
 ```
 
 ## Feature flags & incident scenarios
 
-Currently planted: **payment-service** has a `payment_use_new_validator` flag
-(read from `flags.json` mounted as a ConfigMap). Flipping it to `true` and
-bumping `GIT_VERSION` from `v2.4.1` to `v2.5.0` simulates a bad deploy where
-odd-cents amounts get declined.
+**payment-service** has a `payment_use_new_validator` flag (from `flags.json`,
+a ConfigMap). Flipping it `true` and bumping `git_version` `v2.4.1` → `v2.5.0`
+simulates a bad deploy where odd-cents amounts get declined — `payment.declined`
+spikes under `git_version="v2.5.0"` in both Loki (`sum by (git_version, event)`)
+and Prometheus (declined charges by `git_version`).
 
-To trigger:
+Trigger:
 
 ```bash
 kubectl -n demo create configmap payment-flags \
   --from-literal=flags.json='{"payment_use_new_validator": true}' \
   --dry-run=client -o yaml | kubectl apply -f -
-# Bump the version via the pod-template git_version label (single source of
-# truth). GIT_VERSION and the OTel resource attrs are derived from it, so every
-# signal moves to v2.5.0 together.
 kubectl -n demo patch deployment payment-service --type=merge \
   -p '{"spec":{"template":{"metadata":{"labels":{"git_version":"v2.5.0"}}}}}'
 ```
 
-The agent should see `payment.declined` spike under `git_version="v2.5.0"`
-in both Loki (`sum by (git_version, event)`) and Prometheus
-(`payment_charges_total{status="declined"}`).
-
-Other incident scenarios (order latency, user-service cache lag) are **not
-yet implemented** — don't claim to find them.
+Other incident scenarios (order latency, user-service cache lag) are **not yet
+implemented** — don't claim to find them.
 
 ## Deploy correlation
 
-Whenever you find a spike correlated with a `git_version` boundary:
+When a spike correlates with a `git_version` boundary:
 
-1. The repo is always `tedmax100/o11y-bench` (the monorepo; also on the
-   `git_repo` label).
-2. The previous version is the value of `git_version` immediately before the
-   spike (e.g. `v2.4.1` if the spike is on `v2.5.0`).
-3. Call `github_compare("tedmax100/o11y-bench", base=<old>, head=<new>)` to see
-   what changed. The diff for a single-service deploy is naturally scoped to
-   that service's path (e.g. `demo-services/services/payment/`).
-4. If a suspicious file shows up in the diff,
-   `github_get_file("tedmax100/o11y-bench", path, ref=<new>, start, end)` to
-   read the new code.
-5. Cite the commit SHA(s) and a one-line summary of what changed in your
-   final answer, alongside the telemetry queries.
+1. Repo is always `tedmax100/o11y-bench` (also the `git_repo` label).
+2. Previous version = the `git_version` value just before the spike (e.g.
+   `v2.4.1` if the spike is on `v2.5.0`).
+3. `github_compare("tedmax100/o11y-bench", base=<old>, head=<new>)` to see the
+   diff (naturally scoped to that service's path).
+4. If a suspicious file shows up, `github_get_file(...)` to read the new code.
+5. Cite the commit SHA(s) + a one-line summary alongside the telemetry queries.
+   Only payment-service has real tags today (see Services).

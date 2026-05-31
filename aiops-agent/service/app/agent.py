@@ -7,13 +7,22 @@ from typing import AsyncIterator
 
 from langchain_core.messages import SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import ToolNode, create_react_agent
 from pydantic import BaseModel, Field
 
+from .capability import capability_for_services, resolve_services
 from .config import settings
-from .tools import github_compare, github_get_file, wrap_with_cap
+from .tools import (
+    discover_log_fields_tool,
+    discover_metrics_tool,
+    discover_span_names_tool,
+    github_compare,
+    github_get_file,
+    query_loki_logs,
+    query_prometheus,
+    query_tempo_traces,
+)
 
 logger = logging.getLogger("aiops_agent")
 DEBUG_EVENTS = os.getenv("DEBUG_EVENTS", "0") == "1"
@@ -40,7 +49,7 @@ def _flatten_content(content) -> str:
     return str(content)
 
 SYSTEM_PROMPT_TEMPLATE = """You are an AIOps assistant helping an on-call SRE investigate
-issues using the Grafana stack (Prometheus, Loki, Tempo) via the grafana-mcp tools.
+issues using the Grafana stack — querying Prometheus, Loki and Tempo directly.
 
 # Reply in the user's language
 
@@ -111,24 +120,28 @@ with the default filled in.
 
 # Tool routing
 
-Pick the tool by what kind of signal you need. Don't call discovery tools
-(`list_*_label_names`, `list_*_label_values`) when the catalog below already tells
-you the answer.
+Pick the tool by what kind of signal you need. The catalog below covers the
+common cases; when it doesn't name the metric / span / field you need for a
+service, use a discovery tool to look it up against the live data instead of
+guessing.
 
 | Need | Use |
 |------|-----|
 | Logs (errors, warnings, request lines, deployment events) | `query_loki_logs` with LogQL |
 | Metrics (rates, p95 latency, error ratios, gauge spikes) | `query_prometheus` with PromQL |
 | Traces (find root cause service, slow operations) | `query_tempo_traces` with TraceQL |
-| Dashboards / datasources discovery | `list_datasources`, `search_dashboards` |
+| Which metrics does a service emit? | `discover_metrics(service)` |
+| Which span/operation names does a service have? | `discover_span_names(service)` |
+| Which log fields can I filter/group by? | `discover_log_fields(service)` |
 | Code diff between two deploy versions | `github_compare(repo, base, head)` |
 | Read a slice of a file at a specific ref | `github_get_file(repo, path, ref, start, end)` |
 
 Default ordering for an RCA question:
 
-1. **Metrics first** — narrow the window with `http_requests_total` error rate or
-   `service_retry_queue_depth` / `service_cache_refresh_lag_seconds` gauges. This
-   gives you a service and a time range cheaply.
+1. **Metrics first** — narrow the window with an HTTP error-rate or latency
+   metric for the service (use the exact metric name from the live capability
+   snapshot, e.g. the `*_duration_milliseconds_count` / `*_total` it actually
+   emits). This gives you a service and a time range cheaply.
 2. **Traces next** — `{{ resource.service.name = "<service>" && span:status = error }}`
    confirms the origin service and gives you `trace_id`s to look up.
 3. **Logs last** — pivot on `trace_id` or service+level to read the actual error
@@ -141,12 +154,14 @@ Default ordering for an RCA question:
 
 # Anti-patterns (don't do these)
 
-- Selectors like `{{app="..."}}` or `{{container="..."}}` — the only Loki labels here
-  are `job`, `service`, `level` (see catalog).
+- Loki stream selectors other than the indexed ones — the only `{{...}}`-selectable
+  labels are `service_name`, `git_repo`, `git_version`, `deployment_environment`.
+  `level` / `event` / business fields are structured metadata: filter them with
+  `| level="ERROR"` *after* the selector, not inside `{{...}}`.
 - Fetching > 100 raw log lines to "look for errors" — write a LogQL pipeline that
   aggregates by error message or status instead.
-- Calling `list_loki_label_values` for `service` — the catalog already lists every
-  service.
+- Guessing a metric / span / field name when the catalog doesn't list it — call
+  the matching `discover_*` tool to get the real names first.
 - **Querying `up{{service_name="..."}}` as a liveness check.** This metric does not
   exist for application services in this stack (see Prometheus section of the
   catalog). It returns empty whether the service is healthy or dead, so it is
@@ -165,25 +180,35 @@ user's language" rule at the top).
 ~1 req/s", "0 ERROR logs"). Vague claims like "回應速度正常" without a number
 are not useful.
 
-## Charts (important)
+## Panels (important)
 
-The Grafana plugin **auto-renders** any fenced ```` ```promql ```` block in
-your answer as a live time-series panel. This is the main way the user sees
-metric data — your prose explains, the chart shows.
+The Grafana plugin **auto-renders** fenced query blocks in your answer as live
+panels. This is the main way the user sees the data — your prose explains, the
+panel shows. Three fence types render:
+
+- ```` ```promql ```` → live time-series chart (Prometheus).
+- ```` ```logql ```` → live **logs panel** showing the actual log lines (Loki).
+- ```` ```traceql ```` → live **traces table** of matching traces (Tempo).
 
 Rules:
 
-- **If your answer cites a metric value, you MUST include the underlying
-  PromQL in a ```` ```promql ```` block.** One block per chart. The user
-  reads the prose and watches the chart side by side.
-- **Keep charts focused** — 1 chart for a simple status check, up to 3 for
-  an investigation. Do not dump every query you ran. Pick the ones that
-  carry the story.
-- **No `Queries run:` heading.** Just put the ```` ```promql ```` blocks at
-  the end of your prose. The chart speaks for itself.
-- **Logs-only answers don't need charts** — e.g. "no ERROR logs in last 1h"
-  can just be a sentence with the LogQL in a ```` ```logql ```` block
-  (plugin does not render LogQL as a chart, but the code is still useful).
+- **Whenever your answer is backed by a signal, include the underlying query
+  in the matching fence** so the user sees the panel: a metric value → a
+  ```` ```promql ```` block; a logs answer ("recent errors", "last N lines",
+  "no ERROR logs") → a ```` ```logql ```` block; a traces answer ("slow/error
+  traces", "which traces") → a ```` ```traceql ```` block. One block per panel.
+- **For a "show me the logs / traces" request, the panel IS the answer.** Don't
+  reply with only prose and a suggested query — emit the ```` ```logql ````
+  / ```` ```traceql ```` block that actually returns what they asked for (e.g.
+  the last N lines), so the panel renders it.
+- **If the user asks for a specific count** ("近10筆 log", "3 筆 trace"), put
+  that number on the fence info line so the panel shows exactly that many:
+  ```` ```logql 10 ```` or ```` ```traceql 3 ````. The number is the panel's
+  line/row limit. Omit it for a default view (logs 100, traces 20).
+- **Keep it focused** — 1 panel for a simple check, up to 3 for an
+  investigation. Don't dump every query you ran; pick the ones that carry the story.
+- **No `Queries run:` heading.** Just put the fenced blocks at the end of your
+  prose. The panel speaks for itself.
 
 Format example (casual metric question):
 ```
@@ -280,30 +305,28 @@ async def classify_intent(message: str) -> IntentResult:
     )
 
 
-_mcp_client: MultiServerMCPClient | None = None
 _agent = None
 
 
 async def _build_agent():
-    global _mcp_client, _agent
+    global _agent
     if _agent is not None:
         return _agent
 
-    _mcp_client = MultiServerMCPClient(
-        {
-            "grafana": {
-                "url": settings.mcp_grafana_url,
-                "transport": "streamable_http",
-            }
-        }
-    )
-    mcp_tools = await _mcp_client.get_tools()
-    # v2: wrap query_loki_logs / query_tempo_traces / query_prometheus so a
-    # raw output that blows the byte cap is replaced with a schema-aware
-    # aggregation (sum by service_name/level/event/git_version) instead of
-    # being head-N truncated. See tools/wrap.py.
-    wrapped_mcp = [wrap_with_cap(t) for t in mcp_tools]
-    tools = wrapped_mcp + [github_compare, github_get_file]
+    # v3: query tools talk to the Prometheus/Loki/Tempo native HTTP APIs
+    # directly (the agent runs in-cluster and reaches them over internal DNS).
+    # The byte-cap + schema-aware aggregation fallback that used to wrap the
+    # mcp-grafana tools now lives inside these tools. See tools/query.py.
+    tools = [
+        query_prometheus,
+        query_loki_logs,
+        query_tempo_traces,
+        discover_metrics_tool,
+        discover_span_names_tool,
+        discover_log_fields_tool,
+        github_compare,
+        github_get_file,
+    ]
     # handle_tool_errors=True turns ToolException into a ToolMessage the LLM can
     # read and recover from, instead of bubbling up and terminating the run.
     tool_node = ToolNode(tools, handle_tool_errors=True)
@@ -332,8 +355,16 @@ async def lifespan(app):
     yield
 
 
-async def stream_chat(message: str, thread_id: str) -> AsyncIterator[dict]:
-    """Yield LangGraph events as dicts. Caller serializes to SSE."""
+CLARIFY_PROMPT = "你是指哪一個服務？(Which service do you mean?)"
+
+
+async def stream_chat(
+    message: str, thread_id: str, service_hint: str | None = None
+) -> AsyncIterator[dict]:
+    """Yield LangGraph events as dicts. Caller serializes to SSE.
+
+    `service_hint` is set when the user picked a service from the clarify menu —
+    we skip resolution and inject that service's capability directly."""
     agent = await _build_agent()
     config = {"configurable": {"thread_id": thread_id}}
 
@@ -353,8 +384,37 @@ async def stream_chat(message: str, thread_id: str) -> AsyncIterator[dict]:
         yield {"type": "done"}
         return
 
+    # Resolve which service(s) the question is about, then inject their live
+    # capability snapshot (Phase C/D). Order:
+    #  - service_hint set (user picked from the clarify menu) → use it directly.
+    #  - else resolve; ambiguous candidates → emit a `clarify` menu and stop
+    #    this turn (Phase D-2); confident match → inject; nothing → no injection.
+    turn_messages: list = []
+    snapshot: str | None = None
+    try:
+        if service_hint:
+            snapshot = await capability_for_services([service_hint])
+        else:
+            resolution = await resolve_services(message)
+            if resolution["candidates"]:
+                yield {
+                    "type": "clarify",
+                    "prompt": CLARIFY_PROMPT,
+                    "options": resolution["candidates"],
+                }
+                yield {"type": "done"}
+                return
+            if resolution["services"]:
+                snapshot = await capability_for_services(resolution["services"])
+    except Exception as e:
+        logger.warning("capability/resolve failed, continuing without it: %s", e)
+
+    if snapshot:
+        turn_messages.append(SystemMessage(content=snapshot))
+    turn_messages.append({"role": "user", "content": message})
+
     async for event in agent.astream_events(
-        {"messages": [{"role": "user", "content": message}]},
+        {"messages": turn_messages},
         config=config,
         version="v2",
     ):
