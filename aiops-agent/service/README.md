@@ -33,7 +33,10 @@ The response is SSE. Events:
 | event | payload |
 |-------|---------|
 | `thread` | `{thread_id}` — reuse to continue the same conversation |
+| `status` | `{phase, label}` — progress phase (`understanding` / `locating` / `thinking` / `analyzing` / `wrapping_up`) so the UI can show what the agent is doing |
 | `token` | `{text}` — streaming LLM token |
 | `tool_start` | `{tool, input}` |
 | `tool_end` | `{tool, output_preview}` |
+| `clarify` | `{prompt, options}` — ambiguous service; UI shows a picker, resend with `service_hint` |
+| `final` | `{text}` — full answer, emitted only if token streaming didn't fire |
 | `done` | end of turn |

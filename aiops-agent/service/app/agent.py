@@ -3,12 +3,14 @@ import os
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Annotated, AsyncIterator, TypedDict
 
 from langchain_core.messages import SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.prebuilt import ToolNode, create_react_agent
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel, Field
 
 from .capability import capability_for_services, resolve_services
@@ -305,48 +307,198 @@ async def classify_intent(message: str) -> IntentResult:
     )
 
 
-_agent = None
+# v3: query tools talk to the Prometheus/Loki/Tempo native HTTP APIs directly
+# (the agent runs in-cluster and reaches them over internal DNS). The byte-cap +
+# schema-aware aggregation fallback that used to wrap the mcp-grafana tools now
+# lives inside these tools. See tools/query.py.
+TOOLS = [
+    query_prometheus,
+    query_loki_logs,
+    query_tempo_traces,
+    discover_metrics_tool,
+    discover_span_names_tool,
+    discover_log_fields_tool,
+    github_compare,
+    github_get_file,
+]
 
 
-async def _build_agent():
-    global _agent
-    if _agent is not None:
-        return _agent
+class RcaState(TypedDict):
+    """State for the RCA graph. `tool_calls_used` is reset to 0 on each turn's
+    input (overwrite reducer), so the budget is per-turn, not per-thread, even
+    though `messages` accumulates across the thread (add_messages reducer)."""
 
-    # v3: query tools talk to the Prometheus/Loki/Tempo native HTTP APIs
-    # directly (the agent runs in-cluster and reaches them over internal DNS).
-    # The byte-cap + schema-aware aggregation fallback that used to wrap the
-    # mcp-grafana tools now lives inside these tools. See tools/query.py.
-    tools = [
-        query_prometheus,
-        query_loki_logs,
-        query_tempo_traces,
-        discover_metrics_tool,
-        discover_span_names_tool,
-        discover_log_fields_tool,
-        github_compare,
-        github_get_file,
-    ]
+    messages: Annotated[list, add_messages]
+    tool_calls_used: int
+    budget: int
+
+
+def _last_tool_calls(messages: list) -> list:
+    last = messages[-1] if messages else None
+    return list(getattr(last, "tool_calls", None) or [])
+
+
+def _build_graph():
+    """Explicit StateGraph replacing create_react_agent. Same agent↔tools ReAct
+    loop, but with a *hard* tool-call budget: once `tool_calls_used` hits
+    `budget` the graph routes to `force_answer` (LLM with no tools bound) so a
+    headless run can't loop forever. See doc/aiops-agent-design-v3.md §4.3."""
     # handle_tool_errors=True turns ToolException into a ToolMessage the LLM can
     # read and recover from, instead of bubbling up and terminating the run.
-    tool_node = ToolNode(tools, handle_tool_errors=True)
+    tool_node = ToolNode(TOOLS, handle_tool_errors=True)
 
     llm = ChatGoogleGenerativeAI(
         model=settings.gemini_model,
         google_api_key=settings.google_api_key,
         temperature=0,
     )
+    llm_with_tools = llm.bind_tools(TOOLS)
 
-    def prompt_fn(state):
-        return [SystemMessage(content=build_system_prompt())] + state["messages"]
+    async def agent_node(state: RcaState):
+        msgs = [SystemMessage(content=build_system_prompt())] + state["messages"]
+        return {"messages": [await llm_with_tools.ainvoke(msgs)]}
 
-    _agent = create_react_agent(
-        llm,
-        tool_node,
-        prompt=prompt_fn,
-        checkpointer=MemorySaver(),
+    async def tools_node(state: RcaState):
+        # Count the calls this AIMessage requested *before* ToolNode runs them,
+        # then fold that into the running total so the budget is enforced.
+        n = len(_last_tool_calls(state["messages"]))
+        out = await tool_node.ainvoke(state)
+        return {"messages": out["messages"], "tool_calls_used": state["tool_calls_used"] + n}
+
+    async def force_answer_node(state: RcaState):
+        # Budget exhausted: answer with what we have. No tools bound, so the
+        # model must produce text. Streams as on_chat_model_stream like any answer.
+        nudge = SystemMessage(
+            content=(
+                "You have used your tool-call budget for this turn. Do NOT call "
+                "any more tools. Answer now with what you found so far, and state "
+                "which checks you ran."
+            )
+        )
+        msgs = [SystemMessage(content=build_system_prompt())] + state["messages"] + [nudge]
+        return {"messages": [await llm.ainvoke(msgs)]}
+
+    def route_after_agent(state: RcaState) -> str:
+        if not _last_tool_calls(state["messages"]):
+            return END  # model answered without (more) tools
+        if state["tool_calls_used"] >= state["budget"]:
+            return "force_answer"
+        return "tools"
+
+    graph = StateGraph(RcaState)
+    graph.add_node("agent", agent_node)
+    graph.add_node("tools", tools_node)
+    graph.add_node("force_answer", force_answer_node)
+    graph.add_edge(START, "agent")
+    graph.add_conditional_edges(
+        "agent", route_after_agent, {"tools": "tools", "force_answer": "force_answer", END: END}
     )
+    graph.add_edge("tools", "agent")
+    graph.add_edge("force_answer", END)
+    return graph.compile(checkpointer=MemorySaver())
+
+
+_agent = None
+
+
+async def _build_agent():
+    global _agent
+    if _agent is None:
+        _agent = _build_graph()
     return _agent
+
+
+# ---- structured Findings (seed for the push/webhook entrypoint) -------------
+# A headless alert-driven run has no human reading the prose; the downstream
+# runbook layer needs a machine-readable verdict. This model + helper are the
+# seed for that (doc/aiops-agent-design-v3.md §4.3). NOT called on the chat hot
+# path — chat returns prose only — so it adds no per-turn latency today. The
+# webhook step (next) will call extract_findings() once at the end of a run.
+
+
+class Findings(BaseModel):
+    """Machine-readable conclusion of an RCA run."""
+
+    summary: str = Field(description="One-line conclusion of the investigation.")
+    hypothesis: str = Field(description="The leading root-cause hypothesis.")
+    confidence: float = Field(description="0.0-1.0 confidence in the hypothesis.")
+    evidence: list[str] = Field(
+        default_factory=list, description="Concrete queries / values that support the conclusion."
+    )
+    services: list[str] = Field(
+        default_factory=list, description="Service(s) implicated."
+    )
+    suspected_version: str | None = Field(
+        default=None, description="git_version suspected of introducing the issue, if any."
+    )
+
+
+_FINDINGS_PROMPT = """Extract a structured RCA conclusion from the investigation
+transcript below. Use ONLY what the transcript actually established — do not
+invent evidence. If the run was inconclusive, say so in `summary` and give a low
+`confidence`. `evidence` should quote the concrete queries/values that were run."""
+
+_findings_llm = (
+    ChatGoogleGenerativeAI(
+        model=settings.gemini_model,
+        google_api_key=settings.google_api_key,
+        temperature=0,
+    )
+    .with_structured_output(Findings)
+    .with_config({"run_name": "AIOps_Findings_Extractor"})
+)
+
+
+async def extract_findings(messages: list) -> Findings:
+    """Distill a finished run's messages into a structured Findings. Used by the
+    headless (alert webhook) path; not wired into chat."""
+    return await _findings_llm.ainvoke([SystemMessage(content=_FINDINGS_PROMPT)] + messages)
+
+
+# ---- follow-up suggestions (the "Follow-up" chips under each answer) --------
+# After an answer, propose 2-3 concrete next questions an SRE would click to go
+# deeper. Emitted as a `suggestions` SSE event; the plugin renders them as chips.
+
+
+class FollowUps(BaseModel):
+    suggestions: list[str] = Field(
+        default_factory=list,
+        description="2-3 short follow-up questions the user might ask next.",
+    )
+
+
+_FOLLOWUP_PROMPT = """Given an on-call SRE's question and the assistant's answer,
+propose 2-3 SHORT follow-up questions the SRE would naturally click to go deeper.
+
+Rules:
+- Each is a concrete next investigative step grounded in THIS answer: drill into
+  the errors, compare the suspected versions' diff, check a dependent/upstream
+  service, widen or shift the time window, or pivot signal (metric→logs→traces).
+- Phrase each as the user would type it, in the SAME language as the question.
+- Keep each under ~12 words. No numbering, no preamble.
+- Don't restate what was already answered, and stay within observability/RCA."""
+
+_followup_llm = (
+    ChatGoogleGenerativeAI(
+        model=settings.gemini_model,
+        google_api_key=settings.google_api_key,
+        temperature=0.3,
+    )
+    .with_structured_output(FollowUps)
+    .with_config({"run_name": "AIOps_FollowUp_Suggester"})
+)
+
+
+async def suggest_followups(user_message: str, answer: str) -> list[str]:
+    """Propose next-step questions from the Q/A pair. Cheap: only the user
+    question + final answer are sent, not the full tool transcript."""
+    res = await _followup_llm.ainvoke(
+        [
+            SystemMessage(content=_FOLLOWUP_PROMPT),
+            {"role": "user", "content": f"Question:\n{user_message}\n\nAnswer:\n{answer}"},
+        ]
+    )
+    return [s.strip() for s in res.suggestions if s.strip()][:3]
 
 
 @asynccontextmanager
@@ -356,6 +508,21 @@ async def lifespan(app):
 
 
 CLARIFY_PROMPT = "你是指哪一個服務？(Which service do you mean?)"
+
+# Progress phases surfaced to the UI as `status` events so the user can see the
+# agent is still working and where it is. `phase` is the machine key (for icons /
+# i18n later); `label` is what renders today.
+STATUS_LABELS = {
+    "understanding": "理解問題中…",
+    "locating": "鎖定相關服務中…",
+    "thinking": "思考中…",
+    "analyzing": "分析查詢結果中…",
+    "wrapping_up": "已達查詢上限，整理結論中…",
+}
+
+
+def _status(phase: str) -> dict:
+    return {"type": "status", "phase": phase, "label": STATUS_LABELS.get(phase, phase)}
 
 
 async def stream_chat(
@@ -373,6 +540,7 @@ async def stream_chat(
     # fail-closed: if the classifier errors we refuse rather than let an
     # unclassified message reach the tools. An attacker who can force the
     # classify call to fail must not thereby bypass the gate.
+    yield _status("understanding")
     try:
         intent = await classify_intent(message)
     except Exception as e:
@@ -391,6 +559,7 @@ async def stream_chat(
     #    this turn (Phase D-2); confident match → inject; nothing → no injection.
     turn_messages: list = []
     snapshot: str | None = None
+    yield _status("locating")
     try:
         if service_hint:
             snapshot = await capability_for_services([service_hint])
@@ -413,8 +582,16 @@ async def stream_chat(
         turn_messages.append(SystemMessage(content=snapshot))
     turn_messages.append({"role": "user", "content": message})
 
+    # Tracks whether a tool has run yet, so the agent node's "thinking" status
+    # reads as "analyzing results" once we're past the first query.
+    tool_ran = False
+    # Accumulate the answer text so we can suggest follow-ups from it afterward.
+    answer_parts: list[str] = []
+
     async for event in agent.astream_events(
-        {"messages": turn_messages},
+        # tool_calls_used resets to 0 each turn (overwrite reducer); messages
+        # append to the thread history (add_messages reducer).
+        {"messages": turn_messages, "tool_calls_used": 0, "budget": settings.tool_call_budget},
         config=config,
         version="v2",
     ):
@@ -425,13 +602,24 @@ async def stream_chat(
         if DEBUG_EVENTS:
             logger.warning("event=%s name=%s data_keys=%s", kind, name, list(data.keys()))
 
-        if kind == "on_chat_model_stream":
+        # Node-entry status. `agent` / `force_answer` enter via on_chain_start
+        # with name == the node (route_after_agent also fires with name
+        # "route_after_agent", which we skip). `tools` is covered by tool_start.
+        if kind == "on_chain_start" and name in ("agent", "force_answer"):
+            if name == "force_answer":
+                yield _status("wrapping_up")
+            else:
+                yield _status("analyzing" if tool_ran else "thinking")
+
+        elif kind == "on_chat_model_stream":
             chunk = data.get("chunk")
             text = _flatten_content(getattr(chunk, "content", None)) if chunk is not None else ""
             if text:
+                answer_parts.append(text)
                 yield {"type": "token", "text": text}
 
         elif kind == "on_tool_start":
+            tool_ran = True
             yield {
                 "type": "tool_start",
                 "tool": name,
@@ -458,6 +646,19 @@ async def stream_chat(
                     raw = last.get("content")
                 text = _flatten_content(raw)
                 if text:
+                    if not answer_parts:
+                        answer_parts.append(text)
                     yield {"type": "final", "text": text}
+
+    # Follow-up chips: suggest concrete next questions from the Q/A pair. Best-
+    # effort — never let a suggestion failure break the turn.
+    answer = "".join(answer_parts).strip()
+    if answer:
+        try:
+            items = await suggest_followups(message, answer)
+            if items:
+                yield {"type": "suggestions", "items": items}
+        except Exception as e:
+            logger.warning("follow-up suggestion failed: %s", e)
 
     yield {"type": "done"}

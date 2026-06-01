@@ -16,6 +16,11 @@ class Settings(BaseSettings):
 
     github_token: str = ""
 
+    # Hard ceiling on tool calls per turn, enforced by the RCA graph's budget
+    # guard (not just the system prompt). Matches the prompt's stated ceiling.
+    # The push/webhook entrypoint can override this per-run later.
+    tool_call_budget: int = 4
+
     cors_allow_origins: list[str] = ["http://localhost:3000"]
 
     host: str = "0.0.0.0"

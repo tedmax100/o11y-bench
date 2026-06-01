@@ -14,6 +14,8 @@ type ChatEvent =
   | { type: 'final'; text: string }
   | { type: 'tool_start'; tool: string; input: unknown }
   | { type: 'tool_end'; tool: string; output_preview: string }
+  | { type: 'status'; phase: string; label: string }
+  | { type: 'suggestions'; items: string[] }
   | { type: 'clarify'; prompt: string; options: string[] }
   | { type: 'done' };
 
@@ -38,6 +40,11 @@ type Message = {
   text: string;
   toolCalls: ToolCall[];
   clarify?: Clarify;
+  // Current progress phase ("思考中…" etc). Set by `status` events, cleared once
+  // the answer starts streaming / the turn ends.
+  status?: string;
+  // LLM-suggested follow-up questions, rendered as clickable chips under the answer.
+  suggestions?: string[];
 };
 
 type ChatPageProps = {
@@ -171,7 +178,14 @@ function ChatPage({ agentServiceUrl }: ChatPageProps) {
             </div>
           )}
           {messages.map((m, i) => (
-            <MessageBubble key={i} message={m} index={i} onClarify={handleClarifySelect} busy={busy} />
+            <MessageBubble
+              key={i}
+              message={m}
+              index={i}
+              onClarify={handleClarifySelect}
+              onFollowUp={(text) => sendMessage(text)}
+              busy={busy}
+            />
           ))}
           {busy && <Spinner inline />}
         </div>
@@ -203,10 +217,11 @@ type MessageBubbleProps = {
   message: Message;
   index: number;
   onClarify: (msgIndex: number, service: string, question: string) => void;
+  onFollowUp: (text: string) => void;
   busy: boolean;
 };
 
-function MessageBubble({ message, index, onClarify, busy }: MessageBubbleProps) {
+function MessageBubble({ message, index, onClarify, onFollowUp, busy }: MessageBubbleProps) {
   const styles = useStyles2(getStyles);
   const segments = message.role === 'assistant' ? splitQueryBlocks(message.text) : [{ kind: 'text' as const, value: message.text }];
   return (
@@ -227,12 +242,38 @@ function MessageBubble({ message, index, onClarify, busy }: MessageBubbleProps) 
             return <div key={i} className={styles.text}>{seg.value}</div>;
         }
       })}
+      {message.status && (
+        <div className={styles.status}>
+          <Spinner inline size="sm" />
+          <span>{message.status}</span>
+        </div>
+      )}
       {message.clarify && (
         <ClarifyMenu
           clarify={message.clarify}
           disabled={busy || !!message.clarify.answered}
           onSelect={(service) => onClarify(index, service, message.clarify!.question)}
         />
+      )}
+      {message.suggestions && message.suggestions.length > 0 && (
+        <div className={styles.followups}>
+          <div className={styles.followupLabel}>Follow-up</div>
+          <Stack direction="column" gap={0.5} alignItems="flex-start">
+            {message.suggestions.map((s, i) => (
+              <Button
+                key={i}
+                size="sm"
+                variant="secondary"
+                fill="outline"
+                icon="comment-alt"
+                disabled={busy}
+                onClick={() => onFollowUp(s)}
+              >
+                {s}
+              </Button>
+            ))}
+          </Stack>
+        </div>
       )}
     </div>
   );
@@ -333,17 +374,26 @@ function applyEvent(messages: Message[], evt: ChatEvent): Message[] {
   const updated = { ...last, toolCalls: [...last.toolCalls] };
 
   switch (evt.type) {
+    case 'status':
+      updated.status = evt.label;
+      break;
+    case 'suggestions':
+      updated.suggestions = evt.items;
+      break;
     case 'token':
       updated.text = last.text + evt.text;
+      updated.status = undefined; // answer is streaming — stop showing "thinking"
       break;
     case 'final':
       // Only adopt the final text if streaming tokens never arrived.
       if (!last.text) {
         updated.text = evt.text;
       }
+      updated.status = undefined;
       break;
     case 'tool_start':
       updated.toolCalls.push({ tool: evt.tool, input: evt.input, open: false });
+      updated.status = undefined; // the tool call view conveys the activity now
       break;
     case 'tool_end': {
       for (let i = updated.toolCalls.length - 1; i >= 0; i--) {
@@ -362,6 +412,7 @@ function applyEvent(messages: Message[], evt: ChatEvent): Message[] {
       break;
     }
     case 'done':
+      updated.status = undefined;
       break;
   }
   return [...messages.slice(0, idx), updated];
@@ -405,11 +456,29 @@ const getStyles = (theme: GrafanaTheme2) => ({
     white-space: pre-wrap;
     word-wrap: break-word;
   `,
+  status: css`
+    display: flex;
+    align-items: center;
+    gap: ${theme.spacing(1)};
+    color: ${theme.colors.text.secondary};
+    font-size: ${theme.typography.size.sm};
+    font-style: italic;
+  `,
   clarify: css`
     margin-top: ${theme.spacing(1)};
     display: flex;
     flex-direction: column;
     gap: ${theme.spacing(1)};
+  `,
+  followups: css`
+    margin-top: ${theme.spacing(1.5)};
+    border-top: 1px solid ${theme.colors.border.weak};
+    padding-top: ${theme.spacing(1)};
+  `,
+  followupLabel: css`
+    font-size: ${theme.typography.size.sm};
+    color: ${theme.colors.text.secondary};
+    margin-bottom: ${theme.spacing(0.5)};
   `,
   empty: css`
     color: ${theme.colors.text.secondary};
