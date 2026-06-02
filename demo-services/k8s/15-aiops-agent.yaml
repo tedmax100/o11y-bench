@@ -25,6 +25,9 @@ spec:
     metadata:
       labels:
         app: aiops-agent
+        # Single source of truth for the deployed version, mirrored into
+        # GIT_VERSION via the Downward API (same pattern as the demo services).
+        git_version: v0.0.1
     spec:
       containers:
         - name: aiops-agent
@@ -43,6 +46,33 @@ spec:
               value: http://tempo.demo.svc:3200
             - name: GEMINI_MODEL
               value: gemini-3.1-flash-lite
+            # ---- Self-observability (zero-code OTel) -----------------------
+            # The agent runs under `opentelemetry-instrument`; these env vars
+            # configure the SDK + exporters the same way the demo services do,
+            # so its own GenAI spans/metrics/logs land in Tempo/Prom/Loki and
+            # are queryable alongside the services it investigates.
+            - name: GIT_REPO
+              value: tedmax100/o11y-bench
+            - name: GIT_VERSION
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['git_version']
+            - name: OTEL_SERVICE_NAME
+              value: aiops-agent
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "service.namespace=demo,deployment.environment=demo,service.version=$(GIT_VERSION),git_repo=$(GIT_REPO),git_version=$(GIT_VERSION)"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.demo.svc:4318
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: http/protobuf
+            - name: OTEL_TRACES_EXPORTER
+              value: otlp
+            - name: OTEL_METRICS_EXPORTER
+              value: otlp
+            - name: OTEL_LOGS_EXPORTER
+              value: otlp
+            - name: OTEL_PYTHON_LOG_CORRELATION
+              value: "true"
             # Browser loads the plugin UI from Grafana (:3001) and fetches the
             # agent NodePort (:8000) — so the page Origin is the Grafana one.
             - name: CORS_ALLOW_ORIGINS

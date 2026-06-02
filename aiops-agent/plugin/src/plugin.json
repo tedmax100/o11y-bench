@@ -27,6 +27,13 @@
     },
     {
       "type": "page",
+      "icon": "gf-traces",
+      "name": "Traces",
+      "path": "/a/%PLUGIN_ID%/traces",
+      "addToNav": true
+    },
+    {
+      "type": "page",
       "icon": "cog",
       "name": "Configuration",
       "path": "/plugins/%PLUGIN_ID%",

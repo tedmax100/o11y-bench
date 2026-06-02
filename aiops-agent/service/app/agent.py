@@ -63,18 +63,20 @@ to English.
 
 # Time
 
-Current real-world clock: **{now}**. The telemetry datastore holds the last 24h
-ending at approximately `now`. Older data does not exist.
+The **current real-world clock is given at the very end of this prompt** (see
+*Current time*). The telemetry datastore holds the last 24h ending at
+approximately that time. Older data does not exist.
 
 For **time-range arguments** on tool calls (`startTime`, `endTime`, `startRfc3339`,
 `endRfc3339`, `start`, `end`): you may write either:
 
-- A literal RFC3339 UTC timestamp computed from `{now}` (e.g. `{now}` minus 1h).
+- A literal RFC3339 UTC timestamp computed from the current time (e.g. the
+  current time minus 1h).
 - The shorthand `now`, `now-30s`, `now-15m`, `now-1h`, `now-2d` — the wrapper
   will expand these into RFC3339 for you. Both forms work identically.
 
 **Do not** hardcode calendar dates from your training data ("2024-XX-XX",
-"2025-XX-XX"). Use `{now}` or the `now-...` shorthand.
+"2025-XX-XX"). Use the current time or the `now-...` shorthand.
 
 Loki rejects ranges longer than ~30 days. Keep windows ≤ 6h unless you have a
 specific reason; default to 1h.
@@ -86,7 +88,8 @@ not allowed — the user is in an incident and wants the check, not a dialogue.
 **Do not ask the user to specify tool parameters either** (`stepSeconds`,
 `rateInterval`, `limit`, percentile, etc.). Pick a sensible default and run
 the query. Sensible defaults: `stepSeconds=60`, `rateInterval="5m"`,
-percentile `0.95` if unspecified, `limit=100`. If a tool returns an error
+percentile `0.95` if unspecified, `limit=100`. **Never use a rate window below
+`[5m]`** — metrics export every ~60s, so `rate(...[1m])` returns empty. If a tool returns an error
 about a missing parameter, do NOT come back to the user — re-issue the call
 with the default filled in.
 
@@ -236,6 +239,15 @@ sum by (git_version, reason) (rate(payment_charges_total{{status="declined"}}[5m
 # Schema catalog
 
 {schema_catalog}
+
+# Current time
+
+The current real-world clock is **{now}** (UTC). Compute all relative time
+ranges (the `now-...` shorthand, "past 1h", etc.) from this value.
+
+NOTE: everything above this line is identical on every call — only this
+timestamp changes — so the model provider can serve the prefix from its context
+cache. Keep volatile values out of the prompt body above.
 """
 
 
@@ -244,6 +256,30 @@ def build_system_prompt() -> str:
         now=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         schema_catalog=SCHEMA_CATALOG,
     )
+
+
+# The output contract the model must keep on *every* turn. Pulled out so the
+# post-tool prompts can restate it cheaply without re-sending the full ~4k
+# system prompt (template + schema catalog).
+_OUTPUT_CONTRACT = """Output contract:
+- Reply in the user's language (the language of their question).
+- Lead with the answer; cite concrete numbers with units (e.g. "p95 ≈ 48 ms").
+- Back each signal with the matching fenced block so the panel renders:
+  ```promql``` (metric), ```logql``` (logs), ```traceql``` (traces). 1 block per panel.
+- Don't ask the user for time ranges or tool parameters — use sensible defaults
+  (1h window, stepSeconds=60, rateInterval="5m", p95, limit=100)."""
+
+# ReAct continuation prompt. After the first agent step the model already has
+# the question, the live capability snapshot and the tool results in the
+# conversation, so we DON'T re-send the full system prompt (template + catalog,
+# ~4k tokens) on every loop — only this short reminder. This is the single
+# biggest input-token saving: the post-tool agent call drops from ~7k to ~3k.
+CONTINUE_PROMPT = (
+    "Continue the investigation. You've already run a tool this turn — read the "
+    "latest tool result in the conversation and either run ONE more focused query "
+    "(only if the result clearly demands it and budget remains) or answer now.\n\n"
+    + _OUTPUT_CONTRACT
+)
 
 
 INTENT_SYSTEM_PROMPT = """You are an intent gate for an AIOps / observability assistant.
@@ -267,7 +303,21 @@ OUT of scope (must be rejected):
 Judge ONLY the latest user message (use prior context only to disambiguate
 follow-ups like "and the logs?"). Set in_scope=true only if it is an AIOps /
 observability request.
-"""
+
+# Mode (only when in_scope)
+
+Also classify HOW the request should be served:
+
+- `lookup` — a single, self-contained "show me / what is" request that one query
+  answers: a metric value or chart ("p95 latency of order-service", "error rate
+  now"), "show me the last N error logs", "recent traces for X". One signal, no
+  reasoning across multiple queries needed.
+- `investigate` — needs reasoning across signals or drill-down: "why is X slow",
+  "what changed", root-cause, deploy correlation, anomaly hunting, anything
+  comparing/pivoting (metrics→logs→traces) or likely to need follow-up queries.
+
+When unsure, prefer `investigate` (it can always answer a simple question too;
+the reverse is not true)."""
 
 # Fixed refusal text. Deliberately NOT generated by the LLM: the classifier only
 # returns a bool, so a prompt-injected user message cannot turn this gate into a
@@ -285,6 +335,10 @@ class IntentResult(BaseModel):
 
     reasoning: str = Field(default="", description="Brief reasoning for the decision.")
     in_scope: bool = Field(..., description="True if the message is an AIOps/observability request.")
+    mode: str = Field(
+        default="investigate",
+        description="'lookup' for a single-query show-me request, else 'investigate'.",
+    )
 
 
 _intent_llm = ChatGoogleGenerativeAI(
@@ -305,6 +359,60 @@ async def classify_intent(message: str) -> IntentResult:
             {"role": "user", "content": message},
         ]
     )
+
+
+# ---- fast path (lookup mode) -----------------------------------------------
+# A "show me this metric/logs/traces" question doesn't need the ReAct tool loop:
+# the agent's real job is translating the natural-language question into the
+# right query, and the plugin renders the panel by re-running that query in
+# Grafana. So for `lookup` mode we do ONE LLM call that emits the fenced query
+# block(s) as the answer — no tool execution, no second interpretation call.
+# Investigations (reasoning across signals, drill-down) still take the full
+# graph below. Misclassified lookups self-correct: the follow-up chips a user
+# clicks are reclassified next turn and escalate to `investigate`.
+FAST_PATH_PROMPT = """You are an AIOps assistant. The user wants to SEE a single
+signal (a metric, some logs, or traces). Do NOT call tools and do NOT investigate
+— just translate their question into the correct query and let the panel show it.
+
+Reply in the user's language. Output: one short sentence naming what the panel
+shows, then the matching fenced block (the plugin renders it live):
+
+- metric → ```promql``` (p95/p99 latency → `histogram_quantile(0.95, sum by (le) (rate(<metric>_bucket[5m])))`; rates/QPS → `sum(rate(<counter>_total[5m]))`)
+  **Rate windows MUST be ≥ 5m.** Metrics are exported every ~60s, so `rate(...[1m])`
+  has too few samples and returns EMPTY. Always use `[5m]` (never `[1m]`/`[30s]`).
+- logs   → ```logql```  (only `service_name`/`git_repo`/`git_version`/`deployment_environment` go inside `{...}`; filter `level`/`event`/business fields AFTER with `| level="ERROR"`)
+- traces → ```traceql``` (attrs are dotted: `{ resource.service.name = "X" && status = error }`)
+
+Rules:
+- **Always scope the query to the service the user named** — add the label
+  selector `{service_name="<svc>"}` (Prometheus/Loki) or
+  `resource.service.name="<svc>"` (Tempo). The `http_server_*` metrics are
+  shared across all services; without the label the panel shows everything.
+- Use the EXACT metric / span / field names from the live capability snapshot
+  if one is provided; don't guess.
+- **Do NOT state specific numbers** ("p95 ≈ 48 ms") — you have not measured them;
+  the panel shows the actual values. Describe what it shows, not invented values.
+- If the user asked for a specific count ("近10筆 log"), put it on the fence:
+  ```logql 10``` / ```traceql 3```.
+- Default window 1h; don't ask the user for parameters."""
+
+_fast_llm = ChatGoogleGenerativeAI(
+    model=settings.gemini_model,
+    google_api_key=settings.google_api_key,
+    temperature=0,
+).with_config({"run_name": "AIOps_FastPath"})
+
+
+async def stream_fast_path(message: str, snapshot: str | None) -> AsyncIterator[str]:
+    """One LLM call: NL question -> fenced query block(s). Yields text chunks."""
+    msgs: list = [SystemMessage(content=FAST_PATH_PROMPT)]
+    if snapshot:
+        msgs.append(SystemMessage(content=snapshot))
+    msgs.append({"role": "user", "content": message})
+    async for chunk in _fast_llm.astream(msgs):
+        text = _flatten_content(getattr(chunk, "content", None))
+        if text:
+            yield text
 
 
 # v3: query tools talk to the Prometheus/Loki/Tempo native HTTP APIs directly
@@ -355,7 +463,12 @@ def _build_graph():
     llm_with_tools = llm.bind_tools(TOOLS)
 
     async def agent_node(state: RcaState):
-        msgs = [SystemMessage(content=build_system_prompt())] + state["messages"]
+        # First agent step: full system prompt (instructions + schema catalog).
+        # Subsequent steps (a tool already ran this turn): only the short
+        # continuation reminder — the snapshot + tool results are already in
+        # `messages`, so re-sending the ~4k prompt every loop is pure waste.
+        sys = build_system_prompt() if state["tool_calls_used"] == 0 else CONTINUE_PROMPT
+        msgs = [SystemMessage(content=sys)] + state["messages"]
         return {"messages": [await llm_with_tools.ainvoke(msgs)]}
 
     async def tools_node(state: RcaState):
@@ -368,14 +481,17 @@ def _build_graph():
     async def force_answer_node(state: RcaState):
         # Budget exhausted: answer with what we have. No tools bound, so the
         # model must produce text. Streams as on_chat_model_stream like any answer.
+        # Budget is only ever exhausted *after* tools ran, so the snapshot +
+        # tool results are already in `messages` — no need to re-send the full
+        # system prompt here either; the short answer contract is enough.
         nudge = SystemMessage(
             content=(
                 "You have used your tool-call budget for this turn. Do NOT call "
                 "any more tools. Answer now with what you found so far, and state "
-                "which checks you ran."
+                "which checks you ran.\n\n" + _OUTPUT_CONTRACT
             )
         )
-        msgs = [SystemMessage(content=build_system_prompt())] + state["messages"] + [nudge]
+        msgs = state["messages"] + [nudge]
         return {"messages": [await llm.ainvoke(msgs)]}
 
     def route_after_agent(state: RcaState) -> str:
@@ -525,6 +641,21 @@ def _status(phase: str) -> dict:
     return {"type": "status", "phase": phase, "label": STATUS_LABELS.get(phase, phase)}
 
 
+async def _followups_and_done(message: str, answer_parts: list[str]) -> AsyncIterator[dict]:
+    """Shared turn tail: suggest follow-up chips from the Q/A pair, then `done`.
+    Used by both the fast path and the full-graph path. Best-effort — a
+    suggestion failure never breaks the turn."""
+    answer = "".join(answer_parts).strip()
+    if answer:
+        try:
+            items = await suggest_followups(message, answer)
+            if items:
+                yield {"type": "suggestions", "items": items}
+        except Exception as e:
+            logger.warning("follow-up suggestion failed: %s", e)
+    yield {"type": "done"}
+
+
 async def stream_chat(
     message: str, thread_id: str, service_hint: str | None = None
 ) -> AsyncIterator[dict]:
@@ -582,11 +713,28 @@ async def stream_chat(
         turn_messages.append(SystemMessage(content=snapshot))
     turn_messages.append({"role": "user", "content": message})
 
+    # Accumulate the answer text so we can suggest follow-ups from it afterward.
+    answer_parts: list[str] = []
+
+    # Fast path: a single-query "show me" request. Translate it to the query and
+    # let the panel render it — one LLM call, no tool loop, no interpretation
+    # call. On any failure we fall through to the full graph below.
+    if intent.mode == "lookup":
+        yield _status("thinking")
+        try:
+            async for text in stream_fast_path(message, snapshot):
+                answer_parts.append(text)
+                yield {"type": "token", "text": text}
+            async for ev in _followups_and_done(message, answer_parts):
+                yield ev
+            return
+        except Exception as e:
+            logger.warning("fast path failed, falling back to full graph: %s", e)
+            answer_parts.clear()
+
     # Tracks whether a tool has run yet, so the agent node's "thinking" status
     # reads as "analyzing results" once we're past the first query.
     tool_ran = False
-    # Accumulate the answer text so we can suggest follow-ups from it afterward.
-    answer_parts: list[str] = []
 
     async for event in agent.astream_events(
         # tool_calls_used resets to 0 each turn (overwrite reducer); messages
@@ -650,15 +798,5 @@ async def stream_chat(
                         answer_parts.append(text)
                     yield {"type": "final", "text": text}
 
-    # Follow-up chips: suggest concrete next questions from the Q/A pair. Best-
-    # effort — never let a suggestion failure break the turn.
-    answer = "".join(answer_parts).strip()
-    if answer:
-        try:
-            items = await suggest_followups(message, answer)
-            if items:
-                yield {"type": "suggestions", "items": items}
-        except Exception as e:
-            logger.warning("follow-up suggestion failed: %s", e)
-
-    yield {"type": "done"}
+    async for ev in _followups_and_done(message, answer_parts):
+        yield ev

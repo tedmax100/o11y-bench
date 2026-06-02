@@ -13,6 +13,27 @@ dependencies = [
     "pydantic-settings>=2.6",
     "python-dotenv>=1.0",
     "httpx>=0.27",
+    # Observability for the agent itself (the observer is now observed too).
+    # Zero-code instrumentation: the distro provides the API+SDK and the
+    # `opentelemetry-instrument` entrypoint; exporter-otlp ships all three
+    # signals. Auto-instrumentors are declared as direct deps (not discovered
+    # via `opentelemetry-bootstrap`) so the build is reproducible from uv.lock —
+    # same approach as demo-services/shared. The langchain instrumentor emits
+    # GenAI spans/metrics (gen_ai.* semconv) for every Gemini call + LangGraph
+    # tool; `opentelemetry-instrument` auto-loads it via its entry point.
+    "opentelemetry-distro>=0.48b0",
+    "opentelemetry-exporter-otlp>=1.27",
+    "opentelemetry-instrumentation-fastapi>=0.48b0",
+    "opentelemetry-instrumentation-httpx>=0.48b0",
+    "opentelemetry-instrumentation-logging>=0.48b0",
+    "opentelemetry-instrumentation-langchain>=0.40.0",
+    # The langchain instrumentor's zero-code loader gates on its `instruments`
+    # extra, which requires the top-level `langchain` meta-package — we only
+    # pull in langchain-core / langchain-google-genai transitively, so without
+    # this the `opentelemetry-instrument` loader silently skips it
+    # (DependencyConflict: requested "langchain" but found "None"). Manual
+    # .instrument() works without it, but we keep the build zero-code.
+    "langchain>=0.3",
 ]
 
 [build-system]

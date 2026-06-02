@@ -45,6 +45,13 @@ _order_latency = _meter.create_histogram(
     "order_create_duration_seconds",
     description="Order creation handler duration",
     unit="s",
+    # Recorded in SECONDS (perf_counter). Without this, the SDK's default
+    # millisecond boundaries collapse every sub-second sample into the first
+    # bucket and histogram_quantile returns a constant ~4.75 artifact. These
+    # seconds-scaled boundaries give real resolution. See payment-service note.
+    explicit_bucket_boundaries_advisory=[
+        0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+    ],
 )
 
 app = FastAPI(title="order-service")

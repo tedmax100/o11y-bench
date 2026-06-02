@@ -46,7 +46,10 @@ export function PromqlPanel({
                 title: title ?? truncate(expr, 60),
                 $data: new SceneQueryRunner({
                   datasource: { uid: datasourceUid },
-                  queries: [{ refId: 'A', expr }],
+                  // `range: true` is required — without it the Prometheus DS runs
+                  // an *instant* query and the timeseries viz shows "No data"
+                  // even when the series has points across the window.
+                  queries: [{ refId: 'A', expr, range: true, instant: false }],
                 }),
               }),
             }),

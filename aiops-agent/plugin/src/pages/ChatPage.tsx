@@ -4,6 +4,7 @@ import { GrafanaTheme2 } from '@grafana/data';
 import { PluginPage } from '@grafana/runtime';
 import { Button, Input, Stack, useStyles2, Spinner, Collapse, Alert } from '@grafana/ui';
 import { testIds } from '../components/testIds';
+import { streamSSE } from '../utils/sse';
 import { PromqlPanel } from '../components/PromqlPanel';
 import { LogsPanel } from '../components/LogsPanel';
 import { TracesPanel } from '../components/TracesPanel';
@@ -81,58 +82,17 @@ function ChatPage({ agentServiceUrl }: ChatPageProps) {
       ]);
 
       try {
-        const res = await fetch(`${agentServiceUrl}/chat`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ message: text, thread_id: threadIdRef.current, service_hint: serviceHint }),
-        });
-        if (!res.ok || !res.body) {
-          throw new Error(`agent service returned ${res.status}`);
-        }
-
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) {
-            break;
-          }
-          // Normalize CRLF so split works regardless of sse-starlette's line endings.
-          buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-
-          const blocks = buffer.split('\n\n');
-          buffer = blocks.pop() ?? '';
-          for (const block of blocks) {
-            const lines = block.split('\n');
-            let event = 'message';
-            let dataRaw = '';
-            for (const line of lines) {
-              if (line.startsWith('event: ')) {
-                event = line.slice(7).trim();
-              } else if (line.startsWith('data: ')) {
-                dataRaw += line.slice(6);
-              }
-            }
-            if (!dataRaw) {
-              continue;
-            }
-            let parsed: ChatEvent | { thread_id: string };
-            try {
-              parsed = JSON.parse(dataRaw);
-            } catch {
-              continue;
-            }
-
-            if (event === 'thread' && 'thread_id' in parsed) {
+        await streamSSE(
+          `${agentServiceUrl}/chat`,
+          { message: text, thread_id: threadIdRef.current, service_hint: serviceHint },
+          (event, parsed) => {
+            if (event === 'thread' && parsed?.thread_id) {
               threadIdRef.current = parsed.thread_id;
-              continue;
+              return;
             }
-
             setMessages((prev) => applyEvent(prev, parsed as ChatEvent));
           }
-        }
+        );
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
       } finally {

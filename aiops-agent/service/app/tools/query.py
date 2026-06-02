@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -97,6 +98,92 @@ def _selector(query: str) -> str | None:
     return m.group(1) if m else None
 
 
+# ---- series summarization (feed the LLM a digest, not every datapoint) -----
+# A range query returns one value per step (e.g. 61 points over 1h @ 60s). The
+# LLM only needs to *read* the result to write the answer — it does not need
+# every raw float, and the chart is rendered separately by the plugin re-running
+# the same query in Grafana. So we collapse matrix/vector results to a compact
+# summary (last/min/max/avg + a short sample only if the series actually moves)
+# and round values. This cuts the post-tool LLM call's input tokens sharply
+# (the bloat was ~60 high-precision floats per series) without losing the
+# numbers an answer or a trend/spike call needs.
+
+_SAMPLE_POINTS = 8  # max points kept when a series varies enough to show a trend
+_VARY_THRESHOLD = 0.05  # (max-min)/|max| above this → keep a downsample
+
+
+def _round_sig(x: Any, sig: int = 4) -> Any:
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return x
+    if f == 0 or not math.isfinite(f):
+        return 0.0 if f == 0 else f
+    return round(f, -int(math.floor(math.log10(abs(f)))) + (sig - 1))
+
+
+def _summarize_series_result(result: Any) -> Any:
+    """Collapse a Prometheus/Loki matrix|vector|scalar result for LLM context.
+    Non-series shapes (log streams, etc.) pass through unchanged."""
+    if not isinstance(result, dict):
+        return result
+    rt = result.get("resultType")
+
+    if rt == "matrix":
+        out = []
+        for s in result.get("result", []):
+            pairs = s.get("values", []) or []
+            vals = []
+            for v in pairs:
+                try:
+                    fv = float(v[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if math.isfinite(fv):
+                    vals.append(fv)
+            if not vals:
+                out.append({"metric": s.get("metric", {}), "points": 0})
+                continue
+            n = len(vals)
+            mn, mx = min(vals), max(vals)
+            entry: dict[str, Any] = {
+                "metric": s.get("metric", {}),
+                "points": n,
+                "last": _round_sig(vals[-1]),
+                "min": _round_sig(mn),
+                "max": _round_sig(mx),
+                "avg": _round_sig(sum(vals) / n),
+                "window": [pairs[0][0], pairs[-1][0]],
+            }
+            # Keep a coarse downsample only when the series actually moves, so a
+            # spike/trend is still visible; near-constant series stay tiny.
+            if n > 2 and mx and abs(mx - mn) / abs(mx) > _VARY_THRESHOLD:
+                step = max(n // _SAMPLE_POINTS, 1)
+                entry["sample"] = [[pairs[i][0], _round_sig(vals[i])] for i in range(0, n, step)]
+            out.append(entry)
+        return {
+            "resultType": "matrix_summary",
+            "result": out,
+            "note": (
+                "Series summarized to last/min/max/avg (+ sample if it varies); "
+                "the ```promql``` panel re-runs the full query for the chart."
+            ),
+        }
+
+    if rt == "vector":
+        out = []
+        for s in result.get("result", []):
+            val = s.get("value", [None, None])
+            out.append({"metric": s.get("metric", {}), "value": _round_sig(val[1] if len(val) > 1 else None)})
+        return {"resultType": "vector", "result": out}
+
+    if rt == "scalar":
+        r = result.get("result")
+        return {"resultType": "scalar", "value": _round_sig(r[1] if isinstance(r, list) and len(r) > 1 else r)}
+
+    return result
+
+
 # ---- HTTP helpers ----------------------------------------------------------
 
 _TIMEOUT = httpx.Timeout(30.0)
@@ -143,6 +230,9 @@ async def _query_prometheus(expr: str, queryType: str = "range", start: str = "n
     if isinstance(data, dict) and data.get("status") == "error":
         raise ToolException(f"Prometheus error: {data.get('error')}")
     result = data.get("data", data) if isinstance(data, dict) else data
+    # Digest the series before it reaches the LLM (the chart is rendered from the
+    # query, not from this payload). Drops the per-step float dump to last/min/max/avg.
+    result = _summarize_series_result(result)
     if _approx_size(result) <= PROM_CAP_BYTES:
         return result
     return {
@@ -180,6 +270,11 @@ async def _query_loki_logs(logql: str, start: str = "now-1h", end: str = "now",
     if isinstance(data, dict) and data.get("status") == "error":
         raise ToolException(f"Loki error: {data.get('error')}")
     result = data.get("data", data) if isinstance(data, dict) else data
+    # Metric LogQL (count_over_time, sum by ...) returns a matrix/vector — digest
+    # it like Prometheus. Log *streams* are left intact (the lines are the answer)
+    # and handled by the byte-cap + aggregation fallback below.
+    if isinstance(result, dict) and result.get("resultType") in ("matrix", "vector"):
+        result = _summarize_series_result(result)
     if _approx_size(result) <= LOKI_CAP_BYTES:
         return result
 

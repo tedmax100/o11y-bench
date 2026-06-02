@@ -9,7 +9,16 @@ across **all three signals**:
 | **Metrics** | `registry/model/metrics.yaml` | `orders_total`, `payment_charges_total`, the duration histograms, `user_lookups_total`, `user_auth_checks_total` + their labels |
 | **Logs (events)** | `registry/model/events.yaml` | every `BizEvent` from `o11y_shared.events` + the structured `extra={...}` fields each carries |
 | **Traces (spans)** | `registry/model/spans.yaml` | the business operations (order create / payment charge / proxy hop) |
+| **GenAI** | `registry/model/genai.yaml` | the `aiops-agent`'s own telemetry — `gen_ai.*` LLM/tool spans + `gen_ai.client.*` token/duration metrics, plus the agent-specific `aiops.*` attributes |
 | _shared_ | `registry/model/common.yaml` | the `app.*` / `biz.*` attributes + resource (`vcs.repository.url`, `service.version`) |
+
+The **GenAI** rows come from the aiops-agent running under
+`opentelemetry-instrument` with `opentelemetry-instrumentation-langchain` — the
+observer is observed too. Verified against the live agent: the instrumentor
+emits the official OpenTelemetry `gen_ai.*` names directly
+(`gen_ai.provider.name`, `gen_ai.usage.input_tokens`/`output_tokens`,
+`gen_ai.operation.name`, …) plus `gen_ai.usage.cache_read.input_tokens` for
+Gemini context-cache hits — so there's effectively no naming delta to migrate.
 
 This registry is **self-contained** (no dependency on the upstream
 semantic-conventions model) so it validates fully offline.
