@@ -75,3 +75,15 @@ run = "uv run ruff format --check ."
 [tasks."setup:smoke"]
 description = "HTTP smoke test for the live grading stack (needs o11y-stack on localhost ports)"
 run = "uv run python scripts/grading_stack_smoke.py"
+
+# -- Weaver (semantic-convention registry for demo-services telemetry) --
+
+[tasks."weaver:check"]
+description = "Validate the demo-services Weaver registry (built-in + custom policies)"
+dir = "demo-services"
+run = "bash scripts/weaver.sh check --policy"
+
+[tasks."weaver:docs"]
+description = "Generate Markdown docs from the demo-services Weaver registry"
+dir = "demo-services"
+run = "bash scripts/weaver.sh docs"
