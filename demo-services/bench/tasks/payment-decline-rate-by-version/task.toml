@@ -1,0 +1,29 @@
+version = "1.0"
+
+[metadata]
+category = "investigation"
+tags = ["demo-schema", "payment", "poc"]
+difficulty = "medium"
+
+[verifier]
+timeout_sec = 300.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}"
+GRADING_MODEL = "claude-haiku-4-5-20251001"
+
+[agent]
+timeout_sec = 600.0
+
+[environment]
+build_timeout_sec = 600.0
+docker_image = "o11y-bench-main:latest"
+cpus = 1
+memory_mb = 2048
+storage_mb = 10240
+allow_internet = true
+
+[[environment.mcp_servers]]
+name = "mcp-grafana"
+transport = "streamable-http"
+url = "http://o11y-stack:8080/mcp"

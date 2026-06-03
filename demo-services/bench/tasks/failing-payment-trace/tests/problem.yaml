@@ -1,0 +1,24 @@
+id: failing-payment-trace
+category: investigation
+tags:
+- traceql
+- traces
+- payment
+- root-cause
+statement: |
+  Find a representative failing payment trace from roughly the last 6 hours. Paste one trace id you
+  actually saw, and tell me which service the error originates in (the span whose status is error)
+  and which git_version that service was running.
+checks:
+- weight: 45
+  type: grounding
+  params:
+    prefix_min_chars: 8
+    mode: tool_trace_id
+    tool_name: query_tempo_traces
+  name: Response cites a trace ID that appears in Tempo tool results
+rubric:
+- criterion: The final response identifies payment-service as the service where the error span originates (not merely the webapp/api-gateway relay layer).
+  weight: 35
+- criterion: The final response identifies git_version v2.5.0 as the version the failing payment-service was running.
+  weight: 20

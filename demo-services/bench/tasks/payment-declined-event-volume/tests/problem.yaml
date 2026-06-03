@@ -1,0 +1,31 @@
+id: payment-declined-event-volume
+category: investigation
+tags:
+- logql
+- logs
+- payment
+- biz-event
+- root-cause
+statement: |
+  Using Loki request logs from payment-service (JSON lines carrying an `event` field), how many
+  `payment.declined` events were emitted in the last 6 hours? Is the spike concentrated on one
+  `git_version`, and what is the dominant decline `reason`? Give the total count, the count on the
+  worst version, and name the reason.
+checks: []
+rubric:
+- criterion: The final response states the total payment.declined event count over the window accurately.
+  weight: 40
+  fact:
+    kind: query
+    backend: loki
+    query: sum(count_over_time({service_name="payment-service"} | json | event="payment.declined" [6h]))
+- criterion: The final response states the payment.declined count on git_version v2.5.0 accurately.
+  weight: 30
+  fact:
+    kind: query
+    backend: loki
+    query: sum(count_over_time({service_name="payment-service",git_version="v2.5.0"} | json | event="payment.declined" [6h]))
+- criterion: The final response names `new_validator_odd_cents` as the dominant decline reason.
+  weight: 15
+- criterion: The final response identifies that the declines are concentrated on git_version v2.5.0 rather than spread evenly across versions.
+  weight: 15

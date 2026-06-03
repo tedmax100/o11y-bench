@@ -1,0 +1,31 @@
+id: payment-decline-rate-by-version
+category: investigation
+tags:
+- promql
+- metrics
+- payment
+- deploy-correlation
+- root-cause
+statement: |
+  payment-service's charge decline rate jumped. Using Prometheus over the last 6 hours,
+  break the payment charge decline rate down by deployed version (the `git_version` label on
+  `payment_charges_total`). Tell me which version is responsible and roughly what share of its
+  charges are being declined, and contrast it with the previous version.
+checks: []
+rubric:
+- criterion: The final response states the v2.5.0 decline share accurately.
+  weight: 40
+  fact:
+    kind: query
+    backend: prometheus
+    query: sum(increase(payment_charges_total{status="declined",git_version="v2.5.0"}[6h])) / sum(increase(payment_charges_total{git_version="v2.5.0"}[6h]))
+- criterion: The final response states the v2.4.1 decline share accurately (the calm baseline).
+  weight: 25
+  fact:
+    kind: query
+    backend: prometheus
+    query: sum(increase(payment_charges_total{status="declined",git_version="v2.4.1"}[6h])) / sum(increase(payment_charges_total{git_version="v2.4.1"}[6h]))
+- criterion: The final response identifies git_version v2.5.0 as the version responsible for the elevated decline rate, tying it to metric evidence rather than only generic wording.
+  weight: 20
+- criterion: The response expresses the result as a percentage, ratio, or share and references payment charges / declines (not only generic errors).
+  weight: 15

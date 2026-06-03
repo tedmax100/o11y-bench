@@ -108,6 +108,23 @@ sum by (service_name) (count_over_time({deployment_environment="demo"} | level="
 { resource.service.name = "<service>" && status = error }
 ```
 
+### Count vs rate, and where to read git_version
+
+- **"How many / total / volume over the last Nh"** → an **instant** query of
+  `sum(count_over_time({...}[Nh]))` (Loki tool: `queryType="instant"`). It returns
+  the single total. A **range** query returns one windowed count per step — do
+  **not** average/last those into a total (that yields a per-step number, not the
+  count). Use range only for trends/charts/raw lines. Same for Prometheus:
+  `sum(increase(<counter>[Nh]))` instant for a windowed total; `rate(...)` only
+  for a per-second rate or a share.
+- **trace_id, level, event, business fields are structured metadata** — they need
+  a `{...}` stream selector first: `{service_name="x"} | trace_id="y"`, never
+  `trace_id="y"` alone (that's a LogQL parse error).
+- **git_version is everywhere** — a label on every metric and log, and on a trace's
+  resource as `service.version`. To get the version a failing trace ran on, read
+  `resource.service.version` from the trace you already fetched; do **not** go to
+  Loki to "look it up". Never cite a git_version or trace_id that isn't in a tool result.
+
 ## Feature flags & incident scenarios
 
 **payment-service** has a `payment_use_new_validator` flag (from `flags.json`,

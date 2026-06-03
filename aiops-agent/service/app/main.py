@@ -1,7 +1,7 @@
 import json
 import uuid
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -9,6 +9,7 @@ from sse_starlette.sse import EventSourceResponse
 from .agent import lifespan, stream_chat
 from .config import settings
 from .traces import analyze_trace, get_trace, list_traces, stream_trace_chat
+from .webhook import handle_alert
 
 app = FastAPI(title="aiops-agent-service", lifespan=lifespan)
 
@@ -43,6 +44,31 @@ async def chat(req: ChatRequest):
             yield {"event": evt["type"], "data": json.dumps(evt)}
 
     return EventSourceResponse(event_gen())
+
+
+# ---- Alert webhook (PUSH-mode RCA) ------------------------------------------
+
+
+@app.post("/webhook/alert")
+async def webhook_alert(
+    request: Request,
+    x_webhook_secret: str | None = Header(default=None),
+):
+    """Grafana Alerting POSTs firing alerts here; each distinct alert kicks off a
+    headless RCA (doc v3 §4). fail-closed: disabled unless a secret is configured,
+    and the request must present it (header or ?token=)."""
+    if not settings.webhook_secret:
+        raise HTTPException(status_code=503, detail="alert webhook disabled (no secret configured)")
+    token = x_webhook_secret or request.query_params.get("token")
+    if token != settings.webhook_secret:
+        raise HTTPException(status_code=401, detail="invalid webhook secret")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="body must be JSON")
+
+    return await handle_alert(payload)
 
 
 # ---- Trace Explorer ---------------------------------------------------------

@@ -21,6 +21,8 @@ import json
 import logging
 import math
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -38,12 +40,39 @@ _RELATIVE_RE = re.compile(r"^\s*now\s*(?:-\s*(\d+)\s*([smhd]))?\s*$", re.IGNOREC
 _RFC3339_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
 _DELTA_UNITS = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
 
+# "Now" override for the headless alert path. The interactive chat path leaves
+# this None and every clock reference resolves to the real wall clock. The
+# alert webhook (doc v3 §4.5) sets it to the alert's `startsAt` for the duration
+# of one investigation, so BOTH the `now-...` shorthand expansion below AND the
+# "Current time" line in the system prompt resolve to the alert's fire time
+# instead of when the agent happens to be running. ContextVar (not a module
+# global) so concurrent investigations don't clobber each other's clock.
+_now_override: ContextVar[datetime | None] = ContextVar("now_override", default=None)
+
+
+def current_now() -> datetime:
+    """The clock the agent should treat as 'now'. Real wall clock unless an
+    alert investigation has shifted it to the alert's startsAt."""
+    return _now_override.get() or datetime.now(UTC)
+
+
+@contextmanager
+def now_override(dt: datetime | None):
+    """Pin `current_now()` to `dt` within this block (None → real clock).
+    asyncio copies the context into tasks at creation, so graph nodes spawned
+    during `await agent.ainvoke(...)` inside this block inherit the pinned clock."""
+    token = _now_override.set(dt)
+    try:
+        yield
+    finally:
+        _now_override.reset(token)
+
 
 def _parse_dt(value: str) -> datetime:
     """Resolve a `now` / `now-Xh|m|s|d` shorthand or an RFC3339 string to an
     aware UTC datetime. Gemini Flash-Lite emits the shorthand constantly even
     when told not to, so we accept both forms."""
-    now = datetime.now(UTC)
+    now = current_now()
     m = _RELATIVE_RE.match(value)
     if m:
         num, unit = m.group(1), m.group(2)
@@ -253,6 +282,27 @@ class LokiArgs(BaseModel):
     end: str = Field(default="now", description="RFC3339 or now-shorthand.")
     limit: int = Field(default=100, description="Max log lines (log queries).")
     direction: str = Field(default="backward", description="'backward' or 'forward'.")
+    queryType: str = Field(
+        default="auto",
+        description="'auto' (default — metric aggregations like count_over_time / "
+        "rate / sum run as an instant query returning the windowed total; raw log "
+        "lines run as a range query), or force 'instant' / 'range'. A metric range "
+        "query returns a per-step series you must NOT average into a total.",
+    )
+
+
+# Metric LogQL (returns a number, not log lines): a range version yields one
+# windowed value per step, which a model wrongly averages into a "total". For
+# these we run an INSTANT query so the windowed total is a single value.
+_METRIC_LOGQL_RE = re.compile(
+    r"\b(count_over_time|rate|sum_over_time|avg_over_time|bytes_over_time|"
+    r"bytes_rate|absent_over_time|quantile_over_time)\b|^\s*(sum|topk|count|avg|min|max)\s*\(",
+    re.IGNORECASE,
+)
+
+
+def _is_metric_logql(logql: str) -> bool:
+    return bool(_METRIC_LOGQL_RE.search(logql))
 
 
 def _loki_fallback(selector: str) -> str:
@@ -260,15 +310,51 @@ def _loki_fallback(selector: str) -> str:
             f"(count_over_time({selector} [5m])))")
 
 
+def _loki_query_hint(logql: str, exc: ToolException) -> ToolException:
+    """Turn a raw Loki 400/parse error into an actionable LogQL hint. The model
+    otherwise re-sends the same broken query; a specific correction lets it fix
+    in one shot."""
+    msg = str(exc)
+    if "parse error" not in msg and "returned 400" not in msg and "unexpected" not in msg:
+        return exc
+    if _selector(logql) is None:
+        return ToolException(
+            f"{msg}\nHINT: LogQL must START with a stream selector `{{label=\"...\"}}` "
+            "before any `|` filter. trace_id / level / event / business fields are "
+            "structured metadata — filter them AFTER a selector, e.g. "
+            "`{service_name=\"<svc>\"} | trace_id=\"<id>\"`. Indexable selector labels: "
+            "service_name, git_repo, git_version, deployment_environment."
+        )
+    return ToolException(
+        f"{msg}\nHINT: check the LogQL pipeline. Log filter: `{{...}} | level=\"ERROR\"`. "
+        "Metric/count: `sum(count_over_time({{...}} | <filters> [<window>]))` — the "
+        "range goes INSIDE count_over_time, and the whole thing is wrapped in sum(...)."
+    )
+
+
 async def _query_loki_logs(logql: str, start: str = "now-1h", end: str = "now",
-                          limit: int = 100, direction: str = "backward") -> Any:
+                          limit: int = 100, direction: str = "backward",
+                          queryType: str = "auto") -> Any:
     s, e = _parse_dt(start), _parse_dt(end)
-    base_params = {"start": _epoch_ns(s), "end": _epoch_ns(e)}  # Loki needs ns
-    data = await _get_json(settings.loki_url, "/loki/api/v1/query_range",
-                           {**base_params, "query": logql, "limit": limit,
-                            "direction": direction})
+    # Resolve 'auto': metric aggregation → instant (clean windowed total),
+    # raw log lines → range. Removes the model's chance to mis-pick range and
+    # then average a per-step count series into a wrong total.
+    if queryType == "auto":
+        queryType = "instant" if _is_metric_logql(logql) else "range"
+    try:
+        if queryType == "instant":
+            # Single value at `end` — the right shape for a windowed total/count.
+            data = await _get_json(settings.loki_url, "/loki/api/v1/query",
+                                   {"query": logql, "time": _epoch_ns(e),
+                                    "limit": limit, "direction": direction})
+        else:
+            data = await _get_json(settings.loki_url, "/loki/api/v1/query_range",
+                                   {"start": _epoch_ns(s), "end": _epoch_ns(e),  # Loki needs ns
+                                    "query": logql, "limit": limit, "direction": direction})
+    except ToolException as exc:
+        raise _loki_query_hint(logql, exc) from exc
     if isinstance(data, dict) and data.get("status") == "error":
-        raise ToolException(f"Loki error: {data.get('error')}")
+        raise _loki_query_hint(logql, ToolException(f"Loki error: {data.get('error')}"))
     result = data.get("data", data) if isinstance(data, dict) else data
     # Metric LogQL (count_over_time, sum by ...) returns a matrix/vector — digest
     # it like Prometheus. Log *streams* are left intact (the lines are the answer)
@@ -288,7 +374,8 @@ async def _query_loki_logs(logql: str, start: str = "now-1h", end: str = "now",
     step = max((_epoch_s(e) - _epoch_s(s)) // 100, 1)
     try:
         agg = await _get_json(settings.loki_url, "/loki/api/v1/query_range",
-                              {**base_params, "query": fb, "step": step})
+                              {"start": _epoch_ns(s), "end": _epoch_ns(e),
+                               "query": fb, "step": step})
         agg = agg.get("data", agg) if isinstance(agg, dict) else agg
     except ToolException as exc:
         return {"truncated": True, "original_query": logql, "fallback_query": fb,
@@ -315,12 +402,33 @@ class TempoArgs(BaseModel):
     limit: int = Field(default=20, description="Max traces returned.")
 
 
+def _tempo_query_hint(traceql: str, exc: ToolException) -> ToolException:
+    msg = str(exc)
+    if "400" not in msg and "parse" not in msg.lower():
+        return exc
+    return ToolException(
+        f"{msg}\nHINT: TraceQL predicates must be inside braces, e.g. "
+        "`{ resource.service.name=\"<svc>\" && status=error }`. Use dotted attribute "
+        "names (resource.service.name, span.http.route, status); `status=error` (no "
+        "quotes) selects error spans. Read git_version off the trace's "
+        "resource.service.version — don't go to Loki for it."
+    )
+
+
 async def _query_tempo_traces(traceql: str, start: str = "now-1h", end: str = "now",
                              limit: int = 20) -> Any:
     s, e = _parse_dt(start), _parse_dt(end)
-    data = await _get_json(settings.tempo_url, "/api/search",
-                           {"q": traceql, "start": _epoch_s(s), "end": _epoch_s(e),  # Tempo: unix seconds
-                            "limit": limit})
+    # Surface the deployed version on each matched span so deploy-correlation
+    # questions ("which git_version was this trace running?") can be answered
+    # from the search result itself — Tempo's default summary omits it, which
+    # otherwise sends the model off to Loki (and it fails). select() is additive.
+    q = traceql if "select(" in traceql.lower() else f"{traceql} | select(resource.service.version)"
+    try:
+        data = await _get_json(settings.tempo_url, "/api/search",
+                               {"q": q, "start": _epoch_s(s), "end": _epoch_s(e),  # Tempo: unix seconds
+                                "limit": limit})
+    except ToolException as exc:
+        raise _tempo_query_hint(traceql, exc) from exc
     traces = data.get("traces", []) if isinstance(data, dict) else []
     if _approx_size(traces) <= TEMPO_CAP_BYTES:
         return {"traces": traces, "count": len(traces)}

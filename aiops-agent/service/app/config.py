@@ -23,6 +23,21 @@ class Settings(BaseSettings):
 
     cors_allow_origins: list[str] = ["http://localhost:3000"]
 
+    # --- Alert webhook (PUSH-mode RCA, doc v3 §4) --------------------------
+    # Shared secret for POST /webhook/alert, passed as X-Webhook-Secret header
+    # or ?token=. fail-closed: empty → endpoint disabled (503); set → request
+    # must match or it's rejected (401). doc v3 §4.5 / §6.1.
+    webhook_secret: str = ""
+    # Same fingerprint inside this window folds into the running investigation
+    # instead of spawning a new one — alert storms must not fan out. doc v3 §4.2.
+    alert_cooldown_seconds: int = 600
+    # Headless runs have no human to interrupt them, so their own hard ceiling.
+    webhook_tool_call_budget: int = 6
+    # Optional findings sink: if both set, the headless conclusion is posted as a
+    # Grafana annotation. Absent → the sink just logs.
+    grafana_url: str = ""
+    grafana_token: str = ""
+
     host: str = "0.0.0.0"
     port: int = 8000
 
