@@ -10,7 +10,7 @@ across **all three signals**:
 | **Logs (events)** | `registry/model/events.yaml` | every `BizEvent` from `o11y_shared.events` + the structured `extra={...}` fields each carries |
 | **Traces (spans)** | `registry/model/spans.yaml` | the business operations (order create / payment charge / proxy hop) |
 | **GenAI** | `registry/model/genai.yaml` | the `aiops-agent`'s own telemetry — `gen_ai.*` LLM/tool spans + `gen_ai.client.*` token/duration metrics, plus the agent-specific `aiops.*` attributes |
-| _shared_ | `registry/model/common.yaml` | the `app.*` / `biz.*` attributes + resource (`vcs.repository.url`, `service.version`) |
+| _shared_ | `registry/model/common.yaml` | the `app.*` / `biz.*` attributes + resource (`vcs.repository.url.full`, `service.version`) |
 
 The **GenAI** rows come from the aiops-agent running under
 `opentelemetry-instrument` with `opentelemetry-instrumentation-langchain` — the
@@ -60,7 +60,7 @@ business identifiers). The services currently emit **flat keys**. The mapping:
 | `method` | `app.http.method` | log |
 | `user_id` / `order_id` / `product_id` / `payment_id` | `biz.user.id` / `biz.order.id` / `biz.product.id` / `biz.payment.id` | log/span |
 | `amount_cents` | `biz.amount_cents` | log/span |
-| `git_repo` / `git_version` (resource) | `vcs.repository.url` / `service.version` | resource |
+| `git_repo` / `git_version` (resource) | `vcs.repository.url.full` / `service.version` | resource |
 
 Because of this gap, `weaver registry live-check` against the **running** demo
 will currently report the flat keys as non-conforming — that report *is* the

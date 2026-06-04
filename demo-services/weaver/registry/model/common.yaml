@@ -291,12 +291,14 @@ groups:
     display_name: Deploy provenance
     brief: Resource attributes identifying which build emitted the telemetry.
     attributes:
-      - id: vcs.repository.url
+      - id: vcs.repository.url.full
         type: string
         stability: development
-        brief: The source repository the running build came from.
-        note: "Flat key in current code: `git_repo` (resource attr). Aligns with semconv `vcs.repository.url.full`."
-        examples: ["tedmax100/o11y-bench"]
+        brief: >-
+          The complete URL of the source repository the running build came
+          from (canonical, browser-accessible form).
+        note: "Flat key in current code: `git_repo` (resource attr). This is the OTel semconv attribute `vcs.repository.url.full`; current code emits an `owner/name` slug rather than a full URL."
+        examples: ["https://github.com/tedmax100/o11y-bench"]
       - id: service.version
         type: string
         stability: development
@@ -309,7 +311,7 @@ groups:
     stability: development
     brief: Resource conventions for every demo-service process.
     attributes:
-      - ref: vcs.repository.url
+      - ref: vcs.repository.url.full
         requirement_level: required
       - ref: service.version
         requirement_level: required
