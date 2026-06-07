@@ -6,6 +6,8 @@
 
 ## 1.1 你是否遇過這些痛點？
 
+![](./OpenTelemetry_Weaver_Training_-_Slide_3.png)
+
 ```
 部署新版本後，所有警報瞬間失效 → 有人改了 metric 名稱
 團隊 A 用 host-name，團隊 B 用 host_name → 查詢需要一堆 OR 條件
@@ -24,12 +26,12 @@
 
 ### 傳統做法的結構性缺陷
 
-| 問題 | 傳統做法 | 帶來的後果 |
-|------|---------|-----------|
-| 沒有規格書 | 開發人員自由命名 | 命名不一致，跨服務關聯查詢困難 |
-| 規格書不自動驗證 | Wiki 或 Confluence 手動維護 | 文件與程式碼脫節，資訊腐朽 |
-| 沒有 breaking change 防護 | 靠 code review 人工把關 | 高壓期間容易漏審 |
-| 缺少型別安全 | 手打字串埋點 | 拼字錯誤在生產才發現 |
+| 問題                      | 傳統做法                    | 帶來的後果                     |
+| ------------------------- | --------------------------- | ------------------------------ |
+| 沒有規格書                | 開發人員自由命名            | 命名不一致，跨服務關聯查詢困難 |
+| 規格書不自動驗證          | Wiki 或 Confluence 手動維護 | 文件與程式碼脫節，資訊腐朽     |
+| 沒有 breaking change 防護 | 靠 code review 人工把關     | 高壓期間容易漏審               |
+| 缺少型別安全              | 手打字串埋點                | 拼字錯誤在生產才發現           |
 
 ---
 
@@ -49,6 +51,7 @@
 **1. Schema 即合約（Schema as Contract）**
 
 遙測 Schema 就像 REST API 的 OpenAPI Spec，或 Protobuf 定義。它定義：
+
 - 什麼訊號應該存在（Metric、Span、Log）
 - 每個訊號有哪些屬性（attribute）
 - 屬性的型別、必填性、合法值域
@@ -58,6 +61,7 @@
 **2. 驗證要自動化（Validation must be automated）**
 
 人工 code review 無法可靠地阻止命名錯誤。需要：
+
 - CI 自動檢查 Schema 語法正確性
 - CI 自動比較生成程式碼是否與 Schema 同步
 - 整合測試自動驗證執行時發出的訊號是否符合 Schema
@@ -74,19 +78,21 @@ OpenTelemetry 的語義慣例（Semantic Conventions，簡稱 semconv）是一�
 
 ### T 型知識框架
 
-| 廣度（T 型橫桿）| 深度（T 型縱桿）|
-|---|---|
-| 所有 HTTP 伺服器的標準監控方式 | Go Runtime 指標的深度定義 |
-| 通用屬性命名規範（`service.name`、`host.name`）| 特定資料庫的查詢追蹤規格 |
-| 跨語言、跨框架的一致性 | 特定雲端供應商的資源屬性 |
+![](./OpenTelemetry_Weaver_Training_-_Slide_4.png)
+
+| 廣度（T 型橫桿）                                    | 深度（T 型縱桿）          |
+| --------------------------------------------------- | ------------------------- |
+| 所有 HTTP 伺服器的標準監控方式                      | Go Runtime 指標的深度定義 |
+| 通用屬性命名規範（`service.name`、`host.name`） | 特定資料庫的查詢追蹤規格  |
+| 跨語言、跨框架的一致性                              | 特定雲端供應商的資源屬性  |
 
 ### 為什麼不自己定義命名？
 
-| 自定義命名 | 遵循 Semantic Conventions |
-|----------|--------------------------|
-| 供應商鎖定，遷移成本高 | 工具生態系原生支援（Grafana dashboards、Datadog integration）|
-| 跨組織協作困難 | 開箱即用的跨服務關聯分析 |
-| 需要自行定義文件標準 | 社群共識，降低學習成本 |
+| 自定義命名             | 遵循 Semantic Conventions                                     |
+| ---------------------- | ------------------------------------------------------------- |
+| 供應商鎖定，遷移成本高 | 工具生態系原生支援（Grafana dashboards、Datadog integration） |
+| 跨組織協作困難         | 開箱即用的跨服務關聯分析                                      |
+| 需要自行定義文件標準   | 社群共識，降低學習成本                                        |
 
 ### 命名規範原則
 
@@ -165,13 +171,13 @@ PR Review        → CI 自動執行 weaver registry check + drift detection
 
 ## 1.6 與其他工具的比較
 
-| 工具 | 用途 | 與 Weaver 的關係 |
-|------|------|----------------|
-| OpenTelemetry SDK | 埋點、收集、傳送遙測訊號 | Weaver 生成的常數供 SDK 使用 |
-| Prometheus | 指標儲存與查詢 | Weaver 確保指標名稱與屬性符合規範 |
-| Grafana | 視覺化 | Weaver emit 可預先填充測試資料 |
-| OPA / Rego | Policy Engine | Weaver 使用 OPA 執行自訂命名規則 |
-| protobuf / OpenAPI | API Schema 管理 | 類比：Weaver 是遙測訊號的 protobuf |
+| 工具               | 用途                     | 與 Weaver 的關係                   |
+| ------------------ | ------------------------ | ---------------------------------- |
+| OpenTelemetry SDK  | 埋點、收集、傳送遙測訊號 | Weaver 生成的常數供 SDK 使用       |
+| Prometheus         | 指標儲存與查詢           | Weaver 確保指標名稱與屬性符合規範  |
+| Grafana            | 視覺化                   | Weaver emit 可預先填充測試資料     |
+| OPA / Rego         | Policy Engine            | Weaver 使用 OPA 執行自訂命名規則   |
+| protobuf / OpenAPI | API Schema 管理          | 類比：Weaver 是遙測訊號的 protobuf |
 
 ---
 

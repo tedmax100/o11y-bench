@@ -1,6 +1,7 @@
 # 第三章：撰寫第一個遙測 Schema
 
 > 本章完整介紹 Weaver Schema YAML 的所有欄位與型別，包含 attribute_group、span、metric 的撰寫方式，以及 ref 機制的運作原理，並附常見錯誤對照。
+![](./OpenTelemetry_Weaver_Training_-_Slide_5.png)
 
 ---
 

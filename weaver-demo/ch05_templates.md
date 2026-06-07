@@ -1,7 +1,7 @@
 # 第五章：Weaver 模板系統
 
 > 本章完整介紹 weaver.yaml 設定檔的所有欄位、jq filter 語法、Jinja2 模板語言在 Weaver 中的所有內建 filter，並提供 Go、Python、Markdown 的完整可執行模板範例。
-
+![](./OpenTelemetry_Weaver_Training_-_Slide_4.png)
 ---
 
 ## 5.1 模板系統的完整結構
