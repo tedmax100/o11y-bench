@@ -1,0 +1,31 @@
+groups:
+  - id: metric.cart.add_item.count
+    type: metric
+    metric_name: cart.add_item.count
+    instrument: counter
+    unit: "{items}"
+    stability: stable
+    brief: "加入購物車的商品件數"
+    attributes:
+      - ref: cart.item_id
+      - ref: deployment.environment
+
+  - id: metric.cart.checkout.total
+    type: metric
+    metric_name: cart.checkout.total
+    instrument: histogram
+    unit: "{TWD}"
+    stability: stable
+    brief: "每次結帳金額分佈（TWD）"
+    attributes:
+      - ref: deployment.environment
+
+  - id: metric.cart.active_sessions
+    type: metric
+    metric_name: cart.active_sessions
+    instrument: updowncounter
+    unit: "{sessions}"
+    stability: stable
+    brief: "目前活躍的購物車 Session 數量"
+    attributes:
+      - ref: deployment.environment

@@ -1,0 +1,45 @@
+groups:
+  - id: span.payment.process
+    type: span
+    span_kind: server
+    stability: stable
+    brief: "處理訂單支付流程的 Span"
+    attributes:
+      - ref: git.tag
+      - ref: deployment.environment
+
+      - id: payment.order_id
+        type: string
+        stability: stable
+        brief: "唯一的訂單識別碼"
+        examples: ["ord-20240601-001", "ord-20240601-002"]
+        requirement_level: required
+
+      - id: payment.provider
+        type: string
+        stability: stable
+        brief: "支付服務提供商"
+        examples: ["stripe", "paypal", "bank_transfer"]
+        requirement_level: required
+
+      - id: payment.currency
+        type: string
+        stability: stable
+        brief: "貨幣代碼（ISO 4217）"
+        examples: ["USD", "EUR", "TWD"]
+        requirement_level: required
+
+      - id: payment.status
+        type: string
+        stability: stable
+        brief: "支付結果狀態"
+        examples: ["success", "failed", "pending"]
+        requirement_level: required
+
+      - id: error.type
+        type: string
+        stability: stable
+        brief: "失敗時的錯誤類型"
+        examples: ["insufficient_funds", "card_declined", "network_error"]
+        requirement_level:
+          conditionally_required: "僅在支付失敗時填入"

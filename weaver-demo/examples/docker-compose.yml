@@ -1,0 +1,82 @@
+version: "3.8"
+
+# ============================================================
+# Weaver Demo — 完整本地環境
+#
+# 服務清單：
+#   weaver        → live-check，監聽 OTLP :4317，驗證遙測合規性
+#   jaeger        → Trace 視覺化 UI  http://localhost:16686
+#   prometheus    → Metrics 抓取    http://localhost:9090
+#   grafana       → 儀表板          http://localhost:3000  (admin/admin)
+#   otel-collector→ 轉發 OTLP 訊號到 Jaeger + Prometheus
+# ============================================================
+
+services:
+
+  # ── Weaver live-check ──────────────────────────────────────
+  weaver:
+    image: ghcr.io/open-telemetry/weaver:latest
+    volumes:
+      - ./telemetry:/workspace/telemetry:ro
+      - ./policies:/workspace/policies:ro
+      - ./reports:/reports
+    working_dir: /workspace
+    command: >
+      registry live-check
+      --registry /workspace/telemetry/registry
+      --policy /workspace/policies
+      --input-source otlp
+      --format yaml
+      --output /reports/weaver-report.yaml
+      --otlp-grpc-address 0.0.0.0
+      --otlp-grpc-port 4317
+    ports:
+      - "4317:4317"   # OTLP gRPC（應用程式連這裡）
+    healthcheck:
+      test: ["CMD", "sh", "-c", "echo '' > /dev/tcp/localhost/4317 2>/dev/null && echo ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── OTel Collector（轉發到後端，用於有 Jaeger/Prometheus 的完整模式）──
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.104.0
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    ports:
+      - "4318:4317"   # OTLP gRPC（指向 Collector 而非 Weaver）
+    depends_on:
+      - jaeger
+      - prometheus
+
+  # ── Jaeger ─────────────────────────────────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:1.58
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "14317:4317"   # Jaeger OTLP gRPC（內部用）
+
+  # ── Prometheus ─────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  # ── Grafana ────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - jaeger

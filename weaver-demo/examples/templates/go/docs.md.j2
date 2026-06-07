@@ -1,0 +1,43 @@
+# 遙測規格文件
+
+> 本文件由 Weaver 自動生成，請勿手動修改。
+> 指令：`weaver registry generate --registry ./telemetry/registry --templates ./templates go ./generated_from_template`
+
+---
+
+{% for group in ctx %}
+## {% if group.type == "span" %}📡 Span{% elif group.type == "metric" %}📊 Metric{% else %}{{ group.type }}{% endif %}: `{{ group.id }}`
+
+**{{ group.brief }}**
+
+{% if group.type == "span" %}
+| 屬性 | 值 |
+|------|-----|
+| Span Kind | `{{ group.span_kind }}` |
+| Stability | `{{ group.stability }}` |
+{% endif %}
+{% if group.type == "metric" %}
+| 屬性 | 值 |
+|------|-----|
+| Metric Name | `{{ group.metric_name }}` |
+| Instrument | `{{ group.instrument }}` |
+| Unit | `{{ group.unit }}` |
+| Stability | `{{ group.stability }}` |
+{% endif %}
+
+### 屬性列表
+
+| 屬性名稱 | Go 常數 | 類型 | 必填 | 說明 |
+|---------|---------|------|------|------|
+{% for attr in group.attributes | sort(attribute="name") %}
+{% if attr.requirement_level == "required" %}
+| `{{ attr.name }}` | `{{ attr.name | screaming_snake_case }}` | `{{ attr.type }}` | ✅ 必填 | {{ attr.brief }} |
+{% elif attr.requirement_level == "recommended" %}
+| `{{ attr.name }}` | `{{ attr.name | screaming_snake_case }}` | `{{ attr.type }}` | 💡 建議 | {{ attr.brief }} |
+{% else %}
+| `{{ attr.name }}` | `{{ attr.name | screaming_snake_case }}` | `{{ attr.type }}` | ⬜ 選填 | {{ attr.brief }} |
+{% endif %}
+{% endfor %}
+
+---
+{% endfor %}

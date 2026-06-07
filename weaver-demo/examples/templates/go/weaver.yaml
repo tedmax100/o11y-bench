@@ -1,0 +1,29 @@
+whitespace_control:
+  trim_blocks: true
+  lstrip_blocks: true
+
+templates:
+  - template: semconv_attrs.go.j2
+    filter: >
+      .groups
+      | map(select(.type == "attribute_group" or .type == "span"))
+      | map(.attributes[])
+      | unique_by(.name)
+      | sort_by(.name)
+    application_mode: single
+    file_name: "semconv_attrs.go"
+
+  - template: semconv_metrics.go.j2
+    filter: >
+      .groups
+      | map(select(.type == "metric"))
+      | sort_by(.metric_name)
+    application_mode: single
+    file_name: "semconv_metrics.go"
+
+  - template: docs.md.j2
+    filter: >
+      .groups
+      | map(select(.type == "metric" or .type == "span"))
+    application_mode: single
+    file_name: "docs/telemetry.md"

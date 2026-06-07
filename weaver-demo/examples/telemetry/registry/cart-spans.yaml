@@ -1,0 +1,61 @@
+groups:
+  - id: span.cart.add_item
+    type: span
+    span_kind: server
+    stability: stable
+    brief: "將商品加入購物車的 Span"
+    attributes:
+      - ref: git.tag
+      - ref: deployment.environment
+
+      - id: cart.session_id
+        type: string
+        stability: stable
+        brief: "購物車 Session 識別碼"
+        examples: ["sess-abc123", "sess-xyz789"]
+        requirement_level: required
+
+      - id: cart.item_id
+        type: string
+        stability: stable
+        brief: "加入購物車的商品 SKU"
+        examples: ["SKU-001", "SKU-002"]
+        requirement_level: required
+
+      - id: cart.item_quantity
+        type: int
+        stability: stable
+        brief: "加入的商品數量"
+        examples: [1, 2, 5]
+        requirement_level: required
+
+      - id: cart.item_price
+        type: double
+        stability: stable
+        brief: "商品單價（TWD）"
+        examples: [299.0, 1500.0]
+        requirement_level: required
+
+  - id: span.cart.checkout
+    type: span
+    span_kind: server
+    stability: stable
+    brief: "購物車結帳 Span"
+    attributes:
+      - ref: git.tag
+      - ref: deployment.environment
+      - ref: cart.session_id
+
+      - id: cart.total_amount
+        type: double
+        stability: stable
+        brief: "結帳總金額（TWD）"
+        examples: [598.0, 3000.0]
+        requirement_level: required
+
+      - id: cart.item_count
+        type: int
+        stability: stable
+        brief: "購物車中商品總件數"
+        examples: [1, 3, 10]
+        requirement_level: required

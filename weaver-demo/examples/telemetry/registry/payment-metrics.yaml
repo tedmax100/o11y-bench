@@ -1,0 +1,32 @@
+groups:
+  - id: metric.payment.amount
+    type: metric
+    metric_name: payment.amount
+    instrument: histogram
+    unit: "{TWD}"
+    stability: stable
+    brief: "每筆支付的金額分佈"
+    attributes:
+      - ref: payment.provider
+      - ref: deployment.environment
+
+  - id: metric.payment.errors
+    type: metric
+    metric_name: payment.errors
+    instrument: counter
+    unit: "{errors}"
+    stability: stable
+    brief: "支付失敗次數計數器"
+    attributes:
+      - ref: payment.provider
+
+  - id: metric.payment.duration
+    type: metric
+    metric_name: payment.duration
+    instrument: histogram
+    unit: "ms"
+    stability: stable
+    brief: "支付處理耗時（毫秒）"
+    attributes:
+      - ref: payment.provider
+      - ref: deployment.environment
