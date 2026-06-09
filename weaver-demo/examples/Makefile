@@ -2,10 +2,9 @@
         live-check-go live-check-python stack-up stack-down report clean
 
 OTLP_ENDPOINT ?= localhost:4317
-WEAVER        := docker run --rm -v $(PWD):/workspace -w /workspace \
-                 ghcr.io/open-telemetry/weaver:latest
-REGISTRY      := /workspace/telemetry/registry
-POLICIES      := /workspace/policies
+WEAVER        := weaver
+REGISTRY      := ./telemetry/registry
+POLICIES      := ./policies
 
 # ── 顏色 ──────────────────────────────────────────────────────
 GREEN  := \033[0;32m
@@ -42,13 +41,12 @@ check: ## 執行 Weaver Schema + Policy 靜態驗證
 		--policy $(POLICIES)
 	@echo "$(GREEN)✓ Schema 驗證通過$(RESET)"
 
-check-broken: ## 驗證一個刻意錯誤的 Schema（演示報錯）
-	@echo "$(YELLOW)>>> 驗證錯誤 Schema（預期會報錯）$(RESET)"
-	@echo 'groups:\n  - id: bad.metric\n    type: metric\n    metric_name: bad_no_prefix\n    instrument: counter\n    unit: "{items}"\n    brief: "missing prefix"' > /tmp/bad-schema.yaml
+check-bad: ## 驗證含違規 Schema 的 registry（預期會報錯）
+	@echo "$(RED)>>> 驗證含違規 Schema（預期失敗）$(RESET)"
 	$(WEAVER) registry check \
-		--registry /tmp/bad-schema.yaml \
+		--registry ./telemetry/bad-registry \
 		--policy $(POLICIES) || true
-	@rm /tmp/bad-schema.yaml
+	@echo "$(YELLOW)↑ 上方應看到 metric_naming_prefix 違規$(RESET)"
 
 diff: ## 顯示當前 Schema 的解析結果（依賴展開）
 	$(WEAVER) registry resolve \

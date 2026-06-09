@@ -1,0 +1,25 @@
+groups:
+  # 錯誤 1：指標名稱沒有使用允許的前綴（policy 會擋）
+  - id: metric.orders.total
+    type: metric
+    metric_name: orders.total
+    instrument: counter
+    unit: "{orders}"
+    stability: stable
+    brief: "訂單總數"
+    attributes:
+      - ref: deployment.environment
+
+  # 錯誤 2：attribute 缺少 brief（policy 會擋）
+  - id: span.checkout.submit
+    type: span
+    span_kind: server
+    stability: stable
+    brief: "送出結帳"
+    attributes:
+      - id: checkout.promo_code
+        type: string
+        stability: stable
+        brief: ""
+        examples: ["SUMMER10"]
+        requirement_level: recommended
