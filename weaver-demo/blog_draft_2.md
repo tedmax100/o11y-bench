@@ -369,27 +369,37 @@ weaver registry resolve --registry ./telemetry/registry
 
 Weaver 的 policy 在前一篇只用來做命名規範檢查。更有力的用法是：**在 Schema 被刪除或 type 被改變時，直接讓 CI fail**。
 
-關鍵在於 Weaver 的 `--baseline` 旗標。你可以在 CI 中把目前 main branch 的 registry 當作 baseline，與 PR 的 registry 比對：
+關鍵在於 Weaver 的 `--baseline-registry` 旗標。你可以在 CI 中把目前 main branch 的 registry 當作 baseline，與 PR 的 registry 比對：
 
 ```bash
 weaver registry check \
-  --registry ./telemetry/registry \         # PR 的 registry
-  --baseline ./telemetry/registry-baseline \ # main branch 的 registry（從 git checkout 來）
+  --registry ./telemetry/registry \                    # PR 的 registry
+  --baseline-registry ./telemetry/registry-baseline \  # main branch 的 registry
   --policy ./policies
 ```
+
+寫比對 policy 之前，要先知道 Weaver 的兩個約定：
+
+1. **package 必須是 `comparison_after_resolution`**——只有這個階段拿得到 baseline，一般的 `after_resolution` policy 看不到它。
+2. **baseline 從 `data.groups` 進來，PR 的 registry 才是 `input.groups`**。
 
 搭配這支 breaking change policy：
 
 **`policies/breaking_change.rego`**
 
 ```rego
-package after_resolution
+package comparison_after_resolution
 
 import rego.v1
 
+# Weaver 的約定：
+#   input.groups → 當前 registry（--registry）
+#   data.groups  → baseline registry（--baseline-registry）
+baseline_groups := data.groups
+
 # 規則：屬性不可被刪除（只能標 deprecated）
 deny contains violation if {
-    baseline_group := input.baseline.groups[_]
+    baseline_group := baseline_groups[_]
     baseline_attr := baseline_group.attributes[_]
 
     # 在新版 registry 找不到同名屬性
@@ -411,7 +421,7 @@ deny contains violation if {
 
 # 規則：屬性的 type 不可改變
 deny contains violation if {
-    baseline_group := input.baseline.groups[_]
+    baseline_group := baseline_groups[_]
     baseline_attr := baseline_group.attributes[_]
 
     new_group := input.groups[_]
@@ -447,7 +457,7 @@ attribute_exists_in_new(attr_name) if {
 
 ```
 $ weaver registry check --registry ./telemetry/registry \
-    --baseline ./telemetry/registry-baseline \
+    --baseline-registry ./telemetry/registry-baseline \
     --policy ./policies
 
 ✗ Policy violations detected (exit code 1):
@@ -485,16 +495,16 @@ jobs:
         with:
           fetch-depth: 0   # 需要取 main branch 的 registry 當 baseline
 
+      # Weaver 沒有官方 GitHub Action，從 release 下載 binary 即可
       - name: Setup Weaver
-        uses: open-telemetry/weaver-action/setup@v1
-
-      # 從 main branch 取出 baseline registry
-      - name: Export baseline registry
         run: |
-          git show origin/main:telemetry/registry > /dev/null 2>&1 || true
-          git checkout origin/main -- telemetry/registry
-          mv telemetry/registry telemetry/registry-baseline
-          git checkout HEAD -- telemetry/registry
+          curl -sSL https://github.com/open-telemetry/weaver/releases/latest/download/weaver-x86_64-unknown-linux-gnu.tar.xz \
+            | tar -xJ --strip-components=1 -C /usr/local/bin
+
+      # 用 worktree 把 main branch 展開成獨立目錄當 baseline，
+      # 不用動到當前 checkout 的 PR 版本
+      - name: Export baseline registry
+        run: git worktree add /tmp/baseline origin/main
 
       # 基本 schema 格式 + 命名 policy 驗證
       - name: Validate schema + naming policy
@@ -508,7 +518,7 @@ jobs:
         run: |
           weaver registry check \
             --registry ./telemetry/registry \
-            --baseline ./telemetry/registry-baseline \
+            --baseline-registry /tmp/baseline/telemetry/registry \
             --policy ./policies/breaking_change.rego
 
       # 確認生成的程式碼有被更新
@@ -547,12 +557,15 @@ Weaver 的 `live-check` 在 CI 整合測試階段可以充當 OTLP endpoint，�
 # ci.sh 中的整合測試段落
 
 # 1. 背景啟動 Weaver live-check
+#    --inactivity-timeout：10 秒沒有新資料就自動停止並寫出報告
+#    （不要用 kill——SIGTERM 不保證報告被完整寫出）
 weaver registry live-check \
   --registry ./telemetry/registry \
   --policy ./policies \
   --input-source otlp \
   --format yaml \
-  --output ./reports/drift-report.yaml \
+  --output ./reports \
+  --inactivity-timeout 10 \
   --otlp-grpc-address 0.0.0.0 \
   --otlp-grpc-port 4317 &
 
@@ -563,35 +576,38 @@ sleep 2
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
   go test ./integration/... -timeout 120s
 
-# 3. 等 Weaver 把所有資料寫入報告
-kill $WEAVER_PID
-sleep 1
-
-# 4. 檢查報告是否有 violation
-if grep -q '"level": "violation"' ./reports/drift-report.yaml; then
+# 3. 等 live-check 因 inactivity timeout 自動結束。
+#    Weaver 在報告含有任何 violation 時會以非零 exit code 結束，
+#    所以直接用 wait 的回傳值判斷就好，不用自己 grep。
+if ! wait $WEAVER_PID; then
   echo "❌ Drift detected! 實際 telemetry 與 Schema 不符。"
-  cat ./reports/drift-report.yaml
+  cat ./reports/live_check.yaml
   exit 1
 fi
 
 echo "✅ No drift detected."
 ```
 
-報告長這樣：
+報告長這樣（節錄）：
 
 ```yaml
-# reports/drift-report.yaml
-violations:
-  - group: span.payment.process
-    attribute: payment.orderId     # 服務實際打出的
-    expected: payment.order_id     # Schema 定義的
-    level: violation
-    message: "Unknown attribute 'payment.orderId' (did you mean 'payment.order_id'?)"
-    source_service: payment-service
-    sample_count: 47
+# reports/live_check.yaml
+- attribute:
+    name: payment.orderId          # 服務實際打出的（Schema 裡只有 payment.order_id）
+  live_check_result:
+    all_advice:
+      - advice_type: missing_attribute
+        advice_level: violation
+        value: payment.orderId
+        message: Does not exist in the registry
+
+statistics:
+  advice_level_counts:
+    violation: 47
+  highest_advice_level: violation
 ```
 
-`sample_count: 47` 讓你知道這不是偶發，是每一個 payment span 都在打錯誤的 key。
+`advice_level_counts` 裡的 `violation: 47` 讓你知道這不是偶發，是每一個 payment span 都在打錯誤的 key。
 
 ---
 
@@ -601,6 +617,8 @@ violations:
 
 ### Step 1：新舊並存，舊的標 `deprecated`
 
+前面 `stability` 那節提過：`deprecated` 不是 stability 的值，是獨立欄位。而且它是結構化的，`reason` 有三種——`renamed`（改名，要附 `renamed_to`）、`obsoleted`（廢棄，無替代品）、`uncategorized`（其他）。改名情境正好用 `renamed`：
+
 ```yaml
 # telemetry/registry/payment-spans.yaml
 groups:
@@ -609,8 +627,11 @@ groups:
     attributes:
       - id: payment.order_id
         type: string
-        stability: deprecated          # ← 標記為 deprecated
-        deprecated: "請改用 payment.transaction_id，將於 v3.0 移除"
+        stability: stable              # stability 維持不變
+        deprecated:                    # ← 用結構化欄位標記棄用
+          reason: renamed
+          renamed_to: payment.transaction_id
+          note: "將於 v3.0 移除"
         brief: "訂單識別碼（已棄用）"
         examples: ["ORD-20240601-001"]
         requirement_level: recommended # 從 required 降為 recommended
@@ -623,7 +644,7 @@ groups:
         requirement_level: required
 ```
 
-這個 PR 可以通過 breaking change policy，因為舊屬性還在（只是被標 deprecated）。
+這個 PR 可以通過 breaking change policy，因為舊屬性還在（只是被標 deprecated）。`renamed_to` 不只是文件——程式碼生成的模板和下游工具都讀得到它，知道該往哪裡遷移。
 
 你可以再加一條 policy，讓 Weaver 在 PR 提醒所有使用舊屬性的地方：
 
@@ -636,13 +657,13 @@ import rego.v1
 warn contains warning if {
     group := input.groups[_]
     attr := group.attributes[_]
-    attr.stability == "deprecated"
+    attr.deprecated          # 有 deprecated 欄位就提醒
     warning := {
         "id": "deprecated_attr_in_use",
         "level": "warning",
         "message": sprintf(
-            "屬性 '%s' 已標記為 deprecated：%s",
-            [attr.name, attr.deprecated]
+            "屬性 '%s' 已標記為 deprecated（%s）：%s",
+            [attr.name, attr.deprecated.reason, attr.deprecated.note]
         ),
     }
 }
@@ -706,10 +727,10 @@ Weaver 把這條防線從「希望大家有紀律」變成「機器強制執行�
 git clone https://github.com/your-org/weaver-demo
 cd weaver-demo/examples
 
-# 執行完整的 schema + breaking change 檢查
+# 執行 schema 格式 + 命名 policy 靜態驗證
 make check
 
-# 模擬破壞性變更（預期 CI fail）
+# 驗證含違規 Schema 的 registry（預期 fail，演示 policy 攔截）
 make check-bad
 
 # 看 drift detection 實際攔截
