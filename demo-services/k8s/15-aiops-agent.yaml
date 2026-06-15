@@ -9,6 +9,44 @@
 #     --from-literal=google-api-key="$GOOGLE_API_KEY" \
 #     --from-literal=github-token="$GITHUB_TOKEN"
 # (scripts/up.sh sources aiops-agent/service/.env and does this automatically.)
+# Read-only ServiceAccount for the k8s signal tools (v3 §2 / §6.3). Namespace-
+# scoped Role with get/list/watch on pods, events, deployments and replicasets —
+# the inputs to k8s_pod_status / k8s_events / k8s_deployment_status. No write
+# verbs: any remediation (restart/scale/rollback) is the action-registry's job
+# (v3 §5.3) and would use a separate, privileged SA. read and write stay split.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aiops-agent
+  namespace: demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aiops-agent-readonly
+  namespace: demo
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aiops-agent-readonly
+  namespace: demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: aiops-agent-readonly
+subjects:
+  - kind: ServiceAccount
+    name: aiops-agent
+    namespace: demo
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -29,6 +67,9 @@ spec:
         # GIT_VERSION via the Downward API (same pattern as the demo services).
         git_version: v0.0.1
     spec:
+      # Read-only SA above — lets the k8s_* tools reach pods/events/deployments
+      # in-cluster. Host-side dev uses the local kubeconfig instead.
+      serviceAccountName: aiops-agent
       containers:
         - name: aiops-agent
           image: aiops-agent/service:dev
@@ -87,6 +128,15 @@ spec:
                 secretKeyRef:
                   name: aiops-agent-secrets
                   key: github-token
+                  optional: true
+            # Enables the alert webhook (PUSH-mode RCA). fail-closed: if this key
+            # is absent the env var is unset and /webhook/alert returns 503. The
+            # caller must present the same value via X-Webhook-Secret or ?token=.
+            - name: WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: aiops-agent-secrets
+                  key: webhook-secret
                   optional: true
           readinessProbe:
             httpGet:

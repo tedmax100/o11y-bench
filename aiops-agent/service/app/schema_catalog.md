@@ -58,10 +58,18 @@ HTTP endpoints (owning service):
   regardless of health. Check liveness with a fresh sample on a counter the
   service emits, e.g. `rate(<some_total>[5m]) > 0`.
 - **Loki** — the *only* indexable stream-selector labels are `service_name`,
-  `git_repo`, `git_version`, `deployment_environment`. Everything else (`level`,
-  `event`, `trace_id`, business fields) is **structured metadata**: filter it
-  *after* the selector (`| level="ERROR"`), never as a `{...}` selector. Do not
-  use `app` / `container` / `pod` / `job` — they aren't indexed.
+  `git_repo`, `git_version`, `deployment_environment`. The selector key is
+  `service_name` (**NOT `service`** — `{service="..."}` matches nothing).
+  Everything else (`event`, `trace_id`, `detected_level`, business fields) is
+  **structured metadata**: filter it *after* the selector (e.g.
+  `| event="payment.declined"`), never as a `{...}` selector. Do not use
+  `service` / `app` / `container` / `pod` / `job` as selectors — not indexed.
+- **Log severity / finding "errors"** — these services log business events at
+  **INFO**; there is **no `level` field and no ERROR-level lines** for the demo
+  incidents. The severity field that exists is `detected_level` / `severity_text`
+  (all `info` here). So **find incidents via the `event` field, not severity** —
+  e.g. payment declines are `| event="payment.declined"`, gateway failures are
+  `| event="payment.gateway_error"`. `| level="ERROR"` matches nothing.
 - **Tempo** — resource/span attributes use **dotted** names
   (`resource.service.name`, `span.http.route`, `status`). Trace structure,
   root→leaf: `webapp → api-gateway → <target service> → <dep service>`.
@@ -100,8 +108,9 @@ http.request_received  http.request_failed   cache.miss  deployment.started
 histogram_quantile(0.95, sum by (service_name, le) (rate(<duration>_bucket[5m])))
 ```
 ```logql
-# errors per service — aggregate at the source, don't pull raw lines
-sum by (service_name) (count_over_time({deployment_environment="demo"} | level="ERROR" [1h]))
+# incident events per service — services log at INFO; filter by `event`, NOT by
+# level (no ERROR level exists). E.g. payment declines:
+sum by (service_name) (count_over_time({deployment_environment="demo"} | event="payment.declined" [1h]))
 ```
 ```traceql
 # errors originating in a service
@@ -158,3 +167,26 @@ When a spike correlates with a `git_version` boundary:
 4. If a suspicious file shows up, `github_get_file(...)` to read the new code.
 5. Cite the commit SHA(s) + a one-line summary alongside the telemetry queries.
    Only payment-service has real tags today (see Services).
+
+## Kubernetes (infra signal — the other half of deploy correlation)
+
+The services run as Deployments in namespace **`demo`**, labelled
+`app=<service_name>` (e.g. `app=payment-service`); pods also carry `git_version`
+as a label. The k8s tools resolve a service to its objects through that label.
+
+Use k8s to separate a **platform** failure from a **code** regression — the
+distinction the telemetry alone can't always make:
+
+| Symptom from k8s | Likely cause |
+|---|---|
+| `OOMKilled` (last_terminated) / rising `restarts` | memory limit too low / leak — infra/config, not logic |
+| `CrashLoopBackOff` (waiting_reason) | container can't start (bad config, missing env, panic on boot) |
+| `ImagePullBackOff` / `ErrImagePull` | bad image tag / registry — the deploy never ran |
+| `ProgressDeadlineExceeded`, `available_replicas < desired` | rollout never went healthy — new version is NOT actually serving |
+| `FailedScheduling` / `Evicted` | node resource pressure, not the service's code |
+
+Rule of thumb: if a `git_version` boundary lines up with the incident AND
+`k8s_deployment_status` shows the new revision became Available with healthy
+replicas, the regression is in the **code** (→ `github_compare`). If the rollout
+is stuck or pods are crashing, it's **infra/config** — say so and skip the code
+diff. These tools are **read-only**; they never restart, scale, or delete.

@@ -10,6 +10,10 @@ WORKDIR /app
 
 COPY pyproject.toml uv.lock* /app/
 COPY app /app/app
+# Tier 0/1 runbooks are data the runbook layer loads at runtime (settings.runbook_dir
+# defaults to ./runbooks relative to this WORKDIR). Without this they'd be absent
+# in-cluster and no alert would ever match a runbook.
+COPY runbooks /app/runbooks
 
 RUN uv sync --frozen --no-dev 2>/dev/null \
     || uv sync --no-dev

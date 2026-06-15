@@ -7,7 +7,9 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from .agent import lifespan, stream_chat
+from .calibration import label_run
 from .config import settings
+from .investigations import list_investigations
 from .traces import analyze_trace, get_trace, list_traces, stream_trace_chat
 from .webhook import handle_alert
 
@@ -69,6 +71,30 @@ async def webhook_alert(
         raise HTTPException(status_code=400, detail="body must be JSON")
 
     return await handle_alert(payload)
+
+
+# ---- Headless investigations (plugin visibility) ----------------------------
+
+
+@app.get("/investigations")
+async def investigations_list(limit: int = 50):
+    """Recent alert-driven RCA runs with their conclusion + governance decisions,
+    most recent first. Read-only."""
+    return {"investigations": list_investigations(limit=limit)}
+
+
+class LabelRequest(BaseModel):
+    correct: bool
+
+
+@app.post("/investigations/{fp}/label")
+async def investigations_label(fp: str, req: LabelRequest):
+    """Record the correctness verdict for an investigation (closes the CE loop
+    from the UI). Writes to the calibration store."""
+    ok = label_run(fp, correct=req.correct, source="ui")
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"no calibration record for fingerprint {fp}")
+    return {"ok": True, "fp": fp, "correct": req.correct}
 
 
 # ---- Trace Explorer ---------------------------------------------------------

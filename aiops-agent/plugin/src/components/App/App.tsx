@@ -6,6 +6,7 @@ import type { AppPluginSettings } from '../AppConfig/AppConfig';
 
 const ChatPage = React.lazy(() => import('../../pages/ChatPage'));
 const TraceExplorerPage = React.lazy(() => import('../../pages/TraceExplorerPage'));
+const InvestigationsPage = React.lazy(() => import('../../pages/InvestigationsPage'));
 
 function App(props: AppRootProps<AppPluginSettings>) {
   const agentServiceUrl = props.meta.jsonData?.agentServiceUrl || DEFAULT_AGENT_SERVICE_URL;
@@ -13,6 +14,7 @@ function App(props: AppRootProps<AppPluginSettings>) {
     <Routes>
       <Route path={ROUTES.Chat} element={<ChatPage agentServiceUrl={agentServiceUrl} />} />
       <Route path={ROUTES.Traces} element={<TraceExplorerPage agentServiceUrl={agentServiceUrl} />} />
+      <Route path={ROUTES.Investigations} element={<InvestigationsPage agentServiceUrl={agentServiceUrl} />} />
       <Route path="*" element={<Navigate to={ROUTES.Chat} replace />} />
     </Routes>
   );

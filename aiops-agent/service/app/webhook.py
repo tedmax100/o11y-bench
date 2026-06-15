@@ -16,7 +16,9 @@ import time
 import httpx
 
 from .agent import run_headless
+from .calibration import record_run
 from .config import settings
+from .investigations import record_investigation
 
 logger = logging.getLogger("aiops_agent.webhook")
 
@@ -97,6 +99,14 @@ async def _sink_findings(alert: dict, fp: str, result: dict) -> None:
 async def _investigate_and_sink(alert: dict, fp: str) -> None:
     try:
         result = await run_headless(alert, thread_id=fp)
+        # Log the run's confidence for CE measurement (correctness is labeled
+        # offline). Best-effort inside record_run; fp doubles as the run_id so a
+        # later `label <fp>` ties the verdict back to this investigation.
+        record_run(result["findings"], run_id=fp)
+        for d in result.get("decisions") or []:
+            logger.info("governance fp=%s action=%s -> %s (%s)",
+                        fp, d.action, d.autonomy.value, d.reason)
+        record_investigation(fp, alert, result)
         await _sink_findings(alert, fp, result)
     except Exception as e:
         logger.exception("headless RCA failed fp=%s: %s", fp, e)

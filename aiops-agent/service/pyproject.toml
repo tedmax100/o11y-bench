@@ -34,7 +34,12 @@ dependencies = [
     # (DependencyConflict: requested "langchain" but found "None"). Manual
     # .instrument() works without it, but we keep the build zero-code.
     "langchain>=0.3",
+    "kubernetes>=36.0.2",
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
 
 [build-system]
 requires = ["hatchling"]
@@ -42,3 +47,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.0",
+    "pytest-asyncio>=1.4.0",
+]

@@ -34,6 +34,13 @@
     },
     {
       "type": "page",
+      "icon": "bell",
+      "name": "Investigations",
+      "path": "/a/%PLUGIN_ID%/investigations",
+      "addToNav": true
+    },
+    {
+      "type": "page",
       "icon": "cog",
       "name": "Configuration",
       "path": "/plugins/%PLUGIN_ID%",

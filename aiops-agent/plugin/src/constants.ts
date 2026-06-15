@@ -5,6 +5,7 @@ export const PLUGIN_BASE_URL = `/a/${pluginJson.id}`;
 export enum ROUTES {
   Chat = 'chat',
   Traces = 'traces',
+  Investigations = 'investigations',
 }
 
 export const DEFAULT_AGENT_SERVICE_URL = 'http://localhost:8000';

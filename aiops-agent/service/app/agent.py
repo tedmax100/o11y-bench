@@ -16,6 +16,13 @@ from pydantic import BaseModel, Field
 
 from .capability import capability_for_services, resolve_services
 from .config import settings
+from .runbook import (
+    format_diagnostics,
+    incident_params,
+    match_runbook,
+    render_runbook,
+    run_diagnostics,
+)
 from .tools.query import current_now, now_override
 from .tools import (
     discover_log_fields_tool,
@@ -23,6 +30,9 @@ from .tools import (
     discover_span_names_tool,
     github_compare,
     github_get_file,
+    k8s_deployment_status_tool,
+    k8s_events_tool,
+    k8s_pod_status_tool,
     query_loki_logs,
     query_prometheus,
     query_tempo_traces,
@@ -140,6 +150,9 @@ guessing.
 | Which metrics does a service emit? | `discover_metrics(service)` |
 | Which span/operation names does a service have? | `discover_span_names(service)` |
 | Which log fields can I filter/group by? | `discover_log_fields(service)` |
+| Pod health: restarts, CrashLoopBackOff, OOMKilled, ImagePullBackOff | `k8s_pod_status(service)` |
+| Infra events: scheduling failures, probe failures, evictions, OOM | `k8s_events(service)` |
+| Rollout health: replicas Available, ProgressDeadlineExceeded, revision | `k8s_deployment_status(service)` |
 | Code diff between two deploy versions | `github_compare(repo, base, head)` |
 | Read a slice of a file at a specific ref | `github_get_file(repo, path, ref, start, end)` |
 
@@ -158,13 +171,23 @@ Default ordering for an RCA question:
    just before the incident window, `github_compare` the old→new version on the
    service's repo (see catalog) and look for a suspicious change. Cite the SHA in
    your final answer. Skip this step if there's no deploy event nearby.
+5. **Infra vs code** — before blaming the code, rule out the platform: if pods are
+   restarting or a deploy boundary is involved, check `k8s_pod_status` /
+   `k8s_events`. An `OOMKilled` / `CrashLoopBackOff` / `ProgressDeadlineExceeded`
+   means the new version never came up healthy (infra/config), which is a
+   different root cause from a code regression that runs but behaves wrong. State
+   which of the two it is.
 
 # Anti-patterns (don't do these)
 
 - Loki stream selectors other than the indexed ones — the only `{{...}}`-selectable
-  labels are `service_name`, `git_repo`, `git_version`, `deployment_environment`.
-  `level` / `event` / business fields are structured metadata: filter them with
-  `| level="ERROR"` *after* the selector, not inside `{{...}}`.
+  labels are `service_name`, `git_repo`, `git_version`, `deployment_environment`
+  (the key is `service_name`, NOT `service`). `event` / `trace_id` / business
+  fields are structured metadata: filter them with `| event="..."` *after* the
+  selector, not inside `{{...}}`.
+- Filtering logs by `| level="ERROR"` — there is **no `level` field** and these
+  services log at INFO; find incidents via the `event` field instead
+  (`| event="payment.declined"` / `| event="payment.gateway_error"`).
 - Fetching > 100 raw log lines to "look for errors" — write a LogQL pipeline that
   aggregates by error message or status instead.
 - Guessing a metric / span / field name when the catalog doesn't list it — call
@@ -308,12 +331,18 @@ with GitHub deploys. In-scope intents include:
 - Investigating an incident / outage / alert / anomaly.
 - Reading or aggregating logs, metrics, or traces.
 - Root-cause analysis, deploy correlation, "what changed", "why is X slow".
+- **Comparing the code between two deployed versions of a service** ("diff
+  v2.4.1 vs v2.5.0", "what changed in the new version", "show the code the new
+  deploy introduced"). The assistant has GitHub diff tools (`github_compare`,
+  `github_get_file`) for exactly this — it is deploy correlation, IN scope.
 - Questions about the telemetry data, dashboards, or the observability stack itself.
 
 OUT of scope (must be rejected):
 
 - General chit-chat, jokes, opinions, role-play.
-- Coding help unrelated to investigating this system, general knowledge questions.
+- General programming / "write me code" / debugging help NOT tied to a deploy or
+  incident in this system, and general knowledge questions. (Reading the code
+  diff of a *deployed version* of one of these services is IN scope — see above.)
 - Anything that has nothing to do with operating/observing this system.
 
 Judge ONLY the latest user message (use prior context only to disambiguate
@@ -401,7 +430,7 @@ shows, then the matching fenced block (the plugin renders it live):
 - metric → ```promql``` (p95/p99 latency → `histogram_quantile(0.95, sum by (le) (rate(<metric>_bucket[5m])))`; rates/QPS → `sum(rate(<counter>_total[5m]))`)
   **Rate windows MUST be ≥ 5m.** Metrics are exported every ~60s, so `rate(...[1m])`
   has too few samples and returns EMPTY. Always use `[5m]` (never `[1m]`/`[30s]`).
-- logs   → ```logql```  (only `service_name`/`git_repo`/`git_version`/`deployment_environment` go inside `{...}`; filter `level`/`event`/business fields AFTER with `| level="ERROR"`)
+- logs   → ```logql```  (selector key is `service_name`, NOT `service`; only `service_name`/`git_repo`/`git_version`/`deployment_environment` go inside `{...}`; there is no `level` field — filter incidents AFTER with `| event="payment.declined"`, not `| level="ERROR"`)
 - traces → ```traceql``` (attrs are dotted: `{ resource.service.name = "X" && status = error }`)
 
 Rules:
@@ -449,6 +478,9 @@ TOOLS = [
     discover_log_fields_tool,
     github_compare,
     github_get_file,
+    k8s_pod_status_tool,
+    k8s_events_tool,
+    k8s_deployment_status_tool,
 ]
 
 
@@ -696,12 +728,38 @@ Follow this RCA method (in order; stop once you can state a confident cause; min
 2. **Deploy correlation.** If one git_version dominates, it is the prime suspect;
    note the previous version for contrast. (Only if budget remains and a version
    is implicated: `github_compare` base=<prev> head=<suspect> to see the change.)
-3. **Confirm with a trace.** Pull ONE representative failing trace for the service
+3. **Infra vs code.** Rule out the platform before blaming code: `k8s_pod_status`
+   / `k8s_events` for the service. `OOMKilled` / `CrashLoopBackOff` /
+   `ProgressDeadlineExceeded` ⇒ the new version never came up healthy
+   (infra/config cause), not a code regression. Only spend this call if pods look
+   unhealthy or the spike coincides with a deploy boundary.
+4. **Confirm with a trace.** Pull ONE representative failing trace for the service
    (`status=error`) to confirm the error origin and cite a real trace id.
-4. **Conclude.** State: root cause, implicated service + `git_version`, dominant
-   reason, the supporting numbers, and a trace id. Give a confidence. If the
-   breakdown shows NO concentration on a version/reason, say so with LOW
-   confidence — do not invent a cause."""
+5. **Conclude.** State: root cause (and whether it is code vs infra), implicated
+   service + `git_version`, dominant reason, the supporting numbers, and a trace
+   id. Give a confidence. If the breakdown shows NO concentration on a
+   version/reason, say so with LOW confidence — do not invent a cause."""
+
+
+async def _inject_runbook(turn_messages: list, labels: dict, annotations: dict):
+    """Match a runbook to the alert; inject its rendered guidance (Tier 0) and,
+    if enabled, the results of auto-running its read-only diagnostics (Tier 1).
+    Returns the matched Runbook (or None) so the caller can run the governance
+    gate over its remediation steps. Best-effort — never blocks the run."""
+    try:
+        rb = match_runbook(labels, annotations)
+        if rb is None:
+            return None
+        params = incident_params(labels, annotations)
+        turn_messages.append(SystemMessage(content=render_runbook(rb, params)))
+        if settings.runbook_run_diagnostics and rb.diagnostics:
+            tool_map = {t.name: t for t in TOOLS}  # all read-only
+            results = await run_diagnostics(rb, params, tool_map)
+            turn_messages.append(SystemMessage(content=format_diagnostics(rb, results)))
+        return rb
+    except Exception as e:
+        logger.warning("runbook injection failed: %s", e)
+        return None
 
 
 async def run_headless(alert: dict, thread_id: str) -> dict:
@@ -720,6 +778,16 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
             turn_messages.append(SystemMessage(content=await capability_for_services([service])))
         except Exception as e:
             logger.warning("headless: capability snapshot failed for %s: %s", service, e)
+
+    # Runbook (v3 §5): if this alert matches a runbook, inject its rendered steps
+    # (Tier 0) and auto-run its read-only diagnostics (Tier 1) so the agent
+    # reasons over confirmed preconditions. Diagnostics use the all-read-only
+    # TOOLS map and run *outside* the agent's tool budget. Best-effort.
+    matched_rb = None
+    if settings.runbook_enabled:
+        with now_override(starts_dt):
+            matched_rb = await _inject_runbook(turn_messages, labels, annotations)
+
     turn_messages.append({"role": "user", "content": _alert_to_prompt(labels, annotations, starts_dt)})
 
     agent = await _build_agent()
@@ -738,7 +806,25 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
     messages = result.get("messages", [])
     answer = _flatten_content(getattr(messages[-1], "content", None)) if messages else ""
     findings = await extract_findings(messages)
-    return {"answer": answer, "findings": findings}
+
+    # Governance (ARE Governance plane): if a runbook matched and proposes
+    # remediation, run each action through the gate using this run's confidence
+    # and the measured calibration. Produces proposals only — nothing executes
+    # (actions_enabled is off). Best-effort. See governance.py / actions.py.
+    decisions: list = []
+    if matched_rb and matched_rb.remediation:
+        try:
+            from .calibration import compute_calibration, load_records
+            from .governance import propose_remediations
+
+            calib = compute_calibration(load_records())
+            decisions = propose_remediations(
+                [s.action for s in matched_rb.remediation], findings.confidence, calib
+            )
+        except Exception as e:
+            logger.warning("governance gate failed: %s", e)
+
+    return {"answer": answer, "findings": findings, "decisions": decisions}
 
 
 # ---- follow-up suggestions (the "Follow-up" chips under each answer) --------

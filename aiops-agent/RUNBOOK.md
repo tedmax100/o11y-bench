@@ -1,201 +1,173 @@
-# AIOps Agent — 啟動 Runbook
+# AIOps Agent — 啟動 / 測試 Runbook
 
-從 v2 開始，agent 不再自帶 Grafana/Prom/Loki/Tempo —— data 是 demo-services
-k3d cluster。所以要跑起來需要 **四件事**（demo + mcp-grafana + agent + plugin watch）：
+> v3 起架構變了：**agent 跑在 demo-services 的 k3d cluster 內**（不再是 host-side
+> + mcp-grafana sidecar）。tools 直接打 Prometheus/Loki/Tempo 的 native API（透過
+> cluster 內部 DNS），並用唯讀 ServiceAccount 讀 k8s。plugin 由 `up.sh` 自動
+> provision 進 Grafana。
+>
+> 舊的「四個 terminal（mcp-grafana + host service + plugin watch）」流程已淘汰。
 
 ```
-┌─ demo-services (k3d) ─┐  ┌─ Terminal 1 ──────┐  ┌─ Terminal 2 ─────┐  ┌─ Terminal 3 ──┐
-│ Grafana + Prom/Loki/  │  │ mcp-grafana       │  │ Agent service    │  │ Plugin watch  │
-│ Tempo + 5 services    │  │ (docker compose)  │  │ FastAPI+LangGraph│  │ webpack -w    │
-│ :3001 (graf) :8002    │  │ :8080             │  │ :8000            │  │               │
-└───────────────────────┘  └───────────────────┘  └──────────────────┘  └───────────────┘
+demo-services k3d cluster (ns demo)
+├─ Grafana :3001  ── AIOps app plugin (chat UI)
+├─ webapp :8002 / payment :8001 (direct)
+├─ Prometheus / Loki / Tempo / otel-collector
+├─ 5 demo services (payment / user / order / api-gateway / webapp)
+└─ aiops-agent :8000  ──→ 上面全部 (native API + read-only k8s SA)
 ```
 
-**Plugin UI**：`demo-services/scripts/up.sh` 會把 `aiops-agent/plugin/dist/` docker-cp
-進 k3d node 的 `/aiops-plugin/`，Grafana Deployment 透過 hostPath 掛進
-`/var/lib/grafana/plugins/tedmax100-aiops-app` 並用 `aiops-plugin-provisioning`
-ConfigMap 自動 enable —— 起完 cluster 直接開 `http://localhost:3001` 進 Apps → AIOps → Chat。
+---
 
-> 改 plugin code 時 `npm run dev` 會更新 `dist/`，但 **k3d node 內的 copy 不會自動同步**。
-> 改完跑：`docker cp aiops-agent/plugin/dist k3d-demo-services-server-0:/aiops-plugin/tedmax100-aiops-app && kubectl -n demo rollout restart deploy/grafana`。
-
-每個 terminal 都從 repo root (`/home/nathan/Project/o11y-bench`) 開始。
-
-* * *
-
-## 一次性 setup（每台機器只做一次）
+## 一次性 setup（每台機器一次）
 
 ```bash
-# Plugin 依賴
-cd aiops-agent/plugin
-npm install
+# 1. plugin 依賴 + build（up.sh 會把 dist 塞進 cluster）
+cd aiops-agent/plugin && npm install && npm run build   # ⚠️ 不要跑 npm audit fix --force
 
-# Service 依賴
-cd ../service
-uv sync
+# 2. agent service 依賴 + 環境變數
+cd ../service && uv sync
+cp .env.example .env        # 編輯填 GOOGLE_API_KEY
 
-# Service 環境變數
-cp .env.example .env
-# 編輯 .env，填好 GOOGLE_API_KEY
+# 3. agent secret（GOOGLE_API_KEY，webhook 要測再加 webhook-secret）
+kubectl -n demo create secret generic aiops-agent-secrets \
+  --from-literal=google-api-key="$GOOGLE_API_KEY" \
+  --from-literal=github-token="${GITHUB_TOKEN:-}" \
+  --from-literal=webhook-secret="dev-webhook-secret-1234"
 ```
 
-⚠️ **不要跑 `npm audit fix --force`**——會把 `@grafana/{data,ui,runtime}` 降到 v11，跟 `plugin.json` 的 `grafanaDependency: ">=12.3.0"` 衝突。Scaffold 報的 12 個漏洞警告可以忽略。
+---
 
-* * *
-
-## Step 0 — demo-services k3d cluster
+## Step 1 — 起 cluster + 流量
 
 ```bash
-cd ../demo-services
-./scripts/up.sh                 # k3d cluster + 5 services + telemetry stack
-./scripts/load.sh &             # 持續打流量產生 telemetry
+cd demo-services
+./scripts/up.sh         # k3d + 5 services + Prom/Loki/Tempo + Grafana + agent + plugin
+./scripts/load.sh &     # 持續打一般流量
 ```
 
 健康檢查：
 
 ```bash
-curl -s http://localhost:3001/api/health   # Grafana
-curl -s http://localhost:8002/health       # webapp (public entry)
+curl -s http://localhost:3001/api/health    # Grafana
+curl -s http://localhost:8000/healthz       # agent  → {"ok":true}
 ```
 
-## Terminal 1 — mcp-grafana (Docker)
+## Step 2 — 部署 / 更新 agent
 
-只跑 mcp-grafana 一個 container，指到 demo-services 的 Grafana。
+改了 `service/` 的 code 後，用這支把新 image 建好、匯入 k3d、套 manifest（含唯讀
+RBAC）、滾動重啟、驗證權限：
 
 ```bash
-cd aiops-agent
-docker compose up --build
+cd aiops-agent && ./scripts/deploy.sh
 ```
 
-**啟動完成的訊號**：mcp-grafana 開始 listen 在 `:8080`。
-驗證：`curl -s http://localhost:8080/` 回 404 算正常（它服務在 `/mcp`）。
+它會驗證 SA 可 list pods/deployments、且**不可 delete**（read/write 權限分離）。
 
-* * *
+## Step 3 — 在 plugin UI 用
 
-## Terminal 2 — Agent Service
+開 **http://localhost:3001 → 左側 Apps → AIOps → Chat**，例如：
 
-LangGraph ReAct + Gemini + MCP client，提供 `/chat` SSE endpoint 給 plugin。
+- `payment-service 的 pod 健康嗎？跑哪個版本？` → 觸發 `k8s_pod_status`
+- `payment-service p95 latency` → render promql 圖
+- `payment-service 最近的錯誤 log` → render logql panel（見下面「弄活 demo」才有 decline log）
+- `為什麼 payment-service 在 decline？` → 走完整 RCA（metrics→logs→指認版本）
+
+> 改 plugin code 後 node 內的 copy 不會自動同步：
+> `docker cp aiops-agent/plugin/dist k3d-demo-services-server-0:/aiops-plugin/tedmax100-aiops-app && kubectl -n demo rollout restart deploy/grafana`
+
+---
+
+## 弄活 demo（製造 payment v2.5.0 decline 事件）
+
+預設 demo 很安靜——服務只在事件時記 log，且要有正確金額才會 decline。兩個坑：
+
+1. **flag 啟動時讀一次**：把 ConfigMap 設 true 後要重啟 payment 才生效。
+2. **`load.sh` 金額永遠偶數**（價格 `100*i`），但 decline 條件是奇數分 → load.sh
+   無法觸發 decline，要直接打奇數金額的 charge。
 
 ```bash
-cd aiops-agent/service
-uv run uvicorn app.main:app --reload --port 8000
+# 1. 打開 new validator + 確認版本 v2.5.0，然後重啟讓 flag 生效
+kubectl -n demo create configmap payment-flags \
+  --from-literal=flags.json='{"payment_use_new_validator": true}' \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n demo rollout restart deploy/payment-service
+
+# 2. 直接對 payment 打奇/偶混合的 charge（奇數 → 402 declined）
+while true; do
+  for n in $(seq 5); do
+    base=$(( (RANDOM % 50 + 1) * 100 ))
+    [ $(( RANDOM % 5 )) -lt 2 ] && amt=$((base+1)) || amt=$base   # ~40% odd
+    curl -s -o /dev/null -X POST http://localhost:8001/charge -H 'content-type: application/json' \
+      -d "{\"order_id\":\"o-$RANDOM\",\"user_id\":\"u-$((RANDOM%5+1))\",\"amount_cents\":$amt}"
+  done; sleep 1
+done &
 ```
 
-**啟動完成的訊號**：
+約 1 分鐘後就能查到 `payment_charges_total{status="declined",reason="new_validator",git_version="v2.5.0"}`
+與 `event="payment.declined"` 的 log。
 
-```
-INFO:     Uvicorn running on http://127.0.0.1:8000
-INFO:     Application startup complete.
-```
+---
 
-⚠️ Service 跑在 **host 上**（不在 container 裡），因為要 `--reload` 改 code 自動重啟，方便 debug。
-它透過 `MCP_GRAFANA_URL=http://localhost:8080/mcp` 連 sidecar 的 mcp-grafana。
+## 測試 headless 路徑（webhook → runbook → governance）
 
-### 健康檢查
+需要 secret 裡有 `webhook-secret`（見 setup）。
 
 ```bash
-curl http://localhost:8000/healthz
-# {"ok":true}
+curl -s -X POST 'http://localhost:8000/webhook/alert?token=dev-webhook-secret-1234' \
+  -H 'content-type: application/json' \
+  -d '{"alerts":[{"status":"firing",
+       "labels":{"alertname":"payment-decline-rate-high","service_name":"payment-service","git_version":"v2.5.0","severity":"warning"},
+       "annotations":{"summary":"decline spike","runbook_id":"payment-bad-deploy"},
+       "startsAt":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}]}'
 
-# 端到端 smoke test（不經過 plugin）
-curl -N -X POST http://localhost:8000/chat \
-  -H "content-type: application/json" \
-  -d '{"message": "hi"}'
+# 看 runbook 匹配 → Tier-1 診斷 → findings → 治理決策
+kubectl -n demo logs deploy/aiops-agent -f | grep -E 'headless|governance|runbook'
 ```
 
-正常會看到一連串 `event: token` / `data: {"type": "token", "text": "..."}`。如果只看到 `thread` + `done` 中間空白，看 Terminal 2 有沒有 traceback，最常見是 `GOOGLE_API_KEY` 沒設好或 `GEMINI_MODEL` 名字不存在。
+事件活躍時，結論應為高信心並指認 v2.5.0 validator；治理決策為
+`k8s.rollout_undo -> PROPOSE`（須核准、不自動執行）。
+同一 alertname+service+git_version 在 10 分鐘 cooldown 內只跑一次（改 alertname 可強制重跑，runbook 仍靠 `runbook_id` 匹配）。
 
-### 進階：開 debug log
-
-想看 LangGraph 內部每筆 event：
+## 校準（CE harness）
 
 ```bash
-DEBUG_EVENTS=1 uv run uvicorn app.main:app --reload --port 8000
+kubectl -n demo exec deploy/aiops-agent -- python -m app.calibration report
+kubectl -n demo exec deploy/aiops-agent -- python -m app.calibration label <fingerprint> --correct   # 或 --wrong
 ```
 
-每筆 event 會 log 一行 `event=on_xxx name=... data_keys=[...]`。Production 不要開。
+`label` 的 fingerprint = webhook 回傳的 `accepted[]` 值（也是 headless log 的 `fp=`）。
 
-* * *
+---
 
-## Terminal 3 — Plugin Watch Build
-
-webpack watch mode，改 `plugin/src/**` 自動 rebuild 到 `plugin/dist/`。
+## 單元測試
 
 ```bash
-cd aiops-agent/plugin
-npm run dev
+cd aiops-agent/service && uv run pytest -q     # k8s / calibration / runbook / governance
 ```
 
-**啟動完成的訊號**：
-
-```
-webpack 5.106.2 compiled successfully in 477 ms
-```
-
-之後就停在那邊不動，等你存檔自動 recompile。
-
-### 改了之後在 Grafana 看到新版的步驟
-
-| 改了什麼 | 怎麼套用 |
-|---------|----------|
-| `plugin/src/**.tsx` 純前端 code | **Hard refresh** 瀏覽器 (Ctrl+Shift+R)。Grafana 不用重啟 |
-| `plugin/src/plugin.json` | **重啟 Grafana 容器**（不是 restart，是 down + up） |
-| `plugin/provisioning/**` | 同上 |
-| `plugin/.config/**` | 不要改，是 toolchain managed |
-
-* * *
-
-## 一鍵跑起來（給熟悉之後的人）
-
-打開三個 terminal，分別貼下面：
+## 關閉 / 清理
 
 ```bash
-# Terminal 1
-cd aiops-agent && docker compose up --build
-
-# Terminal 2  
-cd aiops-agent/service && uv run uvicorn app.main:app --reload --port 8000
-
-# Terminal 3
-cd aiops-agent/plugin && npm run dev
+pkill -f load.sh; pkill -f 'charge'            # 停流量產生器
+cd demo-services && ./scripts/down.sh          # 刪 k3d cluster
 ```
 
-等 Terminal 1 出現 `Environment Ready`、Terminal 2 出現 `Application startup complete`、Terminal 3 出現 `compiled successfully`，三個都綠燈後：
+---
 
-打開 <http://localhost:3000> → **左側欄 Apps → AIOps → Chat** → 丟訊息。
+## Troubleshooting
 
-* * *
-
-## 關閉 / 重啟整套
-
-```bash
-# 停 Terminal 2/3（Ctrl+C）
-
-# 停 sidecar
-cd aiops-agent
-docker compose down
-
-# 想清乾淨重來（刪 Grafana DB / Prometheus TSDB）
-docker compose down -v
-```
-
-* * *
-
-## Troubleshooting 速查
-
-| 症狀 | 最可能原因 | 修法 |
-|------|-----------|------|
-| Grafana 看不到 AIOps app | Plugin 沒 enable 或 provisioning 沒掛進去 | 確認 `docker compose.yaml` 有掛 `./plugin/provisioning/plugins`；或 UI 進 `/plugins/tedmax100-aiops-app` 手動 Enable |
-| UI 進 Chat 頁但 assistant 氣泡永遠空白 | SSE parser bug（CRLF）或 chunk content 是 list | 看 `doc/aiops-agent-mvp-notes.md` 第 11、12 條 |
-| Console 顯示「agent service returned 0」 | CORS 沒過或 service 沒起 | 看 Terminal 2 有沒有起來；確認 `service/app/main.py` 的 `cors_allow_origins` 包含你 Grafana 的 origin |
-| Service log 看到 `MCP connection refused` | Sidecar 還沒 ready 或 `MCP_GRAFANA_URL` 設錯 | 等 Terminal 1 出現 `Environment Ready`；確認 `.env` 是 `http://localhost:8080/mcp`（**結尾要有 `/mcp`**） |
-| `uv sync` warning `VIRTUAL_ENV does not match` | repo 根有另一個 `.venv` | 無害，可忽略；想乾淨就 `unset VIRTUAL_ENV` 再跑 |
-| Plugin 改 code 後不生效 | 瀏覽器 chunk cache | DevTools → Application → Clear site data，或開無痕 |
-| Plugin 改 `plugin.json` 後不生效 | Grafana manifest cache | `docker compose down && docker compose up --build`，不是 restart |
-
-* * *
+| 症狀 | 原因 | 修法 |
+|------|------|------|
+| 錯誤 log 查詢回 `No data` | 用了 `{service=...}` 或 `\| level="ERROR"` | selector 是 **`service_name`**；logs 全 INFO **沒有 `level` 欄位**，用 `\| event="payment.declined"` |
+| decline 一直是 0 | flag 沒生效 / 金額是偶數 | 重啟 payment；直接打奇數金額 charge（見「弄活 demo」）|
+| `/webhook/alert` 回 503 | 沒設 `webhook-secret` | secret 加 `webhook-secret` key 後 `deploy.sh` |
+| `/webhook/alert` 回 401 | token 不對 | `?token=` 要等於 secret 的 `webhook-secret` |
+| k8s 工具回 `unavailable` | SA/RBAC 沒套 | 跑 `deploy.sh`（會建 SA/Role/RoleBinding 並驗證）|
+| plugin 看不到 AIOps app | dist 沒進 node 或沒 enable | 重跑 `up.sh`；或 UI `/plugins/tedmax100-aiops-app` 手動 Enable |
+| chat 氣泡空白 | SSE CRLF / multipart content | 見 [../doc/aiops-agent-mvp-notes.md](../doc/aiops-agent-mvp-notes.md) 第 11、12 條 |
 
 ## 相關文件
 
-- 設計思路：[../doc/aiops-agent-design.md](../doc/aiops-agent-design.md)
-- 開發過程踩到的坑：[../doc/aiops-agent-mvp-notes.md](../doc/aiops-agent-mvp-notes.md)
+- ARE 落差分析 + 路線：[../doc/agents/aiops-agent-ARE-gap-analysis.md](../doc/agents/aiops-agent-ARE-gap-analysis.md)
+- v3 設計：[../doc/aiops-agent-design-v3.md](../doc/aiops-agent-design-v3.md)
+- 開發踩坑：[../doc/aiops-agent-mvp-notes.md](../doc/aiops-agent-mvp-notes.md)

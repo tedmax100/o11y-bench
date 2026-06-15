@@ -45,3 +45,7 @@ cd aiops-agent/plugin && npm run dev
   `http://localhost:8000` — CORS in `service/app/main.py` allows `localhost:3000`.
 - See [../doc/aiops-agent-design.md](../doc/aiops-agent-design.md) for the design rationale.
 - See [../doc/aiops-agent-mvp-notes.md](../doc/aiops-agent-mvp-notes.md) for build notes.
+- See [../doc/agents/aiops-agent-ARE-gap-analysis.md](../doc/agents/aiops-agent-ARE-gap-analysis.md)
+  for how this agent maps onto the Agentic Reliability Engineering (ARE) philosophy
+  — what it satisfies (Signal/Reasoning planes, hallucination defense, bounded
+  autonomy) and what's missing (Act/Governance/Learn, CE calibration).

@@ -1,0 +1,41 @@
+# Tier 0/1 runbook for the demo payment-service bad-deploy incident (v3 §5.1).
+# Diagnostics are READ-ONLY and auto-run before the RCA; remediation is rendered
+# for the on-call but NEVER executed at this tier (that's the action registry).
+id: payment-bad-deploy
+title: payment-service decline-rate spike after deploy
+
+trigger:
+  # Matches by trigger when the alert doesn't carry an explicit runbook_id.
+  # An alert can also point here directly with annotations.runbook_id: payment-bad-deploy.
+  alertname: payment-decline-rate-high
+  labels:
+    service_name: payment-service
+
+diagnostics:
+  - desc: Decline rate is concentrated on the running version (not spread across versions)
+    action: query_prometheus
+    args:
+      expr: 'sum by (git_version, reason) (rate(payment_charges_total{status="declined"}[5m]))'
+      queryType: instant
+    expect: one git_version dominates the declined charges
+    check:
+      nonempty: true
+
+  - desc: The running pod is healthy (rules out an infra/OOM cause)
+    action: k8s_deployment_status
+    args:
+      service: payment-service
+    expect: available_replicas == desired and no ProgressDeadlineExceeded
+    check:
+      contains: '"available_replicas"'
+
+remediation:
+  # Shown to the on-call; requires human approval. Executed only by the Tier 2
+  # action registry (step 7), never by this layer.
+  - desc: Roll back payment-service to the previous version
+    action: k8s.rollout_undo
+    args:
+      deployment: payment-service
+      namespace: demo
+    reversible: true
+    requires_approval: true

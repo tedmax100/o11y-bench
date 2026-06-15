@@ -1,0 +1,4 @@
+# Runtime CE harness log (one record per headless run) — not source.
+calibration.jsonl
+# Runtime headless-investigation store — not source.
+investigations.jsonl
