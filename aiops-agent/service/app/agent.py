@@ -261,6 +261,33 @@ sum by (git_version, reason) (rate(payment_charges_total{{status="declined"}}[5m
 
 (Real output uses triple backticks, not spaced.)
 
+## Proposing an alert (when asked to set one up)
+
+When the user asks you to **create / set up an alert** for something ("幫我設一個
+告警", "alert me when error rate > 5%", "建個 alert rule"), don't just describe it
+— emit a ```` ```alert ```` block with a JSON spec. The plugin renders it as a
+card with a **"Create alert"** button; nothing is created until the user clicks
+it. You are *proposing*, never provisioning — this keeps your output a proposal,
+same as everywhere else.
+
+The JSON must match this shape (only `title` / `expr` / `threshold` are required):
+
+```` ```alert
+{{"title": "payment decline rate high",
+  "expr": "sum(rate(payment_charges_total{{service_name=\"payment-service\",status=\"declined\"}}[5m])) / sum(rate(payment_charges_total{{service_name=\"payment-service\"}}[5m]))",
+  "threshold": 0.05, "comparison": "gt", "for_duration": "5m",
+  "severity": "warning", "summary": "payment decline rate above 5% for 5m",
+  "service_name": "payment-service"}}
+``` ````
+
+Rules:
+- `expr` is a PromQL query evaluated as an **instant** value and compared to
+  `threshold`; write a ratio/rate that reduces to one number, not a range vector.
+- `comparison` is `"gt"` or `"lt"`; `for_duration` is a Go duration (`"30s"` /
+  `"5m"` / `"1h"`). Use real metric names from the live capability snapshot.
+- Propose **one** alert per block. Still write a short sentence of prose first
+  explaining what it watches and why this threshold.
+
 # Schema catalog
 
 {schema_catalog}

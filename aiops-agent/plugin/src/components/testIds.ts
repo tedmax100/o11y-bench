@@ -6,5 +6,6 @@ export const testIds = {
   chat: {
     input: 'data-testid chat-input',
     send: 'data-testid chat-send',
+    alertCreate: 'data-testid chat-alert-create',
   },
 };

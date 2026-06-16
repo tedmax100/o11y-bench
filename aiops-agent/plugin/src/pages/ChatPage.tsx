@@ -8,6 +8,7 @@ import { streamSSE } from '../utils/sse';
 import { PromqlPanel } from '../components/PromqlPanel';
 import { LogsPanel } from '../components/LogsPanel';
 import { TracesPanel } from '../components/TracesPanel';
+import { AlertProposalCard, AlertSpec } from '../components/AlertProposalCard';
 
 type ChatEvent =
   | { type: 'thread'; thread_id: string }
@@ -145,6 +146,7 @@ function ChatPage({ agentServiceUrl }: ChatPageProps) {
               onClarify={handleClarifySelect}
               onFollowUp={(text) => sendMessage(text)}
               busy={busy}
+              agentServiceUrl={agentServiceUrl}
             />
           ))}
           {busy && <Spinner inline />}
@@ -179,9 +181,10 @@ type MessageBubbleProps = {
   onClarify: (msgIndex: number, service: string, question: string) => void;
   onFollowUp: (text: string) => void;
   busy: boolean;
+  agentServiceUrl: string;
 };
 
-function MessageBubble({ message, index, onClarify, onFollowUp, busy }: MessageBubbleProps) {
+function MessageBubble({ message, index, onClarify, onFollowUp, busy, agentServiceUrl }: MessageBubbleProps) {
   const styles = useStyles2(getStyles);
   const segments = message.role === 'assistant' ? splitQueryBlocks(message.text) : [{ kind: 'text' as const, value: message.text }];
   return (
@@ -198,6 +201,8 @@ function MessageBubble({ message, index, onClarify, onFollowUp, busy }: MessageB
             return <LogsPanel key={i} expr={seg.query} maxLines={seg.limit} />;
           case 'traceql':
             return <TracesPanel key={i} query={seg.query} limit={seg.limit} />;
+          case 'alert':
+            return <AlertProposalCard key={i} spec={seg.spec} agentServiceUrl={agentServiceUrl} />;
           default:
             return <div key={i} className={styles.text}>{seg.value}</div>;
         }
@@ -271,20 +276,22 @@ function ClarifyMenu({
 
 type Segment =
   | { kind: 'text'; value: string }
-  | { kind: 'promql' | 'logql' | 'traceql'; query: string; limit?: number };
+  | { kind: 'promql' | 'logql' | 'traceql'; query: string; limit?: number }
+  | { kind: 'alert'; spec: AlertSpec };
 
 // Walk the assistant's text and split out fenced ```promql / ```logql /
-// ```traceql blocks so we can render each as a live Scenes panel (timeseries /
-// logs / traces table) instead of monospace code. An optional count on the
-// fence info line (```logql 10 / ```traceql 3) becomes the panel's row/line
-// limit, so "show me 3 traces" renders exactly 3. Other fences fall through as
-// plain text.
+// ```traceql / ```alert blocks so we can render each as a live Scenes panel
+// (timeseries / logs / traces table) or, for ```alert, a proposal card with a
+// provision button. An optional count on a query fence info line (```logql 10 /
+// ```traceql 3) becomes the panel's row/line limit, so "show me 3 traces"
+// renders exactly 3. An ```alert body is JSON (an AlertSpec); a malformed one
+// falls through as plain text so the user still sees what the agent wrote.
 function splitQueryBlocks(text: string): Segment[] {
   if (!text) {
     return [];
   }
   // group 1: language, group 2: rest of info line (optional count), group 3: body
-  const re = /```(promql|logql|traceql)([^\n]*)\n?([\s\S]*?)```/g;
+  const re = /```(promql|logql|traceql|alert)([^\n]*)\n?([\s\S]*?)```/g;
   const out: Segment[] = [];
   let last = 0;
   let m: RegExpExecArray | null;
@@ -292,15 +299,33 @@ function splitQueryBlocks(text: string): Segment[] {
     if (m.index > last) {
       out.push({ kind: 'text', value: text.slice(last, m.index) });
     }
-    const limitMatch = m[2].match(/\d+/);
-    const limit = limitMatch ? parseInt(limitMatch[0], 10) : undefined;
-    out.push({ kind: m[1] as 'promql' | 'logql' | 'traceql', query: m[3].trim(), limit });
+    if (m[1] === 'alert') {
+      const spec = parseAlertSpec(m[3]);
+      // Keep the raw block as text if it isn't valid JSON / lacks the essentials.
+      out.push(spec ? { kind: 'alert', spec } : { kind: 'text', value: m[0] });
+    } else {
+      const limitMatch = m[2].match(/\d+/);
+      const limit = limitMatch ? parseInt(limitMatch[0], 10) : undefined;
+      out.push({ kind: m[1] as 'promql' | 'logql' | 'traceql', query: m[3].trim(), limit });
+    }
     last = m.index + m[0].length;
   }
   if (last < text.length) {
     out.push({ kind: 'text', value: text.slice(last) });
   }
   return out;
+}
+
+function parseAlertSpec(body: string): AlertSpec | null {
+  try {
+    const o = JSON.parse(body);
+    if (typeof o?.title === 'string' && typeof o?.expr === 'string' && typeof o?.threshold === 'number') {
+      return o as AlertSpec;
+    }
+  } catch {
+    // fall through
+  }
+  return null;
 }
 
 function ToolCallView({ call }: { call: ToolCall }) {

@@ -23,7 +23,7 @@ aiops-agent 忠實實現了 ARE 的 **訊號平面 + 推論平面 與安全紀�
 | 平面：Signal | ✅ 有 |
 | 平面：Reasoning | ✅ 有（提案鐵律結構性保證） |
 | 平面：Governance（運行時） | ✅ 運行時策略閘（`governance.py`：confidence × 校準 → AUTO/PROPOSE/ESCALATE，CE 升高即收緊自主權）；範圍守門另由 intent gate |
-| 平面：Execution | ◾ Action Contract 形狀已備（`app/runbook.py` Tier 0/1，唯讀診斷自動執行）；無副作用、Tier 2 remediation 尚未做 |
+| 平面：Execution | ◾ Action Contract 形狀已備（`app/runbook.py` Tier 0/1，唯讀診斷自動執行）；首個 human-gated 副作用已落地（`app/alerts.py` 建 alert，propose→人類按鈕→寫入）；Tier 2 自主 remediation 尚未做 |
 | 紀律：可解釋軌跡 | ✅ 有 |
 | 紀律：信心分數 | ✅ 有（輸出層面） |
 | 紀律：幻覺傳播防禦 | ✅ 有（亮點） |
@@ -133,7 +133,7 @@ aiops-agent 忠實實現了 ARE 的 **訊號平面 + 推論平面 與安全紀�
 | 3. `/webhook/alert` + dedup + 來源驗證 | ✅ 完成（`webhook.py`）| Detect |
 | 4. findings sink + thread=fingerprint | ✅ 完成 | — |
 | 5. Tier 0/1 runbook（連結 + 唯讀診斷）| ✅ 完成（`app/runbook.py` + `runbooks/`）| **Act 的合約骨架（仍唯讀）** |
-| 6. plugin 呈現 + 設計 alert | ◾ 呈現半完成（`/investigations` API + plugin Investigations 頁：結論/信心/治理決策 + UI 標記對錯回寫 CE）；設計 alert（```alert``` block + provisioning 寫入）未做 | **Governance（有副作用就 gate）熱身** |
+| 6. plugin 呈現 + 設計 alert | ✅ 完成（`/investigations` API + plugin Investigations 頁：結論/信心/治理決策 + UI 標記對錯回寫 CE；設計 alert：agent 產 ```alert``` block → plugin 卡片 + 「Create alert」按鈕 → `POST /alerts/provision` 寫入 Grafana provisioning API）| **Governance（有副作用就 gate）熱身** |
 | 7. action registry + Tier 2 remediation | ◾ 前半完成（`actions.py` registry + `governance.py` 策略閘，propose-only）；執行 / circuit-breaker / audit / dry-run 未做 | **Act / Execution / Governance / CE 門檻** |
 
 ### 4.2 建議的下一步（此順序同時是 v3 的 ROI 序，也是 ARE 的安全序）
@@ -155,9 +155,9 @@ aiops-agent 忠實實現了 ARE 的 **訊號平面 + 推論平面 與安全紀�
 - 已接上 `run_headless`（best-effort）。測試：13 個單元測試（match/substitute/render/check 評估/runner 的 pass/skip-非唯讀/skip-未解析/error）+ k3d 實機整合（k8s 診斷 PASS、Prom 步驟優雅 ERROR）。
 > 對齊：Act 合約骨架（唯讀）、執行平面的契約模型。
 
-**4. v3 step 6：設計 alert 能力（解耦，可隨時插入）**
-第一個「有副作用 + human-in-the-loop」能力，是 Governance 模式的熱身（沿用 ```promql``` block→panel 的 pattern 延伸 ```alert``` block→按鈕）。跟主線解耦，急著要可以提前。
-> 對齊：Governance—「有副作用就 gate」。
+**4. v3 step 6：設計 alert 能力 ✅ 已完成**
+第一個「有副作用 + human-in-the-loop」能力，Governance 模式的熱身。沿用 ```promql``` block→panel 的 pattern 延伸 ```alert``` block→卡片+按鈕。實作 `app/alerts.py`（pydantic `AlertSpec` 合約 + 純轉換 `build_alert_rule`：spec→Grafana 三段式 managed alert rule payload〔instant query A → reduce B → threshold C〕+ I/O `provision_alert` + `parse_alert_blocks`，鏡像 plugin 的 splitQueryBlocks）。endpoints：`POST /alerts/preview`（dry-run，不寫入）/ `POST /alerts/provision`（fail-closed：缺 grafana 憑證或 `alert_provisioning_enabled=False`→503）。agent prompt 加 ```alert``` block 規範（**propose-only**，從不自動建立）；plugin `AlertProposalCard.tsx` 渲染卡片，**唯有人類按按鈕**才 POST 去 provisioning——human-in-the-loop 是結構性的。鐵律對齊（§4.3）：唯讀推論核心不變，新增能力可關閉（`alert_provisioning_enabled`）；不像 `actions_enabled`（自主變更，預設 off），建 alert 可逆 + 人類確認，故預設 on 但仍 fail-closed。測試：25 個單元測試（spec 驗證 / payload 形狀 / parse〔含 malformed skip〕/ fail-closed 閘 / 寫入 mock）。
+> 對齊：Governance—「有副作用就 gate」、Execution 契約模型（首次跨進唯讀以外，但仍 human-gated）。
 
 **5. v3 step 7：action registry + Tier 2（前半已完成；執行半段待做）**
 ✅ **前半（safe，propose-only）已實作**：

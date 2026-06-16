@@ -1,12 +1,14 @@
 import json
 import uuid
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from .agent import lifespan, stream_chat
+from .alerts import AlertProvisioningDisabled, AlertSpec, build_alert_rule, provision_alert
 from .calibration import label_run
 from .config import settings
 from .investigations import list_investigations
@@ -95,6 +97,33 @@ async def investigations_label(fp: str, req: LabelRequest):
     if not ok:
         raise HTTPException(status_code=404, detail=f"no calibration record for fingerprint {fp}")
     return {"ok": True, "fp": fp, "correct": req.correct}
+
+
+# ---- Design-alert capability (propose-only; human button provisions) --------
+
+
+@app.post("/alerts/preview")
+async def alerts_preview(spec: AlertSpec):
+    """Dry-run: return the Grafana alert-rule payload this spec would create,
+    without writing anything. Lets the plugin card show exactly what the button
+    will provision; no Grafana credentials required."""
+    return {"payload": build_alert_rule(spec)}
+
+
+@app.post("/alerts/provision")
+async def alerts_provision(spec: AlertSpec):
+    """Write a proposed alert rule to Grafana. Reached only from a human button
+    click in the plugin (the human-in-the-loop gate). fail-closed: 503 when
+    provisioning is switched off or Grafana credentials are absent."""
+    try:
+        result = await provision_alert(spec)
+    except AlertProvisioningDisabled as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"grafana rejected the rule: {e.response.text}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"alert provisioning failed: {e}")
+    return {"ok": True, **result}
 
 
 # ---- Trace Explorer ---------------------------------------------------------

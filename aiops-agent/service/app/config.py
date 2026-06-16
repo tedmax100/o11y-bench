@@ -80,11 +80,21 @@ class Settings(BaseSettings):
     # regardless; nothing mutates state while this is False.
     actions_enabled: bool = False
     governance_conf_high: float = 0.8
+
+    # --- Design-alert capability (ARE gap-analysis §4.2 step 6 / v3 §6) -----
+    # First side-effecting + human-in-the-loop capability: the agent proposes an
+    # alert rule (```alert``` block); a human button click POSTs it to
+    # /alerts/provision, which writes it to Grafana. Reversible (rules can be
+    # deleted) and human-confirmed, so it defaults ON — unlike `actions_enabled`
+    # (autonomous mutation, default off). Still fail-closed: provisioning also
+    # needs grafana_url + grafana_token, else the endpoint refuses.
     governance_conf_low: float = 0.5
     # If measured overconfidence exceeds this, AUTO is downgraded to PROPOSE.
     governance_max_overconfidence: float = 0.1
     # AUTO requires at least this many labeled runs — autonomy must be earned.
     governance_min_labeled_runs: int = 20
+
+    alert_provisioning_enabled: bool = True
 
     host: str = "0.0.0.0"
     port: int = 8000
