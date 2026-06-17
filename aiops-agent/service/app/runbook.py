@@ -58,6 +58,10 @@ class Step(BaseModel):
     # remediation-only metadata; informational at this tier (never executed here)
     reversible: bool | None = None
     requires_approval: bool | None = None
+    # inverse-operation contract carried into the ActionRequest (step 7 §2.2).
+    # {action, args} naming the action that undoes this one. Without it the
+    # executor refuses to run the action (no rollback → not executable, 7b-4).
+    rollback: dict[str, Any] | None = None
 
 
 class Trigger(BaseModel):

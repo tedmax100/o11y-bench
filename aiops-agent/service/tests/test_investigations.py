@@ -27,8 +27,8 @@ def _result():
 
 
 def test_record_and_list(tmp_path, monkeypatch):
-    p = tmp_path / "inv.jsonl"
-    monkeypatch.setattr(inv.settings, "investigations_log_path", str(p))
+    p = tmp_path / "aiops.db"
+    monkeypatch.setattr(inv.settings, "store_path", str(p))
     monkeypatch.setattr(inv.settings, "investigations_enabled", True)
 
     inv.record_investigation("fp-1", _alert(), _result())
@@ -45,8 +45,8 @@ def test_record_and_list(tmp_path, monkeypatch):
 
 
 def test_latest_per_fingerprint(tmp_path, monkeypatch):
-    p = tmp_path / "inv.jsonl"
-    monkeypatch.setattr(inv.settings, "investigations_log_path", str(p))
+    p = tmp_path / "aiops.db"
+    monkeypatch.setattr(inv.settings, "store_path", str(p))
     monkeypatch.setattr(inv.settings, "investigations_enabled", True)
 
     inv.record_investigation("fp-1", _alert(), _result())
@@ -57,26 +57,25 @@ def test_latest_per_fingerprint(tmp_path, monkeypatch):
 
 
 def test_disabled_is_noop(tmp_path, monkeypatch):
-    p = tmp_path / "inv.jsonl"
-    monkeypatch.setattr(inv.settings, "investigations_log_path", str(p))
+    p = tmp_path / "aiops.db"
+    monkeypatch.setattr(inv.settings, "store_path", str(p))
     monkeypatch.setattr(inv.settings, "investigations_enabled", False)
     inv.record_investigation("fp-x", _alert(), _result())
     assert not p.exists()
 
 
 def test_correctness_merged_from_calibration(tmp_path, monkeypatch):
-    invp = tmp_path / "inv.jsonl"
-    calp = tmp_path / "cal.jsonl"
-    monkeypatch.setattr(inv.settings, "investigations_log_path", str(invp))
+    # calibration + investigations now share one store (store_path); the merge
+    # reads the CE verdict from the same db, keyed by run_id == fp.
+    p = tmp_path / "aiops.db"
+    monkeypatch.setattr(inv.settings, "store_path", str(p))
     monkeypatch.setattr(inv.settings, "investigations_enabled", True)
-    # calibration store keyed by run_id == fp
     import app.calibration as cal
-    monkeypatch.setattr(cal.settings, "calibration_log_path", str(calp))
     monkeypatch.setattr(cal.settings, "calibration_enabled", True)
 
     inv.record_investigation("fp-1", _alert(), _result())
     cal.record_run(_findings(), run_id="fp-1")
     cal.label_run("fp-1", correct=True)
 
-    rows = inv.list_investigations(path=invp)
+    rows = inv.list_investigations(path=p)
     assert rows[0]["correct"] is True

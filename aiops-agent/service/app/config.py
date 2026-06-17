@@ -62,6 +62,8 @@ class Settings(BaseSettings):
     # the pairs. Prerequisite for any Tier 2 confidence threshold. Best-effort:
     # a logging failure never breaks an investigation.
     calibration_enabled: bool = True
+    # Legacy JSONL path — kept only as the source for the one-time migration into
+    # the SQLite store (store_path). Live reads/writes go through app.store.
     calibration_log_path: str = "calibration.jsonl"
     # A graded run counts as "correct" when its o11y-bench score clears this.
     calibration_correct_threshold: float = 0.7
@@ -81,6 +83,37 @@ class Settings(BaseSettings):
     actions_enabled: bool = False
     governance_conf_high: float = 0.8
 
+    # --- Action-request lifecycle (step 7 後半 7b-1) -----------------------
+    # Each AUTO/PROPOSE governance decision becomes a tracked ActionRequest the
+    # plugin can approve/reject. Creation is best-effort (gated here); execution
+    # is still kill-switched by actions_enabled above. ESCALATE makes no request.
+    action_requests_enabled: bool = True
+    # Approvals go stale: a request not acted on within this window is expired so
+    # its preconditions can't be acted on after the world has moved (TOCTOU).
+    approval_ttl_seconds: int = 900
+
+    # --- Dry-run + blast-radius policy (step 7 後半 7b-2) -------------------
+    # Read-only gates that run before any (kill-switched) execution: re-verify the
+    # runbook's preconditions still hold, and refuse actions whose computed blast
+    # radius exceeds policy. All fail-closed — an unreadable dry-run aborts.
+    execution_namespace_allowlist: list[str] = ["demo"]
+    max_blast_pods: int = 5          # affected-pod ceiling; over → abort
+    deny_singletons: bool = True     # single-replica targets are riskier → refuse
+    # Namespaces no action may ever touch, regardless of allowlist.
+    protected_namespaces: list[str] = ["kube-system", "kube-public", "kube-node-lease"]
+
+    # --- Circuit breaker + idempotency (step 7 後半 7b-3) ------------------
+    # Stops automation runaway + rollback flapping. Global sliding-window rate
+    # limit; per-(action,target) trips open after N consecutive failures and stays
+    # open until a human resets it (POST /actions/breaker/reset). Idempotency keys
+    # an execution by (action, target, incident fp) so an alert storm can't act on
+    # the same target twice. Breaker state is durable (survives restart) — a
+    # breaker that forgets it tripped isn't a safety mechanism.
+    breaker_enabled: bool = True
+    breaker_max_actions_per_window: int = 3
+    breaker_window_seconds: int = 3600
+    breaker_fail_threshold: int = 2   # consecutive failures on a target → trip open
+
     # --- Design-alert capability (ARE gap-analysis §4.2 step 6 / v3 §6) -----
     # First side-effecting + human-in-the-loop capability: the agent proposes an
     # alert rule (```alert``` block); a human button click POSTs it to
@@ -95,6 +128,13 @@ class Settings(BaseSettings):
     governance_min_labeled_runs: int = 20
 
     alert_provisioning_enabled: bool = True
+
+    # --- Persistence layer (step 7 後半 7b-0) ------------------------------
+    # Durable, atomic store (SQLite) replacing the ephemeral JSONL files for the
+    # CE harness + investigation log (and later action_requests/audit). On a PVC
+    # in-cluster (STORE_PATH=/data/aiops.db) so it survives the rollout restarts
+    # the execution plane itself triggers. See app/store.py.
+    store_path: str = "aiops.db"
 
     host: str = "0.0.0.0"
     port: int = 8000

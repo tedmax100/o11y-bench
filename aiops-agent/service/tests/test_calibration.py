@@ -90,8 +90,8 @@ def test_grade_against_truth_service_in_summary_fallback():
 # ---- store round-trip ------------------------------------------------------
 
 def test_record_and_label_roundtrip(tmp_path, monkeypatch):
-    p = tmp_path / "calib.jsonl"
-    monkeypatch.setattr(cal.settings, "calibration_log_path", str(p))
+    p = tmp_path / "aiops.db"
+    monkeypatch.setattr(cal.settings, "store_path", str(p))
     monkeypatch.setattr(cal.settings, "calibration_enabled", True)
 
     findings = NS(confidence=0.82, summary="s", hypothesis="h",
@@ -107,9 +107,24 @@ def test_record_and_label_roundtrip(tmp_path, monkeypatch):
     assert label_run("missing", correct=True, path=p) is False
 
 
+def test_label_updates_latest_record_for_run_id(tmp_path, monkeypatch):
+    # Two pending records share a run_id; label must hit the newest (atomic UPDATE).
+    p = tmp_path / "aiops.db"
+    monkeypatch.setattr(cal.settings, "store_path", str(p))
+    monkeypatch.setattr(cal.settings, "calibration_enabled", True)
+    record_run(NS(confidence=0.4, summary="old"), run_id="fp")
+    record_run(NS(confidence=0.9, summary="new"), run_id="fp")
+    assert label_run("fp", correct=True, path=p) is True
+    recs = load_records(p)
+    assert len(recs) == 2
+    newest = recs[-1]
+    assert newest.confidence == 0.9 and newest.correct is True
+    assert recs[0].correct is None  # the older one stays unlabeled
+
+
 def test_record_run_disabled_is_noop(tmp_path, monkeypatch):
-    p = tmp_path / "calib.jsonl"
-    monkeypatch.setattr(cal.settings, "calibration_log_path", str(p))
+    p = tmp_path / "aiops.db"
+    monkeypatch.setattr(cal.settings, "store_path", str(p))
     monkeypatch.setattr(cal.settings, "calibration_enabled", False)
     assert record_run(NS(confidence=0.5), run_id="x") is None
     assert not p.exists()

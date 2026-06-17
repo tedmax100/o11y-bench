@@ -16,14 +16,14 @@ Two-phase by necessity: at run time we have the confidence but NOT the verdict
      (`score_to_correct`) or a lightweight ground-truth match (`grade_against_truth`).
 
 The calibration math (`compute_calibration`) is pure and deterministic — it's
-the part with real logic, so it's what the unit tests pin down. The store is a
-plain JSONL file (one record per line); at this scale `label_run` rewriting the
-file is fine. Production would move this to the same Postgres as the checkpointer.
+the part with real logic, so it's what the unit tests pin down. Records live in
+the durable SQLite store (`app.store`), so `label_run` is an atomic UPDATE rather
+than a whole-file rewrite, and the data survives the pod restarts the execution
+plane triggers. See store.py for why JSONL was retired (7b-0).
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,6 +31,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from . import store
 from .config import settings
 
 logger = logging.getLogger("aiops_agent.calibration")
@@ -53,35 +54,16 @@ class CalibrationRecord(BaseModel):
     services: list[str] = Field(default_factory=list)
 
 
-# ---- store -----------------------------------------------------------------
-
-def _store_path() -> Path:
-    return Path(settings.calibration_log_path)
-
+# ---- store (durable SQLite via app.store; `path` = db path) -----------------
 
 def load_records(path: Path | None = None) -> list[CalibrationRecord]:
-    p = path or _store_path()
-    if not p.exists():
-        return []
     out: list[CalibrationRecord] = []
-    for line in p.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
+    for d in store.cal_load(path):
         try:
-            out.append(CalibrationRecord.model_validate_json(line))
-        except Exception as e:  # one bad line must not sink the whole report
-            logger.warning("skipping malformed calibration line: %s", e)
+            out.append(CalibrationRecord.model_validate(d))
+        except Exception as e:  # one bad row must not sink the whole report
+            logger.warning("skipping malformed calibration row: %s", e)
     return out
-
-
-def _write_all(records: list[CalibrationRecord], path: Path | None = None) -> None:
-    p = path or _store_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(
-        "\n".join(r.model_dump_json() for r in records) + ("\n" if records else ""),
-        encoding="utf-8",
-    )
 
 
 def record_run(findings: Any, run_id: str, path: Path | None = None) -> CalibrationRecord | None:
@@ -99,10 +81,11 @@ def record_run(findings: Any, run_id: str, path: Path | None = None) -> Calibrat
             suspected_version=getattr(findings, "suspected_version", None),
             services=list(getattr(findings, "services", []) or []),
         )
-        p = path or _store_path()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with p.open("a", encoding="utf-8") as f:
-            f.write(rec.model_dump_json() + "\n")
+        store.cal_insert(
+            run_id=rec.run_id, ts=rec.ts, confidence=rec.confidence,
+            summary=rec.summary, hypothesis=rec.hypothesis,
+            suspected_version=rec.suspected_version, services=rec.services, path=path,
+        )
         return rec
     except Exception as e:
         logger.warning("record_run failed for %s: %s", run_id, e)
@@ -117,19 +100,12 @@ def label_run(
     source: str = "manual",
     path: Path | None = None,
 ) -> bool:
-    """Fill in the verdict for the most recent record matching run_id. Returns
-    True if a record was updated."""
-    p = path or _store_path()
-    records = load_records(p)
-    for rec in reversed(records):  # newest matching run wins
-        if rec.run_id == run_id:
-            rec.correct = correct
-            rec.score = score
-            rec.source = source
-            _write_all(records, p)
-            return True
-    logger.warning("label_run: no record for run_id=%s", run_id)
-    return False
+    """Fill in the verdict for the most recent record matching run_id (atomic
+    UPDATE in the store). Returns True if a record was updated."""
+    ok = store.cal_label(run_id, correct, score=score, source=source, path=path)
+    if not ok:
+        logger.warning("label_run: no record for run_id=%s", run_id)
+    return ok
 
 
 # ---- correctness sources (pluggable) ---------------------------------------

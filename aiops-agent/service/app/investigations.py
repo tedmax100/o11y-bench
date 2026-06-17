@@ -9,6 +9,9 @@ the UI surface for the headless work (ARE gap-analysis step 6).
 Read-only display: recording here never affects an investigation, and correctness
 verdicts live in the CE harness (calibration.py), merged in at list time so there
 is one source of truth for "was it right".
+
+Rows live in the durable SQLite store (`app.store`) — same reason as the CE
+harness: the ephemeral pod filesystem would lose them on every restart (7b-0).
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from . import store
 from .config import settings
 
 logger = logging.getLogger("aiops_agent.investigations")
@@ -47,10 +51,6 @@ class InvestigationRecord(BaseModel):
     answer: str = ""
     # filled in at list time from the CE harness; None = not yet judged
     correct: bool | None = None
-
-
-def _path() -> Path:
-    return Path(settings.investigations_log_path)
 
 
 def record_investigation(fp: str, alert: dict, result: dict, path: Path | None = None) -> None:
@@ -81,27 +81,18 @@ def record_investigation(fp: str, alert: dict, result: dict, path: Path | None =
             ],
             answer=(result.get("answer") or "")[:2000],
         )
-        p = path or _path()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with p.open("a", encoding="utf-8") as f:
-            f.write(rec.model_dump_json() + "\n")
+        store.inv_insert(rec.fp, rec.ts, rec.model_dump_json(), path)
     except Exception as e:
         logger.warning("record_investigation failed for %s: %s", fp, e)
 
 
 def _load(path: Path | None = None) -> list[InvestigationRecord]:
-    p = path or _path()
-    if not p.exists():
-        return []
     out: list[InvestigationRecord] = []
-    for line in p.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
+    for payload in store.inv_load(path):
         try:
-            out.append(InvestigationRecord.model_validate_json(line))
+            out.append(InvestigationRecord.model_validate_json(payload))
         except Exception as e:
-            logger.warning("skipping malformed investigation line: %s", e)
+            logger.warning("skipping malformed investigation row: %s", e)
     return out
 
 

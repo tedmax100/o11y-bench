@@ -843,11 +843,32 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
         try:
             from .calibration import compute_calibration, load_records
             from .governance import propose_remediations
+            from .runbook import _subst, incident_params
 
             calib = compute_calibration(load_records())
             decisions = propose_remediations(
                 [s.action for s in matched_rb.remediation], findings.confidence, calib
             )
+
+            # Materialize each AUTO/PROPOSE decision as a tracked ActionRequest the
+            # plugin can approve/reject (7b-1). Pair the decision with its
+            # remediation step to carry the concrete (substituted) args + rollback
+            # contract. ESCALATE creates nothing. Best-effort — never blocks the run.
+            if settings.action_requests_enabled and decisions:
+                from . import action_requests
+                params = incident_params(labels, annotations)
+                step_by_action = {s.action: s for s in matched_rb.remediation}
+                for d in decisions:
+                    step = step_by_action.get(d.action)
+                    if step is None:
+                        continue
+                    action_requests.create_from_decision(
+                        thread_id, d,
+                        args=_subst(step.args, params),
+                        rollback=_subst(step.rollback, params) if step.rollback else None,
+                        runbook_id=matched_rb.id,
+                        params=params,
+                    )
         except Exception as e:
             logger.warning("governance gate failed: %s", e)
 
@@ -902,6 +923,8 @@ async def suggest_followups(user_message: str, answer: str) -> list[str]:
 
 @asynccontextmanager
 async def lifespan(app):
+    from . import store
+    store.init()  # schema + one-time legacy JSONL migration (7b-0)
     await _build_agent()
     yield
 

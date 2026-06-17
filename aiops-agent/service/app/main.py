@@ -1,3 +1,4 @@
+import asyncio
 import json
 import uuid
 
@@ -7,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
+from . import action_requests, audit, breaker, execution
 from .agent import lifespan, stream_chat
 from .alerts import AlertProvisioningDisabled, AlertSpec, build_alert_rule, provision_alert
 from .calibration import label_run
@@ -124,6 +126,85 @@ async def alerts_provision(spec: AlertSpec):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"alert provisioning failed: {e}")
     return {"ok": True, **result}
+
+
+# ---- Action requests (execution-plane lifecycle; 7b-1) ----------------------
+# In 7b-1 approval drives the executor, but the kill switch (actions_enabled)
+# keeps every execution a refusal — nothing mutates cluster state yet.
+
+# Strong refs to in-flight executor tasks so the loop doesn't GC them mid-run.
+_executor_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_executor(request_id: str) -> None:
+    task = asyncio.create_task(execution.run(request_id))
+    _executor_tasks.add(task)
+    task.add_done_callback(_executor_tasks.discard)
+
+
+class ActorRequest(BaseModel):
+    actor: str = "operator"
+
+
+@app.get("/actions/requests")
+async def actions_requests_list(status: str | None = None, limit: int = 50):
+    """List action requests (optionally filtered by status), newest first."""
+    return {"requests": action_requests.list_requests(status=status, limit=limit)}
+
+
+@app.get("/actions/requests/{request_id}")
+async def actions_request_get(request_id: str):
+    req = action_requests.get(request_id)
+    if req is None:
+        raise HTTPException(status_code=404, detail=f"no such request {request_id}")
+    return req.model_dump()
+
+
+@app.post("/actions/requests/{request_id}/approve")
+async def actions_request_approve(request_id: str, body: ActorRequest):
+    """Human approves a proposed request (the human-in-the-loop gate). On success
+    the executor is kicked off in the background; in 7b-1 it terminates in REFUSED
+    because actions_enabled is off. 409 if the request can't be approved (missing,
+    expired, or already decided)."""
+    req = action_requests.approve(request_id, actor=body.actor)
+    if req is None:
+        raise HTTPException(status_code=409,
+                            detail="request not approvable (missing, expired, or already decided)")
+    _spawn_executor(request_id)
+    return req.model_dump()
+
+
+@app.post("/actions/requests/{request_id}/reject")
+async def actions_request_reject(request_id: str, body: ActorRequest):
+    req = action_requests.reject(request_id, actor=body.actor)
+    if req is None:
+        raise HTTPException(status_code=409,
+                            detail="request not rejectable (missing or already decided)")
+    return req.model_dump()
+
+
+@app.get("/actions/audit")
+async def actions_audit(request_id: str | None = None, fp: str | None = None, limit: int = 200):
+    """Append-only audit trail, optionally scoped to a request or fingerprint."""
+    return {"audit": audit.history(request_id=request_id, fp=fp, limit=limit)}
+
+
+@app.get("/actions/breaker")
+async def actions_breaker_state():
+    """Currently-open circuit breakers (7b-3)."""
+    return {"open": breaker.snapshot()}
+
+
+class BreakerResetRequest(BaseModel):
+    scope: str | None = None  # None resets all; else "action|target" or "global"
+
+
+@app.post("/actions/breaker/reset")
+async def actions_breaker_reset(body: BreakerResetRequest):
+    """Human re-closes a tripped breaker (a scope, or all). Breakers stay open
+    until this is called — automation can't clear its own trip."""
+    cleared = breaker.reset(body.scope)
+    return {"ok": True, "cleared": cleared, "scope": body.scope or "all"}
 
 
 # ---- Trace Explorer ---------------------------------------------------------

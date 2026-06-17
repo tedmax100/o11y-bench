@@ -46,8 +46,11 @@ class ActionSpec(BaseModel):
     requires_approval: bool
     category: str = "k8s"
     # Intentionally None in this tier — no action has a real, wired implementation
-    # yet. Registering an impl is a later, separately-reviewed change (step 7).
+    # yet. Registering an impl is a later, separately-reviewed change (7b-4).
     impl: Callable[[dict], Awaitable[Any]] | None = Field(default=None, exclude=True)
+    # Read-only blast-radius predictor (7b-2). Safe to wire now (no mutation): the
+    # executor calls it before execution to compute + policy-check the footprint.
+    dry_run: Callable[[dict], Awaitable[Any]] | None = Field(default=None, exclude=True)
 
 
 class ActionRegistry:
@@ -84,13 +87,16 @@ class ActionRegistry:
 
 
 # Module-level registry seeded with the demo's remediation vocabulary. All are
-# reversible + approval-required, and none has an impl — so nothing can run.
+# reversible + approval-required, and none has an impl — so nothing can run. The
+# `dry_run` is read-only (blast_radius.py) so it's wired now; `impl` waits for 7b-4.
+from .blast_radius import dry_run_rollout_undo, dry_run_scale  # noqa: E402
+
 registry = ActionRegistry()
 registry.register(ActionSpec(
     name="k8s.rollout_undo",
     description="Roll a Deployment back to its previous ReplicaSet (kubectl rollout undo).",
-    reversible=True, requires_approval=True))
+    reversible=True, requires_approval=True, dry_run=dry_run_rollout_undo))
 registry.register(ActionSpec(
     name="k8s.scale",
     description="Change a Deployment's replica count.",
-    reversible=True, requires_approval=True))
+    reversible=True, requires_approval=True, dry_run=dry_run_scale))
