@@ -1,0 +1,92 @@
+# Signal Plane — per-service signal contracts (signal-plane-design s3).
+#
+# A signal contract declares, per service, the AUTHORITATIVE way to read its
+# health: which metric is the error/latency/throughput SLI, the correct PromQL
+# (right aggregation, right unit), the freshness guarantee, which decisions the
+# signal supports, and when NOT to trust it. This turns queries the agent used
+# to re-derive every run (and get wrong — histogram-seconds-in-ms-buckets,
+# count-vs-rate) into declared, citeable contracts.
+#
+# Metric names below are verified against demo-services source (not guessed):
+#   payment: payment_charges_total{status,reason}, payment_charge_duration_seconds
+#   order:   orders_total{status,reason}, order_create_duration_seconds
+#   user:    user_lookups_total{op}, user_auth_checks_total
+# The capability snapshot stays authoritative for *existence*; this is
+# authoritative for *how to aggregate*. `python -m app.signals.contract validate`
+# checks these metric base-names still appear in live telemetry.
+version: "1.0.0"
+
+contracts:
+  - service: payment-service
+    freshness_seconds: 60
+    supported_decisions: [rca, deploy-correlation]
+    slis:
+      - kind: error
+        # Share of charge attempts that were declined. clamp_min guards the
+        # divide when there's no traffic in the window.
+        promql: 'sum(rate(payment_charges_total{status="declined"}[5m])) / clamp_min(sum(rate(payment_charges_total[5m])), 1)'
+        objective: "declined_rate < 1%"
+        unit: ratio
+      - kind: latency
+        # duration is recorded in SECONDS into seconds-scaled explicit buckets.
+        # Quantile over _bucket; the result is in seconds, NOT ms — do not
+        # multiply. (Mis-reading this is the ~4.75 constant artifact.)
+        promql: 'histogram_quantile(0.95, sum by (le) (rate(payment_charge_duration_seconds_bucket[5m])))'
+        objective: "p95 < 0.2s"
+        unit: s
+      - kind: throughput
+        promql: 'sum(rate(payment_charges_total[5m]))'
+        unit: rps
+    exclusions:
+      - "No up{} for application services (remote_write, not scraped); judge liveness via rate(payment_charges_total[5m]) > 0."
+      - "declined can be legitimate (odd-cents under the new_validator flag) — correlate with git_version before blaming code."
+
+  - service: order-service
+    freshness_seconds: 60
+    supported_decisions: [rca]
+    slis:
+      - kind: error
+        promql: 'sum(rate(orders_total{status="error"}[5m])) / clamp_min(sum(rate(orders_total[5m])), 1)'
+        objective: "error_rate < 1%"
+        unit: ratio
+      - kind: latency
+        promql: 'histogram_quantile(0.95, sum by (le) (rate(order_create_duration_seconds_bucket[5m])))'
+        objective: "p95 < 0.3s"
+        unit: s
+      - kind: throughput
+        promql: 'sum(rate(orders_total[5m]))'
+        unit: rps
+    exclusions:
+      - "status=cancelled is a business outcome (auth_failed / payment_declined / unknown_product), not a service error — exclude it from the error SLI; check `reason` to see if a downstream dep is the cause."
+
+  - service: user-service
+    freshness_seconds: 60
+    supported_decisions: [rca]
+    slis:
+      - kind: throughput
+        promql: 'sum(rate(user_lookups_total[5m]))'
+        unit: rps
+      - kind: throughput
+        promql: 'sum(rate(user_auth_checks_total[5m]))'
+        unit: rps
+    exclusions:
+      - "user-service emits no latency histogram and no explicit error counter; for errors/latency fall back to the auto HTTP server signal and Loki event=user.auth_failed."
+
+  # webapp + api-gateway emit no custom RED metrics — they rely on auto HTTP
+  # server instrumentation. The contract records this so the agent discovers the
+  # real metric name instead of guessing, and uses Loki for failures.
+  - service: api-gateway
+    freshness_seconds: 60
+    supported_decisions: [rca]
+    slis: []
+    exclusions:
+      - "No custom application metrics: derive latency/throughput from the auto HTTP server histogram (discover_metrics for the exact name), and errors from Loki event=http.request_failed (carries upstream + status)."
+      - "It's a thin proxy — a failure here is usually a *symptom* of a failing downstream (user/order/payment), not an api-gateway bug."
+
+  - service: webapp
+    freshness_seconds: 60
+    supported_decisions: [rca]
+    slis: []
+    exclusions:
+      - "No custom application metrics: derive latency/throughput from the auto HTTP server histogram (discover_metrics for the exact name), and errors from Loki event=http.request_failed."
+      - "Public edge — an error here usually originates downstream (api-gateway → user/order/payment). Trace the journey before blaming webapp."

@@ -144,6 +144,9 @@ class Settings(BaseSettings):
     # empty → the topology.yaml shipped beside app/signals/.
     signal_plane_enabled: bool = True
     topology_path: str = ""
+    # Per-service signal contracts (s3): authoritative SLI queries + freshness +
+    # exclusions. Empty path → contracts.yaml shipped beside app/signals/.
+    signal_contracts_path: str = ""
 
     host: str = "0.0.0.0"
     port: int = 8000

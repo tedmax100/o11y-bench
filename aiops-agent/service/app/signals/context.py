@@ -18,6 +18,7 @@ signal contracts (authoritative SLIs) and live dependency health.
 from __future__ import annotations
 
 from ..config import settings
+from .contract import SignalContract, contract_for
 from .reconcile import TopologyDrift, get_last_drift
 from .topology import get_topology, tier_label
 
@@ -71,7 +72,29 @@ def _service_block(svc: str, drift: TopologyDrift | None) -> str | None:
         if extra:
             lines.append("- ⚠ observed dependencies NOT in the declared topology: " + ", ".join(extra))
 
+    lines.extend(_contract_lines(svc))
     return "\n".join(lines)
+
+
+def _contract_lines(svc: str) -> list[str]:
+    """Authoritative SLI queries + freshness + exclusions for a service (s3)."""
+    contract: SignalContract | None = contract_for(svc)
+    if contract is None:
+        return []
+    lines: list[str] = []
+    if contract.slis:
+        lines.append(
+            "- SLI (authoritative — cite these exact queries, don't re-derive; "
+            "the capability snapshot is authoritative for what *exists*):"
+        )
+        for sli in contract.slis:
+            unit = f" [{sli.unit}]" if sli.unit else ""
+            target = f"  target: {sli.objective}" if sli.objective else ""
+            lines.append(f"    {sli.kind}: {sli.promql}{unit}{target}")
+        lines.append(f"- signal freshness guarantee: ≤{contract.freshness_seconds}s (older samples are stale)")
+    for ex in contract.exclusions:
+        lines.append(f"- caveat: {ex}")
+    return lines
 
 
 def _dq_note(drift: TopologyDrift | None) -> str:
