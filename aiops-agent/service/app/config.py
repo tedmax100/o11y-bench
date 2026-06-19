@@ -147,6 +147,13 @@ class Settings(BaseSettings):
     # Per-service signal contracts (s3): authoritative SLI queries + freshness +
     # exclusions. Empty path → contracts.yaml shipped beside app/signals/.
     signal_contracts_path: str = ""
+    # Dependency-health blame propagation (s4): before the agent loop, run each
+    # neighbour's error SLI live (read-only, off the agent budget) so the agent
+    # knows whether the symptom is inherited from a failing downstream dep. A
+    # neighbour's error ratio over this threshold is "unhealthy".
+    signal_dependency_health_enabled: bool = True
+    signal_health_error_threshold: float = 0.05
+    signal_health_max_neighbors: int = 6
 
     host: str = "0.0.0.0"
     port: int = 8000

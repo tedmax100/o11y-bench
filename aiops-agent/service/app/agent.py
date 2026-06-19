@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from .capability import capability_for_services, resolve_services
 from .signals.context import build_signal_context
+from .signals.health import evaluate_dependency_health
 from .config import settings
 from .runbook import (
     format_diagnostics,
@@ -781,6 +782,18 @@ def _inject_signal_context(turn_messages: list, services: list[str]) -> None:
         logger.warning("signal context injection failed for %s: %s", services, e)
 
 
+async def _inject_dependency_health(turn_messages: list, services: list[str]) -> None:
+    """Evaluate each neighbour's SLI live (s4 blame propagation) and inject the
+    result. Read-only + off the agent budget, mirroring runbook diagnostics;
+    best-effort so a query failure never blocks the run."""
+    try:
+        block = await evaluate_dependency_health(services)
+        if block:
+            turn_messages.append(SystemMessage(content=block))
+    except Exception as e:
+        logger.warning("dependency health injection failed for %s: %s", services, e)
+
+
 async def _inject_runbook(turn_messages: list, labels: dict, annotations: dict):
     """Match a runbook to the alert; inject its rendered guidance (Tier 0) and,
     if enabled, the results of auto-running its read-only diagnostics (Tier 1).
@@ -825,9 +838,13 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
     # reasons over confirmed preconditions. Diagnostics use the all-read-only
     # TOOLS map and run *outside* the agent's tool budget. Best-effort.
     matched_rb = None
-    if settings.runbook_enabled:
-        with now_override(starts_dt):
+    with now_override(starts_dt):
+        if settings.runbook_enabled:
             matched_rb = await _inject_runbook(turn_messages, labels, annotations)
+        # Dependency health (s4) under the pinned incident clock, so neighbour
+        # SLIs are read at the incident time, not real now.
+        if service:
+            await _inject_dependency_health(turn_messages, [service])
 
     turn_messages.append({"role": "user", "content": _alert_to_prompt(labels, annotations, starts_dt)})
 
@@ -1036,6 +1053,7 @@ async def stream_chat(
         turn_messages.append(SystemMessage(content=snapshot))
     if resolved:
         _inject_signal_context(turn_messages, resolved)
+        await _inject_dependency_health(turn_messages, resolved)
     turn_messages.append({"role": "user", "content": message})
 
     # Accumulate the answer text so we can suggest follow-ups from it afterward.
