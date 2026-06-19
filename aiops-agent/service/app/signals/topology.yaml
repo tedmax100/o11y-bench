@@ -48,5 +48,11 @@ edges:
   - {caller: api-gateway, callee: user-service}
   - {caller: api-gateway, callee: order-service}
   - {caller: api-gateway, callee: payment-service}
-  - {caller: order-service, callee: user-service}
-  - {caller: order-service, callee: payment-service}
+  # order attributes its own failures to a dependency via orders_total.reason:
+  # payment* (declined / payment_upstream) and auth/user_upstream for user.
+  - caller: order-service
+    callee: user-service
+    attribution: 'sum(rate(orders_total{reason=~"auth|user_upstream"}[5m]))'
+  - caller: order-service
+    callee: payment-service
+    attribution: 'sum(rate(orders_total{reason=~"payment|payment_upstream"}[5m]))'

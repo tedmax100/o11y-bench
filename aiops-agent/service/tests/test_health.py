@@ -13,9 +13,22 @@ from app.signals.health import (
 
 
 def _fake_scalar(mapping: dict[str, float]):
-    """Return an async _instant_scalar that keys off substrings of the promql."""
-    async def _scalar(expr: str):
+    """Return an async _instant_scalar that keys off substrings of the promql.
+    Accepts the `at` time arg (s4.2 baseline) but ignores it → current==baseline."""
+    async def _scalar(expr: str, at: str = "now"):
         for needle, val in mapping.items():
+            if needle in expr:
+                return val
+        return 0.0
+    return _scalar
+
+
+def _fake_scalar_timed(mapping_now: dict[str, float], mapping_base: dict[str, float]):
+    """Like _fake_scalar but returns different values for `at="now"` vs baseline,
+    so s4.2 impact can show a rise."""
+    async def _scalar(expr: str, at: str = "now"):
+        m = mapping_now if at == "now" else mapping_base
+        for needle, val in m.items():
             if needle in expr:
                 return val
         return 0.0
@@ -71,23 +84,48 @@ async def test_self_breaching_with_no_downstream_is_root_cause(monkeypatch):
     assert "Do NOT dismiss this as normal" in block
 
 
-async def test_unhealthy_downstream_but_self_healthy_is_cautious(monkeypatch):
-    # order-service investigated; itself healthy but downstream payment on fire.
-    # s4.1 (Q2 fix): must NOT assert order is a symptom — its own SLI is healthy,
-    # so tell the agent to confirm impact before blaming the dependency.
+async def test_downstream_unhealthy_impact_flat_not_symptom(monkeypatch):
+    # s4.2 Q2 fix: order itself healthy, payment downstream unhealthy, but order's
+    # failures attributed to payment did NOT rise vs baseline → NOT a symptom.
+    # (no "orders_total" key → self error SLI 0 AND attribution 0 now & baseline.)
     monkeypatch.setattr(health, "_instant_scalar", _fake_scalar({
         "payment_charges_total": 0.12,   # payment error SLI → unhealthy
-        "user_lookups_total": 4.7,       # user throughput
-        # orders_total (order's own) → default 0.0 → order healthy
+        "user_lookups_total": 4.7,
     }))
     block = await evaluate_dependency_health(["order-service"])
     assert "this service order-service: error 0.0% — healthy" in block
     assert "downstream payment-service: error 12.0% — UNHEALTHY" in block
-    assert "liveness only" in block  # user-service throughput
-    # cautious wording, not an over-claim
+    # the impact line + the precise verdict
+    assert "failures attributed to it" in block
+    assert "flat (no material rise" in block
+    assert "NOT materially impacted by this incident" in block
+    assert "do not report order-service as a symptom" in block
+
+
+async def test_downstream_unhealthy_impact_rising_is_symptom(monkeypatch):
+    # Same topology, but order's payment-attributed failures ROSE vs baseline →
+    # confirmed materially impacted, a genuine symptom.
+    monkeypatch.setattr(health, "_instant_scalar", _fake_scalar_timed(
+        mapping_now={'reason=~"payment': 1.5, "payment_charges_total": 0.12, "user_lookups_total": 4.7},
+        mapping_base={'reason=~"payment': 0.1, "payment_charges_total": 0.12, "user_lookups_total": 4.7},
+    ))
+    block = await evaluate_dependency_health(["order-service"])
+    assert "downstream payment-service: error 12.0% — UNHEALTHY" in block
+    assert "RISING (materially impacted)" in block
+    assert "Confirmed: order-service IS materially impacted by payment-service" in block
+    assert "genuine SYMPTOM" in block
+
+
+async def test_downstream_unhealthy_no_attribution_falls_back(monkeypatch):
+    # api-gateway declares no attribution edges, so impact can't be measured →
+    # fall back to s4.1 cautious wording (confirm before claiming symptom).
+    monkeypatch.setattr(health, "_instant_scalar", _fake_scalar({
+        "payment_charges_total": 0.12,   # payment unhealthy
+    }))
+    block = await evaluate_dependency_health(["api-gateway"])
+    assert "downstream payment-service: error 12.0% — UNHEALTHY" in block
     assert "HEALTHY SLIs themselves" in block
     assert "CONFIRM they actually see failures attributed to that dependency" in block
-    assert "Fix the unhealthy dependency regardless" in block
 
 
 async def test_self_and_downstream_both_unhealthy_is_cascade(monkeypatch):

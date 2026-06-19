@@ -48,6 +48,10 @@ class ServiceNode(BaseModel):
 class Edge(BaseModel):
     caller: str
     callee: str
+    # s4.2: PromQL measuring the caller's OWN failures attributed to this callee
+    # (e.g. order's cancelled/errored orders with reason=payment*). Lets s4 prove
+    # the caller is materially impacted by an unhealthy callee, not just adjacent.
+    attribution: str = ""
 
 
 class Topology(BaseModel):
@@ -71,6 +75,12 @@ class Topology(BaseModel):
     def downstream(self, svc: str) -> list[str]:
         """Direct dependencies — what `svc` could be blocked by."""
         return sorted({e.callee for e in self.edges if e.caller == svc})
+
+    def attribution_for(self, caller: str, callee: str) -> str | None:
+        """The PromQL measuring `caller`'s failures attributed to `callee`, if
+        the edge declares one (s4.2). None when the edge or field is absent."""
+        e = next((e for e in self.edges if e.caller == caller and e.callee == callee), None)
+        return e.attribution if e and e.attribution else None
 
     def impacted_by(self, svc: str) -> list[str]:
         """Transitive callers: the full set of services degraded if `svc` fails.

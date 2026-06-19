@@ -42,6 +42,18 @@ class NeighborHealth(BaseModel):
     verdict: str           # healthy | unhealthy | unknown | unavailable
 
 
+class ImpactEdge(BaseModel):
+    """s4.2: how much a caller's own failures attributed to an unhealthy callee
+    have RISEN vs a baseline window — the difference between 'topologically
+    adjacent' and 'materially impacted'."""
+    primary: str
+    dependency: str
+    current: float | None
+    baseline: float | None
+    delta: float | None
+    verdict: str           # rising | flat | unavailable
+
+
 def _health_sli(svc: str) -> SLI | None:
     """The SLI to judge a neighbour by: its error ratio if it has one, else
     throughput as a liveness proxy."""
@@ -54,12 +66,13 @@ def _health_sli(svc: str) -> SLI | None:
     return next((s for s in c.slis if s.kind == "throughput"), None)
 
 
-async def _instant_scalar(expr: str) -> float | None:
-    """Run an instant PromQL query and reduce its vector to one scalar (sum of
-    series values). None on error or empty result."""
+async def _instant_scalar(expr: str, at: str = "now") -> float | None:
+    """Run an instant PromQL query at time `at` (a now-shorthand like "now-1h",
+    honouring any pinned incident clock) and reduce its vector to one scalar
+    (sum of series values). None on error or empty result."""
     data = await _get_json(
         settings.prometheus_url, "/api/v1/query",
-        {"query": expr, "time": _rfc3339(_parse_dt("now"))},
+        {"query": expr, "time": _rfc3339(_parse_dt(at))},
     )
     if not isinstance(data, dict) or data.get("status") == "error":
         return None
@@ -122,6 +135,37 @@ def _fmt(h: NeighborHealth) -> str:
     return f"- {label} {h.service}: {h.metric} {val}{tail}"
 
 
+async def _evaluate_impact(primary: str, dependency: str, attribution: str) -> ImpactEdge:
+    """s4.2: the caller's failures attributed to `dependency`, now vs a baseline
+    `offset` ago. A delta over the floor = materially impacted (real symptom);
+    ~0 = unhealthy dependency but the caller isn't actually feeling it."""
+    try:
+        cur = await _instant_scalar(attribution)
+        base = await _instant_scalar(attribution, at=f"now-{settings.signal_health_baseline_offset}")
+    except Exception as e:
+        logger.warning("impact query for %s→%s failed: %s", primary, dependency, e)
+        cur = None
+        base = None
+    if cur is None:
+        return ImpactEdge(primary=primary, dependency=dependency, current=None,
+                          baseline=base, delta=None, verdict="unavailable")
+    base = base or 0.0
+    delta = cur - base
+    verdict = "rising" if delta > settings.signal_health_impact_min_delta else "flat"
+    return ImpactEdge(primary=primary, dependency=dependency, current=cur,
+                      baseline=base, delta=delta, verdict=verdict)
+
+
+def _fmt_impact(im: ImpactEdge) -> str:
+    if im.verdict == "unavailable":
+        return (f"- impact of {im.dependency} on {im.primary}: unavailable "
+                "(no attribution metric reading)")
+    tail = (" — RISING (materially impacted)" if im.verdict == "rising"
+            else " — flat (no material rise; baseline-level)")
+    return (f"- impact of {im.dependency} on {im.primary}: failures attributed to it "
+            f"{im.current:.3g}/s (baseline {im.baseline:.3g}/s, Δ{im.delta:+.3g}/s){tail}")
+
+
 async def evaluate_dependency_health(services: list[str]) -> str | None:
     """For the service(s) under investigation, evaluate each neighbour's health
     live and return a context block that tells the agent which way blame flows.
@@ -168,11 +212,30 @@ async def evaluate_dependency_health(services: list[str]) -> str | None:
     bad_deps = [h.service for h in evaluated if h.relation == "downstream" and h.verdict == "unhealthy"]
     had_deps = any(h.relation == "downstream" for h in evaluated)
 
+    # s4.2: for each unhealthy downstream a primary declares an attribution edge
+    # to, measure whether the primary's failures attributed to it actually ROSE
+    # (vs baseline) — the difference between adjacent and materially impacted.
+    impacts: list[ImpactEdge] = []
+    for p in sorted(primaries):
+        for dep in bad_deps:
+            attr = topo.attribution_for(p, dep)
+            if attr:
+                impacts.append(await _evaluate_impact(p, dep, attr))
+    lines += [_fmt_impact(im) for im in impacts]
+    rising = [im for im in impacts if im.verdict == "rising"]
+    flat = [im for im in impacts if im.verdict == "flat"]
+
     if bad_self and bad_deps:
+        rise_note = (
+            f" Its failures attributed to {', '.join(sorted({im.dependency for im in rising}))} "
+            "ROSE vs baseline — the breach is inherited from that dependency."
+            if rising else ""
+        )
         verdict = (
             f"→ {', '.join(bad_self)} is breaching its own error SLO AND a downstream "
             f"dependency ({', '.join(bad_deps)}) is unhealthy — likely a cascading "
-            "failure. Determine whether the breach is caused by the unhealthy dependency."
+            "failure." + (rise_note or " Determine whether the breach is caused by the "
+            "unhealthy dependency.")
         )
     elif bad_self:
         deps_note = (
@@ -185,12 +248,31 @@ async def evaluate_dependency_health(services: list[str]) -> str | None:
             "correlate with git_version (sum by git_version,reason) to find which deploy "
             "introduced it."
         )
+    elif bad_deps and rising:
+        # s4.2: attribution metric confirms the primary IS feeling the dependency.
+        svcs = ", ".join(sorted({im.primary for im in rising}))
+        deps = ", ".join(sorted({im.dependency for im in rising}))
+        verdict = (
+            f"→ Confirmed: {svcs} IS materially impacted by {deps} — its own failures "
+            "attributed to that dependency ROSE vs baseline (see impact line). It is a "
+            f"genuine SYMPTOM; fix {deps} to restore it."
+        )
+    elif bad_deps and flat:
+        # s4.2: dependency unhealthy but the primary's attributed-failure rate did
+        # NOT rise → topologically adjacent, not materially impacted. Directly
+        # resolves the Q2 over-claim instead of just asking the agent to confirm.
+        deps = ", ".join(sorted({im.dependency for im in flat}))
+        svcs = ", ".join(sorted({im.primary for im in flat}))
+        verdict = (
+            f"→ {deps} is unhealthy, but {svcs}'s own failures attributed to it did NOT "
+            "rise vs baseline (Δ≈0, see impact line) — it is NOT materially impacted by "
+            f"this incident, only topologically adjacent. Fix {deps} as its own problem; "
+            f"do not report {svcs} as a symptom of it."
+        )
     elif bad_deps:
-        # Self is healthy here (the self+downstream case is the cascade branch
-        # above). An unhealthy downstream alone does NOT prove this service is
-        # dragged — its own SLI being healthy is evidence it may NOT be. Tell the
-        # agent to CONFIRM impact before claiming symptom, rather than assert it
-        # from topology (the Q2 over-claim this fixes).
+        # Downstream unhealthy, no attribution metric declared to measure impact.
+        # Fall back to s4.1: self is healthy, so tell the agent to confirm before
+        # claiming symptom rather than assert it from topology.
         verdict = (
             "→ A downstream dependency is unhealthy ("
             + ", ".join(bad_deps)

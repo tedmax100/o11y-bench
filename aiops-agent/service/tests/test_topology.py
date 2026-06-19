@@ -50,6 +50,16 @@ def test_shipped_topology_loads():
     assert t.upstream("payment-service") == ["api-gateway", "order-service"]
 
 
+def test_shipped_topology_declares_order_attribution():
+    # s4.2: order's edges to its deps carry an attribution query; others don't.
+    get_topology.cache_clear()
+    t = get_topology()
+    assert "orders_total" in (t.attribution_for("order-service", "payment-service") or "")
+    assert "orders_total" in (t.attribution_for("order-service", "user-service") or "")
+    assert t.attribution_for("api-gateway", "payment-service") is None  # not declared
+    assert t.attribution_for("order-service", "webapp") is None         # no such edge
+
+
 def test_unknown_node_queries_are_empty_not_error():
     t = _topo()
     assert t.node("nope") is None

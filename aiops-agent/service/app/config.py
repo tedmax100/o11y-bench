@@ -154,6 +154,13 @@ class Settings(BaseSettings):
     signal_dependency_health_enabled: bool = True
     signal_health_error_threshold: float = 0.05
     signal_health_max_neighbors: int = 6
+    # s4.2 edge-attributed impact: when a downstream is unhealthy, measure the
+    # caller's own failures attributed to it (the edge's `attribution` query) now
+    # vs a baseline `offset` ago. A per-second delta over the floor means the
+    # caller is *materially* impacted (a real symptom), not just topologically
+    # adjacent — so a baseline-level rate isn't mistaken for incident impact.
+    signal_health_baseline_offset: str = "1h"
+    signal_health_impact_min_delta: float = 0.05
 
     host: str = "0.0.0.0"
     port: int = 8000
