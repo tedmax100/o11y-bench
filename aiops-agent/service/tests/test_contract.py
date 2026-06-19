@@ -81,6 +81,42 @@ def test_metric_basenames_strip_suffixes():
     assert c.metric_basenames() == {"foo_duration_seconds", "bar_total"}
 
 
+def test_weaver_prom_metric_names_parses_note(tmp_path):
+    from app.signals.weaver import weaver_prom_metric_names
+    reg = tmp_path / "metrics.yaml"
+    reg.write_text(
+        "groups:\n"
+        "  - id: m1\n    type: metric\n    metric_name: app.foo.count\n"
+        '    note: "Current code metric: `foo_total`."\n'
+        "  - id: g\n    type: attribute_group\n"
+        '    note: "Current code metric: `ignored`."\n',
+        encoding="utf-8",
+    )
+    assert weaver_prom_metric_names(reg) == {"foo_total"}
+
+
+def test_validate_against_weaver_flags_undeclared():
+    from app.signals.contract import validate_against_weaver
+    pay = contract_for("payment-service")
+    warns = validate_against_weaver(pay, {"payment_charges_total"})  # missing the duration metric
+    assert any("payment_charge_duration_seconds" in w and "Weaver" in w for w in warns)
+
+
+def test_shipped_contracts_align_with_weaver():
+    # Regression guard: every contract SLI references a metric the Weaver semconv
+    # registry declares (the schema single source of truth).
+    from app.signals.contract import get_contracts, validate_against_weaver
+    from app.signals.weaver import weaver_prom_metric_names
+    weaver = weaver_prom_metric_names()  # repo registry (dev/CI)
+    if not weaver:
+        import pytest
+        pytest.skip("weaver registry not available in this environment")
+    assert "payment_charges_total" in weaver
+    get_contracts.cache_clear()
+    for c in get_contracts().contracts:
+        assert validate_against_weaver(c, weaver) == [], f"{c.service} drifts from Weaver"
+
+
 def test_validate_against_live_flags_missing():
     pay = contract_for("payment-service")
     # all referenced metrics present → no warnings

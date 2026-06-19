@@ -147,6 +147,10 @@ class Settings(BaseSettings):
     # Per-service signal contracts (s3): authoritative SLI queries + freshness +
     # exclusions. Empty path → contracts.yaml shipped beside app/signals/.
     signal_contracts_path: str = ""
+    # Weaver semconv registry path (schema single source of truth). Empty →
+    # repo-root demo-services/weaver/registry (dev/CI only; not shipped in the
+    # agent image). Used by the dev-time contract↔registry alignment check.
+    weaver_registry_path: str = ""
     # Dependency-health blame propagation (s4): before the agent loop, run each
     # neighbour's error SLI live (read-only, off the agent budget) so the agent
     # knows whether the symptom is inherited from a failing downstream dep. A

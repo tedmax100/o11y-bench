@@ -117,6 +117,17 @@ def validate_against_live(contract: SignalContract, live_metric_names: list[str]
     ]
 
 
+def validate_against_weaver(contract: SignalContract, weaver_metric_names: set[str]) -> list[str]:
+    """Pure check: SLI metric base-names this contract references that the Weaver
+    semconv registry does NOT declare (contract drifting from the schema source
+    of truth). See app/signals/weaver.py for the registry name extraction."""
+    return [
+        f"{contract.service}: SLI references '{m}' not declared in the Weaver registry"
+        for m in sorted(contract.metric_basenames())
+        if m not in weaver_metric_names
+    ]
+
+
 # ---- CLI: validate contracts against live telemetry ------------------------
 
 if __name__ == "__main__":  # pragma: no cover
