@@ -71,19 +71,23 @@ async def test_self_breaching_with_no_downstream_is_root_cause(monkeypatch):
     assert "Do NOT dismiss this as normal" in block
 
 
-async def test_unhealthy_downstream_marks_symptom(monkeypatch):
+async def test_unhealthy_downstream_but_self_healthy_is_cautious(monkeypatch):
     # order-service investigated; itself healthy but downstream payment on fire.
+    # s4.1 (Q2 fix): must NOT assert order is a symptom — its own SLI is healthy,
+    # so tell the agent to confirm impact before blaming the dependency.
     monkeypatch.setattr(health, "_instant_scalar", _fake_scalar({
         "payment_charges_total": 0.12,   # payment error SLI → unhealthy
         "user_lookups_total": 4.7,       # user throughput
-        # orders_total (order's own + nothing) → default 0.0 → order healthy
+        # orders_total (order's own) → default 0.0 → order healthy
     }))
     block = await evaluate_dependency_health(["order-service"])
     assert "this service order-service: error 0.0% — healthy" in block
     assert "downstream payment-service: error 12.0% — UNHEALTHY" in block
     assert "liveness only" in block  # user-service throughput
-    assert "SYMPTOM" in block
-    assert "investigate the unhealthy dependency first" in block
+    # cautious wording, not an over-claim
+    assert "HEALTHY SLIs themselves" in block
+    assert "CONFIRM they actually see failures attributed to that dependency" in block
+    assert "Fix the unhealthy dependency regardless" in block
 
 
 async def test_self_and_downstream_both_unhealthy_is_cascade(monkeypatch):

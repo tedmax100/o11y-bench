@@ -186,11 +186,20 @@ async def evaluate_dependency_health(services: list[str]) -> str | None:
             "introduced it."
         )
     elif bad_deps:
+        # Self is healthy here (the self+downstream case is the cascade branch
+        # above). An unhealthy downstream alone does NOT prove this service is
+        # dragged — its own SLI being healthy is evidence it may NOT be. Tell the
+        # agent to CONFIRM impact before claiming symptom, rather than assert it
+        # from topology (the Q2 over-claim this fixes).
         verdict = (
             "→ A downstream dependency is unhealthy ("
             + ", ".join(bad_deps)
-            + "). The service(s) under investigation are likely showing a SYMPTOM, "
-            "not the root cause — investigate the unhealthy dependency first."
+            + "), but the service(s) under investigation show HEALTHY SLIs themselves. "
+            "An unhealthy downstream does NOT by itself mean they are impacted — before "
+            "calling them a symptom, CONFIRM they actually see failures attributed to that "
+            "dependency (e.g. their own upstream-error / cancelled-by-dependency count, "
+            "not just their overall error SLI). Fix the unhealthy dependency regardless; "
+            "it is the primary problem to investigate."
         )
     elif had_deps:
         verdict = (

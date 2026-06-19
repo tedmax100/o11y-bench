@@ -184,3 +184,25 @@ class SignalContract(BaseModel):
 | confident-wrong 是最危險失敗（ch3.6 / ch5.9） | s4 blame propagation + freshness/drift 顯式 → 從根上收斂 |
 
 > 一句話：把目前靠 LLM「讀懂 `schema_catalog.md` 散文」的 Signal 補貼，換成**宣告 → 對齊遙測 → 帶 drift/freshness 標記**的 decision-grade artifact，餵進不動的唯讀推論核心；RCA 的 confident-wrong 從地基收斂，後面 step7 的 Act 才站得穩。
+
+---
+
+## 6. Backlog / 已知缺口（k3d live 驗收 2026-06-19 揪出）
+
+s1–s4 + A/B 在 live k3d incident 下驗收：payment 根因 RCA、deploy correlation、
+v2.4.1↔v2.5.0 code diff 全正確（confident-wrong 被 A/B 扳回）。仍掛兩項：
+
+- **s4.1 — blame-confirm（Q2 過度宣稱）**：問「order 被下游拖累嗎」時，s4 正確標出
+  下游 payment UNHEALTHY，但 agent 斷言 order 業務被拖累——資料不支持（order
+  `created` 2.37/s、`cancelled{reason=payment}` 僅 0.017/s；declines 幾乎全來自直
+  灌 payment 的測試流量，繞過 order）。根因：blame 是**啟發式提示非證明**，且 order
+  的 error SLI（status=error）量不到「歸因於 payment 的取消」（status=cancelled,
+  reason=payment）。**修法分兩層**：(a) 立即——self 健康 + 下游不健康時，verdict
+  改口「下游不健康但本服務 SLI 健康，先驗本服務是否真的吃到該依賴的失敗再斷言症狀」；
+  (b) 進階（s4.2）——讓 topology edge 宣告「caller 如何歸因 callee 失敗」的指標
+  （如 `orders_total{reason="payment"}`），s4 直接量上游受影響程度。
+- **log signal contract（Loki 查詢生成 bug）**：agent 自寫 LogQL 常用錯 selector
+  `{service=...}`（應 `service_name=`）並捏造 `event="error"`（真實值 `order.cancelled`
+  等）。s1–s4 只管 metric/topology，沒碰 LogQL 生成。自然延伸 = 把 s3 contract 擴到
+  **per-service 權威 LogQL**（宣告錯誤事件的正確 stream selector + `event=` 值），像
+  metric SLI 一樣注入。對齊 RCA findings memory 早記的 LogQL 生成問題。
