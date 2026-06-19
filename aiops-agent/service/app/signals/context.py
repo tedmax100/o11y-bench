@@ -6,19 +6,30 @@ journey membership, and the dependency neighbourhood — so the agent reasons
 about *which node to blame* with the topology as a first-class input instead of
 inferring it from the catalog prose.
 
-Pure and I/O-free (reads the cached static topology), so it can be called inline
-on both the headless and chat paths without adding a network round-trip. s3/s4
-extend the same block with signal contracts (authoritative SLIs) and live
-dependency health.
+Pure and I/O-free (reads the cached static topology + the cached reconcile
+snapshot), so it can be called inline on both the headless and chat paths
+without adding a network round-trip. When a reconcile (s2) has run, declared
+edges not seen in recent traces are marked ⚠, observed-but-undeclared edges are
+surfaced, and a DQ score is shown — turning the static graph into one the agent
+knows is (or isn't) aligned to live telemetry. s3/s4 extend the same block with
+signal contracts (authoritative SLIs) and live dependency health.
 """
 
 from __future__ import annotations
 
 from ..config import settings
+from .reconcile import TopologyDrift, get_last_drift
 from .topology import get_topology, tier_label
 
 
-def _service_block(svc: str) -> str | None:
+def _annotate(edge: tuple[str, str], drift: TopologyDrift | None) -> str:
+    """Mark a declared edge ⚠ if a reconcile saw no traffic on it."""
+    if drift and any((e.caller, e.callee) == edge for e in drift.unobserved_edges):
+        return " (⚠ declared, not seen in recent traces)"
+    return ""
+
+
+def _service_block(svc: str, drift: TopologyDrift | None) -> str | None:
     topo = get_topology()
     node = topo.node(svc)
     if node is None:
@@ -27,28 +38,53 @@ def _service_block(svc: str) -> str | None:
     lines = [f"### {svc}"]
 
     crit = f"tier-{node.tier} ({tier_label(node.tier)})"
-    journeys = node.journeys or []
-    if journeys:
+    if node.journeys:
         parts = []
-        for j in journeys:
+        for j in node.journeys:
             pos = topo.journey_position(j, svc)
             parts.append(f"{j} ({pos[0]}/{pos[1]})" if pos else j)
         crit += "; journey: " + ", ".join(parts)
     lines.append(f"- criticality: {crit}")
 
     up = topo.upstream(svc)
-    lines.append(
-        f"- upstream (callers — degrade if this fails): {', '.join(up)}"
-        if up else "- upstream (callers): none (entry point)"
-    )
+    if up:
+        rendered = ", ".join(c + _annotate((c, svc), drift) for c in up)
+        lines.append(f"- upstream (callers — degrade if this fails): {rendered}")
+    else:
+        lines.append("- upstream (callers): none (entry point)")
 
     down = topo.downstream(svc)
-    lines.append(
-        f"- downstream (dependencies — could be blocking this): {', '.join(down)}"
-        if down else "- downstream (dependencies): none (leaf — not blocked by anything downstream)"
-    )
+    if down:
+        rendered = ", ".join(d + _annotate((svc, d), drift) for d in down)
+        lines.append(f"- downstream (dependencies — could be blocking this): {rendered}")
+    else:
+        lines.append("- downstream (dependencies): none (leaf — not blocked by anything downstream)")
+
+    # Observed-but-undeclared edges touching this service: the topology is
+    # incomplete here, so the agent shouldn't treat the declared graph as closed.
+    if drift:
+        extra = [
+            f"{e.caller} → {e.callee}"
+            for e in drift.undeclared_edges
+            if svc in (e.caller, e.callee)
+        ]
+        if extra:
+            lines.append("- ⚠ observed dependencies NOT in the declared topology: " + ", ".join(extra))
 
     return "\n".join(lines)
+
+
+def _dq_note(drift: TopologyDrift | None) -> str:
+    if not drift or not drift.traces_sampled:
+        return ""
+    score = "n/a" if drift.dq_score is None else f"{drift.dq_score:.0%}"
+    note = (
+        f"\nTopology data-quality (last reconcile, {drift.traces_sampled} traces): "
+        f"declared/observed agreement {score}."
+    )
+    if drift.dq_score is not None and drift.dq_score < 1.0:
+        note += " ⚠ the declared graph is out of date vs live traffic — trust the trace evidence over it where they disagree."
+    return note
 
 
 def build_signal_context(services: list[str]) -> str | None:
@@ -58,7 +94,8 @@ def build_signal_context(services: list[str]) -> str | None:
     if not settings.signal_plane_enabled:
         return None
     topo = get_topology()
-    blocks = [b for svc in services[:3] if (b := _service_block(svc))]
+    drift = get_last_drift()
+    blocks = [b for svc in services[:3] if (b := _service_block(svc, drift))]
     if not blocks:
         return None
     return (
@@ -67,5 +104,5 @@ def build_signal_context(services: list[str]) -> str | None:
         "question. Use this to attribute root cause to the right node: a failing "
         "service may be a *symptom* of a failing downstream dependency, not the "
         "cause. Higher-tier services on a user journey matter more when triaging "
-        "multiple simultaneous alerts.\n\n" + "\n\n".join(blocks)
+        "multiple simultaneous alerts." + _dq_note(drift) + "\n\n" + "\n\n".join(blocks)
     )
