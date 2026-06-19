@@ -41,12 +41,24 @@ class SLI(BaseModel):
     unit: str = ""                 # ratio | s | rps | …
 
 
+class LogSignal(BaseModel):
+    """Authoritative LogQL for a service — the correct stream selector and the
+    real `event=` values that mark failures. Declared because agents reliably get
+    these wrong (use `{service=...}` instead of `{service_name=...}`, invent
+    `event="error"` / `event="order_failed"` that don't exist)."""
+    selector: str                  # e.g. {service_name="payment-service"}
+    error_events: list[str] = Field(default_factory=list)  # real event= values for failures
+    error_query: str = ""          # representative authoritative LogQL to surface failures
+    note: str = ""
+
+
 class SignalContract(BaseModel):
     service: str
     freshness_seconds: int = 60    # samples older than this → treat as stale
     slis: list[SLI] = Field(default_factory=list)
     supported_decisions: list[str] = Field(default_factory=list)
     exclusions: list[str] = Field(default_factory=list)
+    logs: LogSignal | None = None  # authoritative log selector + failure events
 
     def metric_basenames(self) -> set[str]:
         """Metric families referenced by this contract's SLIs (suffix-stripped),

@@ -92,6 +92,20 @@ def _contract_lines(svc: str) -> list[str]:
             target = f"  target: {sli.objective}" if sli.objective else ""
             lines.append(f"    {sli.kind}: {sli.promql}{unit}{target}")
         lines.append(f"- signal freshness guarantee: ≤{contract.freshness_seconds}s (older samples are stale)")
+    if contract.logs:
+        lg = contract.logs
+        lines.append(
+            "- Logs (authoritative — use THIS selector & event values; do NOT use "
+            "`{service=...}` or invent event names like `event=\"error\"`):"
+        )
+        lines.append(f"    stream selector: {lg.selector}")
+        if lg.error_events:
+            lines.append(f"    failure events (filter after the selector with `| event=\"…\"`): "
+                         + ", ".join(lg.error_events))
+        if lg.error_query:
+            lines.append(f"    find failures: {lg.error_query}")
+        if lg.note:
+            lines.append(f"    note: {lg.note}")
     for ex in contract.exclusions:
         lines.append(f"- caveat: {ex}")
     return lines

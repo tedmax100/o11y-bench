@@ -42,6 +42,11 @@ contracts:
     exclusions:
       - "No up{} for application services (remote_write, not scraped); judge liveness via rate(payment_charges_total[5m]) > 0."
       - "A declined-rate spike ABOVE the objective is an incident, not normal business — do NOT dismiss declines as expected. Break it down with `sum by (git_version, reason) (rate(payment_charges_total{status=\"declined\"}[5m]))` to find which deploy/reason drives it (e.g. the new_validator flag shipping in a release)."
+    logs:
+      selector: '{service_name="payment-service"}'
+      error_events: [payment.declined, payment.gateway_error]
+      error_query: 'sum by (git_version, reason) (count_over_time({service_name="payment-service"} | event=~"payment.declined|payment.gateway_error" [5m]))'
+      note: "Selector key is service_name (NOT service). event/reason are structured metadata — filter AFTER the selector with `| event=\"...\"`, never as a {...} selector. There is no level/ERROR line and no event=\"error\"."
 
   - service: order-service
     freshness_seconds: 60
@@ -60,6 +65,11 @@ contracts:
         unit: rps
     exclusions:
       - "status=cancelled is a business outcome (auth_failed / payment_declined / unknown_product), not a service error — exclude it from the error SLI; check `reason` to see if a downstream dep is the cause."
+    logs:
+      selector: '{service_name="order-service"}'
+      error_events: [order.cancelled]
+      error_query: 'sum by (reason) (count_over_time({service_name="order-service"} | event="order.cancelled" [5m]))'
+      note: "order.cancelled carries reason=auth_failed|payment_declined|unknown_product. Selector key is service_name (NOT service). No event=\"order_failed\"/\"error\" exists — filter by event=\"order.cancelled\" after the selector."
 
   - service: user-service
     freshness_seconds: 60
@@ -73,6 +83,11 @@ contracts:
         unit: rps
     exclusions:
       - "user-service emits no latency histogram and no explicit error counter; for errors/latency fall back to the auto HTTP server signal and Loki event=user.auth_failed."
+    logs:
+      selector: '{service_name="user-service"}'
+      error_events: [user.auth_failed]
+      error_query: 'sum by (reason) (count_over_time({service_name="user-service"} | event="user.auth_failed" [5m]))'
+      note: "user.auth_failed carries reason=not_found|transient. Selector key is service_name (NOT service); filter event after the selector."
 
   # webapp + api-gateway emit no custom RED metrics — they rely on auto HTTP
   # server instrumentation. The contract records this so the agent discovers the
@@ -84,6 +99,11 @@ contracts:
     exclusions:
       - "No custom application metrics: derive latency/throughput from the auto HTTP server histogram (discover_metrics for the exact name), and errors from Loki event=http.request_failed (carries upstream + status)."
       - "It's a thin proxy — a failure here is usually a *symptom* of a failing downstream (user/order/payment), not an api-gateway bug."
+    logs:
+      selector: '{service_name="api-gateway"}'
+      error_events: [http.request_failed]
+      error_query: 'sum by (upstream, status) (count_over_time({service_name="api-gateway"} | event="http.request_failed" [5m]))'
+      note: "http.request_failed carries upstream + status + reason. Selector key is service_name (NOT service); the `upstream` field points at the failing downstream."
 
   - service: webapp
     freshness_seconds: 60
@@ -92,3 +112,8 @@ contracts:
     exclusions:
       - "No custom application metrics: derive latency/throughput from the auto HTTP server histogram (discover_metrics for the exact name), and errors from Loki event=http.request_failed."
       - "Public edge — an error here usually originates downstream (api-gateway → user/order/payment). Trace the journey before blaming webapp."
+    logs:
+      selector: '{service_name="webapp"}'
+      error_events: [http.request_failed]
+      error_query: 'sum by (upstream, status) (count_over_time({service_name="webapp"} | event="http.request_failed" [5m]))'
+      note: "http.request_failed carries upstream + status. Selector key is service_name (NOT service); filter event after the selector."

@@ -55,6 +55,19 @@ def test_edge_services_have_no_slis_but_caveats():
     assert any("symptom" in ex for ex in gw.exclusions)
 
 
+def test_shipped_contracts_have_log_signals():
+    get_contracts.cache_clear()
+    pay = contract_for("payment-service")
+    assert pay.logs is not None
+    assert pay.logs.selector == '{service_name="payment-service"}'
+    assert "payment.declined" in pay.logs.error_events
+    # even the no-SLI edge services declare a log signal (http.request_failed)
+    gw = contract_for("api-gateway")
+    assert gw.logs is not None
+    assert "http.request_failed" in gw.logs.error_events
+    assert 'service_name="api-gateway"' in gw.logs.selector
+
+
 # ---- metric base-name extraction + live validation -------------------------
 
 def test_metric_basenames_strip_suffixes():
@@ -89,6 +102,17 @@ def test_context_includes_authoritative_sli(monkeypatch):
     assert "target: p95 < 0.2s" in ctx
     assert "freshness guarantee: ≤60s" in ctx
     assert "caveat:" in ctx
+
+
+def test_context_includes_authoritative_logql(monkeypatch):
+    monkeypatch.setattr(ctx_mod, "get_topology", _topo)
+    monkeypatch.setattr(ctx_mod, "get_last_drift", lambda: None)
+    ctx = build_signal_context(["payment-service"])
+    assert "Logs (authoritative" in ctx
+    assert 'stream selector: {service_name="payment-service"}' in ctx
+    assert "payment.declined" in ctx
+    assert 'do NOT use' in ctx and '{service=...}' in ctx  # the anti-pattern warning
+    assert "find failures:" in ctx
 
 
 def test_context_edge_service_shows_caveats_no_sli_header(monkeypatch):
