@@ -197,9 +197,12 @@ order 被拖累的過度宣稱被 s4.1 收掉。仍掛三項：
   self 健康 + 下游不健康時，verdict 改口「下游不健康但本服務 SLI 健康，先驗本服務是否
   真的吃到該依賴的失敗再斷言症狀」。live 驗證 agent 確實去查了 `cancelled{reason=payment}`
   才下結論、不再過度宣稱。**剩進階 s4.2（下）。**
-- **s4.2 — edge-attributed impact metric**：讓 topology edge 宣告「caller 如何歸因
-  callee 失敗」的指標（如 `orders_total{reason="payment"}`），s4 直接量上游**受影響增量**
-  （incident 前後比較），解掉 order 那個「把 baseline 取消當 incident 影響」的因果精度點。
+- **s4.2 — edge-attributed impact metric ✅ 已做（commit 102c8e3）**：topology edge
+  宣告 `attribution` PromQL（caller 歸因 callee 失敗的指標，如 order 的
+  `orders_total{reason=~"payment|payment_upstream"}`），s4 量 current vs baseline-offset
+  的 delta：rising→確認 materially impacted（genuine symptom）/ flat→只是 topologically
+  adjacent、未受實質影響（不報為症狀）/ 無 attribution→退回 s4.1 措辭。解掉 order「把
+  baseline 取消當 incident 影響」的精度點。**剩 live 重驗（需重新觸發 incident）。**
 - **log signal contract（Loki 查詢生成 bug）**：agent 自寫 LogQL 常用錯 selector
   `{service=...}`（應 `service_name=`）並捏造 `event="error"`（真實值 `order.cancelled`
   等）。s1–s4 只管 metric/topology，沒碰 LogQL 生成。自然延伸 = 把 s3 contract 擴到
