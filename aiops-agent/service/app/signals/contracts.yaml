@@ -41,7 +41,7 @@ contracts:
         unit: rps
     exclusions:
       - "No up{} for application services (remote_write, not scraped); judge liveness via rate(payment_charges_total[5m]) > 0."
-      - "declined can be legitimate (odd-cents under the new_validator flag) — correlate with git_version before blaming code."
+      - "A declined-rate spike ABOVE the objective is an incident, not normal business — do NOT dismiss declines as expected. Break it down with `sum by (git_version, reason) (rate(payment_charges_total{status=\"declined\"}[5m]))` to find which deploy/reason drives it (e.g. the new_validator flag shipping in a release)."
 
   - service: order-service
     freshness_seconds: 60

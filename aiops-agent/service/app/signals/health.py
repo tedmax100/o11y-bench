@@ -34,10 +34,11 @@ logger = logging.getLogger("aiops_agent.signals.health")
 
 class NeighborHealth(BaseModel):
     service: str
-    relation: str          # "downstream" (dependency) | "upstream" (caller)
+    relation: str          # "self" (under investigation) | "downstream" (dep) | "upstream" (caller)
     metric: str            # "error" | "throughput"
     value: float | None
     unit: str
+    objective: str = ""    # the SLI's declared target, e.g. "declined_rate < 1%"
     verdict: str           # healthy | unhealthy | unknown | unavailable
 
 
@@ -78,7 +79,7 @@ async def _instant_scalar(expr: str) -> float | None:
     return total if seen else None
 
 
-async def _evaluate_neighbor(svc: str, relation: str) -> NeighborHealth | None:
+async def _evaluate(svc: str, relation: str) -> NeighborHealth | None:
     sli = _health_sli(svc)
     if sli is None:
         return None
@@ -87,7 +88,8 @@ async def _evaluate_neighbor(svc: str, relation: str) -> NeighborHealth | None:
     except Exception as e:
         logger.warning("dependency health: query for %s failed: %s", svc, e)
         return NeighborHealth(service=svc, relation=relation, metric=sli.kind,
-                              value=None, unit=sli.unit, verdict="unavailable")
+                              value=None, unit=sli.unit, objective=sli.objective,
+                              verdict="unavailable")
     if value is None:
         verdict = "unavailable"
     elif sli.kind == "error":
@@ -97,7 +99,7 @@ async def _evaluate_neighbor(svc: str, relation: str) -> NeighborHealth | None:
         # traffic, not an outage) — report it as a liveness-only signal.
         verdict = "unknown"
     return NeighborHealth(service=svc, relation=relation, metric=sli.kind,
-                          value=value, unit=sli.unit, verdict=verdict)
+                          value=value, unit=sli.unit, objective=sli.objective, verdict=verdict)
 
 
 def _fmt(h: NeighborHealth) -> str:
@@ -107,13 +109,17 @@ def _fmt(h: NeighborHealth) -> str:
         val = f"{h.value:.1%}"
     else:
         val = f"{h.value:.2g} {h.unit}".strip()
-    tail = {
-        "unhealthy": " — UNHEALTHY",
-        "healthy": " — healthy",
-        "unknown": " (liveness only; no error SLI)",
-        "unavailable": " — unavailable",
-    }.get(h.verdict, "")
-    return f"- {h.relation} {h.service}: {h.metric} {val}{tail}"
+    label = "this service" if h.relation == "self" else h.relation
+    if h.verdict == "unhealthy":
+        obj = f" (breaches objective {h.objective})" if h.objective else ""
+        tail = f" — UNHEALTHY{obj}"
+    else:
+        tail = {
+            "healthy": " — healthy",
+            "unknown": " (liveness only; no error SLI)",
+            "unavailable": " — unavailable",
+        }.get(h.verdict, "")
+    return f"- {label} {h.service}: {h.metric} {val}{tail}"
 
 
 async def evaluate_dependency_health(services: list[str]) -> str | None:
@@ -137,22 +143,49 @@ async def evaluate_dependency_health(services: list[str]) -> str | None:
     downstream -= primaries
     upstream -= primaries - downstream  # a node can be both; prefer downstream
 
-    targets: list[tuple[str, str]] = (
+    neighbour_targets: list[tuple[str, str]] = (
         [(s, "downstream") for s in sorted(downstream)]
         + [(s, "upstream") for s in sorted(upstream - downstream)]
     )[: settings.signal_health_max_neighbors]
-    if not targets:
-        return None
 
-    results = await asyncio.gather(*(_evaluate_neighbor(s, rel) for s, rel in targets))
+    # Evaluate the service(s) under investigation themselves AND their
+    # neighbours. The self-verdict is what stops the agent dismissing the
+    # service it's asked about as healthy when its own error SLI is breaching.
+    self_targets = [(s, "self") for s in sorted(primaries)]
+    results = await asyncio.gather(
+        *(_evaluate(s, rel) for s, rel in self_targets + neighbour_targets)
+    )
     evaluated = [h for h in results if h is not None]
     if not evaluated:
         return None
 
+    # self first, then downstream, then upstream — order the agent should read.
+    order = {"self": 0, "downstream": 1, "upstream": 2}
+    evaluated.sort(key=lambda h: (order.get(h.relation, 9), h.service))
     lines = [_fmt(h) for h in evaluated]
+
+    bad_self = [h.service for h in evaluated if h.relation == "self" and h.verdict == "unhealthy"]
     bad_deps = [h.service for h in evaluated if h.relation == "downstream" and h.verdict == "unhealthy"]
     had_deps = any(h.relation == "downstream" for h in evaluated)
-    if bad_deps:
+
+    if bad_self and bad_deps:
+        verdict = (
+            f"→ {', '.join(bad_self)} is breaching its own error SLO AND a downstream "
+            f"dependency ({', '.join(bad_deps)}) is unhealthy — likely a cascading "
+            "failure. Determine whether the breach is caused by the unhealthy dependency."
+        )
+    elif bad_self:
+        deps_note = (
+            "its downstream dependencies are healthy" if had_deps
+            else "it has no downstream dependencies to inherit a fault from"
+        )
+        verdict = (
+            f"→ {', '.join(bad_self)} is itself breaching its error SLO and {deps_note} — "
+            "it is the LIKELY ROOT CAUSE, not a symptom. Do NOT dismiss this as normal; "
+            "correlate with git_version (sum by git_version,reason) to find which deploy "
+            "introduced it."
+        )
+    elif bad_deps:
         verdict = (
             "→ A downstream dependency is unhealthy ("
             + ", ".join(bad_deps)
@@ -161,18 +194,18 @@ async def evaluate_dependency_health(services: list[str]) -> str | None:
         )
     elif had_deps:
         verdict = (
-            "→ All evaluated downstream dependencies are healthy, so the fault is "
-            "likely local to the service(s) under investigation, not inherited."
+            "→ Neither the service(s) under investigation nor their downstream "
+            "dependencies show an unhealthy SLI right now."
         )
     else:
         verdict = (
-            "→ No downstream dependencies (leaf service) — the fault originates here, "
-            "not in something it calls."
+            "→ No unhealthy SLI right now; the service(s) under investigation are a "
+            "leaf with no downstream dependencies."
         )
 
     primary_label = ", ".join(sorted(primaries))
     return (
         f"## Dependency health (live) — {primary_label}\n"
-        "Each neighbour's SLI, read just now, to attribute root cause to the right "
+        "Each service's SLI, read just now, to attribute root cause to the right "
         "node:\n" + "\n".join(lines) + "\n" + verdict
     )
