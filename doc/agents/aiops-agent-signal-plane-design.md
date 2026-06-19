@@ -222,13 +222,11 @@ order 被拖累的過度宣稱被 s4.1 收掉。仍掛三項：
   → Prometheus `payment_charges_total`（`.`→`_` + `_total`）的 mapping。模式同構：Weaver
   `live-check`（遙測 vs schema）≈ s2 reconcile（trace vs 宣告 topology）。
 
-  **ownership 重構（同項，更根本）**：現在 `topology.yaml` / `contracts.yaml` 集中放在
-  **agent 端**（`app/signals/`），是 MVP 的務實選擇（單檔、隨 agent image 出貨、好迭代），
-  但本質是 ARE 警告的「會 drift 的中央 wiki page」搬了位置。ARE 主張 ownership/criticality
-  是**服務團隊擁有的 schema**，不是集中在消費端（agent）。終態按 artifact 性質拆兩類：
-  - **per-service（SLI / criticality / owner）**：拆成片段 **co-located 到 demo-services
-    各服務**（像各服務對 Weaver registry 的貢獻），或直接接 Weaver registry；agent 只
-    負責**聚合**，不持有手維護的中央副本。
-  - **跨服務（依賴圖 topology）**：系統級 artifact，**從 trace 衍生**（s2 reconcile 已在
-    做反推），可不必手宣告——宣告檔退化成「種子 + drift 告警基準」。
-  收斂後 agent 端只剩聚合邏輯 + 衍生快取，schema/ownership 的真相來源回到服務側與 Weaver。
+  **ownership 重構（同項，更根本）✅ 已做（commit 見下）**：每服務在
+  `demo-services/services/<svc>/signal.yaml` **擁有自己的宣告**（tier/journey 成員/slis/
+  logs/exclusions/`depends_on`+attribution）。`app/signals/compile.py` 仿 Weaver 模式
+  （去中心化貢獻 → 編譯產物）把 fragments 聚合成 agent 出貨的 `topology.yaml`/
+  `contracts.yaml`（標 GENERATED、DO NOT EDIT）。dev/CI 編譯（agent image 無 demo-services），
+  runtime loader 不變。**跨服務 topology = 各服務出邊的聯集（caller 擁有）**；**journey 鏈從邊
+  topo-sort 推導**（不再中央宣告）。回歸測試 `test_compile` pin fragments↔生成檔同步。
+  剩可選：把 compile 接進 CI、journey 成員/順序的更嚴格 drift 告警（與 s2 reconcile 合流）。

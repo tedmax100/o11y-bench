@@ -151,6 +151,11 @@ class Settings(BaseSettings):
     # repo-root demo-services/weaver/registry (dev/CI only; not shipped in the
     # agent image). Used by the dev-time contract↔registry alignment check.
     weaver_registry_path: str = ""
+    # Per-service signal fragments (ownership: each service owns its declaration).
+    # Empty → repo-root demo-services/services (dev/CI only). The compiler
+    # (app/signals/compile.py) aggregates *.signal.yaml into the agent's
+    # topology.yaml/contracts.yaml; the agent ships those compiled artifacts.
+    signal_fragments_dir: str = ""
     # Dependency-health blame propagation (s4): before the agent loop, run each
     # neighbour's error SLI live (read-only, off the agent budget) so the agent
     # knows whether the symptom is inherited from a failing downstream dep. A
