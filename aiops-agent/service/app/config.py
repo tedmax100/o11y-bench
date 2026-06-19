@@ -136,6 +136,15 @@ class Settings(BaseSettings):
     # the execution plane itself triggers. See app/store.py.
     store_path: str = "aiops.db"
 
+    # --- Signal Plane (decision-grade telemetry; signal-plane-design s1) ----
+    # A first-class topology/criticality/journey artifact injected into the RCA
+    # as decision-grade context, replacing the prose dependency graph in the
+    # catalog. Read-only enrichment upstream of the reasoning core; fail-open —
+    # an unreadable artifact is skipped, never blocking a run. `topology_path`
+    # empty → the topology.yaml shipped beside app/signals/.
+    signal_plane_enabled: bool = True
+    topology_path: str = ""
+
     host: str = "0.0.0.0"
     port: int = 8000
 

@@ -15,6 +15,7 @@ from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel, Field
 
 from .capability import capability_for_services, resolve_services
+from .signals.context import build_signal_context
 from .config import settings
 from .runbook import (
     format_diagnostics,
@@ -768,6 +769,18 @@ Follow this RCA method (in order; stop once you can state a confident cause; min
    version/reason, say so with LOW confidence — do not invent a cause."""
 
 
+def _inject_signal_context(turn_messages: list, services: list[str]) -> None:
+    """Append the decision-grade Signal context (topology / criticality /
+    dependency neighbourhood) for the RCA's service(s). Fail-open enrichment:
+    a failure to build it just means no extra context, never a broken run."""
+    try:
+        ctx = build_signal_context(services)
+        if ctx:
+            turn_messages.append(SystemMessage(content=ctx))
+    except Exception as e:
+        logger.warning("signal context injection failed for %s: %s", services, e)
+
+
 async def _inject_runbook(turn_messages: list, labels: dict, annotations: dict):
     """Match a runbook to the alert; inject its rendered guidance (Tier 0) and,
     if enabled, the results of auto-running its read-only diagnostics (Tier 1).
@@ -805,6 +818,7 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
             turn_messages.append(SystemMessage(content=await capability_for_services([service])))
         except Exception as e:
             logger.warning("headless: capability snapshot failed for %s: %s", service, e)
+        _inject_signal_context(turn_messages, [service])
 
     # Runbook (v3 §5): if this alert matches a runbook, inject its rendered steps
     # (Tier 0) and auto-run its read-only diagnostics (Tier 1) so the agent
@@ -996,10 +1010,12 @@ async def stream_chat(
     #    this turn (Phase D-2); confident match → inject; nothing → no injection.
     turn_messages: list = []
     snapshot: str | None = None
+    resolved: list[str] = []
     yield _status("locating")
     try:
         if service_hint:
-            snapshot = await capability_for_services([service_hint])
+            resolved = [service_hint]
+            snapshot = await capability_for_services(resolved)
         else:
             resolution = await resolve_services(message)
             if resolution["candidates"]:
@@ -1011,12 +1027,15 @@ async def stream_chat(
                 yield {"type": "done"}
                 return
             if resolution["services"]:
-                snapshot = await capability_for_services(resolution["services"])
+                resolved = resolution["services"]
+                snapshot = await capability_for_services(resolved)
     except Exception as e:
         logger.warning("capability/resolve failed, continuing without it: %s", e)
 
     if snapshot:
         turn_messages.append(SystemMessage(content=snapshot))
+    if resolved:
+        _inject_signal_context(turn_messages, resolved)
     turn_messages.append({"role": "user", "content": message})
 
     # Accumulate the answer text so we can suggest follow-ups from it afterward.

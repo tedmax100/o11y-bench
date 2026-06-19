@@ -29,7 +29,11 @@ label on every signal. **Only `payment-service` currently has real git tags**
 (`v2.4.1` → `v2.5.0`); `github_compare` on the other services 404s, so only run
 deploy correlation for payment-service.
 
-Dependency edges (caller → callee):
+Dependency edges (caller → callee). The **authoritative, queryable** version of
+this graph — plus criticality tier and journey membership — is the Signal Plane
+topology (`app/signals/topology.yaml`), injected per-RCA as a "Signal context"
+block; **trust that block over this prose** when present. This stays as the
+fallback for when signal context isn't injected:
 
 ```
 webapp → api-gateway

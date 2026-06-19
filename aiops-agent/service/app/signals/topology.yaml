@@ -1,0 +1,52 @@
+# Signal Plane — service topology as a first-class, versioned artifact.
+#
+# This replaces the prose dependency graph that used to live in
+# schema_catalog.md (the hand-maintained wiki page ARE warns against). Every
+# value here is migrated from existing, verified facts in that catalog — no new
+# dependency assumptions are introduced at s1. s2 (reconcile.py) reconciles
+# these declared edges against the live Tempo call graph and flags drift.
+#
+# tier: criticality. 1 = revenue/edge-critical, 2 = important, 3 = best-effort.
+#   webapp/api-gateway/order/payment are all on the checkout journey → tier-1.
+#   user-service is off the checkout main chain → tier-2.
+version: "1.0.0"
+
+journeys:
+  # Ordered service chain of the checkout user journey (root → leaf).
+  checkout: [webapp, api-gateway, order-service, payment-service]
+
+nodes:
+  - name: webapp
+    role: "public edge — receives external HTTP, forwards to api-gateway"
+    tier: 1
+    journeys: [checkout]
+    git_version: v5.2.0
+  - name: api-gateway
+    role: "thin proxy router to backend services"
+    tier: 1
+    journeys: [checkout]
+    git_version: v4.0.0
+  - name: order-service
+    role: "products / cart / orders; calls user + payment"
+    tier: 1
+    journeys: [checkout]
+    git_version: v3.1.2
+  - name: payment-service
+    role: "charges; has the payment_use_new_validator flag"
+    tier: 1
+    journeys: [checkout]
+    git_version: v2.4.1
+  - name: user-service
+    role: "user lookup + auth check"
+    tier: 2
+    journeys: []
+    git_version: v1.3.0
+
+# Declared caller → callee dependency edges.
+edges:
+  - {caller: webapp, callee: api-gateway}
+  - {caller: api-gateway, callee: user-service}
+  - {caller: api-gateway, callee: order-service}
+  - {caller: api-gateway, callee: payment-service}
+  - {caller: order-service, callee: user-service}
+  - {caller: order-service, callee: payment-service}
