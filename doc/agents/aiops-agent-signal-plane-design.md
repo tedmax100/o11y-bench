@@ -209,8 +209,10 @@ order 被拖累的過度宣稱被 s4.1 收掉。仍掛三項：
   對 schema_catalog BizEvent enum 驗證）+ 代表性 error_query。context 注入「Logs (authoritative)」
   區塊，明確指示用此 selector/events、**不要** `{service=...}` 或捏造 `event="error"`。
   **剩 live 重驗**（看 agent 是否改用正確 LogQL）。
-- **contract ↔ Weaver registry 對齊（schema 單一真相來源）**：`contracts.yaml` 目前
-  **硬寫** metric 名（`payment_charges_total` 等），踩到「hardcoded demo schema」風險。
+- **contract ↔ Weaver registry 對齊（schema 單一真相來源）◾ schema 半邊已做（commit c6f601e）**：
+  `app/signals/weaver.py` 從 registry note 抽 Prom 名 + `validate_against_weaver()` dev/CI 守門，
+  確認 contract SLI 只引用 registry 宣告的 metric（6/6 對齊）。**剩 ownership 重構（下方）。**
+  原始說明：`contracts.yaml` 曾**硬寫** metric 名（`payment_charges_total` 等），踩到「hardcoded demo schema」風險。
   repo 已有 Weaver semconv registry（`demo-services/weaver/registry/model/metrics.yaml`
   宣告 `metric.app.payment.charges.count`，註解 `Current code metric: payment_charges_total`）。
   ARE 的 Signal Plane 分兩層：**Weaver registry = schema/semantic 半邊**（名字/語意/型別/
