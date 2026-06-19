@@ -22,9 +22,11 @@ contracts:
     supported_decisions: [rca, deploy-correlation]
     slis:
       - kind: error
-        # Share of charge attempts that were declined. clamp_min guards the
-        # divide when there's no traffic in the window.
-        promql: 'sum(rate(payment_charges_total{status="declined"}[5m])) / clamp_min(sum(rate(payment_charges_total[5m])), 1)'
+        # Share of charge attempts that were declined. `or vector(0)` makes the
+        # numerator 0 (not an empty vector) when there are no declines, and
+        # clamp_min keeps the denominator ≥1, so the ratio is a well-defined 0.0
+        # under healthy traffic instead of an empty/undefined result.
+        promql: '(sum(rate(payment_charges_total{status="declined"}[5m])) or vector(0)) / clamp_min(sum(rate(payment_charges_total[5m])) or vector(0), 1)'
         objective: "declined_rate < 1%"
         unit: ratio
       - kind: latency
@@ -46,7 +48,7 @@ contracts:
     supported_decisions: [rca]
     slis:
       - kind: error
-        promql: 'sum(rate(orders_total{status="error"}[5m])) / clamp_min(sum(rate(orders_total[5m])), 1)'
+        promql: '(sum(rate(orders_total{status="error"}[5m])) or vector(0)) / clamp_min(sum(rate(orders_total[5m])) or vector(0), 1)'
         objective: "error_rate < 1%"
         unit: ratio
       - kind: latency
