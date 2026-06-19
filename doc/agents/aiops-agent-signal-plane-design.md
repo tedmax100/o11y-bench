@@ -189,20 +189,29 @@ class SignalContract(BaseModel):
 
 ## 6. Backlog / 已知缺口（k3d live 驗收 2026-06-19 揪出）
 
-s1–s4 + A/B 在 live k3d incident 下驗收：payment 根因 RCA、deploy correlation、
-v2.4.1↔v2.5.0 code diff 全正確（confident-wrong 被 A/B 扳回）。仍掛兩項：
+s1–s4 + A/B + s4.1 在 live k3d incident 下驗收：payment 根因 RCA、deploy
+correlation、v2.4.1↔v2.5.0 code diff 全正確（confident-wrong 被 A/B 扳回），
+order 被拖累的過度宣稱被 s4.1 收掉。仍掛三項：
 
-- **s4.1 — blame-confirm（Q2 過度宣稱）**：問「order 被下游拖累嗎」時，s4 正確標出
-  下游 payment UNHEALTHY，但 agent 斷言 order 業務被拖累——資料不支持（order
-  `created` 2.37/s、`cancelled{reason=payment}` 僅 0.017/s；declines 幾乎全來自直
-  灌 payment 的測試流量，繞過 order）。根因：blame 是**啟發式提示非證明**，且 order
-  的 error SLI（status=error）量不到「歸因於 payment 的取消」（status=cancelled,
-  reason=payment）。**修法分兩層**：(a) 立即——self 健康 + 下游不健康時，verdict
-  改口「下游不健康但本服務 SLI 健康，先驗本服務是否真的吃到該依賴的失敗再斷言症狀」；
-  (b) 進階（s4.2）——讓 topology edge 宣告「caller 如何歸因 callee 失敗」的指標
-  （如 `orders_total{reason="payment"}`），s4 直接量上游受影響程度。
+- **s4.1 — blame-confirm（Q2 過度宣稱）✅ 已做（commit 2ec0dda，live 驗證）**：
+  self 健康 + 下游不健康時，verdict 改口「下游不健康但本服務 SLI 健康，先驗本服務是否
+  真的吃到該依賴的失敗再斷言症狀」。live 驗證 agent 確實去查了 `cancelled{reason=payment}`
+  才下結論、不再過度宣稱。**剩進階 s4.2（下）。**
+- **s4.2 — edge-attributed impact metric**：讓 topology edge 宣告「caller 如何歸因
+  callee 失敗」的指標（如 `orders_total{reason="payment"}`），s4 直接量上游**受影響增量**
+  （incident 前後比較），解掉 order 那個「把 baseline 取消當 incident 影響」的因果精度點。
 - **log signal contract（Loki 查詢生成 bug）**：agent 自寫 LogQL 常用錯 selector
   `{service=...}`（應 `service_name=`）並捏造 `event="error"`（真實值 `order.cancelled`
   等）。s1–s4 只管 metric/topology，沒碰 LogQL 生成。自然延伸 = 把 s3 contract 擴到
   **per-service 權威 LogQL**（宣告錯誤事件的正確 stream selector + `event=` 值），像
   metric SLI 一樣注入。對齊 RCA findings memory 早記的 LogQL 生成問題。
+- **contract ↔ Weaver registry 對齊（schema 單一真相來源）**：`contracts.yaml` 目前
+  **硬寫** metric 名（`payment_charges_total` 等），踩到「hardcoded demo schema」風險。
+  repo 已有 Weaver semconv registry（`demo-services/weaver/registry/model/metrics.yaml`
+  宣告 `metric.app.payment.charges.count`，註解 `Current code metric: payment_charges_total`）。
+  ARE 的 Signal Plane 分兩層：**Weaver registry = schema/semantic 半邊**（名字/語意/型別/
+  versioned/`live-check` 驗證）；**signal-contract = 決策/SLO 半邊**（哪個 metric 是 SLI、
+  objective、topology、criticality）。改進方向：signal-contract 的 SLI metric 名**衍生/
+  驗證自 Weaver registry**，而非各寫一份；需處理 OTel 點號名 `app.payment.charges.count`
+  → Prometheus `payment_charges_total`（`.`→`_` + `_total`）的 mapping。模式同構：Weaver
+  `live-check`（遙測 vs schema）≈ s2 reconcile（trace vs 宣告 topology）。
