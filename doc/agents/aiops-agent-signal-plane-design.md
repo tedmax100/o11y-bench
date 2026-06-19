@@ -203,11 +203,12 @@ order 被拖累的過度宣稱被 s4.1 收掉。仍掛三項：
   的 delta：rising→確認 materially impacted（genuine symptom）/ flat→只是 topologically
   adjacent、未受實質影響（不報為症狀）/ 無 attribution→退回 s4.1 措辭。解掉 order「把
   baseline 取消當 incident 影響」的精度點。**剩 live 重驗（需重新觸發 incident）。**
-- **log signal contract（Loki 查詢生成 bug）**：agent 自寫 LogQL 常用錯 selector
-  `{service=...}`（應 `service_name=`）並捏造 `event="error"`（真實值 `order.cancelled`
-  等）。s1–s4 只管 metric/topology，沒碰 LogQL 生成。自然延伸 = 把 s3 contract 擴到
-  **per-service 權威 LogQL**（宣告錯誤事件的正確 stream selector + `event=` 值），像
-  metric SLI 一樣注入。對齊 RCA findings memory 早記的 LogQL 生成問題。
+- **log signal contract（Loki 查詢生成 bug）✅ 已做（commit 6d1b1b7）**：`SignalContract.logs`
+  （`LogSignal`）宣告權威 stream selector（`{service_name=...}`）+ 真實 failure `event=`
+  值（payment.declined/gateway_error、order.cancelled、user.auth_failed、http.request_failed，
+  對 schema_catalog BizEvent enum 驗證）+ 代表性 error_query。context 注入「Logs (authoritative)」
+  區塊，明確指示用此 selector/events、**不要** `{service=...}` 或捏造 `event="error"`。
+  **剩 live 重驗**（看 agent 是否改用正確 LogQL）。
 - **contract ↔ Weaver registry 對齊（schema 單一真相來源）**：`contracts.yaml` 目前
   **硬寫** metric 名（`payment_charges_total` 等），踩到「hardcoded demo schema」風險。
   repo 已有 Weaver semconv registry（`demo-services/weaver/registry/model/metrics.yaml`
