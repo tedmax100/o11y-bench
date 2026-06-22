@@ -165,7 +165,7 @@ class SignalContract(BaseModel):
 | **s2 活的對齊 + drift** | `reconcile.py`：Tempo `{}` 取 root→leaf，反推實際 caller→callee（parent span 的 `resource.service.name` → child 的），與宣告 edge diff。對不上 → context 標 `⚠ topology drift: api-gateway→X observed but not declared`。產出**第一個 DQ-SLO 資料點**（declared∩observed / observed）。 | 無（唯讀） | 單元：faked trace tree → 反推邊、diff 算 drift；k3d 實機反推 demo 依賴圖 |
 | **s3 signal contract** | `contracts.yaml` + 模型；`context.py` 注入權威 SLI 寫法 + objective + unit + freshness。先做 payment（有真 incident）+ 補齊 5 服務的 error/latency SLI。 | 無（唯讀） | 單元：contract 載入/驗證、SLI promql 形狀、freshness 判定（stale 標記） |
 | **s4 dependency-health / blame propagation** | `health.py`：RCA 時對命中 service 的**上下游各跑一次 SLI**（唯讀、不計 agent budget，比照 runbook diagnostics），把「上游 healthy / 下游 payment error-rate 12%」填進 context。agent 據此把根因歸到正確節點。 | 無（唯讀） | 單元：health 評估 + 注入；k3d：payment incident 下 order 的 context 顯示「下游 payment unhealthy」 |
-| **s5（接續）DQ-SLO → governance** | 把 s2 的 drift / s3 的 freshness 匯成 DQ-SLO 量測，餵 `governance.decide()`：訊號非 decision-grade（drift 高 / stale）時收緊自主權。補出入報告 §2.3 五大 SLO 的第二個。 | 無 | 單元：DQ 低 → 自主收緊 |
+| **s5（接續）DQ-SLO → governance ✅ 已做** | 把 s2 的 drift / s3 的 freshness 匯成 DQ-SLO 量測，餵 `governance.decide()`：訊號非 decision-grade（drift 高 / stale）時收緊自主權。補出入報告 §2.3 五大 SLO 的第二個。`signals/dq.py` + `tests/test_dq.py`（6 tests pass）。 | 無 | 單元：DQ 低 → 自主收緊 |
 
 > s1–s4 全唯讀、無副作用，可安心連續合併；任一階段都能讓 RCA 立刻吃到更好的 context。step7 後半（真 mutate）刻意排在 Signal 穩固之後。
 
@@ -230,3 +230,25 @@ order 被拖累的過度宣稱被 s4.1 收掉。仍掛三項：
   runtime loader 不變。**跨服務 topology = 各服務出邊的聯集（caller 擁有）**；**journey 鏈從邊
   topo-sort 推導**（不再中央宣告）。回歸測試 `test_compile` pin fragments↔生成檔同步。
   剩可選：把 compile 接進 CI、journey 成員/順序的更嚴格 drift 告警（與 s2 reconcile 合流）。
+
+- **polyrepo 演進 — manifest-driven 聚合（fragment 跨 repo 時）◻ 未做**：目前
+  `compile.py:_fragments_dir()` 用 `glob("*/signal.yaml")` **發現** fragment，只在 monorepo
+  成立（檔案同樹）。Weaver 第四/五篇明示這只是「單 repo 內部合約」階段；跨 repo 後 Weaver
+  **不靠 discovery，改用 manifest 宣告依賴**（`manifest.yaml` 的 `dependencies`/`import`/
+  `extends`，pin 版本）→ `weaver registry package` 把依賴圖 resolve 壓平成自包含 artifact →
+  消費者只拿這份、看不到 N 個 repo。同構搬到 Signal Plane，解掉「agent 很難知道有多少 service
+  repo」——**它本來就不該知道，discovery 由 pin 版本的依賴 manifest 取代**。三步：
+  1. **加 `signal-manifest.yaml`**（平台團隊 own，CODEOWNERS 把關）列出納入的服務 + 各自 pin 的
+     版本/URI；`compile.py` 的 `_fragments_dir()` glob 換成「讀 manifest → 拉齊 pinned fragment」
+     的可插拔 collector（保留 monorepo glob 當預設來源）。
+  2. **各服務 CI 把 `signal.yaml` 發布成 versioned artifact**（綁 git tag、帶 `git_version`/
+     `owner`，對映 #4 publish 的 provenance「金線索」）；中央聚合 job 照 manifest 拉齊 → 跑 compile
+     → 一份 `topology.yaml`/`contracts.yaml`（agent image 仍只帶 compiled aggregates，runtime 不變）。
+  3. **compile 加 fail-fast gate**：manifest 列了卻拉不到、或 edge 的 `callee` 不在 manifest 內
+     （懸空邊）→ 直接紅，不靜默（現 `_topo_sort` 會把 leftover 補進 order，monorepo 下無妨，
+     polyrepo 下會變「漏拉一片、圖悄悄殘缺」的隱患）。對映 weaver resolve 對缺 ref 報錯。
+  取捨：`signal.yaml` 內容（SLI/LogQL/拓樸歸因）**不是 semconv attribute schema**，不能直接餵
+  `weaver registry package`。選 (a) **只借模式**：自寫 manifest + collector + 壓平（即上三步，
+  推薦）；或 (b) **真用 weaver**：把 signal 建模成 registry 擴充 group 靠 weaver 解析依賴，省 collector
+  但要把健康訊號硬塞進 attribute schema 形狀，彆扭。建議 (a)——壓平語意（union of caller-owned
+  edges → topo-sort 推導 journey）weaver 不懂，留在自家 `compile.py`。
