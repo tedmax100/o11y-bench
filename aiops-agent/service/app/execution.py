@@ -20,13 +20,16 @@ Pipeline (full shape; ◻ = added in a later phase):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
+from typing import Any
 
 from . import action_requests as ar
 from . import audit, blast_radius, breaker, store
 from .actions import ActionDisabled, registry
 from .action_requests import ActionRequest, Status
+from .config import settings
 # Module-level so tests can monkeypatch without importing the agent stack.
 from .runbook import load_runbooks, run_diagnostics
 
@@ -38,6 +41,113 @@ def _read_only_tools() -> dict:
     executor doesn't pull the LLM stack unless a precondition check needs it."""
     from .agent import TOOLS
     return {t.name: t for t in TOOLS}
+
+
+def _eval_verify_check(check: dict, output: Any) -> tuple[bool, str]:
+    """Evaluate a verify step's check dict against the tool output.
+    Returns (passed, detail_string)."""
+    if not check:
+        return True, "no check specified"
+
+    if "max_value" in check:
+        # Prometheus instant vector: {"resultType": "vector", "result": [{..., "value": float}]}
+        # Empty result = 0 (no series = metric is 0).
+        val: float | None = None
+        if isinstance(output, dict):
+            rt = output.get("resultType")
+            result = output.get("result", [])
+            if rt == "scalar":
+                val = float(output.get("value", 0))
+            elif rt == "vector":
+                if not result:
+                    val = 0.0
+                else:
+                    raw = result[0].get("value")
+                    try:
+                        val = float(raw)
+                    except (TypeError, ValueError):
+                        pass
+        if val is None:
+            return False, f"could not extract numeric value from output: {str(output)[:200]}"
+        limit = float(check["max_value"])
+        ok = val <= limit
+        return ok, f"value {val:.6g} {'≤' if ok else '>'} max_value {limit}"
+
+    # Fall back to DiagnosticCheck for contains/nonempty/min_rows
+    from .runbook import DiagnosticCheck, _evaluate_check
+    known = {k: v for k, v in check.items() if k in DiagnosticCheck.model_fields}
+    dc = DiagnosticCheck(**known)
+    status, detail = _evaluate_check(dc, output)
+    return (status in ("pass", "ran")), detail
+
+
+async def _verify_outcome(req: ActionRequest, path: Path | None) -> bool:
+    """Wait the settle window, run the runbook step's verify spec, return True
+    if the symptom cleared. No verify spec → optimistically returns True (skip)."""
+    rb = next((b for b in load_runbooks() if b.id == req.runbook_id), None) if req.runbook_id else None
+    step = next((s for s in (rb.remediation if rb else []) if s.action == req.action), None)
+
+    if step is None or not step.verify:
+        audit.record("verify", "skip", request_id=req.request_id, fp=req.fp,
+                     detail={"reason": "no verify spec on remediation step"}, path=path)
+        return True
+
+    await asyncio.sleep(settings.verify_delay_seconds)
+
+    verify = step.verify  # {action, args, check}
+    action_name = verify.get("action", "")
+    v_args = verify.get("args", {})
+    check = verify.get("check", {})
+
+    try:
+        tools = _read_only_tools()
+        tool = tools.get(action_name)
+        if tool is None:
+            audit.record("verify", "skip", request_id=req.request_id, fp=req.fp,
+                         detail={"reason": f"verify action {action_name!r} not in read-only tools"},
+                         path=path)
+            return True
+        out = await tool.ainvoke(v_args)
+    except Exception as e:
+        audit.record("verify", "error", request_id=req.request_id, fp=req.fp,
+                     detail={"error": f"{type(e).__name__}: {e}"}, path=path)
+        return False  # error → conservative fail → trigger rollback
+
+    passed, detail = _eval_verify_check(check, out)
+    audit.record("verify", "pass" if passed else "fail", request_id=req.request_id, fp=req.fp,
+                 detail={"check": check, "detail": detail, "output_preview": str(out)[:300]},
+                 path=path)
+    return passed
+
+
+async def _auto_rollback(req: ActionRequest, path: Path | None) -> bool:
+    """Execute the rollback contract stored on the ActionRequest. Returns True
+    if rollback succeeded. Fail-closed: no contract or no impl → False."""
+    contract = req.rollback
+    if not contract:
+        audit.record("rollback", "skip", request_id=req.request_id, fp=req.fp,
+                     detail={"reason": "no rollback contract on request"}, path=path)
+        return False
+
+    rb_action = contract.get("action")
+    rb_args = contract.get("args", {})
+    spec = registry.get(rb_action) if rb_action else None
+    if spec is None or spec.impl is None:
+        audit.record("rollback", "abort", request_id=req.request_id, fp=req.fp,
+                     detail={"reason": f"rollback action {rb_action!r} has no impl"}, path=path)
+        return False
+
+    try:
+        result = await spec.impl(rb_args)
+        audit.record("rollback", "success", request_id=req.request_id, fp=req.fp,
+                     detail={"action": rb_action, "args": rb_args, "result": str(result)[:300]},
+                     path=path)
+        return True
+    except Exception as e:
+        audit.record("rollback", "fail", request_id=req.request_id, fp=req.fp,
+                     detail={"action": rb_action, "error": f"{type(e).__name__}: {e}"},
+                     path=path)
+        return False
 
 
 async def _revalidate_preconditions(req: ActionRequest, path: Path | None) -> bool:
@@ -151,24 +261,48 @@ async def run(request_id: str, path: Path | None = None) -> dict:
         audit.record("execute", "refuse", request_id=req.request_id, fp=req.fp,
                      detail={"reason": str(e)}, path=path)
         return {"status": Status.REFUSED.value, "outcome": str(e)}
-    except Exception as e:  # the action RAN and errored (7b-4+ territory)
+    except Exception as e:  # the action RAN and errored
         breaker.record_outcome(req.action, target, fp=req.fp,
                                request_id=req.request_id, success=False, path=path)
         ar_store_transition(req.request_id, Status.EXECUTING, Status.FAILED,
                             outcome=f"{type(e).__name__}: {e}", path=path)
         audit.record("execute", "fail", request_id=req.request_id, fp=req.fp,
                      detail={"error": str(e)}, path=path)
-        return {"status": Status.FAILED.value, "outcome": str(e)}
+        # execute errored → try rollback, but CE is not touched (§6.2 constraint 2)
+        ar_store_transition(req.request_id, Status.FAILED, Status.ROLLING_BACK,
+                            outcome="auto-rollback after execute failure", path=path)
+        rb_ok = await _auto_rollback(req, path)
+        final = Status.ROLLED_BACK if rb_ok else Status.ROLLBACK_FAILED
+        ar_store_transition(req.request_id, Status.ROLLING_BACK, final,
+                            outcome="rolled back" if rb_ok else "rollback also failed", path=path)
+        return {"status": final.value, "outcome": str(e)}
 
-    # --- 5. verify (7b-4) / 6. rollback (7b-4) / 7. Learn (7b-5) -------------
-    # Success path is unreachable until 7b-4 (nothing has a wired impl).
-    breaker.record_outcome(req.action, target, fp=req.fp,
-                           request_id=req.request_id, success=True, path=path)
-    ar_store_transition(req.request_id, Status.EXECUTING, Status.SUCCEEDED,
-                        outcome="executed", path=path)
     audit.record("execute", "success", request_id=req.request_id, fp=req.fp,
                  detail={"result": str(result)[:500]}, path=path)
-    return {"status": Status.SUCCEEDED.value}
+
+    # --- 5. verify (closed-loop settle + symptom check) ----------------------
+    verified = await _verify_outcome(req, path)
+    if verified:
+        breaker.record_outcome(req.action, target, fp=req.fp,
+                               request_id=req.request_id, success=True, path=path)
+        ar_store_transition(req.request_id, Status.EXECUTING, Status.SUCCEEDED,
+                            outcome="executed and verified", path=path)
+        return {"status": Status.SUCCEEDED.value}
+
+    # --- 6. verify failed → auto-rollback ------------------------------------
+    breaker.record_outcome(req.action, target, fp=req.fp,
+                           request_id=req.request_id, success=False, path=path)
+    ar_store_transition(req.request_id, Status.EXECUTING, Status.VERIFY_FAILED,
+                        outcome="executed but symptom persists after verify window", path=path)
+    ar_store_transition(req.request_id, Status.VERIFY_FAILED, Status.ROLLING_BACK,
+                        outcome="auto-rollback triggered by verify failure", path=path)
+    rb_ok = await _auto_rollback(req, path)
+    final = Status.ROLLED_BACK if rb_ok else Status.ROLLBACK_FAILED
+    ar_store_transition(req.request_id, Status.ROLLING_BACK, final,
+                        outcome="rolled back after verify failure" if rb_ok
+                        else "rollback failed after verify failure",
+                        path=path)
+    return {"status": final.value, "outcome": "verify failed; " + ("rolled back" if rb_ok else "rollback also failed")}
 
 
 # Small wrappers so the store coupling stays in one place and reads cleanly above.

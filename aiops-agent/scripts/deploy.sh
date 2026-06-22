@@ -30,17 +30,34 @@ echo "[deploy] restarting to pick up the freshly imported image"
 kubectl -n demo rollout restart deploy/aiops-agent
 kubectl -n demo rollout status deploy/aiops-agent --timeout=120s
 
-echo "[deploy] verifying the read-only RBAC the k8s tools need"
+echo "[deploy] verifying read SA RBAC (signal tools)"
 kubectl -n demo auth can-i list pods \
   --as="system:serviceaccount:demo:aiops-agent" && echo "  pods: OK"
 kubectl -n demo auth can-i get deployments.apps \
   --as="system:serviceaccount:demo:aiops-agent" && echo "  deployments: OK"
-# Negative check: it must NOT be able to mutate (write actions stay out of this SA).
 if kubectl -n demo auth can-i delete pods \
-     --as="system:serviceaccount:demo:aiops-agent" | grep -q yes; then
-  echo "  WARN: SA can delete pods — RBAC is too broad" >&2
+     --as="system:serviceaccount:demo:aiops-agent" 2>&1 | grep -q yes; then
+  echo "  WARN: read SA can delete pods — RBAC is too broad" >&2
 else
-  echo "  delete pods: correctly DENIED (read-only)"
+  echo "  delete pods (read SA): correctly DENIED"
+fi
+
+echo "[deploy] verifying write SA RBAC (execution plane, 7b-4)"
+kubectl -n demo auth can-i patch deployments.apps \
+  --as="system:serviceaccount:demo:aiops-agent-write" && echo "  patch deployments: OK"
+kubectl -n demo auth can-i list replicasets.apps \
+  --as="system:serviceaccount:demo:aiops-agent-write" && echo "  list replicasets: OK"
+if kubectl -n demo auth can-i delete deployments.apps \
+     --as="system:serviceaccount:demo:aiops-agent-write" 2>&1 | grep -q yes; then
+  echo "  WARN: write SA can delete deployments — RBAC is too broad" >&2
+else
+  echo "  delete deployments (write SA): correctly DENIED"
+fi
+if kubectl -n demo auth can-i delete pods \
+     --as="system:serviceaccount:demo:aiops-agent-write" 2>&1 | grep -q yes; then
+  echo "  WARN: write SA can delete pods — RBAC is too broad" >&2
+else
+  echo "  delete pods (write SA): correctly DENIED"
 fi
 
 echo "[deploy] done. agent: http://localhost:8000/healthz"

@@ -9,11 +9,7 @@
 #     --from-literal=google-api-key="$GOOGLE_API_KEY" \
 #     --from-literal=github-token="$GITHUB_TOKEN"
 # (scripts/up.sh sources aiops-agent/service/.env and does this automatically.)
-# Read-only ServiceAccount for the k8s signal tools (v3 §2 / §6.3). Namespace-
-# scoped Role with get/list/watch on pods, events, deployments and replicasets —
-# the inputs to k8s_pod_status / k8s_events / k8s_deployment_status. No write
-# verbs: any remediation (restart/scale/rollback) is the action-registry's job
-# (v3 §5.3) and would use a separate, privileged SA. read and write stay split.
+# Read-only SA — k8s signal tools (get/list/watch only; no write verbs).
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -46,6 +42,52 @@ subjects:
   - kind: ServiceAccount
     name: aiops-agent
     namespace: demo
+---
+# Write SA — remediation actions only. Deliberately separate from the read SA
+# so a bug in the read path cannot trigger a write. Verbs: get/list/watch
+# (needed to read current state before patching) + patch/update on deployments.
+# NO delete verb — enforced by RBAC and verified in deploy.sh.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aiops-agent-write
+  namespace: demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aiops-agent-write
+  namespace: demo
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aiops-agent-write
+  namespace: demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: aiops-agent-write
+subjects:
+  - kind: ServiceAccount
+    name: aiops-agent-write
+    namespace: demo
+---
+# Long-lived token for the write SA, mounted into the agent pod so k8s_write.py
+# can construct a write-SA-bound ApiClient without needing the pod's own SA to
+# have write permissions (principle of least privilege / separation).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aiops-agent-write-token
+  namespace: demo
+  annotations:
+    kubernetes.io/service-account.name: aiops-agent-write
+type: kubernetes.io/service-account-token
 ---
 # Durable store for the CE harness + investigation log (7b-0). Without this the
 # data lives on the pod's ephemeral filesystem and is wiped on every rollout —
@@ -160,9 +202,17 @@ spec:
                   name: aiops-agent-secrets
                   key: webhook-secret
                   optional: true
+            # 7b-4: enable the execution plane for human-approved PROPOSE actions.
+            # All registered actions have requires_approval=True so AUTO is still
+            # withheld; humans must approve before anything mutates the cluster.
+            - name: ACTIONS_ENABLED
+              value: "true"
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: k8s-write-token
+              mountPath: /var/run/secrets/k8s-write
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /healthz
@@ -179,6 +229,10 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: aiops-agent-data
+        - name: k8s-write-token
+          secret:
+            secretName: aiops-agent-write-token
+            defaultMode: 0400
 ---
 apiVersion: v1
 kind: Service

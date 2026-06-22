@@ -43,11 +43,10 @@ async def test_execute_refuses_when_disabled(monkeypatch):
         await actions_mod.registry.execute("k8s.rollout_undo", {})
 
 
-async def test_execute_refuses_without_impl_even_if_enabled(monkeypatch):
-    # Kill switch on, but the seeded actions have no impl → still refuses.
-    monkeypatch.setattr(actions_mod.settings, "actions_enabled", True)
-    with pytest.raises(ActionDisabled):
-        await actions_mod.registry.execute("k8s.rollout_undo", {})
+async def test_execute_refuses_when_kill_switch_off():
+    # Kill switch off → ActionDisabled regardless of impl presence.
+    with pytest.raises(ActionDisabled, match="actions_enabled"):
+        await actions_mod.registry.execute("k8s.rollout_undo", {"deployment": "x", "namespace": "demo"})
 
 
 async def test_execute_unknown_action():
@@ -56,10 +55,10 @@ async def test_execute_unknown_action():
 
 
 def test_seeded_actions_are_safe():
-    # every shipped action is reversible, approval-required, and has no impl
+    # every shipped action is reversible and approval-required (7b-4: impl now wired)
     for name in actions_mod.registry.names():
         s = actions_mod.registry.get(name)
-        assert s.reversible and s.requires_approval and s.impl is None
+        assert s.reversible and s.requires_approval
 
 
 # ---- gate: hard rules ------------------------------------------------------

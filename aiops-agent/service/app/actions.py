@@ -86,17 +86,20 @@ class ActionRegistry:
         return await spec.impl(args)
 
 
-# Module-level registry seeded with the demo's remediation vocabulary. All are
-# reversible + approval-required, and none has an impl — so nothing can run. The
-# `dry_run` is read-only (blast_radius.py) so it's wired now; `impl` waits for 7b-4.
+# Module-level registry. dry_run wired since 7b-2; impl wired now (7b-4).
 from .blast_radius import dry_run_rollout_undo, dry_run_scale  # noqa: E402
+from .tools.k8s_write import (  # noqa: E402
+    impl_rollout_undo, impl_scale, rollback_rollout_undo,
+)
 
 registry = ActionRegistry()
 registry.register(ActionSpec(
     name="k8s.rollout_undo",
     description="Roll a Deployment back to its previous ReplicaSet (kubectl rollout undo).",
-    reversible=True, requires_approval=True, dry_run=dry_run_rollout_undo))
+    reversible=True, requires_approval=True,
+    dry_run=dry_run_rollout_undo, impl=impl_rollout_undo))
 registry.register(ActionSpec(
     name="k8s.scale",
     description="Change a Deployment's replica count.",
-    reversible=True, requires_approval=True, dry_run=dry_run_scale))
+    reversible=True, requires_approval=True,
+    dry_run=dry_run_scale, impl=impl_scale))

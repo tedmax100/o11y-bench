@@ -114,6 +114,10 @@ class Settings(BaseSettings):
     breaker_window_seconds: int = 3600
     breaker_fail_threshold: int = 2   # consecutive failures on a target → trip open
 
+    # --- Verify + rollback (step 7 後半 7b-4) ---------------------------------
+    verify_delay_seconds: int = 60    # settle window between execute and verify query
+    require_rollback_contract: bool = True  # no rollback contract → executor refuses
+
     # --- Design-alert capability (ARE gap-analysis §4.2 step 6 / v3 §6) -----
     # First side-effecting + human-in-the-loop capability: the agent proposes an
     # alert rule (```alert``` block); a human button click POSTs it to
@@ -156,6 +160,14 @@ class Settings(BaseSettings):
     # (app/signals/compile.py) aggregates *.signal.yaml into the agent's
     # topology.yaml/contracts.yaml; the agent ships those compiled artifacts.
     signal_fragments_dir: str = ""
+    # --- Data-Quality SLO (s5; ARE flagship #2) ----------------------------
+    # The topology reconcile (s2) drift + its freshness become a DQ verdict that
+    # governance reads: when the signal model isn't decision-grade (drift, stale,
+    # or never reconciled) autonomy is narrowed (AUTO → PROPOSE), mirroring how
+    # calibration error gates autonomy. "Confidently acting on a wrong map" is as
+    # dangerous as "confidently wrong" — both must earn AUTO.
+    dq_min_score: float = 0.9               # declared/observed agreement floor for proven-good
+    dq_max_reconcile_age_seconds: int = 3600  # a reconcile older than this → DQ stale
     # Dependency-health blame propagation (s4): before the agent loop, run each
     # neighbour's error SLI live (read-only, off the agent budget) so the agent
     # knows whether the symptom is inherited from a failing downstream dep. A

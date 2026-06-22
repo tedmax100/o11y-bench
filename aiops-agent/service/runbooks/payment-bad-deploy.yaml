@@ -39,11 +39,18 @@ remediation:
       namespace: demo
     reversible: true
     requires_approval: true
-    # Inverse-operation contract carried into the ActionRequest (step 7 §2.2).
-    # rollout undo's undo is another rollout undo (back to the version we left).
-    # Without this the executor will refuse the action once impls are wired (7b-4).
+    # Inverse-operation contract: rollout undo's undo is another rollout undo.
     rollback:
       action: k8s.rollout_undo
       args:
         deployment: payment-service
         namespace: demo
+    # Post-execute verify (7b-4): confirm the decline rate dropped. Runs after
+    # verify_delay_seconds settle window. Failure triggers auto-rollback.
+    verify:
+      action: query_prometheus
+      args:
+        expr: 'sum(rate(payment_charges_total{status="declined"}[2m]))'
+        queryType: instant
+      check:
+        max_value: 0.01
