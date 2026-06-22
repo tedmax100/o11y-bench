@@ -112,11 +112,14 @@ async def impl_rollout_undo(args: dict) -> dict:
     apps_w = await asyncio.to_thread(_load_write_api)
 
     # Overwrite deployment's spec.template with the previous RS's template.
-    # This is exactly what kubectl rollout undo does: the controller detects
-    # the template change, promotes the old RS, and bumps the revision.
-    prev_template = prev_rs.spec.template.to_dict()
-    # Strip the revision annotation from the template metadata so the deployment
-    # controller re-assigns the revision rather than keeping the old one.
+    # Use sanitize_for_serialization to get proper camelCase keys — to_dict()
+    # returns snake_case which breaks strategic merge patch (merge key lookup
+    # fails for e.g. "container_port" vs the expected "containerPort").
+    from kubernetes import client as k8s_client
+    sanitize = k8s_client.ApiClient().sanitize_for_serialization
+    prev_template = sanitize(prev_rs.spec.template)
+
+    # Strip revision annotation from the template so the controller re-assigns it.
     tmpl_meta = prev_template.get("metadata") or {}
     tmpl_ann = tmpl_meta.get("annotations") or {}
     tmpl_ann.pop("deployment.kubernetes.io/revision", None)
