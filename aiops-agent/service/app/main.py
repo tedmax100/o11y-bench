@@ -13,9 +13,9 @@ from .agent import lifespan, stream_chat
 from .alerts import AlertProvisioningDisabled, AlertSpec, build_alert_rule, provision_alert
 from .calibration import label_run
 from .config import settings
-from .investigations import list_investigations
+from .investigations import get_investigation, list_investigations
 from .traces import analyze_trace, get_trace, list_traces, stream_trace_chat
-from .webhook import handle_alert
+from .webhook import handle_alert, reinvestigate
 
 app = FastAPI(title="aiops-agent-service", lifespan=lifespan)
 
@@ -89,16 +89,39 @@ async def investigations_list(limit: int = 50):
 
 class LabelRequest(BaseModel):
     correct: bool
+    error_dimension: str | None = None   # root_cause | scope | action | other
+    correction_note: str | None = None
+
+
+# Strong refs for re-investigation background tasks.
+_reinvestigation_tasks: set[asyncio.Task] = set()
 
 
 @app.post("/investigations/{fp}/label")
 async def investigations_label(fp: str, req: LabelRequest):
     """Record the correctness verdict for an investigation (closes the CE loop
-    from the UI). Writes to the calibration store."""
-    ok = label_run(fp, correct=req.correct, source="ui")
+    from the UI). When correct=False, kicks off a re-investigation in the same
+    thread with the human correction injected as context."""
+    ok = label_run(
+        fp, correct=req.correct, source="ui",
+        error_dimension=req.error_dimension,
+        correction_note=req.correction_note,
+    )
     if not ok:
         raise HTTPException(status_code=404, detail=f"no calibration record for fingerprint {fp}")
-    return {"ok": True, "fp": fp, "correct": req.correct}
+
+    reinvestigating = False
+    if not req.correct:
+        inv = get_investigation(fp)
+        if inv is not None:
+            task = asyncio.create_task(
+                reinvestigate(fp, inv.alert, req.error_dimension, req.correction_note)
+            )
+            _reinvestigation_tasks.add(task)
+            task.add_done_callback(_reinvestigation_tasks.discard)
+            reinvestigating = True
+
+    return {"ok": True, "fp": fp, "correct": req.correct, "reinvestigating": reinvestigating}
 
 
 # ---- Design-alert capability (propose-only; human button provisions) --------

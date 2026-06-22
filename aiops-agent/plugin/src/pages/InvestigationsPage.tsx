@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { css } from '@emotion/css';
 import { GrafanaTheme2 } from '@grafana/data';
 import { PluginPage } from '@grafana/runtime';
-import { Alert, Badge, BadgeColor, Button, Spinner, Stack, useStyles2 } from '@grafana/ui';
+import { Alert, Badge, BadgeColor, Button, Field, Input, Modal, RadioButtonGroup, Spinner, Stack, useStyles2 } from '@grafana/ui';
 
 type Props = { agentServiceUrl: string };
 
@@ -29,11 +29,24 @@ type Investigation = {
   correct: boolean | null;
 };
 
+type WrongModalState = {
+  fp: string;
+  errorDimension: string;
+  correctionNote: string;
+};
+
 const AUTONOMY_COLOR: Record<Decision['autonomy'], BadgeColor> = {
   auto: 'green',
   propose: 'orange',
   escalate: 'red',
 };
+
+const ERROR_DIMENSION_OPTIONS = [
+  { label: 'Root cause', value: 'root_cause', description: 'Wrong root cause identified' },
+  { label: 'Scope', value: 'scope', description: 'Wrong service or affected scope' },
+  { label: 'Action', value: 'action', description: 'Proposed remediation was wrong' },
+  { label: 'Other', value: 'other', description: 'Other issue' },
+];
 
 function confidenceColor(c: number): BadgeColor {
   if (c >= 0.8) {
@@ -50,6 +63,9 @@ function InvestigationsPage({ agentServiceUrl }: Props) {
   const [items, setItems] = useState<Investigation[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [wrongModal, setWrongModal] = useState<WrongModalState | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [reinvestigatingFps, setReinvestigatingFps] = useState<Set<string>>(new Set());
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -74,23 +90,48 @@ function InvestigationsPage({ agentServiceUrl }: Props) {
   }, [load]);
 
   const label = useCallback(
-    async (fp: string, correct: boolean) => {
+    async (fp: string, correct: boolean, errorDimension?: string, correctionNote?: string) => {
       try {
+        const body: Record<string, unknown> = { correct };
+        if (errorDimension) {
+          body.error_dimension = errorDimension;
+        }
+        if (correctionNote) {
+          body.correction_note = correctionNote;
+        }
         const res = await fetch(`${agentServiceUrl}/investigations/${fp}/label`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ correct }),
+          body: JSON.stringify(body),
         });
         if (!res.ok) {
           throw new Error(`HTTP ${res.status}`);
         }
+        const data = await res.json();
         setItems((prev) => prev.map((it) => (it.fp === fp ? { ...it, correct } : it)));
+        if (data.reinvestigating) {
+          setReinvestigatingFps((prev) => new Set(prev).add(fp));
+        }
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
       }
     },
     [agentServiceUrl]
   );
+
+  const openWrongModal = useCallback((fp: string) => {
+    setWrongModal({ fp, errorDimension: 'root_cause', correctionNote: '' });
+  }, []);
+
+  const submitWrong = useCallback(async () => {
+    if (!wrongModal) {
+      return;
+    }
+    setSubmitting(true);
+    await label(wrongModal.fp, false, wrongModal.errorDimension, wrongModal.correctionNote);
+    setSubmitting(false);
+    setWrongModal(null);
+  }, [wrongModal, label]);
 
   return (
     <PluginPage>
@@ -128,7 +169,8 @@ function InvestigationsPage({ agentServiceUrl }: Props) {
                   {it.git_version && <Badge text={it.git_version} color="purple" />}
                   <Badge text={`confidence ${(it.confidence * 100).toFixed(0)}%`} color={confidenceColor(it.confidence)} />
                   {it.correct === true && <Badge text="verified ✓" color="green" />}
-                  {it.correct === false && <Badge text="wrong ✗" color="red" />}
+                  {it.correct === false && !reinvestigatingFps.has(it.fp) && <Badge text="wrong ✗" color="red" />}
+                  {it.correct === false && reinvestigatingFps.has(it.fp) && <Badge text="re-investigating…" color="orange" />}
                 </Stack>
                 <span className={styles.ts}>{it.ts}</span>
               </div>
@@ -163,7 +205,7 @@ function InvestigationsPage({ agentServiceUrl }: Props) {
                   variant={it.correct === false ? 'destructive' : 'secondary'}
                   fill="outline"
                   icon="times"
-                  onClick={() => label(it.fp, false)}
+                  onClick={() => openWrongModal(it.fp)}
                 >
                   Wrong
                 </Button>
@@ -173,6 +215,39 @@ function InvestigationsPage({ agentServiceUrl }: Props) {
           ))}
         </div>
       </div>
+
+      {wrongModal && (
+        <Modal
+          title="What was wrong with this RCA?"
+          isOpen
+          onDismiss={() => setWrongModal(null)}
+        >
+          <div className={styles.modalBody}>
+            <Field label="Which part was incorrect?">
+              <RadioButtonGroup
+                options={ERROR_DIMENSION_OPTIONS}
+                value={wrongModal.errorDimension}
+                onChange={(v) => setWrongModal((prev) => prev ? { ...prev, errorDimension: v } : prev)}
+              />
+            </Field>
+            <Field label="Correction note (optional)" description="Tell the agent what was actually wrong so it can re-investigate with better context.">
+              <Input
+                placeholder="e.g. Root cause was DB connection exhaustion, not a code regression"
+                value={wrongModal.correctionNote}
+                onChange={(e) => setWrongModal((prev) => prev ? { ...prev, correctionNote: e.currentTarget.value } : prev)}
+              />
+            </Field>
+            <Stack direction="row" gap={1} justifyContent="flex-end">
+              <Button variant="secondary" onClick={() => setWrongModal(null)}>
+                Cancel
+              </Button>
+              <Button variant="destructive" icon="sync" onClick={submitWrong} disabled={submitting}>
+                {submitting ? 'Submitting…' : 'Mark Wrong & Re-investigate'}
+              </Button>
+            </Stack>
+          </div>
+        </Modal>
+      )}
     </PluginPage>
   );
 }
@@ -246,6 +321,11 @@ const getStyles = (theme: GrafanaTheme2) => ({
     font-style: italic;
     text-align: center;
     padding: ${theme.spacing(4)};
+  `,
+  modalBody: css`
+    display: flex;
+    flex-direction: column;
+    gap: ${theme.spacing(2)};
   `,
 });
 

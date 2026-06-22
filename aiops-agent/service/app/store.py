@@ -51,7 +51,9 @@ CREATE TABLE IF NOT EXISTS calibration (
     summary   TEXT NOT NULL DEFAULT '',
     hypothesis TEXT NOT NULL DEFAULT '',
     suspected_version TEXT,
-    services  TEXT NOT NULL DEFAULT '[]'  -- json array
+    services  TEXT NOT NULL DEFAULT '[]',  -- json array
+    error_dimension TEXT,                  -- which part was wrong (root_cause/scope/action/other)
+    correction_note TEXT                   -- free-text human correction
 );
 CREATE INDEX IF NOT EXISTS idx_calibration_run_id ON calibration(run_id);
 
@@ -123,6 +125,13 @@ CREATE INDEX IF NOT EXISTS idx_audit_request ON audit(request_id);
 CREATE INDEX IF NOT EXISTS idx_audit_fp ON audit(fp);
 """
 
+# Additive migrations for columns added after initial schema creation.
+# Each ALTER is wrapped in a no-op try so re-running on an up-to-date db is safe.
+_MIGRATIONS = [
+    "ALTER TABLE calibration ADD COLUMN error_dimension TEXT",
+    "ALTER TABLE calibration ADD COLUMN correction_note TEXT",
+]
+
 
 def _resolve(path: str | Path | None) -> Path:
     return Path(path) if path is not None else Path(settings.store_path)
@@ -141,6 +150,11 @@ def _connect(path: str | Path | None = None) -> Iterator[sqlite3.Connection]:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=30000")
         conn.executescript(_SCHEMA)
+        for migration in _MIGRATIONS:
+            try:
+                conn.execute(migration)
+            except sqlite3.OperationalError:
+                pass  # column already exists
         yield conn
         conn.commit()
     finally:
@@ -166,6 +180,7 @@ def cal_insert(
 
 def cal_label(
     run_id: str, correct: bool, *, score: float | None, source: str,
+    error_dimension: str | None = None, correction_note: str | None = None,
     path: str | Path | None = None,
 ) -> bool:
     """Atomically set the verdict on the *most recent* record for run_id. One
@@ -173,10 +188,11 @@ def cal_label(
     row matched."""
     with _write_lock, _connect(path) as conn:
         cur = conn.execute(
-            "UPDATE calibration SET correct=?, score=?, source=? "
+            "UPDATE calibration SET correct=?, score=?, source=?, "
+            "error_dimension=?, correction_note=? "
             "WHERE id = (SELECT id FROM calibration WHERE run_id=? "
             "            ORDER BY id DESC LIMIT 1)",
-            (1 if correct else 0, score, source, run_id),
+            (1 if correct else 0, score, source, error_dimension, correction_note, run_id),
         )
         return cur.rowcount > 0
 

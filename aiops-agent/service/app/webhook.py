@@ -112,6 +112,35 @@ async def _investigate_and_sink(alert: dict, fp: str) -> None:
         logger.exception("headless RCA failed fp=%s: %s", fp, e)
 
 
+async def reinvestigate(fp: str, alert: dict, error_dimension: str | None, correction_note: str | None) -> None:
+    """Re-run RCA for an alert that was labeled Wrong, injecting the human
+    correction as context so the agent knows what to reconsider."""
+    correction_lines = [
+        "The previous RCA for this alert was marked INCORRECT by a human reviewer.",
+    ]
+    if error_dimension:
+        labels = {
+            "root_cause": "The root cause identification was wrong.",
+            "scope": "The affected service/scope was wrong.",
+            "action": "The proposed remediation action was wrong.",
+            "other": "The assessment was wrong (see note).",
+        }
+        correction_lines.append(f"Error dimension: {labels.get(error_dimension, error_dimension)}")
+    if correction_note:
+        correction_lines.append(f"Human note: {correction_note}")
+    correction_lines.append(
+        "Please re-examine the signals from scratch and revise your conclusion. "
+        "Do NOT repeat the previous answer."
+    )
+    hint = "\n".join(correction_lines)
+
+    # Inject the correction as a new user turn in the SAME thread so the agent
+    # sees its prior reasoning and knows exactly what to fix.
+    alert_with_hint = dict(alert)
+    alert_with_hint["_correction_hint"] = hint
+    await _investigate_and_sink(alert_with_hint, fp)
+
+
 async def handle_alert(payload: dict) -> dict:
     """Process a Grafana webhook payload. Returns which alerts were accepted for
     investigation vs skipped (and why) — the investigations run in the

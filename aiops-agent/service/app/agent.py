@@ -848,6 +848,10 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
 
     turn_messages.append({"role": "user", "content": _alert_to_prompt(labels, annotations, starts_dt)})
 
+    correction_hint = alert.get("_correction_hint")
+    if correction_hint:
+        turn_messages.append({"role": "user", "content": correction_hint})
+
     agent = await _build_agent()
     config = {"configurable": {"thread_id": thread_id}}
     # Pin the clock to the alert's fire time for the whole run (prompt + wrapper).
@@ -875,10 +879,12 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
             from .calibration import compute_calibration, load_records
             from .governance import propose_remediations
             from .runbook import _subst, incident_params
+            from .signals.dq import dq_verdict
 
             calib = compute_calibration(load_records())
             decisions = propose_remediations(
-                [s.action for s in matched_rb.remediation], findings.confidence, calib
+                [s.action for s in matched_rb.remediation], findings.confidence,
+                calib, dq_verdict(),
             )
 
             # Materialize each AUTO/PROPOSE decision as a tracked ActionRequest the

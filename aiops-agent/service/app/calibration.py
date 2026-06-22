@@ -52,6 +52,9 @@ class CalibrationRecord(BaseModel):
     hypothesis: str = ""
     suspected_version: str | None = None
     services: list[str] = Field(default_factory=list)
+    # Filled in when correct=False: which part was wrong + human-supplied note.
+    error_dimension: str | None = None  # root_cause | scope | action | other
+    correction_note: str | None = None
 
 
 # ---- store (durable SQLite via app.store; `path` = db path) -----------------
@@ -98,11 +101,17 @@ def label_run(
     *,
     score: float | None = None,
     source: str = "manual",
+    error_dimension: str | None = None,
+    correction_note: str | None = None,
     path: Path | None = None,
 ) -> bool:
     """Fill in the verdict for the most recent record matching run_id (atomic
     UPDATE in the store). Returns True if a record was updated."""
-    ok = store.cal_label(run_id, correct, score=score, source=source, path=path)
+    ok = store.cal_label(
+        run_id, correct, score=score, source=source,
+        error_dimension=error_dimension, correction_note=correction_note,
+        path=path,
+    )
     if not ok:
         logger.warning("label_run: no record for run_id=%s", run_id)
     return ok

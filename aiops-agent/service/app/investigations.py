@@ -51,6 +51,8 @@ class InvestigationRecord(BaseModel):
     answer: str = ""
     # filled in at list time from the CE harness; None = not yet judged
     correct: bool | None = None
+    # original alert payload — needed to re-run investigation on Wrong label
+    alert: dict = Field(default_factory=dict)
 
 
 def record_investigation(fp: str, alert: dict, result: dict, path: Path | None = None) -> None:
@@ -80,6 +82,7 @@ def record_investigation(fp: str, alert: dict, result: dict, path: Path | None =
                 for d in decisions
             ],
             answer=(result.get("answer") or "")[:2000],
+            alert={k: v for k, v in alert.items() if k != "_correction_hint"},
         )
         store.inv_insert(rec.fp, rec.ts, rec.model_dump_json(), path)
     except Exception as e:
@@ -94,6 +97,13 @@ def _load(path: Path | None = None) -> list[InvestigationRecord]:
         except Exception as e:
             logger.warning("skipping malformed investigation row: %s", e)
     return out
+
+
+def get_investigation(fp: str, path: Path | None = None) -> InvestigationRecord | None:
+    """Return the most recent investigation record for a fingerprint, or None."""
+    records = _load(path)
+    matches = [r for r in records if r.fp == fp]
+    return matches[-1] if matches else None
 
 
 def list_investigations(limit: int = 50, path: Path | None = None) -> list[dict[str, Any]]:
