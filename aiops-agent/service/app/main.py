@@ -207,6 +207,51 @@ async def actions_breaker_reset(body: BreakerResetRequest):
     return {"ok": True, "cleared": cleared, "scope": body.scope or "all"}
 
 
+@app.get("/actions/fix-efficacy")
+async def actions_fix_efficacy():
+    """Per-action fix-efficacy summary (7b-5 Learn). Reads the executions ledger
+    to compute success rate per action, and the CE calibration store for the
+    remediation-verified/-failed self-label count. Separate from the headline CE
+    (which requires human/grader labels) — this is the 'did the fix work' view."""
+    from . import store as _store
+    from .calibration import load_records
+
+    # Per-action success rate from the executions ledger
+    with _store._connect() as conn:
+        rows = conn.execute(
+            "SELECT action, COUNT(*) as total, SUM(success) as successes "
+            "FROM executions GROUP BY action ORDER BY action"
+        ).fetchall()
+    by_action = [
+        {
+            "action": r["action"],
+            "total": r["total"],
+            "successes": int(r["successes"] or 0),
+            "success_rate": round(int(r["successes"] or 0) / r["total"], 3) if r["total"] else None,
+        }
+        for r in rows
+    ]
+
+    # Self-label counts from CE calibration store
+    recs = load_records()
+    remediation_labels = [r for r in recs if r.source in ("remediation-verified", "remediation-failed")]
+    verified_count = sum(1 for r in remediation_labels if r.correct is True)
+    failed_count = sum(1 for r in remediation_labels if r.correct is False)
+
+    return {
+        "per_action": by_action,
+        "remediation_ce_labels": {
+            "verified": verified_count,
+            "failed": failed_count,
+            "total": len(remediation_labels),
+            "note": (
+                "learn_remediation_into_ce=True" if settings.learn_remediation_into_ce
+                else "learn_remediation_into_ce=False (labels not written to CE headline stream)"
+            ),
+        },
+    }
+
+
 # ---- Trace Explorer ---------------------------------------------------------
 
 

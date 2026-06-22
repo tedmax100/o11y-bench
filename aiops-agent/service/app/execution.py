@@ -29,6 +29,7 @@ from . import action_requests as ar
 from . import audit, blast_radius, breaker, store
 from .actions import ActionDisabled, registry
 from .action_requests import ActionRequest, Status
+from .calibration import label_run
 from .config import settings
 # Module-level so tests can monkeypatch without importing the agent stack.
 from .runbook import load_runbooks, run_diagnostics
@@ -148,6 +149,26 @@ async def _auto_rollback(req: ActionRequest, path: Path | None) -> bool:
                      detail={"action": rb_action, "error": f"{type(e).__name__}: {e}"},
                      path=path)
         return False
+
+
+def _learn_outcome(req: ActionRequest, *, verified: bool, path: Path | None) -> None:
+    """Write the verify outcome back to the CE harness (step 7 / §6.2).
+
+    Two constraints from the design (§6.2):
+    1. Only write when `learn_remediation_into_ce=True` (default False) — remediation
+       labels feed fix-efficacy by default, not the headline CE stream.
+    2. Only a *verify* failure (execute succeeded, symptom persisted) is evidence of
+       RCA incorrectness. An execute failure is evidence of an infrastructure problem,
+       not a wrong diagnosis — those labels stay out of CE entirely.
+    """
+    if not settings.learn_remediation_into_ce:
+        return
+    source = "remediation-verified" if verified else "remediation-failed"
+    ok = label_run(req.fp, correct=verified, source=source, path=path)
+    if ok:
+        logger.info("learn: labeled fp=%s correct=%s source=%s", req.fp, verified, source)
+    else:
+        logger.warning("learn: no CE record for fp=%s (run may predate this execution)", req.fp)
 
 
 async def _revalidate_preconditions(req: ActionRequest, path: Path | None) -> bool:
@@ -287,9 +308,14 @@ async def run(request_id: str, path: Path | None = None) -> dict:
                                request_id=req.request_id, success=True, path=path)
         ar_store_transition(req.request_id, Status.EXECUTING, Status.SUCCEEDED,
                             outcome="executed and verified", path=path)
+        # --- 7. Learn: verified → correct label (§6.2 constraint 1+3) --------
+        _learn_outcome(req, verified=True, path=path)
         return {"status": Status.SUCCEEDED.value}
 
     # --- 6. verify failed → auto-rollback ------------------------------------
+    # §6.2 constraint 2: only verify failure (not execute failure) is RCA-wrongness
+    # evidence; label AFTER rollback (whether it succeeded or not — the RCA was wrong
+    # regardless of whether rollback worked).
     breaker.record_outcome(req.action, target, fp=req.fp,
                            request_id=req.request_id, success=False, path=path)
     ar_store_transition(req.request_id, Status.EXECUTING, Status.VERIFY_FAILED,
@@ -302,6 +328,8 @@ async def run(request_id: str, path: Path | None = None) -> dict:
                         outcome="rolled back after verify failure" if rb_ok
                         else "rollback failed after verify failure",
                         path=path)
+    # --- 7. Learn: verify failed → incorrect label ---------------------------
+    _learn_outcome(req, verified=False, path=path)
     return {"status": final.value, "outcome": "verify failed; " + ("rolled back" if rb_ok else "rollback also failed")}
 
 

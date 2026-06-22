@@ -83,7 +83,10 @@ def test_mid_confidence_proposes():
     assert decide(_spec(), 0.65, _calib()).autonomy is Autonomy.PROPOSE
 
 
-def test_high_confidence_good_calibration_auto():
+def test_high_confidence_good_calibration_auto(monkeypatch):
+    # bypass the human-label store check: this test verifies the confidence +
+    # calibration gate only; the human-label gate is tested in test_learn.py
+    monkeypatch.setattr(gov.settings, "governance_min_human_labeled_runs", 0)
     d = decide(_spec(), 0.9, _calib(labeled=50, overconfidence=0.02))
     assert d.autonomy is Autonomy.AUTO and not d.requires_human
 
@@ -118,6 +121,7 @@ def test_propose_remediations_maps_registered_only():
 
 def test_format_decisions_notes_killswitch(monkeypatch):
     monkeypatch.setattr(gov.settings, "actions_enabled", False)
+    monkeypatch.setattr(gov.settings, "governance_min_human_labeled_runs", 0)
     d = decide(_spec(), 0.9, _calib())  # AUTO by policy
     text = gov.format_decisions([d])
     assert "kill-switch is OFF" in text and "AUTO" in text

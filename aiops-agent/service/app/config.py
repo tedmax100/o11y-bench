@@ -130,6 +130,14 @@ class Settings(BaseSettings):
     governance_max_overconfidence: float = 0.1
     # AUTO requires at least this many labeled runs — autonomy must be earned.
     governance_min_labeled_runs: int = 20
+    # Of those, at least this many must be human/grader labels (source not
+    # "remediation-verified/-failed"). Self-produced labels alone cannot unlock AUTO.
+    governance_min_human_labeled_runs: int = 20
+
+    # --- Learn 閉環效度約束 (7b-5 §6.2) ------------------------------------
+    # Whether remediation verify outcomes are written back as CE correctness labels.
+    # Default False: remediation outcomes only feed fix-efficacy + breaker, not CE.
+    learn_remediation_into_ce: bool = False
 
     alert_provisioning_enabled: bool = True
 

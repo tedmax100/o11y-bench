@@ -181,6 +181,24 @@ def cal_label(
         return cur.rowcount > 0
 
 
+def cal_count_by_source(
+    *, exclude_sources: tuple[str, ...] = (), path: str | Path | None = None
+) -> int:
+    """Count labeled calibration records, optionally excluding specific sources.
+    Used by governance to count human/grader labels without remediation self-labels."""
+    placeholders = ",".join("?" * len(exclude_sources))
+    with _connect(path) as conn:
+        if exclude_sources:
+            return conn.execute(
+                f"SELECT COUNT(*) FROM calibration WHERE correct IS NOT NULL "
+                f"AND (source IS NULL OR source NOT IN ({placeholders}))",
+                list(exclude_sources),
+            ).fetchone()[0]
+        return conn.execute(
+            "SELECT COUNT(*) FROM calibration WHERE correct IS NOT NULL"
+        ).fetchone()[0]
+
+
 def cal_load(path: str | Path | None = None) -> list[dict[str, Any]]:
     """All calibration records in insert order, as dicts (services parsed,
     correct mapped back to bool/None)."""
