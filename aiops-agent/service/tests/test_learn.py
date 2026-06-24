@@ -9,9 +9,8 @@ human-label gate. Three concerns:
 import app.execution as ex
 import app.governance as gov
 import app.store as store
-from app.calibration import label_run, load_records
+from app.calibration import load_records
 from app.governance import Autonomy, decide
-
 
 # ---- helpers ----------------------------------------------------------------
 

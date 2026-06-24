@@ -1,4 +1,43 @@
 groups:
+  - id: entity.service
+    type: entity
+    name: service
+    stability: stable
+    brief: "邏輯服務實體"
+    attributes:
+      - id: service.name
+        type: string
+        stability: stable
+        brief: "服務名稱"
+        examples: ["payment-service", "cart-service"]
+        requirement_level: required
+
+  - id: entity.k8s.pod
+    type: entity
+    name: k8s.pod
+    stability: stable
+    brief: "Kubernetes Pod 實體"
+    attributes:
+      - id: k8s.pod.name
+        type: string
+        stability: stable
+        brief: "Pod 名稱"
+        examples: ["payment-7d9f-abc", "cart-5c8d-xyz"]
+        requirement_level: required
+
+  - id: entity.k8s.node
+    type: entity
+    name: k8s.node
+    stability: stable
+    brief: "Kubernetes Node 實體"
+    attributes:
+      - id: k8s.node.name
+        type: string
+        stability: stable
+        brief: "Node 名稱"
+        examples: ["ip-10-0-1-2", "ip-10-0-1-3"]
+        requirement_level: required
+
   - id: common.resource
     type: attribute_group
     brief: "跨服務通用的資源屬性"

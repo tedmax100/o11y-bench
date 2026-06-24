@@ -3,10 +3,9 @@ import random
 import time
 from dataclasses import dataclass
 
-from opentelemetry import trace, metrics
+from generated.semconv import CommonAttrs, ErrorAttrs, PaymentAttrs, PaymentMetric
+from opentelemetry import metrics, trace
 from opentelemetry.trace import SpanKind, StatusCode
-
-from generated.semconv import PaymentAttrs, PaymentMetric, ErrorAttrs, CommonAttrs
 
 tracer = trace.get_tracer("payment-service")
 meter  = metrics.get_meter("payment-service")

@@ -8,8 +8,6 @@ import os
 import random
 
 from fastapi import FastAPI, HTTPException
-from opentelemetry import metrics
-
 from o11y_shared import (
     BizEvent,
     FeatureFlags,
@@ -17,6 +15,7 @@ from o11y_shared import (
     log_event,
     setup_stdout_json_logging,
 )
+from opentelemetry import metrics
 
 setup_stdout_json_logging(level=os.environ.get("LOG_LEVEL", "INFO"))
 

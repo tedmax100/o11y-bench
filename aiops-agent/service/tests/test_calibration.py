@@ -11,9 +11,9 @@ from app.calibration import (
     CalibrationRecord,
     compute_calibration,
     grade_against_truth,
+    label_run,
     load_records,
     record_run,
-    label_run,
     score_to_correct,
 )
 

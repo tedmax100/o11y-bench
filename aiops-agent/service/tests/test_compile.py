@@ -13,7 +13,6 @@ from app.signals.compile import (
 from app.signals.contract import get_contracts
 from app.signals.topology import Edge, ServiceNode, get_topology
 
-
 # ---- topo-sort / journey derivation ---------------------------------------
 
 def test_topo_sort_deterministic_alpha_tiebreak():

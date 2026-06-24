@@ -13,7 +13,6 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-
 from o11y_shared import (
     BizEvent,
     get_logger,

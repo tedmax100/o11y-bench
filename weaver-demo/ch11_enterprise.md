@@ -65,6 +65,30 @@ groups:
     brief: "ACME Corp 支付金額分佈"
 ```
 
+### 宣告依賴，而不是掃描發現
+
+上面那條繼承鏈是怎麼被找到的？直覺答案是「掃描」——平台團隊寫個 job，把組織所有 repo 爬一遍找出每個 `*.yaml` 拼起來。**不要這樣做。** 服務散在數十個 repo 後，掃描會在最糟的時機失效：某 repo CI 還沒推、某 fork 混進半成品、某次抖動少抓一個——「完整 schema」就**悄悄殘缺**且不報錯，因為缺的東西本來就不在場。
+
+Weaver 反過來：**依賴是被「宣告」的，不是被「發現」的。** 每一層在自己的 `manifest.yaml` 裡明寫依賴誰、pin 哪個版本：
+
+```yaml
+# 各 domain registry 的 manifest.yaml（示意）
+name: payment-registry
+dependencies:
+  - name: acme-common
+    version: v3.2.0          # pin 死版本，不是 "latest"
+  - name: otel-semconv
+    version: v1.29.0
+```
+
+`weaver registry resolve`（發布時用 `package`，見 11.5）**只**沿這張宣告的依賴圖走並壓平成自包含 artifact。沒列進 manifest 的不會被吸進來；列了卻拉不到的**直接報錯**，不靜默略過。跨團隊後這放大成三件事：
+
+- **可重現**：pin 版本 → 同一份 manifest 今天與半年後 resolve 出同一份 schema；掃描做不到。
+- **provenance**：出事能反查壓平 schema 由哪些 registry 的哪些版本組成（對映 11.5 的 git tag）。
+- **缺片會紅**：宣告了卻拉不到 = 編譯失敗，漏一片是 CI 紅燈而非「悄悄少一段」。
+
+> 一句話：**消費者不該去「發現」有多少貢獻者，它只認一份 pin 死版本的依賴清單。**
+
 ---
 
 ## 11.3 遺留系統整合

@@ -1,13 +1,10 @@
 """購物車服務 — 使用 Weaver 生成的常數確保屬性名稱合規"""
-import random
 import time
 from dataclasses import dataclass, field
-from typing import List
-
-from opentelemetry import trace, metrics
-from opentelemetry.trace import SpanKind
 
 from generated.semconv import CartAttrs, CartMetric, CommonAttrs
+from opentelemetry import metrics, trace
+from opentelemetry.trace import SpanKind
 
 tracer = trace.get_tracer("cart-service")
 meter  = metrics.get_meter("cart-service")
@@ -41,7 +38,7 @@ class AddItemRequest:
 @dataclass
 class CheckoutRequest:
     session_id:   str
-    items:        List[AddItemRequest] = field(default_factory=list)
+    items:        list[AddItemRequest] = field(default_factory=list)
     total_amount: float = 0.0
 
 

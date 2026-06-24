@@ -11,9 +11,6 @@ import uuid
 
 import httpx
 from fastapi import FastAPI, HTTPException
-from opentelemetry import metrics
-from pydantic import BaseModel, Field
-
 from o11y_shared import (
     BizEvent,
     FeatureFlags,
@@ -21,6 +18,8 @@ from o11y_shared import (
     log_event,
     setup_stdout_json_logging,
 )
+from opentelemetry import metrics
+from pydantic import BaseModel, Field
 
 USER_SERVICE_URL = os.environ.get("USER_SERVICE_URL", "http://user-service.demo.svc:8000")
 PAYMENT_SERVICE_URL = os.environ.get(

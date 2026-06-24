@@ -21,6 +21,12 @@ templates:
     application_mode: single
     file_name: "semconv_metrics.go"
 
+  # 0.24.0 新增的 semconv_grouped_events helper：依 root namespace 分組 event
+  - template: semconv_events.go.j2
+    filter: semconv_grouped_events
+    application_mode: single
+    file_name: "semconv_events.go"
+
   - template: docs.md.j2
     filter: >
       .groups

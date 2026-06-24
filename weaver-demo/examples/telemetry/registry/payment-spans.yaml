@@ -4,6 +4,9 @@ groups:
     span_kind: server
     stability: stable
     brief: "處理訂單支付流程的 Span"
+    entity_associations:
+      - all_of: [service]            # payment-service 一定要帶
+      - one_of: [k8s.pod, k8s.node]  # k8s 帶 pod，裸機帶 node，擇一
     attributes:
       - ref: git.tag
       - ref: deployment.environment

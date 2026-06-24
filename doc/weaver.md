@@ -293,7 +293,7 @@ demo-services/scripts/weaver.sh   # 包 otel/weaver 容器的執行器
 
 ### 5.6 接進工具鏈
 
-**執行器** [`scripts/weaver.sh`](../demo-services/scripts/weaver.sh)：包 `otel/weaver:v0.23.0`
+**執行器** [`scripts/weaver.sh`](../demo-services/scripts/weaver.sh)：包 `otel/weaver:v0.24.0`
 容器（釘版本、免本機安裝、自動判斷有沒有 tty 所以 CI 也能用）。
 
 **mise 任務**（`mise.toml`）：

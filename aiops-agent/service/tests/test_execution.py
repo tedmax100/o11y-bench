@@ -215,8 +215,8 @@ def _wire_impl(monkeypatch, *, impl_ok: bool, rollback_ok: bool = True):
 
 def _setup_verify_test(monkeypatch, tmp_path, *, verify_pass: bool, rollback_ok: bool = True):
     """Common setup for verify tests: enabled kill switch, faked impl, faked verify tool."""
-    from app.actions import registry
     import app.execution as ex_mod
+    from app.actions import registry
 
     p = _db(monkeypatch, tmp_path)
     monkeypatch.setattr(arq.settings, "actions_enabled", True)

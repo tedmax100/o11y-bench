@@ -2,7 +2,6 @@
 """Weaver Demo — Python 版本"""
 import argparse
 import random
-import sys
 import time
 
 import telemetry_setup
@@ -23,7 +22,7 @@ def main() -> None:
     tp, mp = telemetry_setup.setup("weaver-demo-python", args.otlp)
 
     mode = "❌ 破壞模式（錯誤屬性名稱，Weaver 應攔截）" if args.broken else "✅ 正常模式（符合 Schema）"
-    print(f"\n=== Weaver Demo Python Service ===")
+    print("\n=== Weaver Demo Python Service ===")
     print(f"模式: {mode}")
     print(f"OTLP endpoint: {args.otlp}")
     print(f"操作次數: {args.loops}\n")

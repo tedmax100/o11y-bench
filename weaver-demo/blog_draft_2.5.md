@@ -4,7 +4,7 @@
 > 這篇要回答「**所以呢？**」：一份 registry 寫好之後，到底能拿來**做**什麼。
 > 三個動詞貫穿全篇——`emit`（看）、`generate`（用）、`live-check`（比對）。建議開著 terminal 邊讀邊跑。
 
-> 本篇全部指令、輸出都在 weaver 0.23.0 + 我們的電商 demo（`examples/`）實跑過，輸出原樣貼上。
+> 本篇全部指令、輸出都在 weaver 0.24.0 + 我們的電商 demo（`examples/`）實跑過，輸出原樣貼上。
 
 ---
 
@@ -345,7 +345,7 @@ const PAYMENT_AMOUNT_DESC = "每筆支付的金額分佈"
 
 ### 把 codegen 用滿：模式、filter、偵錯
 
-上面的 `weaver.yaml` 只用了最基本的設定，但 codegen 引擎還有幾個一定會用到的武器（以下都在 0.23.0 實跑過）：
+上面的 `weaver.yaml` 只用了最基本的設定，但 codegen 引擎還有幾個一定會用到的武器（以下都在 0.24.0 實跑過）：
 
 **1. `application_mode: single` vs `each`**——`single` 把整批資料丟給模板出一個檔；`each` 則對 filter 結果的**每個元素各跑一次**，配合 `file_name` 的 Jinja 模板就能動態命名、一個元素一個檔：
 
