@@ -1,10 +1,11 @@
 import json
 import logging
 import os
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, AsyncIterator, TypedDict
+from typing import Annotated, TypedDict
 
 from langchain_core.messages import SystemMessage, ToolMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -14,11 +15,9 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel, Field
 
-from .capability import capability_for_services, resolve_services
-from .signals.context import build_signal_context
-from .signals.health import evaluate_dependency_health
-from .config import settings
 from . import store
+from .capability import capability_for_services, resolve_services
+from .config import settings
 from .runbook import (
     format_diagnostics,
     incident_params,
@@ -26,7 +25,8 @@ from .runbook import (
     render_runbook,
     run_diagnostics,
 )
-from .tools.query import current_now, now_override
+from .signals.context import build_signal_context
+from .signals.health import evaluate_dependency_health
 from .tools import (
     discover_log_fields_tool,
     discover_metrics_tool,
@@ -40,6 +40,7 @@ from .tools import (
     query_prometheus,
     query_tempo_traces,
 )
+from .tools.query import current_now, now_override
 
 logger = logging.getLogger("aiops_agent")
 DEBUG_EVENTS = os.getenv("DEBUG_EVENTS", "0") == "1"

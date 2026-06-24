@@ -69,7 +69,8 @@ async def discover_metrics(service: str, lookback: str = "now-1h") -> dict[str, 
     start, end = _parse_dt(lookback), _parse_dt("now")
     data = await _get_json(
         settings.prometheus_url, "/api/v1/series",
-        {"match[]": f'{{service_name="{service}"}}', "start": _epoch_s(start), "end": _epoch_s(end)},
+        {"match[]": f'{{service_name="{service}"}}',
+         "start": _epoch_s(start), "end": _epoch_s(end)},
     )
     series = data.get("data", []) if isinstance(data, dict) else []
     families: dict[tuple[str, str], set[str]] = {}
@@ -102,7 +103,8 @@ async def discover_span_names(service: str, lookback: str = "now-1h") -> dict[st
     start, end = _parse_dt(lookback), _parse_dt("now")
     data = await _get_json(
         settings.tempo_url, "/api/v2/search/tag/name/values",
-        {"q": f'{{resource.service.name="{service}"}}', "start": _epoch_s(start), "end": _epoch_s(end)},
+        {"q": f'{{resource.service.name="{service}"}}',
+         "start": _epoch_s(start), "end": _epoch_s(end)},
     )
     raw = data.get("tagValues", []) if isinstance(data, dict) else []
     names = sorted({tv.get("value") for tv in raw if isinstance(tv, dict) and tv.get("value")})
@@ -116,7 +118,8 @@ async def discover_log_fields(service: str, lookback: str = "now-1h") -> dict[st
     start, end = _parse_dt(lookback), _parse_dt("now")
     data = await _get_json(
         settings.loki_url, "/loki/api/v1/detected_fields",
-        {"query": f'{{service_name="{service}"}}', "start": _epoch_ns(start), "end": _epoch_ns(end)},
+        {"query": f'{{service_name="{service}"}}',
+         "start": _epoch_ns(start), "end": _epoch_ns(end)},
     )
     fields = data.get("fields", []) if isinstance(data, dict) else []
     out = [

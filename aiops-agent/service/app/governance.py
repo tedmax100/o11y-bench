@@ -28,15 +28,15 @@ on purpose: "should we" vs "can we".
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from .actions import ActionSpec, registry
 from .config import settings
 
 
-class Autonomy(str, Enum):
+class Autonomy(StrEnum):
     AUTO = "auto"        # policy permits autonomous execution (still subject to the kill switch)
     PROPOSE = "propose"  # surface to a human to confirm
     ESCALATE = "escalate"  # hand back to a human; do not even pre-fill an action
@@ -99,7 +99,10 @@ def decide(action: ActionSpec, confidence: float, calib: dict, dq: dict | None =
     # `path=None` means use settings.store_path; tests that don't wire a store
     # should set governance_min_human_labeled_runs=0 to bypass the DB hit.
     human_labeled: int | None = None
-    if confidence >= settings.governance_conf_high and settings.governance_min_human_labeled_runs > 0:
+    if (
+        confidence >= settings.governance_conf_high
+        and settings.governance_min_human_labeled_runs > 0
+    ):
         from . import store
         human_labeled = store.cal_count_by_source(exclude_sources=_SELF_LABEL_SOURCES, path=path)
     good, cal_note = _calibration_verdict(calib, human_labeled=human_labeled)

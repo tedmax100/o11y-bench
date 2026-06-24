@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import time
 
-from .reconcile import get_last_drift
 from ..config import settings
+from .reconcile import get_last_drift
 
 
 def dq_verdict() -> dict:
@@ -32,15 +32,27 @@ def dq_verdict() -> dict:
 
     age = int(time.time() - drift.computed_ts)
     if age > settings.dq_max_reconcile_age_seconds:
-        return {"proven_good": False, "score": drift.dq_score,
-                "note": f"last reconcile {age}s old (> {settings.dq_max_reconcile_age_seconds}s); DQ stale"}
+        return {
+            "proven_good": False, "score": drift.dq_score,
+            "note": (
+                f"last reconcile {age}s old"
+                f" (> {settings.dq_max_reconcile_age_seconds}s); DQ stale"
+            ),
+        }
     if drift.undeclared_edges:
         n = len(drift.undeclared_edges)
-        return {"proven_good": False, "score": drift.dq_score,
-                "note": f"{n} observed-but-undeclared edge(s) (topology drift); DQ degraded"}
+        return {
+            "proven_good": False, "score": drift.dq_score,
+            "note": f"{n} observed-but-undeclared edge(s) (topology drift); DQ degraded",
+        }
     if drift.dq_score is not None and drift.dq_score < settings.dq_min_score:
-        return {"proven_good": False, "score": drift.dq_score,
-                "note": f"declared/observed agreement {drift.dq_score} < {settings.dq_min_score}; DQ degraded"}
+        return {
+            "proven_good": False, "score": drift.dq_score,
+            "note": (
+                f"declared/observed agreement {drift.dq_score}"
+                f" < {settings.dq_min_score}; DQ degraded"
+            ),
+        }
     return {"proven_good": True, "score": drift.dq_score,
             "note": f"topology aligned to live traffic (agreement {drift.dq_score}, "
                     f"{drift.traces_sampled} traces, reconciled {age}s ago)"}

@@ -203,12 +203,16 @@ def _summarize_series_result(result: Any) -> Any:
         out = []
         for s in result.get("result", []):
             val = s.get("value", [None, None])
-            out.append({"metric": s.get("metric", {}), "value": _round_sig(val[1] if len(val) > 1 else None)})
+            out.append({
+                "metric": s.get("metric", {}),
+                "value": _round_sig(val[1] if len(val) > 1 else None),
+            })
         return {"resultType": "vector", "result": out}
 
     if rt == "scalar":
         r = result.get("result")
-        return {"resultType": "scalar", "value": _round_sig(r[1] if isinstance(r, list) and len(r) > 1 else r)}
+        v = _round_sig(r[1] if isinstance(r, list) and len(r) > 1 else r)
+        return {"resultType": "scalar", "value": v}
 
     return result
 
@@ -366,10 +370,12 @@ async def _query_loki_logs(logql: str, start: str = "now-1h", end: str = "now",
 
     selector = _selector(logql)
     if selector is None:
-        return {"truncated": True,
-                "reason": f"Loki result > {LOKI_CAP_BYTES}B and no `{{...}}` selector to aggregate on.",
-                "original_query": logql,
-                "hint": "Rewrite with an explicit stream selector, then re-query."}
+        return {
+            "truncated": True,
+            "reason": f"Loki result > {LOKI_CAP_BYTES}B and no `{{...}}` selector to aggregate on.",
+            "original_query": logql,
+            "hint": "Rewrite with an explicit stream selector, then re-query.",
+        }
     fb = _loki_fallback(selector)
     step = max((_epoch_s(e) - _epoch_s(s)) // 100, 1)
     try:
@@ -424,9 +430,11 @@ async def _query_tempo_traces(traceql: str, start: str = "now-1h", end: str = "n
     # otherwise sends the model off to Loki (and it fails). select() is additive.
     q = traceql if "select(" in traceql.lower() else f"{traceql} | select(resource.service.version)"
     try:
-        data = await _get_json(settings.tempo_url, "/api/search",
-                               {"q": q, "start": _epoch_s(s), "end": _epoch_s(e),  # Tempo: unix seconds
-                                "limit": limit})
+        data = await _get_json(
+            settings.tempo_url, "/api/search",
+            # Tempo expects unix seconds for start/end
+            {"q": q, "start": _epoch_s(s), "end": _epoch_s(e), "limit": limit},
+        )
     except ToolException as exc:
         raise _tempo_query_hint(traceql, exc) from exc
     traces = data.get("traces", []) if isinstance(data, dict) else []

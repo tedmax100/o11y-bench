@@ -141,7 +141,9 @@ async def _evaluate_impact(primary: str, dependency: str, attribution: str) -> I
     ~0 = unhealthy dependency but the caller isn't actually feeling it."""
     try:
         cur = await _instant_scalar(attribution)
-        base = await _instant_scalar(attribution, at=f"now-{settings.signal_health_baseline_offset}")
+        base = await _instant_scalar(
+            attribution, at=f"now-{settings.signal_health_baseline_offset}"
+        )
     except Exception as e:
         logger.warning("impact query for %s→%s failed: %s", primary, dependency, e)
         cur = None
@@ -209,7 +211,10 @@ async def evaluate_dependency_health(services: list[str]) -> str | None:
     lines = [_fmt(h) for h in evaluated]
 
     bad_self = [h.service for h in evaluated if h.relation == "self" and h.verdict == "unhealthy"]
-    bad_deps = [h.service for h in evaluated if h.relation == "downstream" and h.verdict == "unhealthy"]
+    bad_deps = [
+        h.service for h in evaluated
+        if h.relation == "downstream" and h.verdict == "unhealthy"
+    ]
     had_deps = any(h.relation == "downstream" for h in evaluated)
 
     # s4.2: for each unhealthy downstream a primary declares an attribution edge

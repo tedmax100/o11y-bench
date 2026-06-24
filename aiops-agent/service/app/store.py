@@ -26,9 +26,10 @@ import json
 import logging
 import sqlite3
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from .config import settings
 
@@ -662,9 +663,11 @@ def rb_feedback_health_report(
         if vf_rate > 0.30 or has_rb_failed:
             signals = []
             if has_rb_failed:
-                signals.append(f"rollback_failed ×{r['rollback_failed']} — suspend auto-execution")
+                n = r["rollback_failed"]
+                signals.append(f"rollback_failed x{n} — suspend auto-execution")
             if vf_rate > 0.30:
-                signals.append(f"verify_failed {vf_rate:.0%} ({r['verify_failed']}/{total}) — needs-review")
+                vf, tot = r["verify_failed"], total
+                signals.append(f"verify_failed {vf_rate:.0%} ({vf}/{tot}) — needs-review")
             results.append({
                 "runbook_id": r["runbook_id"],
                 "total_executions": total,

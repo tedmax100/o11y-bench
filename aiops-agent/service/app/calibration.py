@@ -46,7 +46,9 @@ class CalibrationRecord(BaseModel):
     # Filled in offline. None = not yet judged (excluded from CE until labeled).
     correct: bool | None = None
     score: float | None = Field(default=None, description="Raw grading score, if from o11y-bench.")
-    source: str | None = Field(default=None, description="How `correct` was decided (truth/grader).")
+    source: str | None = Field(
+        default=None, description="How `correct` was decided (truth/grader)."
+    )
     # Digest for after-the-fact labeling — enough to judge without re-running.
     summary: str = ""
     hypothesis: str = ""

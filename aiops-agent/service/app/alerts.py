@@ -159,7 +159,9 @@ async def provision_alert(spec: AlertSpec) -> dict:
     Fail-closed: no Grafana credentials or operator switch off → refuse, like the
     webhook secret gate, rather than silently no-op."""
     if not settings.alert_provisioning_enabled:
-        raise AlertProvisioningDisabled("alert provisioning disabled (alert_provisioning_enabled=False)")
+        raise AlertProvisioningDisabled(
+            "alert provisioning disabled (alert_provisioning_enabled=False)"
+        )
     if not (settings.grafana_url and settings.grafana_token):
         raise AlertProvisioningDisabled(
             "alert provisioning disabled (no grafana_url/grafana_token configured)")

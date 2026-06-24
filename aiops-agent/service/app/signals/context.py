@@ -59,7 +59,9 @@ def _service_block(svc: str, drift: TopologyDrift | None) -> str | None:
         rendered = ", ".join(d + _annotate((svc, d), drift) for d in down)
         lines.append(f"- downstream (dependencies — could be blocking this): {rendered}")
     else:
-        lines.append("- downstream (dependencies): none (leaf — not blocked by anything downstream)")
+        lines.append(
+            "- downstream (dependencies): none (leaf — not blocked by anything downstream)"
+        )
 
     # Observed-but-undeclared edges touching this service: the topology is
     # incomplete here, so the agent shouldn't treat the declared graph as closed.
@@ -70,7 +72,10 @@ def _service_block(svc: str, drift: TopologyDrift | None) -> str | None:
             if svc in (e.caller, e.callee)
         ]
         if extra:
-            lines.append("- ⚠ observed dependencies NOT in the declared topology: " + ", ".join(extra))
+            lines.append(
+                "- ⚠ observed dependencies NOT in the declared topology: "
+                + ", ".join(extra)
+            )
 
     lines.extend(_contract_lines(svc))
     return "\n".join(lines)
@@ -91,7 +96,10 @@ def _contract_lines(svc: str) -> list[str]:
             unit = f" [{sli.unit}]" if sli.unit else ""
             target = f"  target: {sli.objective}" if sli.objective else ""
             lines.append(f"    {sli.kind}: {sli.promql}{unit}{target}")
-        lines.append(f"- signal freshness guarantee: ≤{contract.freshness_seconds}s (older samples are stale)")
+        lines.append(
+            f"- signal freshness guarantee: ≤{contract.freshness_seconds}s"
+            " (older samples are stale)"
+        )
     if contract.logs:
         lg = contract.logs
         lines.append(
@@ -100,7 +108,7 @@ def _contract_lines(svc: str) -> list[str]:
         )
         lines.append(f"    stream selector: {lg.selector}")
         if lg.error_events:
-            lines.append(f"    failure events (filter after the selector with `| event=\"…\"`): "
+            lines.append("    failure events (filter after the selector with `| event=\"…\"`): "
                          + ", ".join(lg.error_events))
         if lg.error_query:
             lines.append(f"    find failures: {lg.error_query}")
@@ -120,7 +128,10 @@ def _dq_note(drift: TopologyDrift | None) -> str:
         f"declared/observed agreement {score}."
     )
     if drift.dq_score is not None and drift.dq_score < 1.0:
-        note += " ⚠ the declared graph is out of date vs live traffic — trust the trace evidence over it where they disagree."
+        note += (
+            " ⚠ the declared graph is out of date vs live traffic"
+            " — trust the trace evidence over it where they disagree."
+        )
     return note
 
 

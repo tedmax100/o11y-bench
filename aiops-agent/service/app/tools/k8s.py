@@ -130,7 +130,10 @@ def _summarize_pod(pod) -> dict[str, Any]:
         if last and last.terminated and last.terminated.reason:
             last_terminated.append(
                 f"{last.terminated.reason}"
-                + (f"(exit {last.terminated.exit_code})" if last.terminated.exit_code is not None else "")
+                + (
+                    f"(exit {last.terminated.exit_code})"
+                    if last.terminated.exit_code is not None else ""
+                )
             )
 
     labels = pod.metadata.labels or {}
@@ -199,7 +202,10 @@ async def get_k8s_events(service: str, limit: int = 20) -> dict[str, Any]:
             continue
         if ev.type == "Normal" and ev.reason not in _INTERESTING_EVENT_REASONS:
             continue
-        ts = ev.last_timestamp or ev.event_time or (ev.metadata.creation_timestamp if ev.metadata else None)
+        ts = (
+            ev.last_timestamp or ev.event_time
+            or (ev.metadata.creation_timestamp if ev.metadata else None)
+        )
         events.append({
             "type": ev.type,
             "reason": ev.reason,
@@ -248,7 +254,10 @@ async def get_deployment_status(service: str) -> dict[str, Any]:
 
     st = dep.status
     conditions = [
-        {"type": c.type, "status": c.status, "reason": c.reason, "message": (c.message or "").strip()}
+        {
+            "type": c.type, "status": c.status, "reason": c.reason,
+            "message": (c.message or "").strip(),
+        }
         for c in (st.conditions or [])
     ]
     annotations = dep.metadata.annotations or {}

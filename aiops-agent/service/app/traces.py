@@ -25,7 +25,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -161,7 +162,10 @@ def _node_kind(name: str, attrs: dict) -> str:
         return "llm"
     if name.startswith("execute_tool") or "gen_ai.tool.name" in attrs:
         return "tool"
-    if any(k.startswith("http.") for k in attrs) or name.startswith(("GET ", "POST ", "PUT ", "DELETE ")):
+    if (
+        any(k.startswith("http.") for k in attrs)
+        or name.startswith(("GET ", "POST ", "PUT ", "DELETE "))
+    ):
         return "http"
     return "business"
 
@@ -233,7 +237,9 @@ def _normalize_trace(raw: dict, *, compact: bool = False) -> dict:
                     "model": model,
                     "provider": attrs.get("gen_ai.provider.name"),
                     "operation": attrs.get("gen_ai.operation.name"),
-                    "duration_ms": round((end_ns - start_ns) / 1e6, 2) if end_ns and start_ns else None,
+                    "duration_ms": (
+                        round((end_ns - start_ns) / 1e6, 2) if end_ns and start_ns else None
+                    ),
                     "start_ns": start_ns,
                     "input_tokens": in_tok or None,
                     "output_tokens": out_tok or None,
@@ -303,7 +309,9 @@ async def analyze_trace(trace_id: str) -> str:
     res = await _analysis_llm().ainvoke(
         [
             SystemMessage(content=_ANALYSIS_PROMPT),
-            HumanMessage(content="Trace (normalized JSON):\n" + json.dumps(tree, ensure_ascii=False)),
+            HumanMessage(
+                content="Trace (normalized JSON):\n" + json.dumps(tree, ensure_ascii=False)
+            ),
         ]
     )
     # gemini-3.x returns multipart content (text + thinking blocks); flatten to text.

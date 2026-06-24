@@ -118,7 +118,10 @@ async def _investigate_and_sink(alert: dict, fp: str) -> None:
         logger.exception("headless RCA failed fp=%s: %s", fp, e)
 
 
-async def reinvestigate(fp: str, alert: dict, error_dimension: str | None, correction_note: str | None) -> None:
+async def reinvestigate(
+    fp: str, alert: dict,
+    error_dimension: str | None, correction_note: str | None,
+) -> None:
     """Re-run RCA for an alert that was labeled Wrong, injecting the human
     correction as context so the agent knows what to reconsider."""
     correction_lines = [

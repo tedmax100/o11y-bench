@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +33,7 @@ from .governance import Autonomy, Decision
 logger = logging.getLogger("aiops_agent.action_requests")
 
 
-class Status(str, Enum):
+class Status(StrEnum):
     PROPOSED = "proposed"          # awaiting a human decision (PROPOSE band)
     APPROVED = "approved"          # cleared to execute (human or AUTO)
     REJECTED = "rejected"          # human declined

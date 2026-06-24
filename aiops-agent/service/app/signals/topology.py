@@ -126,7 +126,10 @@ def get_topology() -> Topology:
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         topo = Topology.model_validate(data)
-        logger.info("loaded topology v%s: %d nodes, %d edges", topo.version, len(topo.nodes), len(topo.edges))
+        logger.info(
+            "loaded topology v%s: %d nodes, %d edges",
+            topo.version, len(topo.nodes), len(topo.edges),
+        )
         return topo
     except Exception as e:  # missing file / bad yaml / schema mismatch
         logger.warning("topology load failed (%s); signal context disabled: %s", path, e)

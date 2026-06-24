@@ -27,10 +27,11 @@ from typing import Any
 
 from . import action_requests as ar
 from . import audit, blast_radius, breaker, store
-from .actions import ActionDisabled, registry
 from .action_requests import ActionRequest, Status
+from .actions import ActionDisabled, registry
 from .calibration import label_run
 from .config import settings
+
 # Module-level so tests can monkeypatch without importing the agent stack.
 from .runbook import load_runbooks, run_diagnostics
 
@@ -85,7 +86,10 @@ def _eval_verify_check(check: dict, output: Any) -> tuple[bool, str]:
 async def _verify_outcome(req: ActionRequest, path: Path | None) -> bool:
     """Wait the settle window, run the runbook step's verify spec, return True
     if the symptom cleared. No verify spec → optimistically returns True (skip)."""
-    rb = next((b for b in load_runbooks() if b.id == req.runbook_id), None) if req.runbook_id else None
+    rb = (
+        next((b for b in load_runbooks() if b.id == req.runbook_id), None)
+        if req.runbook_id else None
+    )
     step = next((s for s in (rb.remediation if rb else []) if s.action == req.action), None)
 
     if step is None or not step.verify:
@@ -257,9 +261,11 @@ async def run(request_id: str, path: Path | None = None) -> dict:
     if dup:
         audit.record("idempotency", "abort", request_id=req.request_id, fp=req.fp,
                      detail={"superseded_by": dup, "idem_key": req.idem_key}, path=path)
-        ar_store_transition(req.request_id, Status.EXECUTING, Status.ABORTED,
-                            outcome=f"idempotent: target already acted on for this incident ({dup})",
-                            path=path)
+        ar_store_transition(
+            req.request_id, Status.EXECUTING, Status.ABORTED,
+            outcome=f"idempotent: target already acted on for this incident ({dup})",
+            path=path,
+        )
         return {"status": Status.ABORTED.value, "outcome": "idempotent duplicate"}
 
     allowed, reason = breaker.check(req.action, target, path)
@@ -336,7 +342,8 @@ async def run(request_id: str, path: Path | None = None) -> dict:
     _rb_feedback("rollback" if rb_ok else "rollback_failed", req, path)
     # --- 7. Learn: verify failed → incorrect label ---------------------------
     _learn_outcome(req, verified=False, path=path)
-    return {"status": final.value, "outcome": "verify failed; " + ("rolled back" if rb_ok else "rollback also failed")}
+    rollback_outcome = "rolled back" if rb_ok else "rollback also failed"
+    return {"status": final.value, "outcome": f"verify failed; {rollback_outcome}"}
 
 
 def _rb_feedback(outcome: str, req: ActionRequest, path: Path | None) -> None:

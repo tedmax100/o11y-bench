@@ -274,7 +274,9 @@ async def actions_fix_efficacy():
 
     # Self-label counts from CE calibration store
     recs = load_records()
-    remediation_labels = [r for r in recs if r.source in ("remediation-verified", "remediation-failed")]
+    remediation_labels = [
+        r for r in recs if r.source in ("remediation-verified", "remediation-failed")
+    ]
     verified_count = sum(1 for r in remediation_labels if r.correct is True)
     failed_count = sum(1 for r in remediation_labels if r.correct is False)
 

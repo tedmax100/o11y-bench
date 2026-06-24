@@ -18,7 +18,8 @@ registry decides *what* an action is and is the only thing that *could* run it.
 from __future__ import annotations
 
 import logging
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -89,7 +90,8 @@ class ActionRegistry:
 # Module-level registry. dry_run wired since 7b-2; impl wired now (7b-4).
 from .blast_radius import dry_run_rollout_undo, dry_run_scale  # noqa: E402
 from .tools.k8s_write import (  # noqa: E402
-    impl_rollout_undo, impl_scale, rollback_rollout_undo,
+    impl_rollout_undo,
+    impl_scale,
 )
 
 registry = ActionRegistry()

@@ -79,7 +79,9 @@ def edges_from_trace(raw: dict) -> set[tuple[str, str]]:
     return edges
 
 
-def diff_edges(topo: Topology, observed: set[tuple[str, str]], traces_sampled: int) -> TopologyDrift:
+def diff_edges(
+    topo: Topology, observed: set[tuple[str, str]], traces_sampled: int
+) -> TopologyDrift:
     """Pure diff of declared vs observed edges → drift + DQ score."""
     declared = {(e.caller, e.callee) for e in topo.edges}
     undeclared = observed - declared
@@ -126,7 +128,9 @@ async def _search_trace_ids(lookback: str, limit: int) -> list[str]:
     return [t.get("traceID") for t in traces if t.get("traceID")]
 
 
-async def observe_edges(lookback: str = "now-1h", max_traces: int = 50) -> tuple[set[tuple[str, str]], int]:
+async def observe_edges(
+    lookback: str = "now-1h", max_traces: int = 50
+) -> tuple[set[tuple[str, str]], int]:
     """Sample recent traces and union their observed edges."""
     trace_ids = await _search_trace_ids(lookback, max_traces)
     observed: set[tuple[str, str]] = set()
@@ -158,7 +162,10 @@ async def reconcile(lookback: str = "now-1h", max_traces: int = 50) -> TopologyD
 if __name__ == "__main__":  # pragma: no cover
     drift = asyncio.run(reconcile())
     print(f"topology v{drift.topology_version} reconciled against {drift.traces_sampled} traces")
-    print(f"  declared={drift.declared_count} observed={drift.observed_count} dq_score={drift.dq_score}")
+    print(
+        f"  declared={drift.declared_count} observed={drift.observed_count}"
+        f" dq_score={drift.dq_score}"
+    )
     if drift.undeclared_edges:
         print("  ⚠ observed but NOT declared (drift):")
         for e in drift.undeclared_edges:

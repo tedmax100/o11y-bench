@@ -98,7 +98,9 @@ def get_contracts() -> ContractSet:
         logger.info("loaded signal contracts v%s: %d services", cs.version, len(cs.contracts))
         return cs
     except Exception as e:
-        logger.warning("signal contracts load failed (%s); contract injection disabled: %s", path, e)
+        logger.warning(
+            "signal contracts load failed (%s); contract injection disabled: %s", path, e
+        )
         return ContractSet()
 
 
