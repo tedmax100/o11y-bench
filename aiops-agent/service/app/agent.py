@@ -18,6 +18,7 @@ from .capability import capability_for_services, resolve_services
 from .signals.context import build_signal_context
 from .signals.health import evaluate_dependency_health
 from .config import settings
+from . import store
 from .runbook import (
     format_diagnostics,
     incident_params,
@@ -669,7 +670,20 @@ class Findings(BaseModel):
 _FINDINGS_PROMPT = """Extract a structured RCA conclusion from the investigation
 transcript below. Use ONLY what the transcript actually established — do not
 invent evidence. If the run was inconclusive, say so in `summary` and give a low
-`confidence`. `evidence` should quote the concrete queries/values that were run."""
+`confidence`. `evidence` should quote the concrete queries/values that were run.
+
+Before assigning `confidence`, evaluate these three dimensions:
+1. **Signal diversity**: how many independent signal types (metrics / logs / traces / k8s)
+   confirmed the hypothesis? More independent types → higher confidence.
+2. **Refutation attempt**: did the investigation explicitly try to find evidence that
+   CONTRADICTS the leading hypothesis? If NO refutation was attempted, confidence MUST
+   be ≤ 0.5.
+3. **Hypothesis convergence**: are there competing hypotheses that could NOT be ruled
+   out? If any alternative remains plausible, confidence MUST be ≤ 0.6.
+
+Calibrate `confidence` against all three: a high number (> 0.7) requires multiple
+independent signals, an explicit failed refutation attempt, AND no surviving
+alternative hypotheses."""
 
 _findings_llm = (
     ChatGoogleGenerativeAI(
@@ -686,6 +700,80 @@ async def extract_findings(messages: list) -> Findings:
     """Distill a finished run's messages into a structured Findings. Used by the
     headless (alert webhook) path; not wired into chat."""
     return await _findings_llm.ainvoke([SystemMessage(content=_FINDINGS_PROMPT)] + messages)
+
+
+# ---- Structured Uncertainty (knowledge-loop §4.6) ----------------------------
+# Emitted when all hypothesis loops are exhausted and confidence is still below
+# threshold. Gives the on-call engineer a structured view of what was tried and
+# what to do next — far more actionable than a vague "I'm not sure" message.
+
+
+class HypothesisStatus(BaseModel):
+    hypothesis: str = Field(description="The hypothesis that was investigated.")
+    supporting_evidence: list[str] = Field(
+        default_factory=list,
+        description="Evidence from the transcript that supports this hypothesis.",
+    )
+    refuting_evidence: list[str] = Field(
+        default_factory=list,
+        description="Evidence from the transcript that refutes or weakens this hypothesis.",
+    )
+    confidence: float = Field(description="0.0-1.0 per-hypothesis confidence.")
+
+
+class StructuredUncertainty(BaseModel):
+    """Emitted when the RCA run ends with confidence below threshold after all
+    hypothesis loops. Gives the on-call a structured escalation package."""
+
+    confidence: float = Field(description="Overall confidence (always < loop threshold).")
+    summary: str = Field(description="One-line summary of the unresolved situation.")
+    hypothesis_status: list[HypothesisStatus] = Field(
+        default_factory=list,
+        description="Each hypothesis tried, with its supporting and refuting evidence.",
+    )
+    missing_signals: list[str] = Field(
+        default_factory=list,
+        description="Signals the agent could not check but that would clarify the root cause.",
+    )
+    recommended_human_action: str = Field(
+        default="",
+        description="The single most useful next action for the on-call engineer.",
+    )
+
+
+_UNCERTAINTY_PROMPT = """The investigation ran to its maximum loop budget without reaching
+a confident conclusion. Extract a structured uncertainty report from the transcript.
+
+For `hypothesis_status`: list every competing hypothesis that was investigated, with
+the ACTUAL evidence the transcript found for and against each. Do not invent evidence.
+
+For `missing_signals`: list the specific signals (metric names, log fields, k8s checks,
+service names) that WERE NOT checked but could resolve the ambiguity.
+
+For `recommended_human_action`: write one concrete, actionable sentence — not "investigate
+further" but "check k8s events for user-service and look for OOMKilled or Evicted events"."""
+
+_uncertainty_llm = (
+    ChatGoogleGenerativeAI(
+        model=settings.gemini_model,
+        google_api_key=settings.google_api_key,
+        temperature=0,
+    )
+    .with_structured_output(StructuredUncertainty)
+    .with_config({"run_name": "AIOps_Uncertainty_Extractor"})
+)
+
+
+async def extract_uncertainty(messages: list, findings: Findings) -> StructuredUncertainty:
+    """Extract a structured uncertainty report when confidence is below threshold
+    after all loops. Seeds `confidence` and `summary` from the final Findings."""
+    result = await _uncertainty_llm.ainvoke(
+        [SystemMessage(content=_UNCERTAINTY_PROMPT)] + messages
+    )
+    # Override with the authoritative values from Findings so they stay consistent.
+    result.confidence = findings.confidence
+    result.summary = findings.summary or result.summary
+    return result
 
 
 # ---- headless (alert-driven) RCA --------------------------------------------
@@ -745,6 +833,21 @@ def _alert_to_prompt(labels: dict, annotations: dict, starts_dt: datetime | None
 # *shape* of each step, not a specific metric (real names come from the injected
 # capability snapshot). Ordered + budget-aware: step 1 alone often suffices.
 _RCA_PLAYBOOK = """
+## Step 0 — Hypothesis tree (do this BEFORE any tool call)
+
+State 2–3 mutually exclusive hypotheses ranked by prior probability. For each:
+- What evidence would CONFIRM it?
+- What evidence would REFUTE it?
+
+Example for a payment decline alert:
+- H1 (most likely): code regression in the latest deploy — confirmed by spike concentrated on one git_version; refuted if all versions equally affected.
+- H2: upstream dependency degradation — confirmed by upstream latency spike; refuted if payment's own internal errors are also high.
+- H3: infrastructure (OOM / pod restarts) — confirmed by k8s OOMKilled events; refuted if pods are healthy and available_replicas == desired.
+
+Investigate the highest-probability hypothesis first, but **actively seek refuting evidence** for it before moving on.
+
+---
+
 Follow this RCA method (in order; stop once you can state a confident cause; mind the budget):
 
 1. **Attribute the spike.** Take the metric behind this alert (use the real
@@ -764,10 +867,51 @@ Follow this RCA method (in order; stop once you can state a confident cause; min
    unhealthy or the spike coincides with a deploy boundary.
 4. **Confirm with a trace.** Pull ONE representative failing trace for the service
    (`status=error`) to confirm the error origin and cite a real trace id.
-5. **Conclude.** State: root cause (and whether it is code vs infra), implicated
-   service + `git_version`, dominant reason, the supporting numbers, and a trace
-   id. Give a confidence. If the breakdown shows NO concentration on a
-   version/reason, say so with LOW confidence — do not invent a cause."""
+5. **Conclude.** Before stating your confidence, explicitly answer:
+   - (a) How many independent signal types (metrics / logs / traces / k8s) confirmed
+     the hypothesis?
+   - (b) Did you try to find evidence that CONTRADICTS the hypothesis? What did you find?
+   - (c) Are there competing hypotheses you could NOT rule out?
+
+   Confidence rules: if you did NOT attempt (b) → confidence ≤ 0.5; if (c) has
+   surviving alternatives → confidence ≤ 0.6; all three satisfied → confidence may
+   be higher. State: root cause (code vs infra), implicated service + `git_version`,
+   dominant reason, the supporting numbers, a trace id, and a calibrated confidence."""
+
+
+def _past_incident_context(service: str, alertname: str) -> str:
+    """Build a markdown block of past correct investigations for the same
+    service+alertname. Returns an empty string when there are no matches."""
+    try:
+        rows = store.inv_query_similar(service=service, alertname=alertname, limit=5)
+    except Exception as e:
+        logger.warning("past_incident_context query failed: %s", e)
+        return ""
+    if not rows:
+        return ""
+    lines = ["## Past similar incidents (reference only — trust current evidence over these)"]
+    for r in rows:
+        lines.append(
+            f"- [{r.get('ts', '')[:10]}] {r.get('summary', '')} "
+            f"(confidence {r.get('confidence', 0):.0%})"
+        )
+        if r.get("hypothesis"):
+            lines.append(f"  hypothesis: {r['hypothesis']}")
+        if r.get("suspected_version"):
+            lines.append(f"  culprit version: {r['suspected_version']}")
+    return "\n".join(lines)
+
+
+def _inject_past_incidents(turn_messages: list, service: str | None, alertname: str | None) -> None:
+    """Inject past-incident context into the turn messages. Fail-open."""
+    if not service or not alertname:
+        return
+    try:
+        ctx = _past_incident_context(service, alertname)
+        if ctx:
+            turn_messages.append(SystemMessage(content=ctx))
+    except Exception as e:
+        logger.warning("past incident injection failed: %s", e)
 
 
 def _inject_signal_context(turn_messages: list, services: list[str]) -> None:
@@ -837,6 +981,10 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
     # (Tier 0) and auto-run its read-only diagnostics (Tier 1) so the agent
     # reasons over confirmed preconditions. Diagnostics use the all-read-only
     # TOOLS map and run *outside* the agent's tool budget. Best-effort.
+    # Closed-loop one: inject past correct investigations for the same alert so
+    # the agent knows "last time this fired, the root cause was X". Best-effort.
+    _inject_past_incidents(turn_messages, service, labels.get("alertname"))
+
     matched_rb = None
     with now_override(starts_dt):
         if settings.runbook_enabled:
@@ -854,7 +1002,13 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
 
     agent = await _build_agent()
     config = {"configurable": {"thread_id": thread_id}}
-    # Pin the clock to the alert's fire time for the whole run (prompt + wrapper).
+
+    # Loop engineering (knowledge-loop §4.4): run → extract findings → if
+    # confidence < threshold, pivot to the next untried hypothesis and retry.
+    # Each iteration uses a fresh per-turn budget; MemorySaver preserves the
+    # full message history across invocations on the same thread_id, so the
+    # agent sees everything it already tried when asked to pivot.
+    loop_count = 0
     with now_override(starts_dt):
         result = await agent.ainvoke(
             {
@@ -868,6 +1022,63 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
     messages = result.get("messages", [])
     answer = _flatten_content(getattr(messages[-1], "content", None)) if messages else ""
     findings = await extract_findings(messages)
+
+    while (
+        findings.confidence < settings.confidence_loop_threshold
+        and loop_count < settings.max_hypothesis_loops
+    ):
+        loop_count += 1
+        logger.info(
+            "headless loop %d/%d: conf=%.2f < %.2f, pivoting to next hypothesis (fp=%s)",
+            loop_count, settings.max_hypothesis_loops,
+            findings.confidence, settings.confidence_loop_threshold, thread_id,
+        )
+        pivot_msg = (
+            f"Your previous conclusion had confidence {findings.confidence:.0%}, "
+            f"which is below the required threshold ({settings.confidence_loop_threshold:.0%}). "
+            f"The hypothesis you investigated was: {findings.hypothesis!r}.\n\n"
+            "Do NOT repeat the same investigation. From the 2–3 hypotheses you listed "
+            "at the start, pick a DIFFERENT one you have not yet fully explored. "
+            "Investigate it now, actively seeking both confirming AND refuting evidence. "
+            "Then re-evaluate all three confidence dimensions (signal diversity, "
+            "refutation attempt, hypothesis convergence) before concluding."
+        )
+        with now_override(starts_dt):
+            result = await agent.ainvoke(
+                {
+                    "messages": [{"role": "user", "content": pivot_msg}],
+                    "tool_calls_used": 0,
+                    "budget": settings.webhook_tool_call_budget,
+                },
+                config=config,
+            )
+        messages = result.get("messages", [])
+        answer = _flatten_content(getattr(messages[-1], "content", None)) if messages else ""
+        findings = await extract_findings(messages)
+
+    if loop_count > 0:
+        logger.info(
+            "headless loop done after %d pivot(s): final conf=%.2f (fp=%s)",
+            loop_count, findings.confidence, thread_id,
+        )
+
+    # Structured Uncertainty (knowledge-loop §4.6): when all loops are exhausted
+    # and confidence is still below threshold, produce a structured escalation
+    # package so the on-call knows exactly what was tried and what to check next.
+    uncertainty: StructuredUncertainty | None = None
+    if (
+        loop_count >= settings.max_hypothesis_loops
+        and findings.confidence < settings.confidence_loop_threshold
+    ):
+        logger.info(
+            "headless: confidence %.2f still below %.2f after %d loops — "
+            "extracting structured uncertainty (fp=%s)",
+            findings.confidence, settings.confidence_loop_threshold, loop_count, thread_id,
+        )
+        try:
+            uncertainty = await extract_uncertainty(messages, findings)
+        except Exception as e:
+            logger.warning("extract_uncertainty failed fp=%s: %s", thread_id, e)
 
     # Governance (ARE Governance plane): if a runbook matched and proposes
     # remediation, run each action through the gate using this run's confidence
@@ -909,7 +1120,8 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
         except Exception as e:
             logger.warning("governance gate failed: %s", e)
 
-    return {"answer": answer, "findings": findings, "decisions": decisions}
+    return {"answer": answer, "findings": findings, "decisions": decisions,
+            "uncertainty": uncertainty}
 
 
 # ---- follow-up suggestions (the "Follow-up" chips under each answer) --------

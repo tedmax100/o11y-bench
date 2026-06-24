@@ -54,9 +54,15 @@ async def _sink_findings(alert: dict, fp: str, result: dict) -> None:
     """Push the conclusion out of the headless run. Always logs; posts a Grafana
     annotation when grafana_url + grafana_token are set (best-effort)."""
     findings = result["findings"]
+    uncertainty = result.get("uncertainty")
     logger.info(
         "headless RCA done fp=%s conf=%.2f: %s", fp, findings.confidence, findings.summary
     )
+    if uncertainty:
+        logger.warning(
+            "headless RCA uncertain fp=%s: missing_signals=%s recommended=%s",
+            fp, uncertainty.missing_signals, uncertainty.recommended_human_action,
+        )
 
     if not (settings.grafana_url and settings.grafana_token):
         return

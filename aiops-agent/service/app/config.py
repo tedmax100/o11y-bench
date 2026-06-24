@@ -134,6 +134,24 @@ class Settings(BaseSettings):
     # "remediation-verified/-failed"). Self-produced labels alone cannot unlock AUTO.
     governance_min_human_labeled_runs: int = 20
 
+    # --- Draft runbook synthesis (knowledge-loop §1 閉環二) ----------------
+    # When an investigation is labeled correct=True and no active runbook matched
+    # the alert, synthesize a draft runbook YAML and write it to
+    # `runbook_dir/drafts/`. If `draft_runbook_pr_enabled` is True (requires
+    # `github_token` + `draft_runbook_repo`), also open a GitHub PR for review.
+    draft_runbook_enabled: bool = True
+    draft_runbook_pr_enabled: bool = False
+    # owner/repo of the Git repo where runbooks live (e.g. "acme/o11y-runbooks").
+    # Required only when `draft_runbook_pr_enabled` is True.
+    draft_runbook_repo: str = ""
+
+    # --- Loop engineering (knowledge-loop §4.4) ----------------------------
+    # If the extracted Findings.confidence is below this after a headless run,
+    # re-invoke the agent on the same thread asking it to pivot to a different
+    # hypothesis. Gated by max_hypothesis_loops so it can't loop indefinitely.
+    confidence_loop_threshold: float = 0.6
+    max_hypothesis_loops: int = 3
+
     # --- Learn 閉環效度約束 (7b-5 §6.2) ------------------------------------
     # Whether remediation verify outcomes are written back as CE correctness labels.
     # Default False: remediation outcomes only feed fix-efficacy + breaker, not CE.

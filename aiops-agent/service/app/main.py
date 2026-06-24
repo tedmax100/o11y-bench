@@ -93,15 +93,17 @@ class LabelRequest(BaseModel):
     correction_note: str | None = None
 
 
-# Strong refs for re-investigation background tasks.
+# Strong refs for re-investigation and draft-runbook background tasks.
 _reinvestigation_tasks: set[asyncio.Task] = set()
+_draft_tasks: set[asyncio.Task] = set()
 
 
 @app.post("/investigations/{fp}/label")
 async def investigations_label(fp: str, req: LabelRequest):
     """Record the correctness verdict for an investigation (closes the CE loop
     from the UI). When correct=False, kicks off a re-investigation in the same
-    thread with the human correction injected as context."""
+    thread with the human correction injected as context. When correct=True and
+    no active runbook covers the alert, synthesizes a draft runbook (閉環二)."""
     ok = label_run(
         fp, correct=req.correct, source="ui",
         error_dimension=req.error_dimension,
@@ -111,6 +113,8 @@ async def investigations_label(fp: str, req: LabelRequest):
         raise HTTPException(status_code=404, detail=f"no calibration record for fingerprint {fp}")
 
     reinvestigating = False
+    draft_queued = False
+
     if not req.correct:
         inv = get_investigation(fp)
         if inv is not None:
@@ -120,8 +124,21 @@ async def investigations_label(fp: str, req: LabelRequest):
             _reinvestigation_tasks.add(task)
             task.add_done_callback(_reinvestigation_tasks.discard)
             reinvestigating = True
+    else:
+        # Closed-loop 二: correct=True → synthesize draft runbook if no active
+        # runbook covers this alert. Best-effort background task.
+        inv = get_investigation(fp)
+        if inv is not None:
+            from .draft_runbook import maybe_synthesize_draft
+            task = asyncio.create_task(maybe_synthesize_draft(inv))
+            _draft_tasks.add(task)
+            task.add_done_callback(_draft_tasks.discard)
+            draft_queued = True
 
-    return {"ok": True, "fp": fp, "correct": req.correct, "reinvestigating": reinvestigating}
+    return {
+        "ok": True, "fp": fp, "correct": req.correct,
+        "reinvestigating": reinvestigating, "draft_queued": draft_queued,
+    }
 
 
 # ---- Design-alert capability (propose-only; human button provisions) --------
@@ -273,6 +290,17 @@ async def actions_fix_efficacy():
             ),
         },
     }
+
+
+# ---- Runbook health (knowledge-loop §1 閉環三) ------------------------------
+
+
+@app.get("/runbooks/health")
+async def runbooks_health(days: int = 30):
+    """SOP decay report: runbooks with verify_failed rate > 30% or any
+    rollback_failed in the past `days` days. Used for periodic SOP review."""
+    from . import store as _store
+    return {"days": days, "decayed_runbooks": _store.rb_feedback_health_report(days=days)}
 
 
 # ---- Trace Explorer ---------------------------------------------------------

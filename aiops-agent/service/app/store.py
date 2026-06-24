@@ -123,6 +123,22 @@ CREATE TABLE IF NOT EXISTS audit (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_request ON audit(request_id);
 CREATE INDEX IF NOT EXISTS idx_audit_fp ON audit(fp);
+
+-- Runbook execution feedback (knowledge-loop §1 閉環三): append-only record of
+-- every verify/rollback outcome. Used by runbook_health_report() to surface
+-- SOP decay before it silently causes autonomous rollouts to fail.
+CREATE TABLE IF NOT EXISTS runbook_feedback (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          TEXT NOT NULL,
+    runbook_id  TEXT NOT NULL,
+    step_desc   TEXT NOT NULL DEFAULT '',
+    outcome     TEXT NOT NULL,   -- ok / verify_failed / rollback / rollback_failed
+    request_id  TEXT NOT NULL DEFAULT '',
+    fp          TEXT NOT NULL DEFAULT '',
+    detail      TEXT NOT NULL DEFAULT '{}'  -- json
+);
+CREATE INDEX IF NOT EXISTS idx_rb_feedback_runbook ON runbook_feedback(runbook_id);
+CREATE INDEX IF NOT EXISTS idx_rb_feedback_ts ON runbook_feedback(ts);
 """
 
 # Additive migrations for columns added after initial schema creation.
@@ -250,6 +266,34 @@ def inv_load(path: str | Path | None = None) -> list[str]:
             "SELECT payload FROM investigations ORDER BY id"
         ).fetchall()
     return [r["payload"] for r in rows]
+
+
+def inv_query_similar(
+    service: str, alertname: str, limit: int = 5,
+    path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Return up to `limit` past investigations for the same service+alertname
+    that were labeled correct=True (joined with calibration by fp=run_id).
+    Most-recent first. Returns parsed payload dicts."""
+    with _connect(path) as conn:
+        rows = conn.execute(
+            """
+            SELECT i.payload FROM investigations i
+            JOIN calibration c ON c.run_id = i.fp
+            WHERE json_extract(i.payload, '$.service') = ?
+              AND json_extract(i.payload, '$.alertname') = ?
+              AND c.correct = 1
+            ORDER BY i.id DESC LIMIT ?
+            """,
+            (service, alertname, limit),
+        ).fetchall()
+    out = []
+    for r in rows:
+        try:
+            out.append(json.loads(r["payload"]))
+        except Exception:
+            pass
+    return out
 
 
 # ---- action_requests (lifecycle state machine; 7b-1) ----------------------
@@ -552,4 +596,87 @@ def init(path: str | Path | None = None) -> None:
     """Materialize the schema + run the one-time legacy import. Called at startup."""
     with _connect(path):
         pass
+
+
+# ---- runbook feedback (knowledge-loop §1 閉環三) ---------------------------
+
+def rb_feedback_insert(
+    *,
+    runbook_id: str,
+    outcome: str,
+    step_desc: str = "",
+    request_id: str = "",
+    fp: str = "",
+    detail: dict | None = None,
+    path: str | Path | None = None,
+) -> None:
+    """Append one execution outcome for a runbook step (ok / verify_failed /
+    rollback / rollback_failed). Append-only; never updated."""
+    from datetime import UTC, datetime
+    ts = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _write_lock, _connect(path) as conn:
+        conn.execute(
+            "INSERT INTO runbook_feedback "
+            "(ts, runbook_id, step_desc, outcome, request_id, fp, detail) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (ts, runbook_id, step_desc, outcome, request_id, fp,
+             json.dumps(detail or {})),
+        )
+
+
+def rb_feedback_health_report(
+    days: int = 30, path: str | Path | None = None
+) -> list[dict[str, Any]]:
+    """Return a list of runbooks that show decay signals over the past `days` days.
+
+    Decay signals (per design doc §1 閉環三):
+    - verify_failed rate > 30% in the window
+    - any rollback_failed (immediate flag)
+    Returns one dict per runbook that tripped at least one signal, sorted by
+    severity (rollback_failed first, then by verify_failed rate desc)."""
+    from datetime import UTC, datetime, timedelta
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _connect(path) as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                runbook_id,
+                COUNT(*) AS total,
+                SUM(CASE WHEN outcome = 'verify_failed' THEN 1 ELSE 0 END) AS verify_failed,
+                SUM(CASE WHEN outcome = 'rollback_failed' THEN 1 ELSE 0 END) AS rollback_failed,
+                SUM(CASE WHEN outcome = 'rollback' THEN 1 ELSE 0 END) AS rollback,
+                SUM(CASE WHEN outcome = 'ok' THEN 1 ELSE 0 END) AS ok
+            FROM runbook_feedback
+            WHERE ts >= ?
+            GROUP BY runbook_id
+            """,
+            (cutoff,),
+        ).fetchall()
+
+    results = []
+    for r in rows:
+        total = r["total"]
+        vf_rate = r["verify_failed"] / total if total else 0.0
+        has_rb_failed = r["rollback_failed"] > 0
+        # Only surface runbooks with a decay signal
+        if vf_rate > 0.30 or has_rb_failed:
+            signals = []
+            if has_rb_failed:
+                signals.append(f"rollback_failed ×{r['rollback_failed']} — suspend auto-execution")
+            if vf_rate > 0.30:
+                signals.append(f"verify_failed {vf_rate:.0%} ({r['verify_failed']}/{total}) — needs-review")
+            results.append({
+                "runbook_id": r["runbook_id"],
+                "total_executions": total,
+                "verify_failed": r["verify_failed"],
+                "verify_failed_rate": round(vf_rate, 3),
+                "rollback_failed": r["rollback_failed"],
+                "rollback": r["rollback"],
+                "ok": r["ok"],
+                "decay_signals": signals,
+            })
+
+    # rollback_failed first (critical), then by verify_failed_rate desc
+    results.sort(key=lambda x: (-x["rollback_failed"], -x["verify_failed_rate"]))
+    return results
     migrate_legacy_jsonl(path)

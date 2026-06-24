@@ -308,6 +308,8 @@ async def run(request_id: str, path: Path | None = None) -> dict:
                                request_id=req.request_id, success=True, path=path)
         ar_store_transition(req.request_id, Status.EXECUTING, Status.SUCCEEDED,
                             outcome="executed and verified", path=path)
+        # Closed-loop 三: record ok execution for SOP decay detection.
+        _rb_feedback("ok", req, path)
         # --- 7. Learn: verified → correct label (§6.2 constraint 1+3) --------
         _learn_outcome(req, verified=True, path=path)
         return {"status": Status.SUCCEEDED.value}
@@ -320,6 +322,8 @@ async def run(request_id: str, path: Path | None = None) -> dict:
                            request_id=req.request_id, success=False, path=path)
     ar_store_transition(req.request_id, Status.EXECUTING, Status.VERIFY_FAILED,
                         outcome="executed but symptom persists after verify window", path=path)
+    # Closed-loop 三: record verify failure before rollback.
+    _rb_feedback("verify_failed", req, path)
     ar_store_transition(req.request_id, Status.VERIFY_FAILED, Status.ROLLING_BACK,
                         outcome="auto-rollback triggered by verify failure", path=path)
     rb_ok = await _auto_rollback(req, path)
@@ -328,9 +332,36 @@ async def run(request_id: str, path: Path | None = None) -> dict:
                         outcome="rolled back after verify failure" if rb_ok
                         else "rollback failed after verify failure",
                         path=path)
+    # Closed-loop 三: record rollback outcome.
+    _rb_feedback("rollback" if rb_ok else "rollback_failed", req, path)
     # --- 7. Learn: verify failed → incorrect label ---------------------------
     _learn_outcome(req, verified=False, path=path)
     return {"status": final.value, "outcome": "verify failed; " + ("rolled back" if rb_ok else "rollback also failed")}
+
+
+def _rb_feedback(outcome: str, req: ActionRequest, path: Path | None) -> None:
+    """Best-effort: write one runbook execution outcome for SOP decay detection."""
+    if not req.runbook_id:
+        return
+    try:
+        # Find the matching remediation step description from the runbook.
+        rb = next((b for b in load_runbooks() if b.id == req.runbook_id), None)
+        step_desc = ""
+        if rb:
+            for s in rb.remediation:
+                if s.action == req.action:
+                    step_desc = s.desc
+                    break
+        store.rb_feedback_insert(
+            runbook_id=req.runbook_id,
+            outcome=outcome,
+            step_desc=step_desc,
+            request_id=req.request_id,
+            fp=req.fp,
+            path=path,
+        )
+    except Exception as e:
+        logger.warning("rb_feedback write failed request_id=%s: %s", req.request_id, e)
 
 
 # Small wrappers so the store coupling stays in one place and reads cleanly above.
