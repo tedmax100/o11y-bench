@@ -62,6 +62,8 @@ ignore = [
 # query.py uses camelCase field names (queryType, stepSeconds) to match the
 # Prometheus/Loki/Tempo JSON API — renaming them would break tool call parsing.
 "app/tools/query.py" = ["N803", "N806", "N815", "RUF046"]
+# tests: NS alias, long assert strings, and inline setup semicolons are fine.
+"tests/**" = ["N814", "E501", "E702"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

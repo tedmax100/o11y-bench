@@ -51,6 +51,25 @@ ignore = [
 "o11y_bench/**" = ["ANN", "E501"]
 "scripts/**" = ["ANN", "E501"]
 "grading/**" = ["ANN", "E501"]
+# aiops-agent service: own pyproject.toml handles most rules; mirror the key
+# per-file suppressions here so `ruff check .` from root passes too.
+"aiops-agent/service/app/**" = ["ANN", "RUF001", "RUF002", "RUF003", "RUF005", "N818"]
+"aiops-agent/service/app/agent.py" = [
+    "ANN", "RUF001", "RUF002", "RUF003", "RUF005", "N818", "E501",
+]
+"aiops-agent/service/app/tools/query.py" = [
+    "ANN", "N803", "N806", "N815", "RUF046",
+]
+"aiops-agent/service/tests/**" = [
+    "ANN",       # test helpers don't need annotations
+    "N814",      # SimpleNamespace as NS is conventional in these tests
+    "E501",      # test strings / long assert messages
+    "E702",      # occasional inline setup (x = ...; y = ...)
+]
+# demo-services and weaver-demo: example / generated code — Chinese comments,
+# no annotations, generated telemetry helpers.
+"demo-services/**" = ["ANN", "RUF001", "RUF002", "RUF003", "E501", "E702"]
+"weaver-demo/**" = ["ANN", "RUF001", "RUF002", "RUF003", "E501", "E702"]
 
 [tool.mypy]
 python_version = "3.14"
