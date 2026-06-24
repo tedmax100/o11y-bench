@@ -83,6 +83,7 @@ class Runbook(BaseModel):
 
 # ---- load / match ----------------------------------------------------------
 
+
 def load_runbooks(directory: str | Path | None = None) -> list[Runbook]:
     d = Path(directory or settings.runbook_dir)
     if not d.exists():
@@ -125,6 +126,7 @@ def match_runbook(
 
 # ---- parameter substitution ------------------------------------------------
 
+
 def incident_params(labels: dict, annotations: dict) -> dict[str, str]:
     """The substitution context for `{...}` placeholders in runbook steps."""
     params = {k: str(v) for k, v in (labels or {}).items()}
@@ -151,6 +153,7 @@ def _unresolved(value: Any) -> list[str]:
 
 # ---- Tier 0: render --------------------------------------------------------
 
+
 def render_runbook(rb: Runbook, params: dict[str, str]) -> str:
     """Markdown guidance with incident parameters filled in. Remediation steps
     are shown but flagged as human-approval-only (not executed at this tier)."""
@@ -159,8 +162,10 @@ def render_runbook(rb: Runbook, params: dict[str, str]) -> str:
         lines.append("\n**Diagnostics (read-only — auto-verifiable preconditions):**")
         for i, s in enumerate(rb.diagnostics, 1):
             args = _subst(s.args, params)
-            lines.append(f"{i}. {s.desc} — `{s.action}({json.dumps(args, separators=(',', ':'))})`"
-                         + (f"  _expect: {s.expect}_" if s.expect else ""))
+            lines.append(
+                f"{i}. {s.desc} — `{s.action}({json.dumps(args, separators=(',', ':'))})`"
+                + (f"  _expect: {s.expect}_" if s.expect else "")
+            )
     if rb.remediation:
         lines.append("\n**Remediation (requires human approval — NOT auto-executed):**")
         for i, s in enumerate(rb.remediation, 1):
@@ -175,6 +180,7 @@ def render_runbook(rb: Runbook, params: dict[str, str]) -> str:
 
 
 # ---- Tier 1: read-only diagnostics runner ----------------------------------
+
 
 class DiagnosticResult(BaseModel):
     desc: str
@@ -191,9 +197,14 @@ def _evaluate_check(check: DiagnosticCheck | None, output: Any) -> tuple[str, st
     if check is None:
         return "ran", ""
     text = output if isinstance(output, str) else json.dumps(output, default=str)
-    rows = output if isinstance(output, list) else (
-        output.get("data") if isinstance(output, dict) and isinstance(output.get("data"), list)
-        else None
+    rows = (
+        output
+        if isinstance(output, list)
+        else (
+            output.get("data")
+            if isinstance(output, dict) and isinstance(output.get("data"), list)
+            else None
+        )
     )
     if check.contains is not None:
         ok = check.contains in text
@@ -219,36 +230,67 @@ async def run_diagnostics(
     for s in rb.diagnostics:
         args = _subst(s.args, params)
         if s.action not in tool_map:
-            results.append(DiagnosticResult(
-                desc=s.desc, action=s.action, args=args, status="skipped", expect=s.expect,
-                detail="action is not a read-only tool (remediation is not run at Tier 1)"))
+            results.append(
+                DiagnosticResult(
+                    desc=s.desc,
+                    action=s.action,
+                    args=args,
+                    status="skipped",
+                    expect=s.expect,
+                    detail="action is not a read-only tool (remediation is not run at Tier 1)",
+                )
+            )
             continue
         missing = _unresolved(args)
         if missing:
-            results.append(DiagnosticResult(
-                desc=s.desc, action=s.action, args=args, status="skipped", expect=s.expect,
-                detail=f"unresolved parameters: {', '.join(sorted(set(missing)))}"))
+            results.append(
+                DiagnosticResult(
+                    desc=s.desc,
+                    action=s.action,
+                    args=args,
+                    status="skipped",
+                    expect=s.expect,
+                    detail=f"unresolved parameters: {', '.join(sorted(set(missing)))}",
+                )
+            )
             continue
         try:
             out = await tool_map[s.action].ainvoke(args)
         except Exception as e:
-            results.append(DiagnosticResult(
-                desc=s.desc, action=s.action, args=args, status="error", expect=s.expect,
-                detail=f"{type(e).__name__}: {e}"))
+            results.append(
+                DiagnosticResult(
+                    desc=s.desc,
+                    action=s.action,
+                    args=args,
+                    status="error",
+                    expect=s.expect,
+                    detail=f"{type(e).__name__}: {e}",
+                )
+            )
             continue
         status, detail = _evaluate_check(s.check, out)
         preview = (out if isinstance(out, str) else json.dumps(out, default=str))[:500]
-        results.append(DiagnosticResult(
-            desc=s.desc, action=s.action, args=args, status=status,
-            expect=s.expect, detail=detail, output_preview=preview))
+        results.append(
+            DiagnosticResult(
+                desc=s.desc,
+                action=s.action,
+                args=args,
+                status=status,
+                expect=s.expect,
+                detail=detail,
+                output_preview=preview,
+            )
+        )
     return results
 
 
 def format_diagnostics(rb: Runbook, results: list[DiagnosticResult]) -> str:
     """Inject-ready summary of what the diagnostics confirmed/refuted."""
-    lines = [f"## Runbook diagnostics auto-run: {rb.id}",
-             "These read-only checks ran before your investigation. Treat 'pass' as "
-             "a confirmed precondition and build on it; don't re-run them."]
+    lines = [
+        f"## Runbook diagnostics auto-run: {rb.id}",
+        "These read-only checks ran before your investigation. Treat 'pass' as "
+        "a confirmed precondition and build on it; don't re-run them.",
+    ]
     for i, r in enumerate(results, 1):
         head = f"{i}. [{r.status.upper()}] {r.desc}"
         if r.expect:

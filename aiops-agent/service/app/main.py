@@ -89,7 +89,7 @@ async def investigations_list(limit: int = 50):
 
 class LabelRequest(BaseModel):
     correct: bool
-    error_dimension: str | None = None   # root_cause | scope | action | other
+    error_dimension: str | None = None  # root_cause | scope | action | other
     correction_note: str | None = None
 
 
@@ -105,7 +105,9 @@ async def investigations_label(fp: str, req: LabelRequest):
     thread with the human correction injected as context. When correct=True and
     no active runbook covers the alert, synthesizes a draft runbook (閉環二)."""
     ok = label_run(
-        fp, correct=req.correct, source="ui",
+        fp,
+        correct=req.correct,
+        source="ui",
         error_dimension=req.error_dimension,
         correction_note=req.correction_note,
     )
@@ -130,14 +132,18 @@ async def investigations_label(fp: str, req: LabelRequest):
         inv = get_investigation(fp)
         if inv is not None:
             from .draft_runbook import maybe_synthesize_draft
+
             task = asyncio.create_task(maybe_synthesize_draft(inv))
             _draft_tasks.add(task)
             task.add_done_callback(_draft_tasks.discard)
             draft_queued = True
 
     return {
-        "ok": True, "fp": fp, "correct": req.correct,
-        "reinvestigating": reinvestigating, "draft_queued": draft_queued,
+        "ok": True,
+        "fp": fp,
+        "correct": req.correct,
+        "reinvestigating": reinvestigating,
+        "draft_queued": draft_queued,
     }
 
 
@@ -208,8 +214,9 @@ async def actions_request_approve(request_id: str, body: ActorRequest):
     expired, or already decided)."""
     req = action_requests.approve(request_id, actor=body.actor)
     if req is None:
-        raise HTTPException(status_code=409,
-                            detail="request not approvable (missing, expired, or already decided)")
+        raise HTTPException(
+            status_code=409, detail="request not approvable (missing, expired, or already decided)"
+        )
     _spawn_executor(request_id)
     return req.model_dump()
 
@@ -218,8 +225,9 @@ async def actions_request_approve(request_id: str, body: ActorRequest):
 async def actions_request_reject(request_id: str, body: ActorRequest):
     req = action_requests.reject(request_id, actor=body.actor)
     if req is None:
-        raise HTTPException(status_code=409,
-                            detail="request not rejectable (missing or already decided)")
+        raise HTTPException(
+            status_code=409, detail="request not rejectable (missing or already decided)"
+        )
     return req.model_dump()
 
 
@@ -287,7 +295,8 @@ async def actions_fix_efficacy():
             "failed": failed_count,
             "total": len(remediation_labels),
             "note": (
-                "learn_remediation_into_ce=True" if settings.learn_remediation_into_ce
+                "learn_remediation_into_ce=True"
+                if settings.learn_remediation_into_ce
                 else "learn_remediation_into_ce=False (labels not written to CE headline stream)"
             ),
         },
@@ -302,6 +311,7 @@ async def runbooks_health(days: int = 30):
     """SOP decay report: runbooks with verify_failed rate > 30% or any
     rollback_failed in the past `days` days. Used for periodic SOP review."""
     from . import store as _store
+
     return {"days": days, "decayed_runbooks": _store.rb_feedback_health_report(days=days)}
 
 

@@ -51,13 +51,33 @@ class _JsonFormatter(logging.Formatter):
 
         for key, value in record.__dict__.items():
             if key in {
-                "args", "asctime", "created", "exc_info", "exc_text", "filename",
-                "funcName", "levelname", "levelno", "lineno", "module", "msecs",
-                "message", "msg", "name", "pathname", "process", "processName",
-                "relativeCreated", "stack_info", "thread", "threadName",
+                "args",
+                "asctime",
+                "created",
+                "exc_info",
+                "exc_text",
+                "filename",
+                "funcName",
+                "levelname",
+                "levelno",
+                "lineno",
+                "module",
+                "msecs",
+                "message",
+                "msg",
+                "name",
+                "pathname",
+                "process",
+                "processName",
+                "relativeCreated",
+                "stack_info",
+                "thread",
+                "threadName",
                 "taskName",
                 # Don't double-write fields that OTLP logging adds:
-                "otelSpanID", "otelTraceID", "otelServiceName",
+                "otelSpanID",
+                "otelTraceID",
+                "otelServiceName",
                 "otelTraceSampled",
             }:
                 continue
@@ -78,7 +98,8 @@ def setup_stdout_json_logging(level: str = "INFO") -> None:
     # zero-code (OTLP LoggingHandler, etc.).
     for h in list(root.handlers):
         if isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) in (
-            sys.stdout, sys.stderr,
+            sys.stdout,
+            sys.stderr,
         ):
             root.removeHandler(h)
 

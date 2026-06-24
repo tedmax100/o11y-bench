@@ -22,15 +22,12 @@ from opentelemetry import metrics
 from pydantic import BaseModel, Field
 
 USER_SERVICE_URL = os.environ.get("USER_SERVICE_URL", "http://user-service.demo.svc:8000")
-PAYMENT_SERVICE_URL = os.environ.get(
-    "PAYMENT_SERVICE_URL", "http://payment-service.demo.svc:8000"
-)
+PAYMENT_SERVICE_URL = os.environ.get("PAYMENT_SERVICE_URL", "http://payment-service.demo.svc:8000")
 
 setup_stdout_json_logging(level=os.environ.get("LOG_LEVEL", "INFO"))
 
 _products = {
-    f"p-{i}": {"id": f"p-{i}", "name": f"product-{i}", "price_cents": 100 * i}
-    for i in range(1, 11)
+    f"p-{i}": {"id": f"p-{i}", "name": f"product-{i}", "price_cents": 100 * i} for i in range(1, 11)
 }
 _orders: dict[str, dict] = {}
 _flags = FeatureFlags(file_path=os.environ.get("FEATURE_FLAGS_PATH"))
@@ -49,7 +46,19 @@ _order_latency = _meter.create_histogram(
     # bucket and histogram_quantile returns a constant ~4.75 artifact. These
     # seconds-scaled boundaries give real resolution. See payment-service note.
     explicit_bucket_boundaries_advisory=[
-        0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+        0.001,
+        0.0025,
+        0.005,
+        0.01,
+        0.025,
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.5,
+        5.0,
+        10.0,
     ],
 )
 

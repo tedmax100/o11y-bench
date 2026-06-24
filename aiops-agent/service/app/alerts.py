@@ -164,7 +164,8 @@ async def provision_alert(spec: AlertSpec) -> dict:
         )
     if not (settings.grafana_url and settings.grafana_token):
         raise AlertProvisioningDisabled(
-            "alert provisioning disabled (no grafana_url/grafana_token configured)")
+            "alert provisioning disabled (no grafana_url/grafana_token configured)"
+        )
 
     payload = build_alert_rule(spec)
     logger.warning("provisioning alert rule title=%r service=%s", spec.title, spec.service_name)

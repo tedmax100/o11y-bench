@@ -32,8 +32,11 @@ def _pod(name, *, phase="Running", statuses=None, git_version="v1", node="n1"):
     return NS(
         metadata=NS(name=name, labels={"git_version": git_version} if git_version else {}),
         spec=NS(node_name=node),
-        status=NS(phase=phase, container_statuses=statuses or [],
-                  start_time=datetime.now(UTC) - timedelta(minutes=10)),
+        status=NS(
+            phase=phase,
+            container_statuses=statuses or [],
+            start_time=datetime.now(UTC) - timedelta(minutes=10),
+        ),
     )
 
 
@@ -41,18 +44,23 @@ def _cstatus(*, ready=True, restarts=0, waiting=None, last_term=None):
     state = NS(waiting=NS(reason=waiting) if waiting else None, terminated=None, running=None)
     last_state = NS(
         terminated=NS(reason=last_term[0], exit_code=last_term[1]) if last_term else None,
-        waiting=None, running=None,
+        waiting=None,
+        running=None,
     )
     return NS(ready=ready, restart_count=restarts, state=state, last_state=last_state)
 
 
 # ---- pod status ------------------------------------------------------------
 
+
 async def test_pod_status_parses_oom_and_crashloop(monkeypatch):
     pod = _pod(
         "payment-service-abc-123",
-        statuses=[_cstatus(ready=False, restarts=7, waiting="CrashLoopBackOff",
-                           last_term=("OOMKilled", 137))],
+        statuses=[
+            _cstatus(
+                ready=False, restarts=7, waiting="CrashLoopBackOff", last_term=("OOMKilled", 137)
+            )
+        ],
         git_version="v2.5.0",
     )
     core = NS(list_namespaced_pod=lambda **kw: NS(items=[pod]))
@@ -82,22 +90,34 @@ async def test_pod_status_label_selector_uses_config(monkeypatch):
 
 # ---- events ----------------------------------------------------------------
 
+
 def _event(*, name, kind="Pod", etype="Warning", reason="BackOff", msg="m", count=1, mins_ago=1):
     ts = datetime.now(UTC) - timedelta(minutes=mins_ago)
     return NS(
         involved_object=NS(name=name, kind=kind),
-        type=etype, reason=reason, message=msg, count=count,
-        last_timestamp=ts, event_time=None, metadata=NS(creation_timestamp=ts),
+        type=etype,
+        reason=reason,
+        message=msg,
+        count=count,
+        last_timestamp=ts,
+        event_time=None,
+        metadata=NS(creation_timestamp=ts),
     )
 
 
 async def test_events_filter_and_sort(monkeypatch):
     events = [
         _event(name="payment-service-abc-1", reason="OOMKilling", mins_ago=2),
-        _event(name="payment-service-abc-2", etype="Normal", reason="Pulled", mins_ago=1),   # routine → dropped
-        _event(name="payment-service", kind="Deployment", reason="ProgressDeadlineExceeded", mins_ago=5),
-        _event(name="order-service-xyz", reason="BackOff", mins_ago=1),                        # other service → dropped
-        _event(name="payment-service-abc-3", etype="Normal", reason="Killing", mins_ago=3),    # Normal but interesting → kept
+        _event(
+            name="payment-service-abc-2", etype="Normal", reason="Pulled", mins_ago=1
+        ),  # routine → dropped
+        _event(
+            name="payment-service", kind="Deployment", reason="ProgressDeadlineExceeded", mins_ago=5
+        ),
+        _event(name="order-service-xyz", reason="BackOff", mins_ago=1),  # other service → dropped
+        _event(
+            name="payment-service-abc-3", etype="Normal", reason="Killing", mins_ago=3
+        ),  # Normal but interesting → kept
     ]
     core = NS(list_namespaced_event=lambda **kw: NS(items=events))
     _install(monkeypatch, core=core)
@@ -110,7 +130,9 @@ async def test_events_filter_and_sort(monkeypatch):
 
 
 async def test_events_limit(monkeypatch):
-    events = [_event(name=f"payment-service-{i}", reason="BackOff", mins_ago=i) for i in range(1, 10)]
+    events = [
+        _event(name=f"payment-service-{i}", reason="BackOff", mins_ago=i) for i in range(1, 10)
+    ]
     core = NS(list_namespaced_event=lambda **kw: NS(items=events))
     _install(monkeypatch, core=core)
     out = await k8s.get_k8s_events("payment-service", limit=3)
@@ -120,13 +142,20 @@ async def test_events_limit(monkeypatch):
 
 # ---- deployment status -----------------------------------------------------
 
+
 async def test_deployment_status_healthy(monkeypatch):
     dep = NS(
         metadata=NS(annotations={"deployment.kubernetes.io/revision": "5"}),
         spec=NS(replicas=3, template=NS(metadata=NS(labels={"git_version": "v2.5.0"}))),
-        status=NS(ready_replicas=3, available_replicas=3, updated_replicas=3,
-                  unavailable_replicas=None,
-                  conditions=[NS(type="Available", status="True", reason="MinimumReplicasAvailable", message="ok")]),
+        status=NS(
+            ready_replicas=3,
+            available_replicas=3,
+            updated_replicas=3,
+            unavailable_replicas=None,
+            conditions=[
+                NS(type="Available", status="True", reason="MinimumReplicasAvailable", message="ok")
+            ],
+        ),
     )
     apps = NS(read_namespaced_deployment=lambda **kw: dep)
     _install(monkeypatch, apps=apps)
@@ -135,7 +164,7 @@ async def test_deployment_status_healthy(monkeypatch):
     assert out["found"] is True
     assert out["revision"] == "5"
     assert out["available_replicas"] == 3
-    assert out["unavailable_replicas"] == 0   # None coalesced to 0
+    assert out["unavailable_replicas"] == 0  # None coalesced to 0
     assert out["git_version"] == "v2.5.0"
 
 
@@ -153,9 +182,11 @@ async def test_deployment_status_404(monkeypatch):
 
 # ---- unavailable degradation ----------------------------------------------
 
+
 async def test_unavailable_when_config_missing(monkeypatch):
     def _boom():
         raise RuntimeError("kubernetes config not available (ConfigException)")
+
     monkeypatch.setattr(k8s, "_load_client", _boom)
 
     out = await k8s.get_pod_status("payment-service")

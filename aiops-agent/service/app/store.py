@@ -180,9 +180,17 @@ def _connect(path: str | Path | None = None) -> Iterator[sqlite3.Connection]:
 
 # ---- calibration ----------------------------------------------------------
 
+
 def cal_insert(
-    *, run_id: str, ts: str, confidence: float, summary: str, hypothesis: str,
-    suspected_version: str | None, services: list[str], path: str | Path | None = None,
+    *,
+    run_id: str,
+    ts: str,
+    confidence: float,
+    summary: str,
+    hypothesis: str,
+    suspected_version: str | None,
+    services: list[str],
+    path: str | Path | None = None,
 ) -> None:
     """Append a pending calibration record (correct=NULL until labeled)."""
     with _write_lock, _connect(path) as conn:
@@ -190,14 +198,18 @@ def cal_insert(
             "INSERT INTO calibration "
             "(run_id, ts, confidence, summary, hypothesis, suspected_version, services) "
             "VALUES (?,?,?,?,?,?,?)",
-            (run_id, ts, confidence, summary, hypothesis,
-             suspected_version, json.dumps(services)),
+            (run_id, ts, confidence, summary, hypothesis, suspected_version, json.dumps(services)),
         )
 
 
 def cal_label(
-    run_id: str, correct: bool, *, score: float | None, source: str,
-    error_dimension: str | None = None, correction_note: str | None = None,
+    run_id: str,
+    correct: bool,
+    *,
+    score: float | None,
+    source: str,
+    error_dimension: str | None = None,
+    correction_note: str | None = None,
     path: str | Path | None = None,
 ) -> bool:
     """Atomically set the verdict on the *most recent* record for run_id. One
@@ -251,6 +263,7 @@ def cal_load(path: str | Path | None = None) -> list[dict[str, Any]]:
 
 # ---- investigations -------------------------------------------------------
 
+
 def inv_insert(fp: str, ts: str, payload_json: str, path: str | Path | None = None) -> None:
     with _write_lock, _connect(path) as conn:
         conn.execute(
@@ -263,14 +276,14 @@ def inv_load(path: str | Path | None = None) -> list[str]:
     """Investigation payloads (json strings) in insert order = chronological, so
     callers can keep 'latest per fp wins'."""
     with _connect(path) as conn:
-        rows = conn.execute(
-            "SELECT payload FROM investigations ORDER BY id"
-        ).fetchall()
+        rows = conn.execute("SELECT payload FROM investigations ORDER BY id").fetchall()
     return [r["payload"] for r in rows]
 
 
 def inv_query_similar(
-    service: str, alertname: str, limit: int = 5,
+    service: str,
+    alertname: str,
+    limit: int = 5,
     path: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     """Return up to `limit` past investigations for the same service+alertname
@@ -299,14 +312,36 @@ def inv_query_similar(
 
 # ---- action_requests (lifecycle state machine; 7b-1) ----------------------
 
-_AR_COLS = ("request_id", "fp", "action", "args", "autonomy", "status", "reversible",
-            "rollback", "blast_radius", "runbook_id", "params", "idem_key",
-            "created_ts", "expires_ts", "actor", "outcome")
+_AR_COLS = (
+    "request_id",
+    "fp",
+    "action",
+    "args",
+    "autonomy",
+    "status",
+    "reversible",
+    "rollback",
+    "blast_radius",
+    "runbook_id",
+    "params",
+    "idem_key",
+    "created_ts",
+    "expires_ts",
+    "actor",
+    "outcome",
+)
 
 # Statuses meaning the action actually ran or is running — the set idempotency
 # treats as "already acted on" (REFUSED/ABORTED/etc. don't count: nothing ran).
-_RAN_STATUSES = ("executing", "succeeded", "failed", "verify_failed",
-                 "rolling_back", "rolled_back", "rollback_failed")
+_RAN_STATUSES = (
+    "executing",
+    "succeeded",
+    "failed",
+    "verify_failed",
+    "rolling_back",
+    "rolled_back",
+    "rollback_failed",
+)
 
 
 def _ar_row_to_dict(r: sqlite3.Row) -> dict[str, Any]:
@@ -336,8 +371,13 @@ def ar_insert(rec: dict, path: str | Path | None = None) -> None:
         )
 
 
-def ar_update(request_id: str, *, blast_radius: dict | None = None,
-              outcome: str | None = None, path: str | Path | None = None) -> None:
+def ar_update(
+    request_id: str,
+    *,
+    blast_radius: dict | None = None,
+    outcome: str | None = None,
+    path: str | Path | None = None,
+) -> None:
     """Attach computed fields (e.g. blast radius) without changing status — the
     dry-run gate records its result while the request stays in `executing`."""
     sets, params = [], []
@@ -354,8 +394,9 @@ def ar_update(request_id: str, *, blast_radius: dict | None = None,
         conn.execute(f"UPDATE action_requests SET {','.join(sets)} WHERE request_id=?", params)
 
 
-def ar_find_ran(idem_key: str, exclude_request_id: str,
-                path: str | Path | None = None) -> str | None:
+def ar_find_ran(
+    idem_key: str, exclude_request_id: str, path: str | Path | None = None
+) -> str | None:
     """Idempotency probe: the request_id of *another* request with the same
     idem_key that already ran or is running, else None. Empty idem_key never
     matches (no target to dedup on)."""
@@ -374,8 +415,18 @@ def ar_find_ran(idem_key: str, exclude_request_id: str,
 
 # ---- circuit breaker + execution ledger (7b-3) ----------------------------
 
-def exec_record(*, ts: str, scope_key: str, action: str, target: str, fp: str,
-                request_id: str, success: bool, path: str | Path | None = None) -> None:
+
+def exec_record(
+    *,
+    ts: str,
+    scope_key: str,
+    action: str,
+    target: str,
+    fp: str,
+    request_id: str,
+    success: bool,
+    path: str | Path | None = None,
+) -> None:
     with _write_lock, _connect(path) as conn:
         conn.execute(
             "INSERT INTO executions (ts, scope_key, action, target, fp, request_id, success) "
@@ -417,8 +468,9 @@ def breaker_get(scope_key: str, path: str | Path | None = None) -> dict[str, Any
     return d
 
 
-def breaker_set_open(scope_key: str, opened_ts: str, reason: str,
-                     path: str | Path | None = None) -> None:
+def breaker_set_open(
+    scope_key: str, opened_ts: str, reason: str, path: str | Path | None = None
+) -> None:
     with _write_lock, _connect(path) as conn:
         conn.execute(
             "INSERT INTO breaker (scope_key, open, opened_ts, reason) VALUES (?,1,?,?) "
@@ -457,8 +509,9 @@ def ar_get(request_id: str, path: str | Path | None = None) -> dict[str, Any] | 
     return _ar_row_to_dict(r) if r else None
 
 
-def ar_list(*, status: str | None = None, limit: int = 50,
-            path: str | Path | None = None) -> list[dict[str, Any]]:
+def ar_list(
+    *, status: str | None = None, limit: int = 50, path: str | Path | None = None
+) -> list[dict[str, Any]]:
     with _connect(path) as conn:
         if status:
             rows = conn.execute(
@@ -473,9 +526,14 @@ def ar_list(*, status: str | None = None, limit: int = 50,
 
 
 def ar_transition(
-    request_id: str, expect_status: str, new_status: str, *,
-    actor: str | None = None, outcome: str | None = None,
-    blast_radius: dict | None = None, path: str | Path | None = None,
+    request_id: str,
+    expect_status: str,
+    new_status: str,
+    *,
+    actor: str | None = None,
+    outcome: str | None = None,
+    blast_radius: dict | None = None,
+    path: str | Path | None = None,
 ) -> bool:
     """Atomic compare-and-set on status: only flips when the row is *currently* in
     `expect_status`. This is what makes double-approve / approve-racing-AUTO safe —
@@ -494,8 +552,7 @@ def ar_transition(
     params += [request_id, expect_status]
     with _write_lock, _connect(path) as conn:
         cur = conn.execute(
-            f"UPDATE action_requests SET {','.join(sets)} "
-            f"WHERE request_id=? AND status=?",
+            f"UPDATE action_requests SET {','.join(sets)} WHERE request_id=? AND status=?",
             params,
         )
         return cur.rowcount > 0
@@ -503,19 +560,31 @@ def ar_transition(
 
 # ---- audit (insert-only) --------------------------------------------------
 
+
 def audit_insert(rec: dict, path: str | Path | None = None) -> None:
     with _write_lock, _connect(path) as conn:
         conn.execute(
             "INSERT INTO audit (ts, request_id, fp, phase, verdict, actor, detail) "
             "VALUES (?,?,?,?,?,?,?)",
-            (rec["ts"], rec.get("request_id", ""), rec.get("fp", ""),
-             rec["phase"], rec["verdict"], rec.get("actor", "system"),
-             json.dumps(rec.get("detail") or {})),
+            (
+                rec["ts"],
+                rec.get("request_id", ""),
+                rec.get("fp", ""),
+                rec["phase"],
+                rec["verdict"],
+                rec.get("actor", "system"),
+                json.dumps(rec.get("detail") or {}),
+            ),
         )
 
 
-def audit_list(*, request_id: str | None = None, fp: str | None = None,
-               limit: int = 200, path: str | Path | None = None) -> list[dict[str, Any]]:
+def audit_list(
+    *,
+    request_id: str | None = None,
+    fp: str | None = None,
+    limit: int = 200,
+    path: str | Path | None = None,
+) -> list[dict[str, Any]]:
     where, params = [], []
     if request_id is not None:
         where.append("request_id=?")
@@ -528,7 +597,8 @@ def audit_list(*, request_id: str | None = None, fp: str | None = None,
     with _connect(path) as conn:
         rows = conn.execute(
             f"SELECT ts, request_id, fp, phase, verdict, actor, detail "
-            f"FROM audit{clause} ORDER BY id LIMIT ?", params
+            f"FROM audit{clause} ORDER BY id LIMIT ?",
+            params,
         ).fetchall()
     out = []
     for r in rows:
@@ -539,6 +609,7 @@ def audit_list(*, request_id: str | None = None, fp: str | None = None,
 
 
 # ---- one-time legacy JSONL migration --------------------------------------
+
 
 def _import_jsonl(p: Path) -> list[str]:
     if not p.exists():
@@ -564,11 +635,18 @@ def migrate_legacy_jsonl(path: str | Path | None = None) -> dict[str, int]:
                             "INSERT INTO calibration (run_id, ts, confidence, correct, "
                             "score, source, summary, hypothesis, suspected_version, services) "
                             "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                            (d.get("run_id", ""), d.get("ts", ""), float(d.get("confidence", 0.0)),
-                             None if d.get("correct") is None else (1 if d["correct"] else 0),
-                             d.get("score"), d.get("source"), d.get("summary", ""),
-                             d.get("hypothesis", ""), d.get("suspected_version"),
-                             json.dumps(d.get("services", []))),
+                            (
+                                d.get("run_id", ""),
+                                d.get("ts", ""),
+                                float(d.get("confidence", 0.0)),
+                                None if d.get("correct") is None else (1 if d["correct"] else 0),
+                                d.get("score"),
+                                d.get("source"),
+                                d.get("summary", ""),
+                                d.get("hypothesis", ""),
+                                d.get("suspected_version"),
+                                json.dumps(d.get("services", [])),
+                            ),
                         )
                         imported["calibration"] += 1
                     except Exception as e:
@@ -601,6 +679,7 @@ def init(path: str | Path | None = None) -> None:
 
 # ---- runbook feedback (knowledge-loop §1 閉環三) ---------------------------
 
+
 def rb_feedback_insert(
     *,
     runbook_id: str,
@@ -614,14 +693,14 @@ def rb_feedback_insert(
     """Append one execution outcome for a runbook step (ok / verify_failed /
     rollback / rollback_failed). Append-only; never updated."""
     from datetime import UTC, datetime
+
     ts = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     with _write_lock, _connect(path) as conn:
         conn.execute(
             "INSERT INTO runbook_feedback "
             "(ts, runbook_id, step_desc, outcome, request_id, fp, detail) "
             "VALUES (?,?,?,?,?,?,?)",
-            (ts, runbook_id, step_desc, outcome, request_id, fp,
-             json.dumps(detail or {})),
+            (ts, runbook_id, step_desc, outcome, request_id, fp, json.dumps(detail or {})),
         )
 
 
@@ -636,6 +715,7 @@ def rb_feedback_health_report(
     Returns one dict per runbook that tripped at least one signal, sorted by
     severity (rollback_failed first, then by verify_failed rate desc)."""
     from datetime import UTC, datetime, timedelta
+
     cutoff = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     with _connect(path) as conn:
         rows = conn.execute(
@@ -668,16 +748,18 @@ def rb_feedback_health_report(
             if vf_rate > 0.30:
                 vf, tot = r["verify_failed"], total
                 signals.append(f"verify_failed {vf_rate:.0%} ({vf}/{tot}) — needs-review")
-            results.append({
-                "runbook_id": r["runbook_id"],
-                "total_executions": total,
-                "verify_failed": r["verify_failed"],
-                "verify_failed_rate": round(vf_rate, 3),
-                "rollback_failed": r["rollback_failed"],
-                "rollback": r["rollback"],
-                "ok": r["ok"],
-                "decay_signals": signals,
-            })
+            results.append(
+                {
+                    "runbook_id": r["runbook_id"],
+                    "total_executions": total,
+                    "verify_failed": r["verify_failed"],
+                    "verify_failed_rate": round(vf_rate, 3),
+                    "rollback_failed": r["rollback_failed"],
+                    "rollback": r["rollback"],
+                    "ok": r["ok"],
+                    "decay_signals": signals,
+                }
+            )
 
     # rollback_failed first (critical), then by verify_failed_rate desc
     results.sort(key=lambda x: (-x["rollback_failed"], -x["verify_failed_rate"]))

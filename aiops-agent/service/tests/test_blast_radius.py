@@ -9,13 +9,21 @@ from app.blast_radius import BlastRadius, dry_run_rollout_undo, dry_run_scale, e
 
 
 def _ok(**over):
-    base = dict(action="k8s.rollout_undo", target="demo/payment-service", namespace="demo",
-                target_revision="4", affected_pods=3, singleton=False, available=True)
+    base = dict(
+        action="k8s.rollout_undo",
+        target="demo/payment-service",
+        namespace="demo",
+        target_revision="4",
+        affected_pods=3,
+        singleton=False,
+        available=True,
+    )
     base.update(over)
     return BlastRadius(**base)
 
 
 # ---- policy (pure) ---------------------------------------------------------
+
 
 def test_policy_within(monkeypatch):
     ok, reason = evaluate_policy(_ok())
@@ -23,8 +31,11 @@ def test_policy_within(monkeypatch):
 
 
 def test_policy_unavailable_fails_closed():
-    ok, reason = evaluate_policy(BlastRadius(action="k8s.scale", target="x", namespace="demo",
-                                             available=False, detail="k8s down"))
+    ok, reason = evaluate_policy(
+        BlastRadius(
+            action="k8s.scale", target="x", namespace="demo", available=False, detail="k8s down"
+        )
+    )
     assert not ok and "fail-closed" in reason
 
 
@@ -58,6 +69,7 @@ def test_policy_rollout_undo_needs_previous_revision():
 
 # ---- dry-runs (faked read-only client) -------------------------------------
 
+
 def _fake_apps(deployment="payment-service", replicas=3, current_rev="5", rs_revs=("5", "4", "3")):
     dep = NS(
         spec=NS(replicas=replicas, template=NS(metadata=NS(labels={}))),
@@ -66,9 +78,12 @@ def _fake_apps(deployment="payment-service", replicas=3, current_rev="5", rs_rev
     )
 
     def _rs(rev):
-        return NS(metadata=NS(
-            annotations={"deployment.kubernetes.io/revision": rev},
-            owner_references=[NS(kind="Deployment", name=deployment)]))
+        return NS(
+            metadata=NS(
+                annotations={"deployment.kubernetes.io/revision": rev},
+                owner_references=[NS(kind="Deployment", name=deployment)],
+            )
+        )
 
     rs_list = NS(items=[_rs(r) for r in rs_revs])
     apps = NS(
@@ -80,6 +95,7 @@ def _fake_apps(deployment="payment-service", replicas=3, current_rev="5", rs_rev
 
 def _wire(monkeypatch, apps):
     from app.tools import k8s
+
     monkeypatch.setattr(k8s, "_load_client", lambda: (None, apps))
 
 
@@ -115,6 +131,7 @@ async def test_dry_run_unavailable_when_k8s_down(monkeypatch):
 
     def _boom():
         raise RuntimeError("kubernetes config not available")
+
     monkeypatch.setattr(k8s, "_load_client", _boom)
     out = await dry_run_rollout_undo({"deployment": "x", "namespace": "demo"})
     assert out.available is False and "not available" in out.detail

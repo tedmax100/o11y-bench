@@ -48,7 +48,7 @@ def synthesize_draft_runbook(inv: InvestigationRecord) -> dict:
         step: dict = {
             "desc": d.reason or d.action,
             "action": d.action,
-            "reversible": None,       # human fills in
+            "reversible": None,  # human fills in
             "requires_approval": True,  # safe default for drafts
         }
         remediation.append(step)
@@ -71,7 +71,7 @@ def synthesize_draft_runbook(inv: InvestigationRecord) -> dict:
             "alertname": inv.alertname or "",
             "labels": {"service_name": inv.service} if inv.service else {},
         },
-        "diagnostics": [],   # intentionally empty — human fills from agent's tool history
+        "diagnostics": [],  # intentionally empty — human fills from agent's tool history
         "remediation": remediation,
     }
     return draft
@@ -189,8 +189,14 @@ async def _open_github_pr(draft: dict, local_path: Path, inv: InvestigationRecor
                 headers=headers,
                 json={
                     "base_tree": base_sha,
-                    "tree": [{"path": file_path_in_repo, "mode": "100644",
-                               "type": "blob", "sha": blob_sha}],
+                    "tree": [
+                        {
+                            "path": file_path_in_repo,
+                            "mode": "100644",
+                            "type": "blob",
+                            "sha": blob_sha,
+                        }
+                    ],
                 },
             )
             r.raise_for_status()

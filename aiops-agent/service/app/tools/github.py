@@ -86,8 +86,7 @@ async def github_compare(repo: str, base: str, head: str) -> dict[str, Any]:
         "commits": [
             {
                 "sha": c["sha"][:8],
-                "author": (c.get("author") or {}).get("login")
-                or c["commit"]["author"]["name"],
+                "author": (c.get("author") or {}).get("login") or c["commit"]["author"]["name"],
                 "msg": c["commit"]["message"].splitlines()[0],
             }
             for c in commits[:MAX_COMMITS]

@@ -21,12 +21,8 @@ from o11y_shared import (
 )
 
 USER_SERVICE_URL = os.environ.get("USER_SERVICE_URL", "http://user-service.demo.svc:8000")
-ORDER_SERVICE_URL = os.environ.get(
-    "ORDER_SERVICE_URL", "http://order-service.demo.svc:8000"
-)
-PAYMENT_SERVICE_URL = os.environ.get(
-    "PAYMENT_SERVICE_URL", "http://payment-service.demo.svc:8000"
-)
+ORDER_SERVICE_URL = os.environ.get("ORDER_SERVICE_URL", "http://order-service.demo.svc:8000")
+PAYMENT_SERVICE_URL = os.environ.get("PAYMENT_SERVICE_URL", "http://payment-service.demo.svc:8000")
 
 setup_stdout_json_logging(level=os.environ.get("LOG_LEVEL", "INFO"))
 

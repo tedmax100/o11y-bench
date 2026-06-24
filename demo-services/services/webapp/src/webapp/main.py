@@ -19,9 +19,7 @@ from o11y_shared import (
     setup_stdout_json_logging,
 )
 
-API_GATEWAY_URL = os.environ.get(
-    "API_GATEWAY_URL", "http://api-gateway.demo.svc:8000"
-)
+API_GATEWAY_URL = os.environ.get("API_GATEWAY_URL", "http://api-gateway.demo.svc:8000")
 
 setup_stdout_json_logging(level=os.environ.get("LOG_LEVEL", "INFO"))
 

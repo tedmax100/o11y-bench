@@ -162,9 +162,8 @@ def _node_kind(name: str, attrs: dict) -> str:
         return "llm"
     if name.startswith("execute_tool") or "gen_ai.tool.name" in attrs:
         return "tool"
-    if (
-        any(k.startswith("http.") for k in attrs)
-        or name.startswith(("GET ", "POST ", "PUT ", "DELETE "))
+    if any(k.startswith("http.") for k in attrs) or name.startswith(
+        ("GET ", "POST ", "PUT ", "DELETE ")
     ):
         return "http"
     return "business"
@@ -196,9 +195,17 @@ def _payload(kind: str, attrs: dict, *, compact: bool) -> dict:
     else:
         # http / business: keep a few low-noise, high-signal attributes.
         keep = (
-            "http.method", "http.route", "http.target", "http.status_code",
-            "http.request.method", "http.response.status_code", "url.path",
-            "status", "app.outcome", "app.fail_reason", "git_version",
+            "http.method",
+            "http.route",
+            "http.target",
+            "http.status_code",
+            "http.request.method",
+            "http.response.status_code",
+            "url.path",
+            "status",
+            "app.outcome",
+            "app.fail_reason",
+            "git_version",
         )
         p["attributes"] = {k: attrs[k] for k in keep if k in attrs}
     if compact:
@@ -359,8 +366,10 @@ async def stream_trace_chat(
     streamed = False
     try:
         async for chunk in _trace_chat_llm().astream(msgs):
-            text = chunk.content if isinstance(chunk.content, str) else "".join(
-                b.get("text", "") for b in chunk.content if isinstance(b, dict)
+            text = (
+                chunk.content
+                if isinstance(chunk.content, str)
+                else "".join(b.get("text", "") for b in chunk.content if isinstance(b, dict))
             )
             if text:
                 streamed = True

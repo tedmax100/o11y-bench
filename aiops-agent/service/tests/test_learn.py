@@ -14,37 +14,65 @@ from app.governance import Autonomy, decide
 
 # ---- helpers ----------------------------------------------------------------
 
+
 def _plant(run_id: str, *, source: str, correct: bool = True, path=None) -> None:
     """Insert + label a CE record in one call."""
-    store.cal_insert(run_id=run_id, ts="2026-01-01T00:00:00Z",
-                     confidence=0.9, summary="s", hypothesis="",
-                     suspected_version=None, services=[], path=path)
+    store.cal_insert(
+        run_id=run_id,
+        ts="2026-01-01T00:00:00Z",
+        confidence=0.9,
+        summary="s",
+        hypothesis="",
+        suspected_version=None,
+        services=[],
+        path=path,
+    )
     store.cal_label(run_id, correct, score=None, source=source, path=path)
 
 
 def _req(fp: str):
     from app.action_requests import ActionRequest
+
     return ActionRequest(
-        request_id="r-" + fp, fp=fp, action="k8s.rollout_undo", args={},
-        autonomy="propose", status="executing", reversible=True,
-        idem_key="k", created_ts="2026-01-01T00:00:00Z",
+        request_id="r-" + fp,
+        fp=fp,
+        action="k8s.rollout_undo",
+        args={},
+        autonomy="propose",
+        status="executing",
+        reversible=True,
+        idem_key="k",
+        created_ts="2026-01-01T00:00:00Z",
         expires_ts="2026-01-01T01:00:00Z",
     )
 
 
 def _calib(labeled=50, overconfidence=0.0):
-    return {"labeled": labeled, "overconfidence": overconfidence,
-            "ece": overconfidence, "brier": 0.1, "bins": []}
+    return {
+        "labeled": labeled,
+        "overconfidence": overconfidence,
+        "ece": overconfidence,
+        "brier": 0.1,
+        "bins": [],
+    }
 
 
 # ---- _learn_outcome ---------------------------------------------------------
 
+
 def test_learn_disabled_writes_nothing(tmp_path, monkeypatch):
     p = tmp_path / "l.db"
     monkeypatch.setattr(ex.settings, "learn_remediation_into_ce", False)
-    store.cal_insert(run_id="fp1", ts="2026-01-01T00:00:00Z",
-                     confidence=0.9, summary="s", hypothesis="",
-                     suspected_version=None, services=[], path=p)
+    store.cal_insert(
+        run_id="fp1",
+        ts="2026-01-01T00:00:00Z",
+        confidence=0.9,
+        summary="s",
+        hypothesis="",
+        suspected_version=None,
+        services=[],
+        path=p,
+    )
 
     ex._learn_outcome(_req("fp1"), verified=True, path=p)
 
@@ -55,9 +83,16 @@ def test_learn_disabled_writes_nothing(tmp_path, monkeypatch):
 def test_learn_enabled_verified_labels_correct_true(tmp_path, monkeypatch):
     p = tmp_path / "l.db"
     monkeypatch.setattr(ex.settings, "learn_remediation_into_ce", True)
-    store.cal_insert(run_id="fp2", ts="2026-01-01T00:00:00Z",
-                     confidence=0.9, summary="s", hypothesis="",
-                     suspected_version=None, services=[], path=p)
+    store.cal_insert(
+        run_id="fp2",
+        ts="2026-01-01T00:00:00Z",
+        confidence=0.9,
+        summary="s",
+        hypothesis="",
+        suspected_version=None,
+        services=[],
+        path=p,
+    )
 
     ex._learn_outcome(_req("fp2"), verified=True, path=p)
 
@@ -69,9 +104,16 @@ def test_learn_enabled_verified_labels_correct_true(tmp_path, monkeypatch):
 def test_learn_enabled_verify_failure_labels_correct_false(tmp_path, monkeypatch):
     p = tmp_path / "l.db"
     monkeypatch.setattr(ex.settings, "learn_remediation_into_ce", True)
-    store.cal_insert(run_id="fp3", ts="2026-01-01T00:00:00Z",
-                     confidence=0.9, summary="s", hypothesis="",
-                     suspected_version=None, services=[], path=p)
+    store.cal_insert(
+        run_id="fp3",
+        ts="2026-01-01T00:00:00Z",
+        confidence=0.9,
+        summary="s",
+        hypothesis="",
+        suspected_version=None,
+        services=[],
+        path=p,
+    )
 
     ex._learn_outcome(_req("fp3"), verified=False, path=p)
 
@@ -89,6 +131,7 @@ def test_learn_missing_fp_is_noop(tmp_path, monkeypatch):
 
 
 # ---- store.cal_count_by_source ----------------------------------------------
+
 
 def test_cal_count_by_source_excludes_self_labels(tmp_path):
     p = tmp_path / "c.db"
@@ -108,14 +151,22 @@ def test_cal_count_by_source_excludes_self_labels(tmp_path):
 def test_cal_count_by_source_unlabeled_not_counted(tmp_path):
     p = tmp_path / "c.db"
     # insert without labeling
-    store.cal_insert(run_id="unlabeled", ts="2026-01-01T00:00:00Z",
-                     confidence=0.9, summary="s", hypothesis="",
-                     suspected_version=None, services=[], path=p)
+    store.cal_insert(
+        run_id="unlabeled",
+        ts="2026-01-01T00:00:00Z",
+        confidence=0.9,
+        summary="s",
+        hypothesis="",
+        suspected_version=None,
+        services=[],
+        path=p,
+    )
     _plant("labeled", source="ui", path=p)
     assert store.cal_count_by_source(path=p) == 1
 
 
 # ---- governance human-label gate --------------------------------------------
+
 
 def test_human_label_gate_withholds_auto_when_self_labels_only(tmp_path, monkeypatch):
     """50 self-labels → AUTO still withheld (human-label gate not cleared)."""
@@ -127,6 +178,7 @@ def test_human_label_gate_withholds_auto_when_self_labels_only(tmp_path, monkeyp
         _plant(f"r{i}", source="remediation-verified", path=p)
 
     from app.actions import registry
+
     spec = registry.get("k8s.rollout_undo")
     d = decide(spec, 0.9, _calib(labeled=50, overconfidence=0.0), path=p)
     assert d.autonomy is Autonomy.PROPOSE
@@ -146,8 +198,8 @@ def test_human_label_gate_allows_auto_with_enough_human_labels(tmp_path, monkeyp
 
     # k8s.rollout_undo requires_approval=True → PROPOSE anyway; use a non-approval spec
     from app.actions import ActionSpec
-    spec = ActionSpec(name="test.action", description="t",
-                      reversible=True, requires_approval=False)
+
+    spec = ActionSpec(name="test.action", description="t", reversible=True, requires_approval=False)
     d = decide(spec, 0.9, _calib(labeled=30, overconfidence=0.0), path=p)
     assert d.autonomy is Autonomy.AUTO
 
@@ -158,7 +210,7 @@ def test_human_label_gate_skipped_when_min_is_zero(monkeypatch):
     monkeypatch.setattr(gov.settings, "governance_min_labeled_runs", 0)
 
     from app.actions import ActionSpec
-    spec = ActionSpec(name="test.action", description="t",
-                      reversible=True, requires_approval=False)
+
+    spec = ActionSpec(name="test.action", description="t", reversible=True, requires_approval=False)
     d = decide(spec, 0.9, _calib(labeled=50, overconfidence=0.0))
     assert d.autonomy is Autonomy.AUTO

@@ -10,8 +10,9 @@ from app.governance import Autonomy, decide, propose_remediations
 
 
 def _spec(reversible=True, requires_approval=False, name="k8s.test"):
-    return ActionSpec(name=name, description="d", reversible=reversible,
-                      requires_approval=requires_approval)
+    return ActionSpec(
+        name=name, description="d", reversible=reversible, requires_approval=requires_approval
+    )
 
 
 def _calib(labeled=50, overconfidence=0.02):
@@ -28,6 +29,7 @@ def _thresholds(monkeypatch):
 
 
 # ---- registry --------------------------------------------------------------
+
 
 def test_registry_register_get_and_dup():
     r = ActionRegistry()
@@ -46,7 +48,9 @@ async def test_execute_refuses_when_disabled(monkeypatch):
 async def test_execute_refuses_when_kill_switch_off():
     # Kill switch off → ActionDisabled regardless of impl presence.
     with pytest.raises(ActionDisabled, match="actions_enabled"):
-        await actions_mod.registry.execute("k8s.rollout_undo", {"deployment": "x", "namespace": "demo"})
+        await actions_mod.registry.execute(
+            "k8s.rollout_undo", {"deployment": "x", "namespace": "demo"}
+        )
 
 
 async def test_execute_unknown_action():
@@ -63,6 +67,7 @@ def test_seeded_actions_are_safe():
 
 # ---- gate: hard rules ------------------------------------------------------
 
+
 def test_irreversible_always_escalates_even_at_max_confidence():
     d = decide(_spec(reversible=False), confidence=1.0, calib=_calib())
     assert d.autonomy is Autonomy.ESCALATE and d.requires_human
@@ -74,6 +79,7 @@ def test_approval_required_never_auto():
 
 
 # ---- gate: confidence bands ------------------------------------------------
+
 
 def test_low_confidence_escalates():
     assert decide(_spec(), 0.4, _calib()).autonomy is Autonomy.ESCALATE
@@ -92,6 +98,7 @@ def test_high_confidence_good_calibration_auto(monkeypatch):
 
 
 # ---- gate: calibration narrows autonomy (the ARE rule) ---------------------
+
 
 def test_overconfident_history_downgrades_auto_to_propose():
     d = decide(_spec(), 0.9, _calib(labeled=50, overconfidence=0.25))
@@ -112,9 +119,11 @@ def test_no_calibration_data_withholds_auto():
 
 # ---- propose_remediations + format -----------------------------------------
 
+
 def test_propose_remediations_maps_registered_only():
     decisions = propose_remediations(
-        ["k8s.rollout_undo", "totally.unregistered"], confidence=0.9, calib=_calib())
+        ["k8s.rollout_undo", "totally.unregistered"], confidence=0.9, calib=_calib()
+    )
     assert [d.action for d in decisions] == ["k8s.rollout_undo"]  # unregistered skipped
     assert decisions[0].autonomy is Autonomy.PROPOSE  # approval-required
 

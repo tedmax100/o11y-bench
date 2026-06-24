@@ -37,7 +37,7 @@ from .config import settings
 
 
 class Autonomy(StrEnum):
-    AUTO = "auto"        # policy permits autonomous execution (still subject to the kill switch)
+    AUTO = "auto"  # policy permits autonomous execution (still subject to the kill switch)
     PROPOSE = "propose"  # surface to a human to confirm
     ESCALATE = "escalate"  # hand back to a human; do not even pre-fill an action
 
@@ -69,8 +69,10 @@ def _calibration_verdict(calib: dict, *, human_labeled: int | None = None) -> tu
     pass it explicitly."""
     labeled = calib.get("labeled") or 0
     if labeled < settings.governance_min_labeled_runs:
-        return False, (f"calibration unproven ({labeled} labeled run(s) < "
-                       f"{settings.governance_min_labeled_runs}); autonomy withheld")
+        return False, (
+            f"calibration unproven ({labeled} labeled run(s) < "
+            f"{settings.governance_min_labeled_runs}); autonomy withheld"
+        )
 
     # Require the minimum human/grader label count when the caller supplies it.
     if human_labeled is not None and human_labeled < settings.governance_min_human_labeled_runs:
@@ -83,13 +85,16 @@ def _calibration_verdict(calib: dict, *, human_labeled: int | None = None) -> tu
     if overconf is None:
         return False, "calibration unavailable; autonomy withheld"
     if overconf > settings.governance_max_overconfidence:
-        return False, (f"overconfident by {overconf:+} > "
-                       f"{settings.governance_max_overconfidence}; autonomy narrowed")
+        return False, (
+            f"overconfident by {overconf:+} > "
+            f"{settings.governance_max_overconfidence}; autonomy narrowed"
+        )
     return True, f"calibration ok (overconfidence {overconf:+}, {labeled} runs)"
 
 
-def decide(action: ActionSpec, confidence: float, calib: dict, dq: dict | None = None, *,
-           path=None) -> Decision:
+def decide(
+    action: ActionSpec, confidence: float, calib: dict, dq: dict | None = None, *, path=None
+) -> Decision:
     """Policy verdict for one proposed action given the run confidence, the
     current calibration state, and (optionally) the data-quality verdict. When a
     DQ verdict is supplied, AUTO additionally requires it to be proven-good —
@@ -104,25 +109,33 @@ def decide(action: ActionSpec, confidence: float, calib: dict, dq: dict | None =
         and settings.governance_min_human_labeled_runs > 0
     ):
         from . import store
+
         human_labeled = store.cal_count_by_source(exclude_sources=_SELF_LABEL_SOURCES, path=path)
     good, cal_note = _calibration_verdict(calib, human_labeled=human_labeled)
-    dq_note = (dq.get("note", "") if dq else "DQ not evaluated")
+    dq_note = dq.get("note", "") if dq else "DQ not evaluated"
 
     def mk(level: Autonomy, reason: str) -> Decision:
         return Decision(
-            action=action.name, autonomy=level,
+            action=action.name,
+            autonomy=level,
             requires_human=(level is not Autonomy.AUTO),
-            confidence=confidence, reason=reason, calibration_note=cal_note,
+            confidence=confidence,
+            reason=reason,
+            calibration_note=cal_note,
             dq_note=dq_note,
-            reversible=action.reversible, requires_approval=action.requires_approval)
+            reversible=action.reversible,
+            requires_approval=action.requires_approval,
+        )
 
     # Hard safety rules first — independent of confidence/calibration.
     if not action.reversible:
         return mk(Autonomy.ESCALATE, "action is irreversible — never autonomous")
 
     if confidence < settings.governance_conf_low:
-        return mk(Autonomy.ESCALATE, f"confidence {confidence} below low threshold "
-                                     f"{settings.governance_conf_low}")
+        return mk(
+            Autonomy.ESCALATE,
+            f"confidence {confidence} below low threshold {settings.governance_conf_low}",
+        )
     if confidence < settings.governance_conf_high:
         return mk(Autonomy.PROPOSE, f"confidence {confidence} in the propose band")
 
@@ -136,8 +149,9 @@ def decide(action: ActionSpec, confidence: float, calib: dict, dq: dict | None =
     return mk(Autonomy.AUTO, "high confidence, reversible, calibration + data-quality proven-good")
 
 
-def propose_remediations(remediation_actions: list[str], confidence: float,
-                         calib: dict, dq: dict | None = None) -> list[Decision]:
+def propose_remediations(
+    remediation_actions: list[str], confidence: float, calib: dict, dq: dict | None = None
+) -> list[Decision]:
     """Map a runbook's remediation step action names to registered actions and run
     each through the gate. Unregistered names are skipped (only the typed,
     whitelisted vocabulary is eligible)."""
@@ -158,7 +172,7 @@ def format_decisions(decisions: list[Decision]) -> str:
     for d in decisions:
         verb = {
             Autonomy.AUTO: "AUTO (policy permits autonomous execution)"
-                           + ("" if enabled else " — but execution kill-switch is OFF, so PROPOSE"),
+            + ("" if enabled else " — but execution kill-switch is OFF, so PROPOSE"),
             Autonomy.PROPOSE: "PROPOSE (needs human confirmation)",
             Autonomy.ESCALATE: "ESCALATE (hand to human)",
         }[d.autonomy]

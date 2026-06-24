@@ -1,4 +1,5 @@
 """OTel SDK 初始化，將訊號發往 OTLP endpoint（Weaver live-check 或 OTel Collector）"""
+
 from opentelemetry import metrics, trace
 from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
@@ -14,10 +15,12 @@ def setup(service_name: str, otlp_endpoint: str) -> tuple:
     初始化 OTel SDK。
     回傳 (tracer_provider, meter_provider) 供手動 shutdown 使用。
     """
-    resource = Resource(attributes={
-        SERVICE_NAME: service_name,
-        SERVICE_VERSION: "v1.0.0",
-    })
+    resource = Resource(
+        attributes={
+            SERVICE_NAME: service_name,
+            SERVICE_VERSION: "v1.0.0",
+        }
+    )
 
     # Trace
     trace_exporter = OTLPSpanExporter(

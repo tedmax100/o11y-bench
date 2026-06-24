@@ -34,18 +34,18 @@ logger = logging.getLogger("aiops_agent.action_requests")
 
 
 class Status(StrEnum):
-    PROPOSED = "proposed"          # awaiting a human decision (PROPOSE band)
-    APPROVED = "approved"          # cleared to execute (human or AUTO)
-    REJECTED = "rejected"          # human declined
-    EXPIRED = "expired"            # approval TTL passed before action — preconditions stale
-    EXECUTING = "executing"        # executor running (transient)
-    SUCCEEDED = "succeeded"        # executed + verified (7b-4+)
-    FAILED = "failed"              # executed but errored (7b-4+)
+    PROPOSED = "proposed"  # awaiting a human decision (PROPOSE band)
+    APPROVED = "approved"  # cleared to execute (human or AUTO)
+    REJECTED = "rejected"  # human declined
+    EXPIRED = "expired"  # approval TTL passed before action — preconditions stale
+    EXECUTING = "executing"  # executor running (transient)
+    SUCCEEDED = "succeeded"  # executed + verified (7b-4+)
+    FAILED = "failed"  # executed but errored (7b-4+)
     VERIFY_FAILED = "verify_failed"  # executed cleanly but symptom persists (7b-4+)
-    ABORTED = "aborted"            # a pre-execution gate refused (preconditions / blast radius)
-    REFUSED = "refused"            # kill switch off / no impl — the 7b-1 terminal
+    ABORTED = "aborted"  # a pre-execution gate refused (preconditions / blast radius)
+    REFUSED = "refused"  # kill switch off / no impl — the 7b-1 terminal
     ROLLING_BACK = "rolling_back"  # (7b-4+)
-    ROLLED_BACK = "rolled_back"    # (7b-4+)
+    ROLLED_BACK = "rolled_back"  # (7b-4+)
     ROLLBACK_FAILED = "rollback_failed"  # (7b-4+)
 
 
@@ -94,9 +94,13 @@ def _parse(ts: str) -> datetime:
 
 
 def create_from_decision(
-    fp: str, decision: Decision, *,
-    args: dict | None = None, rollback: dict | None = None,
-    runbook_id: str | None = None, params: dict | None = None,
+    fp: str,
+    decision: Decision,
+    *,
+    args: dict | None = None,
+    rollback: dict | None = None,
+    runbook_id: str | None = None,
+    params: dict | None = None,
     path: Path | None = None,
 ) -> ActionRequest | None:
     """Materialize a request from a governance Decision. ESCALATE produces no
@@ -127,10 +131,17 @@ def create_from_decision(
         )
         store.ar_insert(req.model_dump(), path)
         audit.record(
-            "proposed", "ok", request_id=req.request_id, fp=fp,
+            "proposed",
+            "ok",
+            request_id=req.request_id,
+            fp=fp,
             actor=req.actor or "system",
-            detail={"action": req.action, "autonomy": req.autonomy,
-                    "initial_status": status.value, "reversible": req.reversible},
+            detail={
+                "action": req.action,
+                "autonomy": req.autonomy,
+                "initial_status": status.value,
+                "reversible": req.reversible,
+            },
             path=path,
         )
         return req
@@ -144,8 +155,9 @@ def get(request_id: str, path: Path | None = None) -> ActionRequest | None:
     return ActionRequest.model_validate(d) if d else None
 
 
-def list_requests(*, status: str | None = None, limit: int = 50,
-                  path: Path | None = None) -> list[dict[str, Any]]:
+def list_requests(
+    *, status: str | None = None, limit: int = 50, path: Path | None = None
+) -> list[dict[str, Any]]:
     return store.ar_list(status=status, limit=limit, path=path)
 
 
@@ -156,10 +168,21 @@ def _expire_if_stale(req: ActionRequest, path: Path | None = None) -> bool:
         return False
     if _now() <= _parse(req.expires_ts):
         return False
-    if store.ar_transition(req.request_id, Status.PROPOSED.value, Status.EXPIRED.value,
-                           outcome="approval TTL elapsed before action", path=path):
-        audit.record("expired", "ok", request_id=req.request_id, fp=req.fp,
-                     detail={"expires_ts": req.expires_ts}, path=path)
+    if store.ar_transition(
+        req.request_id,
+        Status.PROPOSED.value,
+        Status.EXPIRED.value,
+        outcome="approval TTL elapsed before action",
+        path=path,
+    ):
+        audit.record(
+            "expired",
+            "ok",
+            request_id=req.request_id,
+            fp=req.fp,
+            detail={"expires_ts": req.expires_ts},
+            path=path,
+        )
     return True
 
 
@@ -172,10 +195,18 @@ def approve(request_id: str, actor: str, path: Path | None = None) -> ActionRequ
         return None
     if _expire_if_stale(req, path):
         return None
-    if not store.ar_transition(request_id, Status.PROPOSED.value, Status.APPROVED.value,
-                               actor=actor, path=path):
-        audit.record("approved", "abort", request_id=request_id, fp=req.fp, actor=actor,
-                     detail={"reason": f"not in proposed state (was {req.status})"}, path=path)
+    if not store.ar_transition(
+        request_id, Status.PROPOSED.value, Status.APPROVED.value, actor=actor, path=path
+    ):
+        audit.record(
+            "approved",
+            "abort",
+            request_id=request_id,
+            fp=req.fp,
+            actor=actor,
+            detail={"reason": f"not in proposed state (was {req.status})"},
+            path=path,
+        )
         return None
     audit.record("approved", "ok", request_id=request_id, fp=req.fp, actor=actor, path=path)
     return get(request_id, path)
@@ -185,8 +216,9 @@ def reject(request_id: str, actor: str, path: Path | None = None) -> ActionReque
     req = get(request_id, path)
     if req is None:
         return None
-    if not store.ar_transition(request_id, Status.PROPOSED.value, Status.REJECTED.value,
-                               actor=actor, path=path):
+    if not store.ar_transition(
+        request_id, Status.PROPOSED.value, Status.REJECTED.value, actor=actor, path=path
+    ):
         return None
     audit.record("rejected", "ok", request_id=request_id, fp=req.fp, actor=actor, path=path)
     return get(request_id, path)

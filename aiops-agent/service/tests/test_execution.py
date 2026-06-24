@@ -22,23 +22,40 @@ def _db(monkeypatch, tmp_path):
 
 
 def _decision():
-    return Decision(action="k8s.rollout_undo", autonomy=Autonomy.PROPOSE,
-                    requires_human=True, confidence=0.9, reason="r",
-                    calibration_note="c", reversible=True, requires_approval=True)
+    return Decision(
+        action="k8s.rollout_undo",
+        autonomy=Autonomy.PROPOSE,
+        requires_human=True,
+        confidence=0.9,
+        reason="r",
+        calibration_note="c",
+        reversible=True,
+        requires_approval=True,
+    )
 
 
 def _wire_ok_dry_run(monkeypatch, **over):
     """Make the blast-radius gate pass with an in-policy footprint, so a run can
     reach the (kill-switched) execute step."""
-    base = dict(action="k8s.rollout_undo", target="demo/x", namespace="demo",
-                current_revision="5", target_revision="4",
-                current_replicas=3, target_replicas=3, affected_pods=3,
-                singleton=False, available=True)
+    base = dict(
+        action="k8s.rollout_undo",
+        target="demo/x",
+        namespace="demo",
+        current_revision="5",
+        target_revision="4",
+        current_replicas=3,
+        target_replicas=3,
+        affected_pods=3,
+        singleton=False,
+        available=True,
+    )
     base.update(over)
 
     async def _dr(args):
         return BlastRadius(**base)
+
     from app.actions import registry
+
     monkeypatch.setattr(registry.get("k8s.rollout_undo"), "dry_run", _dr)
 
 
@@ -84,16 +101,21 @@ async def test_precondition_flip_aborts(tmp_path, monkeypatch):
     _wire_ok_dry_run(monkeypatch)
     # A runbook with one diagnostic; revalidation finds it now FAILS.
     from app.runbook import DiagnosticResult, Runbook, Step
+
     rb = Runbook(id="rb1", diagnostics=[Step(desc="version still bad", action="query_prometheus")])
     monkeypatch.setattr(ex, "load_runbooks", lambda: [rb])
     monkeypatch.setattr(ex, "_read_only_tools", lambda: {})
 
     async def _diag(rb_, params, tool_map):
-        return [DiagnosticResult(desc="version still bad", action="query_prometheus", status="fail")]
+        return [
+            DiagnosticResult(desc="version still bad", action="query_prometheus", status="fail")
+        ]
+
     monkeypatch.setattr(ex, "run_diagnostics", _diag)
 
-    req = create_from_decision("fp1", _decision(), args={"deployment": "x"},
-                               runbook_id="rb1", params={}, path=p)
+    req = create_from_decision(
+        "fp1", _decision(), args={"deployment": "x"}, runbook_id="rb1", params={}, path=p
+    )
     approve(req.request_id, actor="alice", path=p)
     res = await run(req.request_id, path=p)
     assert res["status"] == Status.ABORTED.value
@@ -105,12 +127,14 @@ async def test_precondition_pass_then_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(arq.settings, "actions_enabled", False)
     _wire_ok_dry_run(monkeypatch)
     from app.runbook import DiagnosticResult, Runbook, Step
+
     rb = Runbook(id="rb1", diagnostics=[Step(desc="check", action="query_prometheus")])
     monkeypatch.setattr(ex, "load_runbooks", lambda: [rb])
     monkeypatch.setattr(ex, "_read_only_tools", lambda: {})
 
     async def _diag(rb_, params, tool_map):
         return [DiagnosticResult(desc="check", action="query_prometheus", status="pass")]
+
     monkeypatch.setattr(ex, "run_diagnostics", _diag)
 
     req = create_from_decision("fp1", _decision(), runbook_id="rb1", params={}, path=p)
@@ -184,6 +208,7 @@ async def test_missing_request(tmp_path, monkeypatch):
 # 7b-4: verify (step 5) + auto-rollback (step 6)
 # ---------------------------------------------------------------------------
 
+
 def _wire_impl(monkeypatch, *, impl_ok: bool, rollback_ok: bool = True):
     """Monkeypatch actions_enabled + impl + verify settle window to 0."""
     from app.actions import registry
@@ -191,7 +216,11 @@ def _wire_impl(monkeypatch, *, impl_ok: bool, rollback_ok: bool = True):
     async def _impl(args):
         if not impl_ok:
             raise RuntimeError("fake impl error")
-        return {"action": "rollout_undo", "deployment": args.get("deployment"), "rolled_back_to_revision": 4}
+        return {
+            "action": "rollout_undo",
+            "deployment": args.get("deployment"),
+            "rolled_back_to_revision": 4,
+        }
 
     async def _rb_impl(args):
         if not rollback_ok:
@@ -199,17 +228,23 @@ def _wire_impl(monkeypatch, *, impl_ok: bool, rollback_ok: bool = True):
         return {"action": "rollout_undo", "rolled_back_to_revision": 5}
 
     monkeypatch.setattr(registry.get("k8s.rollout_undo"), "impl", _impl)
-    monkeypatch.setattr(registry.get("k8s.rollout_undo"), "dry_run",
-                        (lambda: None).__class__(  # reuse _wire_ok_dry_run helper below
-                            *[], **{}))
+    monkeypatch.setattr(
+        registry.get("k8s.rollout_undo"),
+        "dry_run",
+        (lambda: None).__class__(  # reuse _wire_ok_dry_run helper below
+            *[], **{}
+        ),
+    )
     # patch the rollback action impl (same action for rollout_undo)
     # rollback_rollout_undo === impl_rollout_undo; give it a separate fake
     monkeypatch.setattr(
         __import__("app.tools.k8s_write", fromlist=["rollback_rollout_undo"]),
-        "rollback_rollout_undo", _rb_impl,
+        "rollback_rollout_undo",
+        _rb_impl,
     )
     # Re-wire the registry's rollback callable
     import app.tools.k8s_write as kw
+
     kw.rollback_rollout_undo = _rb_impl
 
 
@@ -238,6 +273,7 @@ def _setup_verify_test(monkeypatch, tmp_path, *, verify_pass: bool, rollback_ok:
 
     class _FakeTool:
         name = "query_prometheus"
+
         async def ainvoke(self, args):
             return verify_out
 
@@ -254,24 +290,42 @@ def _setup_verify_test(monkeypatch, tmp_path, *, verify_pass: bool, rollback_ok:
     # on the registry spec to return the rollback fake on second call won't work cleanly
     # so we patch _auto_rollback directly for rollback_ok=False case
     if not rollback_ok:
+
         async def _fail_rb(req, path):
             import app.audit as audit
-            audit.record("rollback", "fail", request_id=req.request_id, fp=req.fp,
-                         detail={"error": "fake rollback error"}, path=path)
+
+            audit.record(
+                "rollback",
+                "fail",
+                request_id=req.request_id,
+                fp=req.fp,
+                detail={"error": "fake rollback error"},
+                path=path,
+            )
             return False
+
         monkeypatch.setattr(ex_mod, "_auto_rollback", _fail_rb)
 
     # runbook with verify spec
     from app.runbook import Runbook, Step
+
     rb = Runbook(
         id="rb1",
-        remediation=[Step(
-            desc="rollback", action="k8s.rollout_undo",
-            rollback={"action": "k8s.rollout_undo", "args": {"deployment": "x", "namespace": "demo"}},
-            verify={"action": "query_prometheus",
+        remediation=[
+            Step(
+                desc="rollback",
+                action="k8s.rollout_undo",
+                rollback={
+                    "action": "k8s.rollout_undo",
+                    "args": {"deployment": "x", "namespace": "demo"},
+                },
+                verify={
+                    "action": "query_prometheus",
                     "args": {"expr": "sum(rate(foo[2m]))", "queryType": "instant"},
-                    "check": {"max_value": 0.01}},
-        )],
+                    "check": {"max_value": 0.01},
+                },
+            )
+        ],
     )
     monkeypatch.setattr(ex_mod, "load_runbooks", lambda: [rb])
 
@@ -281,8 +335,9 @@ def _setup_verify_test(monkeypatch, tmp_path, *, verify_pass: bool, rollback_ok:
 async def test_verify_pass_reaches_succeeded(tmp_path, monkeypatch):
     """Execute succeeds + verify passes → SUCCEEDED."""
     p = _setup_verify_test(monkeypatch, tmp_path, verify_pass=True)
-    req = create_from_decision("fp1", _decision(), runbook_id="rb1",
-                               args={"deployment": "x", "namespace": "demo"}, path=p)
+    req = create_from_decision(
+        "fp1", _decision(), runbook_id="rb1", args={"deployment": "x", "namespace": "demo"}, path=p
+    )
     approve(req.request_id, actor="alice", path=p)
     res = await run(req.request_id, path=p)
     assert res["status"] == Status.SUCCEEDED.value
@@ -294,15 +349,20 @@ async def test_verify_fail_triggers_rollback(tmp_path, monkeypatch):
     p = _setup_verify_test(monkeypatch, tmp_path, verify_pass=False, rollback_ok=True)
     # wire rollback via the registry impl (same action → same impl = our fake)
     from app.actions import registry
+
     async def _rb(args):
         return {"rolled_back": True}
+
     monkeypatch.setattr(registry.get("k8s.rollout_undo"), "impl", _rb)
 
-    req = create_from_decision("fp1", _decision(), runbook_id="rb1",
-                               args={"deployment": "x", "namespace": "demo"},
-                               rollback={"action": "k8s.rollout_undo",
-                                         "args": {"deployment": "x", "namespace": "demo"}},
-                               path=p)
+    req = create_from_decision(
+        "fp1",
+        _decision(),
+        runbook_id="rb1",
+        args={"deployment": "x", "namespace": "demo"},
+        rollback={"action": "k8s.rollout_undo", "args": {"deployment": "x", "namespace": "demo"}},
+        path=p,
+    )
     approve(req.request_id, actor="alice", path=p)
     res = await run(req.request_id, path=p)
     assert res["status"] == Status.ROLLED_BACK.value
@@ -312,11 +372,14 @@ async def test_verify_fail_triggers_rollback(tmp_path, monkeypatch):
 async def test_verify_fail_rollback_fail(tmp_path, monkeypatch):
     """Verify fails + rollback also fails → ROLLBACK_FAILED."""
     p = _setup_verify_test(monkeypatch, tmp_path, verify_pass=False, rollback_ok=False)
-    req = create_from_decision("fp1", _decision(), runbook_id="rb1",
-                               args={"deployment": "x", "namespace": "demo"},
-                               rollback={"action": "k8s.rollout_undo",
-                                         "args": {"deployment": "x", "namespace": "demo"}},
-                               path=p)
+    req = create_from_decision(
+        "fp1",
+        _decision(),
+        runbook_id="rb1",
+        args={"deployment": "x", "namespace": "demo"},
+        rollback={"action": "k8s.rollout_undo", "args": {"deployment": "x", "namespace": "demo"}},
+        path=p,
+    )
     approve(req.request_id, actor="alice", path=p)
     res = await run(req.request_id, path=p)
     assert res["status"] == Status.ROLLBACK_FAILED.value

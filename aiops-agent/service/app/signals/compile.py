@@ -48,6 +48,7 @@ class Dependency(BaseModel):
 
 class ServiceSignal(BaseModel):
     """One service's owned signal declaration (the fragment schema)."""
+
     service: str
     role: str = ""
     tier: int = 3
@@ -114,34 +115,52 @@ def _journey_chains(nodes: list[ServiceNode], edges: list[Edge]) -> dict[str, li
 
 def compile_signals(fragments: list[ServiceSignal]) -> tuple[Topology, ContractSet]:
     nodes = [
-        ServiceNode(name=f.service, role=f.role, tier=f.tier, journeys=f.journeys,
-                    git_version=f.git_version, owner=f.owner)
+        ServiceNode(
+            name=f.service,
+            role=f.role,
+            tier=f.tier,
+            journeys=f.journeys,
+            git_version=f.git_version,
+            owner=f.owner,
+        )
         for f in fragments
     ]
     edges = [
         Edge(caller=f.service, callee=d.callee, attribution=d.attribution)
-        for f in fragments for d in f.depends_on
-    ]
-    topo = Topology(version=SIGNAL_VERSION, nodes=nodes, edges=edges,
-                    journeys=_journey_chains(nodes, edges))
-    contracts = ContractSet(version=SIGNAL_VERSION, contracts=[
-        SignalContract(service=f.service, freshness_seconds=f.freshness_seconds,
-                       slis=f.slis, supported_decisions=f.supported_decisions,
-                       exclusions=f.exclusions, logs=f.logs)
         for f in fragments
-    ])
+        for d in f.depends_on
+    ]
+    topo = Topology(
+        version=SIGNAL_VERSION, nodes=nodes, edges=edges, journeys=_journey_chains(nodes, edges)
+    )
+    contracts = ContractSet(
+        version=SIGNAL_VERSION,
+        contracts=[
+            SignalContract(
+                service=f.service,
+                freshness_seconds=f.freshness_seconds,
+                slis=f.slis,
+                supported_decisions=f.supported_decisions,
+                exclusions=f.exclusions,
+                logs=f.logs,
+            )
+            for f in fragments
+        ],
+    )
     return topo, contracts
 
 
 def _dump(model: BaseModel) -> str:
     data = model.model_dump(exclude_defaults=True, exclude_none=True)
-    body = yaml.dump(data, sort_keys=False, default_flow_style=False,
-                     allow_unicode=True, width=4096)
+    body = yaml.dump(
+        data, sort_keys=False, default_flow_style=False, allow_unicode=True, width=4096
+    )
     return _GENERATED_HEADER + body
 
 
-def write_compiled(topo: Topology, contracts: ContractSet,
-                   out_dir: Path | None = None) -> tuple[Path, Path]:
+def write_compiled(
+    topo: Topology, contracts: ContractSet, out_dir: Path | None = None
+) -> tuple[Path, Path]:
     d = out_dir or (Path(__file__).parent)
     tp, cp = d / "topology.yaml", d / "contracts.yaml"
     tp.write_text(_dump(topo), encoding="utf-8")
@@ -156,6 +175,8 @@ if __name__ == "__main__":  # pragma: no cover
         raise SystemExit(1)
     topo, contracts = compile_signals(frags)
     tp, cp = write_compiled(topo, contracts)
-    print(f"compiled {len(frags)} fragments → {tp.name} ({len(topo.nodes)} nodes, "
-          f"{len(topo.edges)} edges, journeys={list(topo.journeys)}) + {cp.name} "
-          f"({len(contracts.contracts)} contracts)")
+    print(
+        f"compiled {len(frags)} fragments → {tp.name} ({len(topo.nodes)} nodes, "
+        f"{len(topo.edges)} edges, journeys={list(topo.journeys)}) + {cp.name} "
+        f"({len(contracts.contracts)} contracts)"
+    )

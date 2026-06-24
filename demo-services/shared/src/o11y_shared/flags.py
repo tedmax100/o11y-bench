@@ -33,7 +33,7 @@ class FeatureFlags:
         try:
             self._cache = json.loads(self._path.read_text())
             self._mtime = mtime
-        except (json.JSONDecodeError, OSError):
+        except json.JSONDecodeError, OSError:
             self._cache = {}
 
     def get(self, name: str, default: Any = None) -> Any:

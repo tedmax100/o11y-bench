@@ -16,10 +16,24 @@ def _cfg(monkeypatch, tmp_path, name="aiops.db"):
 
 def test_calibration_insert_load_label(tmp_path, monkeypatch):
     p = _cfg(monkeypatch, tmp_path)
-    store.cal_insert(run_id="fp", ts="t1", confidence=0.4, summary="old",
-                     hypothesis="h", suspected_version=None, services=[])
-    store.cal_insert(run_id="fp", ts="t2", confidence=0.9, summary="new",
-                     hypothesis="h", suspected_version="v2.5.0", services=["payment"])
+    store.cal_insert(
+        run_id="fp",
+        ts="t1",
+        confidence=0.4,
+        summary="old",
+        hypothesis="h",
+        suspected_version=None,
+        services=[],
+    )
+    store.cal_insert(
+        run_id="fp",
+        ts="t2",
+        confidence=0.9,
+        summary="new",
+        hypothesis="h",
+        suspected_version="v2.5.0",
+        services=["payment"],
+    )
 
     rows = store.cal_load(p)
     assert len(rows) == 2
@@ -54,8 +68,12 @@ def test_legacy_migration_idempotent(tmp_path, monkeypatch):
     p = _cfg(monkeypatch, tmp_path)
     calj = tmp_path / "calibration.jsonl"
     invj = tmp_path / "investigations.jsonl"
-    calj.write_text(json.dumps({"run_id": "fp", "ts": "t", "confidence": 0.7,
-                                "correct": True, "services": ["payment"]}) + "\n")
+    calj.write_text(
+        json.dumps(
+            {"run_id": "fp", "ts": "t", "confidence": 0.7, "correct": True, "services": ["payment"]}
+        )
+        + "\n"
+    )
     invj.write_text(json.dumps({"fp": "fp", "ts": "t", "summary": "s"}) + "\n")
     monkeypatch.setattr(store.settings, "calibration_log_path", str(calj))
     monkeypatch.setattr(store.settings, "investigations_log_path", str(invj))

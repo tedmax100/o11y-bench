@@ -3,39 +3,47 @@
 
 # ── Payment ──────────────────────────────────────────────────────────────────
 
+
 class PaymentAttrs:
     """payment.* Span 屬性常數"""
-    ORDER_ID   = "payment.order_id"
-    PROVIDER   = "payment.provider"
-    CURRENCY   = "payment.currency"
-    STATUS     = "payment.status"
+
+    ORDER_ID = "payment.order_id"
+    PROVIDER = "payment.provider"
+    CURRENCY = "payment.currency"
+    STATUS = "payment.status"
+
 
 class ErrorAttrs:
     TYPE = "error.type"
 
-class PaymentMetric:
-    AMOUNT_NAME   = "payment.amount"
-    AMOUNT_UNIT   = "{TWD}"
-    AMOUNT_DESC   = "每筆支付的金額分佈"
 
-    ERRORS_NAME   = "payment.errors"
-    ERRORS_UNIT   = "{errors}"
-    ERRORS_DESC   = "支付失敗次數計數器"
+class PaymentMetric:
+    AMOUNT_NAME = "payment.amount"
+    AMOUNT_UNIT = "{TWD}"
+    AMOUNT_DESC = "每筆支付的金額分佈"
+
+    ERRORS_NAME = "payment.errors"
+    ERRORS_UNIT = "{errors}"
+    ERRORS_DESC = "支付失敗次數計數器"
 
     DURATION_NAME = "payment.duration"
     DURATION_UNIT = "ms"
     DURATION_DESC = "支付處理耗時（毫秒）"
 
+
 # ── Cart ──────────────────────────────────────────────────────────────────────
+
 
 class CartAttrs:
     """cart.* Span 屬性常數"""
-    SESSION_ID    = "cart.session_id"
-    ITEM_ID       = "cart.item_id"
+
+    SESSION_ID = "cart.session_id"
+    ITEM_ID = "cart.item_id"
     ITEM_QUANTITY = "cart.item_quantity"
-    ITEM_PRICE    = "cart.item_price"
-    TOTAL_AMOUNT  = "cart.total_amount"
-    ITEM_COUNT    = "cart.item_count"
+    ITEM_PRICE = "cart.item_price"
+    TOTAL_AMOUNT = "cart.total_amount"
+    ITEM_COUNT = "cart.item_count"
+
 
 class CartMetric:
     ADD_ITEM_COUNT_NAME = "cart.add_item.count"
@@ -50,9 +58,11 @@ class CartMetric:
     ACTIVE_SESSIONS_UNIT = "{sessions}"
     ACTIVE_SESSIONS_DESC = "目前活躍的購物車 Session 數量"
 
+
 # ── Common ────────────────────────────────────────────────────────────────────
 
+
 class CommonAttrs:
-    GIT_TAG                = "git.tag"
+    GIT_TAG = "git.tag"
     DEPLOYMENT_ENVIRONMENT = "deployment.environment"
-    SERVICE_TEAM           = "service.team"
+    SERVICE_TEAM = "service.team"

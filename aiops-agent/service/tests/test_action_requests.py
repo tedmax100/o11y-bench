@@ -14,19 +14,30 @@ def _db(monkeypatch, tmp_path):
     return p
 
 
-def _decision(autonomy=Autonomy.PROPOSE, action="k8s.rollout_undo",
-              reversible=True, requires_approval=True):
-    return Decision(action=action, autonomy=autonomy,
-                    requires_human=(autonomy is not Autonomy.AUTO),
-                    confidence=0.9, reason="r", calibration_note="c",
-                    reversible=reversible, requires_approval=requires_approval)
+def _decision(
+    autonomy=Autonomy.PROPOSE, action="k8s.rollout_undo", reversible=True, requires_approval=True
+):
+    return Decision(
+        action=action,
+        autonomy=autonomy,
+        requires_human=(autonomy is not Autonomy.AUTO),
+        confidence=0.9,
+        reason="r",
+        calibration_note="c",
+        reversible=reversible,
+        requires_approval=requires_approval,
+    )
 
 
 def test_propose_creates_proposed_request(tmp_path, monkeypatch):
     p = _db(monkeypatch, tmp_path)
-    req = create_from_decision("fp1", _decision(Autonomy.PROPOSE),
-                               args={"deployment": "payment-service"},
-                               rollback={"action": "k8s.rollout_undo"}, path=p)
+    req = create_from_decision(
+        "fp1",
+        _decision(Autonomy.PROPOSE),
+        args={"deployment": "payment-service"},
+        rollback={"action": "k8s.rollout_undo"},
+        path=p,
+    )
     assert req is not None
     assert req.status == Status.PROPOSED.value
     assert req.actor is None

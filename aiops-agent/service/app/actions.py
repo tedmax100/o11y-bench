@@ -80,7 +80,8 @@ class ActionRegistry:
         if not settings.actions_enabled:
             raise ActionDisabled(
                 f"action execution is disabled (actions_enabled=False); '{name}' "
-                "would require human-approved enablement")
+                "would require human-approved enablement"
+            )
         if spec.impl is None:
             raise ActionDisabled(f"action '{name}' has no wired implementation (propose-only tier)")
         logger.warning("executing action %s args=%s", name, args)  # audit (step 7 expands this)
@@ -95,13 +96,23 @@ from .tools.k8s_write import (  # noqa: E402
 )
 
 registry = ActionRegistry()
-registry.register(ActionSpec(
-    name="k8s.rollout_undo",
-    description="Roll a Deployment back to its previous ReplicaSet (kubectl rollout undo).",
-    reversible=True, requires_approval=True,
-    dry_run=dry_run_rollout_undo, impl=impl_rollout_undo))
-registry.register(ActionSpec(
-    name="k8s.scale",
-    description="Change a Deployment's replica count.",
-    reversible=True, requires_approval=True,
-    dry_run=dry_run_scale, impl=impl_scale))
+registry.register(
+    ActionSpec(
+        name="k8s.rollout_undo",
+        description="Roll a Deployment back to its previous ReplicaSet (kubectl rollout undo).",
+        reversible=True,
+        requires_approval=True,
+        dry_run=dry_run_rollout_undo,
+        impl=impl_rollout_undo,
+    )
+)
+registry.register(
+    ActionSpec(
+        name="k8s.scale",
+        description="Change a Deployment's replica count.",
+        reversible=True,
+        requires_approval=True,
+        dry_run=dry_run_scale,
+        impl=impl_scale,
+    )
+)

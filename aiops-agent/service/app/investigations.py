@@ -76,8 +76,10 @@ def record_investigation(fp: str, alert: dict, result: dict, path: Path | None =
             services=list(getattr(findings, "services", []) or []),
             decisions=[
                 DecisionRow(
-                    action=d.action, autonomy=d.autonomy.value,
-                    reason=d.reason, requires_human=d.requires_human,
+                    action=d.action,
+                    autonomy=d.autonomy.value,
+                    reason=d.reason,
+                    requires_human=d.requires_human,
                 )
                 for d in decisions
             ],

@@ -31,25 +31,60 @@ logger = logging.getLogger("aiops_agent.discovery")
 
 # Resource/identity labels present on every series — not interesting as the
 # "extra" dimensions of a metric.
-_COMMON_LABELS = frozenset({
-    "__name__", "service_name", "service_namespace", "git_repo", "git_version",
-    "service_version", "deployment_environment", "job", "instance",
-})
+_COMMON_LABELS = frozenset(
+    {
+        "__name__",
+        "service_name",
+        "service_namespace",
+        "git_repo",
+        "git_version",
+        "service_version",
+        "deployment_environment",
+        "job",
+        "instance",
+    }
+)
 # High-cardinality auto-instrumentation / SDK labels that are noise in a summary.
-_NOISE_LABELS = frozenset({
-    "http_host", "http_server_name", "http_target", "http_url", "http_scheme",
-    "http_flavor", "net_host_name", "net_host_port", "net_peer_ip",
-    "net_peer_port", "le", "telemetry_auto_version", "telemetry_sdk_language",
-    "telemetry_sdk_name", "telemetry_sdk_version",
-})
+_NOISE_LABELS = frozenset(
+    {
+        "http_host",
+        "http_server_name",
+        "http_target",
+        "http_url",
+        "http_scheme",
+        "http_flavor",
+        "net_host_name",
+        "net_host_port",
+        "net_peer_ip",
+        "net_peer_port",
+        "le",
+        "telemetry_auto_version",
+        "telemetry_sdk_language",
+        "telemetry_sdk_name",
+        "telemetry_sdk_version",
+    }
+)
 # Loki detected fields that are SDK/telemetry plumbing or duplicates of the
 # standard trace_id/span_id, not business signal.
-_NOISE_LOG_FIELDS = frozenset({
-    "telemetry_sdk_language", "telemetry_sdk_name", "telemetry_sdk_version",
-    "telemetry_auto_version", "severity_number", "severity_text", "detected_level",
-    "observed_timestamp", "otelServiceName", "otelTraceID", "otelSpanID",
-    "otelTraceSampled", "service_version", "schema_url", "scope_name",
-})
+_NOISE_LOG_FIELDS = frozenset(
+    {
+        "telemetry_sdk_language",
+        "telemetry_sdk_name",
+        "telemetry_sdk_version",
+        "telemetry_auto_version",
+        "severity_number",
+        "severity_text",
+        "detected_level",
+        "observed_timestamp",
+        "otelServiceName",
+        "otelTraceID",
+        "otelSpanID",
+        "otelTraceSampled",
+        "service_version",
+        "schema_url",
+        "scope_name",
+    }
+)
 
 
 def _metric_family(name: str) -> tuple[str, str]:
@@ -65,12 +100,17 @@ def _metric_family(name: str) -> tuple[str, str]:
 
 # ---- Prometheus metrics ----------------------------------------------------
 
+
 async def discover_metrics(service: str, lookback: str = "now-1h") -> dict[str, Any]:
     start, end = _parse_dt(lookback), _parse_dt("now")
     data = await _get_json(
-        settings.prometheus_url, "/api/v1/series",
-        {"match[]": f'{{service_name="{service}"}}',
-         "start": _epoch_s(start), "end": _epoch_s(end)},
+        settings.prometheus_url,
+        "/api/v1/series",
+        {
+            "match[]": f'{{service_name="{service}"}}',
+            "start": _epoch_s(start),
+            "end": _epoch_s(end),
+        },
     )
     series = data.get("data", []) if isinstance(data, dict) else []
     families: dict[tuple[str, str], set[str]] = {}
@@ -90,6 +130,7 @@ async def discover_metrics(service: str, lookback: str = "now-1h") -> dict[str, 
 
 # ---- Tempo span names ------------------------------------------------------
 
+
 def _is_useful_span(name: str) -> bool:
     # Drop the auto httpx client child spans and bare HTTP-verb spans.
     if name.endswith((" http send", " http receive")):
@@ -102,9 +143,13 @@ def _is_useful_span(name: str) -> bool:
 async def discover_span_names(service: str, lookback: str = "now-1h") -> dict[str, Any]:
     start, end = _parse_dt(lookback), _parse_dt("now")
     data = await _get_json(
-        settings.tempo_url, "/api/v2/search/tag/name/values",
-        {"q": f'{{resource.service.name="{service}"}}',
-         "start": _epoch_s(start), "end": _epoch_s(end)},
+        settings.tempo_url,
+        "/api/v2/search/tag/name/values",
+        {
+            "q": f'{{resource.service.name="{service}"}}',
+            "start": _epoch_s(start),
+            "end": _epoch_s(end),
+        },
     )
     raw = data.get("tagValues", []) if isinstance(data, dict) else []
     names = sorted({tv.get("value") for tv in raw if isinstance(tv, dict) and tv.get("value")})
@@ -114,12 +159,17 @@ async def discover_span_names(service: str, lookback: str = "now-1h") -> dict[st
 
 # ---- Loki log fields -------------------------------------------------------
 
+
 async def discover_log_fields(service: str, lookback: str = "now-1h") -> dict[str, Any]:
     start, end = _parse_dt(lookback), _parse_dt("now")
     data = await _get_json(
-        settings.loki_url, "/loki/api/v1/detected_fields",
-        {"query": f'{{service_name="{service}"}}',
-         "start": _epoch_ns(start), "end": _epoch_ns(end)},
+        settings.loki_url,
+        "/loki/api/v1/detected_fields",
+        {
+            "query": f'{{service_name="{service}"}}',
+            "start": _epoch_ns(start),
+            "end": _epoch_ns(end),
+        },
     )
     fields = data.get("fields", []) if isinstance(data, dict) else []
     out = [
@@ -133,17 +183,20 @@ async def discover_log_fields(service: str, lookback: str = "now-1h") -> dict[st
 
 # ---- live service set (used by the resolver) -------------------------------
 
+
 async def list_service_names(lookback: str = "now-6h") -> list[str]:
     """The set of service_name values actually present in Loki right now."""
     start, end = _parse_dt(lookback), _parse_dt("now")
     data = await _get_json(
-        settings.loki_url, "/loki/api/v1/label/service_name/values",
+        settings.loki_url,
+        "/loki/api/v1/label/service_name/values",
         {"start": _epoch_ns(start), "end": _epoch_ns(end)},
     )
     return sorted(data.get("data", []) if isinstance(data, dict) else [])
 
 
 # ---- agent-facing tools ----------------------------------------------------
+
 
 class ServiceArg(BaseModel):
     service: str = Field(description="Exact service_name, e.g. order-service.")
@@ -152,7 +205,7 @@ class ServiceArg(BaseModel):
 discover_metrics_tool = StructuredTool(
     name="discover_metrics",
     description="List the Prometheus metrics a service actually emits (name, type, "
-                "label keys). Use when you're unsure which metric to query for a service.",
+    "label keys). Use when you're unsure which metric to query for a service.",
     args_schema=ServiceArg,
     coroutine=discover_metrics,
 )
@@ -160,7 +213,7 @@ discover_metrics_tool = StructuredTool(
 discover_span_names_tool = StructuredTool(
     name="discover_span_names",
     description="List the Tempo span/operation names a service produces. Use to find "
-                "the right operation to filter traces on.",
+    "the right operation to filter traces on.",
     args_schema=ServiceArg,
     coroutine=discover_span_names,
 )
@@ -168,7 +221,7 @@ discover_span_names_tool = StructuredTool(
 discover_log_fields_tool = StructuredTool(
     name="discover_log_fields",
     description="List the Loki structured-metadata/log fields a service emits (with "
-                "cardinality). Use to find which fields you can filter or group logs by.",
+    "cardinality). Use to find which fields you can filter or group logs by.",
     args_schema=ServiceArg,
     coroutine=discover_log_fields,
 )

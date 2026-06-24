@@ -38,12 +38,17 @@ def _topo():
 
 # ---- shipped artifact loads & matches the catalog facts --------------------
 
+
 def test_shipped_topology_loads():
     get_topology.cache_clear()
     t = get_topology()
     assert t.version == "1.0.0"
     assert set(t.names()) == {
-        "webapp", "api-gateway", "order-service", "payment-service", "user-service",
+        "webapp",
+        "api-gateway",
+        "order-service",
+        "payment-service",
+        "user-service",
     }
     # payment-service is a leaf called by api-gateway and order-service.
     assert t.downstream("payment-service") == []
@@ -57,7 +62,7 @@ def test_shipped_topology_declares_order_attribution():
     assert "orders_total" in (t.attribution_for("order-service", "payment-service") or "")
     assert "orders_total" in (t.attribution_for("order-service", "user-service") or "")
     assert t.attribution_for("api-gateway", "payment-service") is None  # not declared
-    assert t.attribution_for("order-service", "webapp") is None         # no such edge
+    assert t.attribution_for("order-service", "webapp") is None  # no such edge
 
 
 def test_unknown_node_queries_are_empty_not_error():
@@ -70,6 +75,7 @@ def test_unknown_node_queries_are_empty_not_error():
 
 
 # ---- query API -------------------------------------------------------------
+
 
 def test_upstream_downstream():
     t = _topo()
@@ -106,18 +112,21 @@ def test_tier_label():
 
 # ---- live-set validation (s1 alignment surface) ---------------------------
 
+
 def test_validate_against_live():
     t = _topo()
     # perfect alignment → no warnings
     assert validate_against_live(t, t.names()) == []
     # a declared service gone from telemetry + an undeclared live one
-    warns = validate_against_live(t, ["webapp", "api-gateway", "order-service",
-                                      "payment-service", "new-service"])
+    warns = validate_against_live(
+        t, ["webapp", "api-gateway", "order-service", "payment-service", "new-service"]
+    )
     assert any("user-service" in w and "not present" in w for w in warns)
     assert any("new-service" in w and "not declared" in w for w in warns)
 
 
 # ---- injected decision-grade context ---------------------------------------
+
 
 def test_build_signal_context_for_known_service(monkeypatch):
     monkeypatch.setattr(ctx_mod, "get_topology", _topo)
@@ -138,15 +147,21 @@ def test_build_signal_context_unknown_service_is_none(monkeypatch):
 
 def test_build_signal_context_disabled(monkeypatch):
     from app.config import settings
+
     monkeypatch.setattr(settings, "signal_plane_enabled", False)
     assert build_signal_context(["payment-service"]) is None
 
 
 def test_build_signal_context_caps_at_three(monkeypatch):
     monkeypatch.setattr(ctx_mod, "get_topology", _topo)
-    ctx = build_signal_context([
-        "webapp", "api-gateway", "order-service", "payment-service",
-    ])
+    ctx = build_signal_context(
+        [
+            "webapp",
+            "api-gateway",
+            "order-service",
+            "payment-service",
+        ]
+    )
     assert ctx is not None
     # 4th service must not appear
     assert "### payment-service" not in ctx

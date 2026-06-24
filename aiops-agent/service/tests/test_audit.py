@@ -29,8 +29,13 @@ def test_record_and_scope(tmp_path, monkeypatch):
 
 def test_detail_roundtrips_as_dict(tmp_path, monkeypatch):
     p = _db(monkeypatch, tmp_path)
-    audit.record("execute", "refuse", request_id="r1",
-                 detail={"reason": "kill switch off", "action": "k8s.rollout_undo"}, path=p)
+    audit.record(
+        "execute",
+        "refuse",
+        request_id="r1",
+        detail={"reason": "kill switch off", "action": "k8s.rollout_undo"},
+        path=p,
+    )
     row = audit.history(request_id="r1", path=p)[0]
     assert row["detail"]["reason"] == "kill switch off"
     assert row["verdict"] == "refuse"

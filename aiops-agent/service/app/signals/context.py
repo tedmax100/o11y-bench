@@ -73,8 +73,7 @@ def _service_block(svc: str, drift: TopologyDrift | None) -> str | None:
         ]
         if extra:
             lines.append(
-                "- ⚠ observed dependencies NOT in the declared topology: "
-                + ", ".join(extra)
+                "- ⚠ observed dependencies NOT in the declared topology: " + ", ".join(extra)
             )
 
     lines.extend(_contract_lines(svc))
@@ -104,12 +103,14 @@ def _contract_lines(svc: str) -> list[str]:
         lg = contract.logs
         lines.append(
             "- Logs (authoritative — use THIS selector & event values; do NOT use "
-            "`{service=...}` or invent event names like `event=\"error\"`):"
+            '`{service=...}` or invent event names like `event="error"`):'
         )
         lines.append(f"    stream selector: {lg.selector}")
         if lg.error_events:
-            lines.append("    failure events (filter after the selector with `| event=\"…\"`): "
-                         + ", ".join(lg.error_events))
+            lines.append(
+                '    failure events (filter after the selector with `| event="…"`): '
+                + ", ".join(lg.error_events)
+            )
         if lg.error_query:
             lines.append(f"    find failures: {lg.error_query}")
         if lg.note:

@@ -60,20 +60,31 @@ def check(action: str, target: str, path=None) -> tuple[bool, str]:
     since = _fmt(_now() - timedelta(seconds=settings.breaker_window_seconds))
     n = store.exec_window_count(since, path)
     if n >= settings.breaker_max_actions_per_window:
-        return False, (f"rate limit: {n} executions in last "
-                       f"{settings.breaker_window_seconds}s "
-                       f"(max {settings.breaker_max_actions_per_window})")
+        return False, (
+            f"rate limit: {n} executions in last "
+            f"{settings.breaker_window_seconds}s "
+            f"(max {settings.breaker_max_actions_per_window})"
+        )
     return True, "closed"
 
 
-def record_outcome(action: str, target: str, *, fp: str = "", request_id: str = "",
-                   success: bool, path=None) -> None:
+def record_outcome(
+    action: str, target: str, *, fp: str = "", request_id: str = "", success: bool, path=None
+) -> None:
     """Record an *actual* execution outcome (call this only after something ran —
     not for refusals/aborts). On enough consecutive failures for the scope, trips
     the breaker open."""
     sk = scope_key(action, target)
-    store.exec_record(ts=_fmt(_now()), scope_key=sk, action=action, target=target,
-                      fp=fp, request_id=request_id, success=success, path=path)
+    store.exec_record(
+        ts=_fmt(_now()),
+        scope_key=sk,
+        action=action,
+        target=target,
+        fp=fp,
+        request_id=request_id,
+        success=success,
+        path=path,
+    )
     if success:
         return  # a success ends the consecutive-failure streak
     fails = store.exec_consecutive_failures(sk, path)

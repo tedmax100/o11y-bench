@@ -28,7 +28,7 @@ logger = logging.getLogger("aiops_agent.blast_radius")
 
 class BlastRadius(BaseModel):
     action: str
-    target: str                       # "<namespace>/<deployment>"
+    target: str  # "<namespace>/<deployment>"
     namespace: str
     current_revision: str | None = None
     target_revision: str | None = None
@@ -45,8 +45,9 @@ class BlastRadius(BaseModel):
 
 
 def _unavailable(action: str, namespace: str, target: str, detail: str) -> BlastRadius:
-    return BlastRadius(action=action, namespace=namespace, target=target,
-                       available=False, detail=detail)
+    return BlastRadius(
+        action=action, namespace=namespace, target=target, available=False, detail=detail
+    )
 
 
 def _revision(annotations: dict | None) -> str | None:
@@ -54,6 +55,7 @@ def _revision(annotations: dict | None) -> str | None:
 
 
 # ---- dry-runs (read-only) --------------------------------------------------
+
 
 async def dry_run_rollout_undo(args: dict) -> BlastRadius:
     """Predict a `kubectl rollout undo`: which deployment, current → previous
@@ -66,19 +68,24 @@ async def dry_run_rollout_undo(args: dict) -> BlastRadius:
     target = f"{namespace}/{deployment}"
     try:
         _, apps = await asyncio.to_thread(k8s._load_client)
-        dep = await asyncio.to_thread(apps.read_namespaced_deployment,
-                                      name=deployment, namespace=namespace)
-        rs_list = await asyncio.to_thread(apps.list_namespaced_replica_set,
-                                          namespace=namespace)
-    except RuntimeError as e:        # k8s not wired
+        dep = await asyncio.to_thread(
+            apps.read_namespaced_deployment, name=deployment, namespace=namespace
+        )
+        rs_list = await asyncio.to_thread(apps.list_namespaced_replica_set, namespace=namespace)
+    except RuntimeError as e:  # k8s not wired
         return _unavailable("k8s.rollout_undo", namespace, target, str(e))
     except Exception as e:
         status = getattr(e, "status", None)
         if status == 404:
-            return _unavailable("k8s.rollout_undo", namespace, target,
-                                f"no Deployment named '{deployment}' in {namespace}")
-        return _unavailable("k8s.rollout_undo", namespace, target,
-                            f"k8s API error: {type(e).__name__}: {e}")
+            return _unavailable(
+                "k8s.rollout_undo",
+                namespace,
+                target,
+                f"no Deployment named '{deployment}' in {namespace}",
+            )
+        return _unavailable(
+            "k8s.rollout_undo", namespace, target, f"k8s API error: {type(e).__name__}: {e}"
+        )
 
     desired = dep.spec.replicas if dep.spec else None
     current_rev = _revision(dep.metadata.annotations)
@@ -105,10 +112,14 @@ async def dry_run_rollout_undo(args: dict) -> BlastRadius:
         notes.append("no previous revision to roll back to")
 
     return BlastRadius(
-        action="k8s.rollout_undo", target=target, namespace=namespace,
-        current_revision=current_rev, target_revision=target_rev,
-        current_replicas=desired, target_replicas=desired,
-        affected_pods=desired or 0,                 # a rollout replaces all pods
+        action="k8s.rollout_undo",
+        target=target,
+        namespace=namespace,
+        current_revision=current_rev,
+        target_revision=target_rev,
+        current_replicas=desired,
+        target_replicas=desired,
+        affected_pods=desired or 0,  # a rollout replaces all pods
         singleton=(desired is not None and desired <= 1),
         cross_namespace=False,
         in_protected_namespace=namespace in settings.protected_namespaces,
@@ -126,20 +137,24 @@ async def dry_run_scale(args: dict) -> BlastRadius:
     try:
         target_replicas = int(args["replicas"])
     except (KeyError, TypeError, ValueError):
-        return _unavailable("k8s.scale", namespace, target,
-                            "scale requires an integer 'replicas' arg")
+        return _unavailable(
+            "k8s.scale", namespace, target, "scale requires an integer 'replicas' arg"
+        )
     try:
         _, apps = await asyncio.to_thread(k8s._load_client)
-        dep = await asyncio.to_thread(apps.read_namespaced_deployment,
-                                      name=deployment, namespace=namespace)
+        dep = await asyncio.to_thread(
+            apps.read_namespaced_deployment, name=deployment, namespace=namespace
+        )
     except RuntimeError as e:
         return _unavailable("k8s.scale", namespace, target, str(e))
     except Exception as e:
         if getattr(e, "status", None) == 404:
-            return _unavailable("k8s.scale", namespace, target,
-                                f"no Deployment named '{deployment}' in {namespace}")
-        return _unavailable("k8s.scale", namespace, target,
-                            f"k8s API error: {type(e).__name__}: {e}")
+            return _unavailable(
+                "k8s.scale", namespace, target, f"no Deployment named '{deployment}' in {namespace}"
+            )
+        return _unavailable(
+            "k8s.scale", namespace, target, f"k8s API error: {type(e).__name__}: {e}"
+        )
 
     current = dep.spec.replicas if dep.spec else None
     delta = abs((target_replicas) - (current or 0))
@@ -148,8 +163,11 @@ async def dry_run_scale(args: dict) -> BlastRadius:
         notes.append("scales to zero — takes the service fully down")
 
     return BlastRadius(
-        action="k8s.scale", target=target, namespace=namespace,
-        current_replicas=current, target_replicas=target_replicas,
+        action="k8s.scale",
+        target=target,
+        namespace=namespace,
+        current_replicas=current,
+        target_replicas=target_replicas,
         affected_pods=delta,
         singleton=(target_replicas <= 1),
         cross_namespace=False,
@@ -160,6 +178,7 @@ async def dry_run_scale(args: dict) -> BlastRadius:
 
 # ---- policy (fail-closed) --------------------------------------------------
 
+
 def evaluate_policy(br: BlastRadius) -> tuple[bool, str]:
     """(ok, reason). Refuses on: unreadable dry-run, protected/off-allowlist
     namespace, cross-namespace effect, singleton (when denied), too many affected
@@ -169,19 +188,18 @@ def evaluate_policy(br: BlastRadius) -> tuple[bool, str]:
     if br.in_protected_namespace:
         return False, f"namespace {br.namespace} is protected"
     if br.namespace not in settings.execution_namespace_allowlist:
-        return False, (f"namespace {br.namespace} not in allowlist "
-                       f"{settings.execution_namespace_allowlist}")
+        return False, (
+            f"namespace {br.namespace} not in allowlist {settings.execution_namespace_allowlist}"
+        )
     if br.cross_namespace:
         return False, "action crosses namespaces"
     if settings.deny_singletons and br.singleton:
         return False, "target is a singleton (single replica) — denied by policy"
     if br.affected_pods > settings.max_blast_pods:
-        return False, (f"affected pods {br.affected_pods} exceeds max "
-                       f"{settings.max_blast_pods}")
+        return False, (f"affected pods {br.affected_pods} exceeds max {settings.max_blast_pods}")
     if br.action == "k8s.rollout_undo" and not br.target_revision:
         return False, "no previous revision to roll back to"
-    return True, (f"within policy (affected {br.affected_pods} pod(s), "
-                  f"ns {br.namespace})")
+    return True, (f"within policy (affected {br.affected_pods} pod(s), ns {br.namespace})")
 
 
 def format_blast_radius(br: BlastRadius) -> str:

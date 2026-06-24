@@ -203,10 +203,12 @@ def _summarize_series_result(result: Any) -> Any:
         out = []
         for s in result.get("result", []):
             val = s.get("value", [None, None])
-            out.append({
-                "metric": s.get("metric", {}),
-                "value": _round_sig(val[1] if len(val) > 1 else None),
-            })
+            out.append(
+                {
+                    "metric": s.get("metric", {}),
+                    "value": _round_sig(val[1] if len(val) > 1 else None),
+                }
+            )
         return {"resultType": "vector", "result": out}
 
     if rt == "scalar":
@@ -241,25 +243,43 @@ async def _get_json(base: str, path: str, params: dict) -> Any:
 
 # ---- Prometheus ------------------------------------------------------------
 
+
 class PrometheusArgs(BaseModel):
-    expr: str = Field(description="PromQL expression. Aggregate at the source "
-                       "(sum by / topk / histogram_quantile); don't fetch raw series.")
+    expr: str = Field(
+        description="PromQL expression. Aggregate at the source "
+        "(sum by / topk / histogram_quantile); don't fetch raw series."
+    )
     queryType: str = Field(default="range", description="'range' or 'instant'.")
     start: str = Field(default="now-1h", description="RFC3339 or now-shorthand (range only).")
     end: str = Field(default="now", description="RFC3339 or now-shorthand (range only).")
     stepSeconds: int = Field(default=60, description="Range step in seconds.")
 
 
-async def _query_prometheus(expr: str, queryType: str = "range", start: str = "now-1h",
-                            end: str = "now", stepSeconds: int = 60) -> Any:
+async def _query_prometheus(
+    expr: str,
+    queryType: str = "range",
+    start: str = "now-1h",
+    end: str = "now",
+    stepSeconds: int = 60,
+) -> Any:
     if queryType == "instant":
-        data = await _get_json(settings.prometheus_url, "/api/v1/query",
-                               {"query": expr, "time": _rfc3339(_parse_dt(end))})
+        data = await _get_json(
+            settings.prometheus_url,
+            "/api/v1/query",
+            {"query": expr, "time": _rfc3339(_parse_dt(end))},
+        )
     else:
         s, e = _parse_dt(start), _parse_dt(end)
-        data = await _get_json(settings.prometheus_url, "/api/v1/query_range",
-                               {"query": expr, "start": _rfc3339(s), "end": _rfc3339(e),
-                                "step": str(max(stepSeconds, 1))})
+        data = await _get_json(
+            settings.prometheus_url,
+            "/api/v1/query_range",
+            {
+                "query": expr,
+                "start": _rfc3339(s),
+                "end": _rfc3339(e),
+                "step": str(max(stepSeconds, 1)),
+            },
+        )
     if isinstance(data, dict) and data.get("status") == "error":
         raise ToolException(f"Prometheus error: {data.get('error')}")
     result = data.get("data", data) if isinstance(data, dict) else data
@@ -272,16 +292,20 @@ async def _query_prometheus(expr: str, queryType: str = "range", start: str = "n
         "truncated": True,
         "reason": f"Prometheus result > {PROM_CAP_BYTES}B — likely raw per-series.",
         "original_query": expr,
-        "hint": ("Wrap the query in `sum by (...)` / `topk(...)` or narrow the "
-                 "matcher (e.g. add `{service_name=\"...\"}`), then re-query."),
+        "hint": (
+            "Wrap the query in `sum by (...)` / `topk(...)` or narrow the "
+            'matcher (e.g. add `{service_name="..."}`), then re-query.'
+        ),
     }
 
 
 # ---- Loki ------------------------------------------------------------------
 
+
 class LokiArgs(BaseModel):
-    logql: str = Field(description="LogQL. Aggregate with count_over_time / sum by; "
-                       "avoid pulling >100 raw lines.")
+    logql: str = Field(
+        description="LogQL. Aggregate with count_over_time / sum by; avoid pulling >100 raw lines."
+    )
     start: str = Field(default="now-1h", description="RFC3339 or now-shorthand.")
     end: str = Field(default="now", description="RFC3339 or now-shorthand.")
     limit: int = Field(default=100, description="Max log lines (log queries).")
@@ -310,8 +334,10 @@ def _is_metric_logql(logql: str) -> bool:
 
 
 def _loki_fallback(selector: str) -> str:
-    return ("topk(20, sum by (service_name, level, event, git_version) "
-            f"(count_over_time({selector} [5m])))")
+    return (
+        "topk(20, sum by (service_name, level, event, git_version) "
+        f"(count_over_time({selector} [5m])))"
+    )
 
 
 def _loki_query_hint(logql: str, exc: ToolException) -> ToolException:
@@ -323,22 +349,27 @@ def _loki_query_hint(logql: str, exc: ToolException) -> ToolException:
         return exc
     if _selector(logql) is None:
         return ToolException(
-            f"{msg}\nHINT: LogQL must START with a stream selector `{{label=\"...\"}}` "
+            f'{msg}\nHINT: LogQL must START with a stream selector `{{label="..."}}` '
             "before any `|` filter. trace_id / level / event / business fields are "
             "structured metadata — filter them AFTER a selector, e.g. "
-            "`{service_name=\"<svc>\"} | trace_id=\"<id>\"`. Indexable selector labels: "
+            '`{service_name="<svc>"} | trace_id="<id>"`. Indexable selector labels: '
             "service_name, git_repo, git_version, deployment_environment."
         )
     return ToolException(
-        f"{msg}\nHINT: check the LogQL pipeline. Log filter: `{{...}} | level=\"ERROR\"`. "
+        f'{msg}\nHINT: check the LogQL pipeline. Log filter: `{{...}} | level="ERROR"`. '
         "Metric/count: `sum(count_over_time({{...}} | <filters> [<window>]))` — the "
         "range goes INSIDE count_over_time, and the whole thing is wrapped in sum(...)."
     )
 
 
-async def _query_loki_logs(logql: str, start: str = "now-1h", end: str = "now",
-                          limit: int = 100, direction: str = "backward",
-                          queryType: str = "auto") -> Any:
+async def _query_loki_logs(
+    logql: str,
+    start: str = "now-1h",
+    end: str = "now",
+    limit: int = 100,
+    direction: str = "backward",
+    queryType: str = "auto",
+) -> Any:
     s, e = _parse_dt(start), _parse_dt(end)
     # Resolve 'auto': metric aggregation → instant (clean windowed total),
     # raw log lines → range. Removes the model's chance to mis-pick range and
@@ -348,13 +379,23 @@ async def _query_loki_logs(logql: str, start: str = "now-1h", end: str = "now",
     try:
         if queryType == "instant":
             # Single value at `end` — the right shape for a windowed total/count.
-            data = await _get_json(settings.loki_url, "/loki/api/v1/query",
-                                   {"query": logql, "time": _epoch_ns(e),
-                                    "limit": limit, "direction": direction})
+            data = await _get_json(
+                settings.loki_url,
+                "/loki/api/v1/query",
+                {"query": logql, "time": _epoch_ns(e), "limit": limit, "direction": direction},
+            )
         else:
-            data = await _get_json(settings.loki_url, "/loki/api/v1/query_range",
-                                   {"start": _epoch_ns(s), "end": _epoch_ns(e),  # Loki needs ns
-                                    "query": logql, "limit": limit, "direction": direction})
+            data = await _get_json(
+                settings.loki_url,
+                "/loki/api/v1/query_range",
+                {
+                    "start": _epoch_ns(s),
+                    "end": _epoch_ns(e),  # Loki needs ns
+                    "query": logql,
+                    "limit": limit,
+                    "direction": direction,
+                },
+            )
     except ToolException as exc:
         raise _loki_query_hint(logql, exc) from exc
     if isinstance(data, dict) and data.get("status") == "error":
@@ -379,30 +420,41 @@ async def _query_loki_logs(logql: str, start: str = "now-1h", end: str = "now",
     fb = _loki_fallback(selector)
     step = max((_epoch_s(e) - _epoch_s(s)) // 100, 1)
     try:
-        agg = await _get_json(settings.loki_url, "/loki/api/v1/query_range",
-                              {"start": _epoch_ns(s), "end": _epoch_ns(e),
-                               "query": fb, "step": step})
+        agg = await _get_json(
+            settings.loki_url,
+            "/loki/api/v1/query_range",
+            {"start": _epoch_ns(s), "end": _epoch_ns(e), "query": fb, "step": step},
+        )
         agg = agg.get("data", agg) if isinstance(agg, dict) else agg
     except ToolException as exc:
-        return {"truncated": True, "original_query": logql, "fallback_query": fb,
-                "fallback_error": str(exc)}
+        return {
+            "truncated": True,
+            "original_query": logql,
+            "fallback_query": fb,
+            "fallback_error": str(exc),
+        }
     return {
         "truncated": True,
         "reason": f"Raw Loki output > {LOKI_CAP_BYTES}B; auto-aggregated.",
         "original_query": logql,
         "fallback_query": fb,
         "fallback_aggregation": agg,
-        "hint": ("Aggregated by (service_name, level, event, git_version). Pick a "
-                 "bucket and re-query with it as an extra filter, or shorten the window."),
+        "hint": (
+            "Aggregated by (service_name, level, event, git_version). Pick a "
+            "bucket and re-query with it as an extra filter, or shorten the window."
+        ),
     }
 
 
 # ---- Tempo -----------------------------------------------------------------
 
+
 class TempoArgs(BaseModel):
-    traceql: str = Field(description="TraceQL, e.g. "
-                         "{ resource.service.name=\"order-service\" && status=error }. "
-                         "Tempo attrs use dotted names.")
+    traceql: str = Field(
+        description="TraceQL, e.g. "
+        '{ resource.service.name="order-service" && status=error }. '
+        "Tempo attrs use dotted names."
+    )
     start: str = Field(default="now-1h", description="RFC3339 or now-shorthand.")
     end: str = Field(default="now", description="RFC3339 or now-shorthand.")
     limit: int = Field(default=20, description="Max traces returned.")
@@ -414,15 +466,16 @@ def _tempo_query_hint(traceql: str, exc: ToolException) -> ToolException:
         return exc
     return ToolException(
         f"{msg}\nHINT: TraceQL predicates must be inside braces, e.g. "
-        "`{ resource.service.name=\"<svc>\" && status=error }`. Use dotted attribute "
+        '`{ resource.service.name="<svc>" && status=error }`. Use dotted attribute '
         "names (resource.service.name, span.http.route, status); `status=error` (no "
         "quotes) selects error spans. Read git_version off the trace's "
         "resource.service.version — don't go to Loki for it."
     )
 
 
-async def _query_tempo_traces(traceql: str, start: str = "now-1h", end: str = "now",
-                             limit: int = 20) -> Any:
+async def _query_tempo_traces(
+    traceql: str, start: str = "now-1h", end: str = "now", limit: int = 20
+) -> Any:
     s, e = _parse_dt(start), _parse_dt(end)
     # Surface the deployed version on each matched span so deploy-correlation
     # questions ("which git_version was this trace running?") can be answered
@@ -431,7 +484,8 @@ async def _query_tempo_traces(traceql: str, start: str = "now-1h", end: str = "n
     q = traceql if "select(" in traceql.lower() else f"{traceql} | select(resource.service.version)"
     try:
         data = await _get_json(
-            settings.tempo_url, "/api/search",
+            settings.tempo_url,
+            "/api/search",
             # Tempo expects unix seconds for start/end
             {"q": q, "start": _epoch_s(s), "end": _epoch_s(e), "limit": limit},
         )
@@ -441,9 +495,15 @@ async def _query_tempo_traces(traceql: str, start: str = "now-1h", end: str = "n
     if _approx_size(traces) <= TEMPO_CAP_BYTES:
         return {"traces": traces, "count": len(traces)}
     # Trace summaries are already compact; if still oversize, return id+service+duration only.
-    slim = [{"traceID": t.get("traceID"), "rootServiceName": t.get("rootServiceName"),
-             "rootTraceName": t.get("rootTraceName"), "durationMs": t.get("durationMs")}
-            for t in traces[:limit]]
+    slim = [
+        {
+            "traceID": t.get("traceID"),
+            "rootServiceName": t.get("rootServiceName"),
+            "rootTraceName": t.get("rootTraceName"),
+            "durationMs": t.get("durationMs"),
+        }
+        for t in traces[:limit]
+    ]
     return {
         "truncated": True,
         "reason": f"Tempo result > {TEMPO_CAP_BYTES}B; returning slim summaries.",
@@ -457,7 +517,7 @@ async def _query_tempo_traces(traceql: str, start: str = "now-1h", end: str = "n
 query_prometheus = StructuredTool(
     name="query_prometheus",
     description="Run a PromQL query against Prometheus (range or instant). Use for "
-                "rates, error ratios, p95/p99 latency (histogram_quantile), gauges.",
+    "rates, error ratios, p95/p99 latency (histogram_quantile), gauges.",
     args_schema=PrometheusArgs,
     coroutine=_query_prometheus,
 )
@@ -465,7 +525,7 @@ query_prometheus = StructuredTool(
 query_loki_logs = StructuredTool(
     name="query_loki_logs",
     description="Run a LogQL query against Loki. Use for error/warn lines, BizEvent "
-                "counts, deployment events. Aggregate with count_over_time / sum by.",
+    "counts, deployment events. Aggregate with count_over_time / sum by.",
     args_schema=LokiArgs,
     coroutine=_query_loki_logs,
 )
@@ -473,7 +533,7 @@ query_loki_logs = StructuredTool(
 query_tempo_traces = StructuredTool(
     name="query_tempo_traces",
     description="Search traces in Tempo with TraceQL. Use to find the origin service "
-                "of an error or slow operations. Resource/span attrs use dotted names.",
+    "of an error or slow operations. Resource/span attrs use dotted names.",
     args_schema=TempoArgs,
     coroutine=_query_tempo_traces,
 )

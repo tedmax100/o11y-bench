@@ -34,24 +34,25 @@ logger = logging.getLogger("aiops_agent.signals.health")
 
 class NeighborHealth(BaseModel):
     service: str
-    relation: str          # "self" (under investigation) | "downstream" (dep) | "upstream" (caller)
-    metric: str            # "error" | "throughput"
+    relation: str  # "self" (under investigation) | "downstream" (dep) | "upstream" (caller)
+    metric: str  # "error" | "throughput"
     value: float | None
     unit: str
-    objective: str = ""    # the SLI's declared target, e.g. "declined_rate < 1%"
-    verdict: str           # healthy | unhealthy | unknown | unavailable
+    objective: str = ""  # the SLI's declared target, e.g. "declined_rate < 1%"
+    verdict: str  # healthy | unhealthy | unknown | unavailable
 
 
 class ImpactEdge(BaseModel):
     """s4.2: how much a caller's own failures attributed to an unhealthy callee
     have RISEN vs a baseline window — the difference between 'topologically
     adjacent' and 'materially impacted'."""
+
     primary: str
     dependency: str
     current: float | None
     baseline: float | None
     delta: float | None
-    verdict: str           # rising | flat | unavailable
+    verdict: str  # rising | flat | unavailable
 
 
 def _health_sli(svc: str) -> SLI | None:
@@ -71,7 +72,8 @@ async def _instant_scalar(expr: str, at: str = "now") -> float | None:
     honouring any pinned incident clock) and reduce its vector to one scalar
     (sum of series values). None on error or empty result."""
     data = await _get_json(
-        settings.prometheus_url, "/api/v1/query",
+        settings.prometheus_url,
+        "/api/v1/query",
         {"query": expr, "time": _rfc3339(_parse_dt(at))},
     )
     if not isinstance(data, dict) or data.get("status") == "error":
@@ -100,9 +102,15 @@ async def _evaluate(svc: str, relation: str) -> NeighborHealth | None:
         value = await _instant_scalar(sli.promql)
     except Exception as e:
         logger.warning("dependency health: query for %s failed: %s", svc, e)
-        return NeighborHealth(service=svc, relation=relation, metric=sli.kind,
-                              value=None, unit=sli.unit, objective=sli.objective,
-                              verdict="unavailable")
+        return NeighborHealth(
+            service=svc,
+            relation=relation,
+            metric=sli.kind,
+            value=None,
+            unit=sli.unit,
+            objective=sli.objective,
+            verdict="unavailable",
+        )
     if value is None:
         verdict = "unavailable"
     elif sli.kind == "error":
@@ -111,8 +119,15 @@ async def _evaluate(svc: str, relation: str) -> NeighborHealth | None:
         # throughput: can't call it unhealthy from rate alone (0 may be no
         # traffic, not an outage) — report it as a liveness-only signal.
         verdict = "unknown"
-    return NeighborHealth(service=svc, relation=relation, metric=sli.kind,
-                          value=value, unit=sli.unit, objective=sli.objective, verdict=verdict)
+    return NeighborHealth(
+        service=svc,
+        relation=relation,
+        metric=sli.kind,
+        value=value,
+        unit=sli.unit,
+        objective=sli.objective,
+        verdict=verdict,
+    )
 
 
 def _fmt(h: NeighborHealth) -> str:
@@ -149,23 +164,42 @@ async def _evaluate_impact(primary: str, dependency: str, attribution: str) -> I
         cur = None
         base = None
     if cur is None:
-        return ImpactEdge(primary=primary, dependency=dependency, current=None,
-                          baseline=base, delta=None, verdict="unavailable")
+        return ImpactEdge(
+            primary=primary,
+            dependency=dependency,
+            current=None,
+            baseline=base,
+            delta=None,
+            verdict="unavailable",
+        )
     base = base or 0.0
     delta = cur - base
     verdict = "rising" if delta > settings.signal_health_impact_min_delta else "flat"
-    return ImpactEdge(primary=primary, dependency=dependency, current=cur,
-                      baseline=base, delta=delta, verdict=verdict)
+    return ImpactEdge(
+        primary=primary,
+        dependency=dependency,
+        current=cur,
+        baseline=base,
+        delta=delta,
+        verdict=verdict,
+    )
 
 
 def _fmt_impact(im: ImpactEdge) -> str:
     if im.verdict == "unavailable":
-        return (f"- impact of {im.dependency} on {im.primary}: unavailable "
-                "(no attribution metric reading)")
-    tail = (" — RISING (materially impacted)" if im.verdict == "rising"
-            else " — flat (no material rise; baseline-level)")
-    return (f"- impact of {im.dependency} on {im.primary}: failures attributed to it "
-            f"{im.current:.3g}/s (baseline {im.baseline:.3g}/s, Δ{im.delta:+.3g}/s){tail}")
+        return (
+            f"- impact of {im.dependency} on {im.primary}: unavailable "
+            "(no attribution metric reading)"
+        )
+    tail = (
+        " — RISING (materially impacted)"
+        if im.verdict == "rising"
+        else " — flat (no material rise; baseline-level)"
+    )
+    return (
+        f"- impact of {im.dependency} on {im.primary}: failures attributed to it "
+        f"{im.current:.3g}/s (baseline {im.baseline:.3g}/s, Δ{im.delta:+.3g}/s){tail}"
+    )
 
 
 async def evaluate_dependency_health(services: list[str]) -> str | None:
@@ -212,8 +246,7 @@ async def evaluate_dependency_health(services: list[str]) -> str | None:
 
     bad_self = [h.service for h in evaluated if h.relation == "self" and h.verdict == "unhealthy"]
     bad_deps = [
-        h.service for h in evaluated
-        if h.relation == "downstream" and h.verdict == "unhealthy"
+        h.service for h in evaluated if h.relation == "downstream" and h.verdict == "unhealthy"
     ]
     had_deps = any(h.relation == "downstream" for h in evaluated)
 
@@ -234,17 +267,19 @@ async def evaluate_dependency_health(services: list[str]) -> str | None:
         rise_note = (
             f" Its failures attributed to {', '.join(sorted({im.dependency for im in rising}))} "
             "ROSE vs baseline — the breach is inherited from that dependency."
-            if rising else ""
+            if rising
+            else ""
         )
         verdict = (
             f"→ {', '.join(bad_self)} is breaching its own error SLO AND a downstream "
             f"dependency ({', '.join(bad_deps)}) is unhealthy — likely a cascading "
-            "failure." + (rise_note or " Determine whether the breach is caused by the "
-            "unhealthy dependency.")
+            "failure."
+            + (rise_note or " Determine whether the breach is caused by the unhealthy dependency.")
         )
     elif bad_self:
         deps_note = (
-            "its downstream dependencies are healthy" if had_deps
+            "its downstream dependencies are healthy"
+            if had_deps
             else "it has no downstream dependencies to inherit a fault from"
         )
         verdict = (

@@ -66,6 +66,7 @@ def _flatten_content(content) -> str:
         return "".join(parts)
     return str(content)
 
+
 SYSTEM_PROMPT_TEMPLATE = """You are an AIOps assistant helping an on-call SRE investigate
 issues using the Grafana stack — querying Prometheus, Loki and Tempo directly.
 
@@ -347,8 +348,7 @@ CONTINUE_PROMPT = (
     "(queryType='instant') of sum(count_over_time({...}[window])) and report that single "
     "total — never average a per-step range series into a total.\n"
     "- git_version lives on a trace's resource (service.version) and on every metric/log "
-    "as a label — read it from a result you already have; don't invent it.\n\n"
-    + _OUTPUT_CONTRACT
+    "as a label — read it from a result you already have; don't invent it.\n\n" + _OUTPUT_CONTRACT
 )
 
 
@@ -415,7 +415,9 @@ class IntentResult(BaseModel):
     """Structured output for the AIOps intent gate."""
 
     reasoning: str = Field(default="", description="Brief reasoning for the decision.")
-    in_scope: bool = Field(..., description="True if the message is an AIOps/observability request.")
+    in_scope: bool = Field(
+        ..., description="True if the message is an AIOps/observability request."
+    )
     mode: str = Field(
         default="investigate",
         description="'lookup' for a single-query show-me request, else 'investigate'.",
@@ -573,19 +575,22 @@ def _build_graph():
         # change it or run discovery instead of spending another HTTP round-trip.
         seen = set()
         for m in msgs[:-1]:
-            for tc in (getattr(m, "tool_calls", None) or []):
+            for tc in getattr(m, "tool_calls", None) or []:
                 seen.add(_call_sig(tc))
         fresh, dup_results = [], []
         for tc in calls:
             if _call_sig(tc) in seen:
-                dup_results.append(ToolMessage(
-                    tool_call_id=tc.get("id", ""),
-                    content=(
-                        "You already ran this exact query this turn and it did not help. "
-                        "Do NOT repeat it. Change the stream selector / matcher / syntax "
-                        "(follow any HINT in the earlier error), or call the matching "
-                        "discover_* tool to get the real labels/fields, then retry."),
-                ))
+                dup_results.append(
+                    ToolMessage(
+                        tool_call_id=tc.get("id", ""),
+                        content=(
+                            "You already ran this exact query this turn and it did not help. "
+                            "Do NOT repeat it. Change the stream selector / matcher / syntax "
+                            "(follow any HINT in the earlier error), or call the matching "
+                            "discover_* tool to get the real labels/fields, then retry."
+                        ),
+                    )
+                )
             else:
                 fresh.append(tc)
 
@@ -660,9 +665,7 @@ class Findings(BaseModel):
     evidence: list[str] = Field(
         default_factory=list, description="Concrete queries / values that support the conclusion."
     )
-    services: list[str] = Field(
-        default_factory=list, description="Service(s) implicated."
-    )
+    services: list[str] = Field(default_factory=list, description="Service(s) implicated.")
     suspected_version: str | None = Field(
         default=None, description="git_version suspected of introducing the issue, if any."
     )
@@ -768,9 +771,7 @@ _uncertainty_llm = (
 async def extract_uncertainty(messages: list, findings: Findings) -> StructuredUncertainty:
     """Extract a structured uncertainty report when confidence is below threshold
     after all loops. Seeds `confidence` and `summary` from the final Findings."""
-    result = await _uncertainty_llm.ainvoke(
-        [SystemMessage(content=_UNCERTAINTY_PROMPT)] + messages
-    )
+    result = await _uncertainty_llm.ainvoke([SystemMessage(content=_UNCERTAINTY_PROMPT)] + messages)
     # Override with the authoritative values from Findings so they stay consistent.
     result.confidence = findings.confidence
     result.summary = findings.summary or result.summary
@@ -995,7 +996,9 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
         if service:
             await _inject_dependency_health(turn_messages, [service])
 
-    turn_messages.append({"role": "user", "content": _alert_to_prompt(labels, annotations, starts_dt)})
+    turn_messages.append(
+        {"role": "user", "content": _alert_to_prompt(labels, annotations, starts_dt)}
+    )
 
     correction_hint = alert.get("_correction_hint")
     if correction_hint:
@@ -1031,8 +1034,11 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
         loop_count += 1
         logger.info(
             "headless loop %d/%d: conf=%.2f < %.2f, pivoting to next hypothesis (fp=%s)",
-            loop_count, settings.max_hypothesis_loops,
-            findings.confidence, settings.confidence_loop_threshold, thread_id,
+            loop_count,
+            settings.max_hypothesis_loops,
+            findings.confidence,
+            settings.confidence_loop_threshold,
+            thread_id,
         )
         pivot_msg = (
             f"Your previous conclusion had confidence {findings.confidence:.0%}, "
@@ -1060,7 +1066,9 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
     if loop_count > 0:
         logger.info(
             "headless loop done after %d pivot(s): final conf=%.2f (fp=%s)",
-            loop_count, findings.confidence, thread_id,
+            loop_count,
+            findings.confidence,
+            thread_id,
         )
 
     # Structured Uncertainty (knowledge-loop §4.6): when all loops are exhausted
@@ -1074,7 +1082,10 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
         logger.info(
             "headless: confidence %.2f still below %.2f after %d loops — "
             "extracting structured uncertainty (fp=%s)",
-            findings.confidence, settings.confidence_loop_threshold, loop_count, thread_id,
+            findings.confidence,
+            settings.confidence_loop_threshold,
+            loop_count,
+            thread_id,
         )
         try:
             uncertainty = await extract_uncertainty(messages, findings)
@@ -1095,8 +1106,10 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
 
             calib = compute_calibration(load_records())
             decisions = propose_remediations(
-                [s.action for s in matched_rb.remediation], findings.confidence,
-                calib, dq_verdict(),
+                [s.action for s in matched_rb.remediation],
+                findings.confidence,
+                calib,
+                dq_verdict(),
             )
 
             # Materialize each AUTO/PROPOSE decision as a tracked ActionRequest the
@@ -1105,6 +1118,7 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
             # contract. ESCALATE creates nothing. Best-effort — never blocks the run.
             if settings.action_requests_enabled and decisions:
                 from . import action_requests
+
                 params = incident_params(labels, annotations)
                 step_by_action = {s.action: s for s in matched_rb.remediation}
                 for d in decisions:
@@ -1112,7 +1126,8 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
                     if step is None:
                         continue
                     action_requests.create_from_decision(
-                        thread_id, d,
+                        thread_id,
+                        d,
                         args=_subst(step.args, params),
                         rollback=_subst(step.rollback, params) if step.rollback else None,
                         runbook_id=matched_rb.id,
@@ -1121,8 +1136,12 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
         except Exception as e:
             logger.warning("governance gate failed: %s", e)
 
-    return {"answer": answer, "findings": findings, "decisions": decisions,
-            "uncertainty": uncertainty}
+    return {
+        "answer": answer,
+        "findings": findings,
+        "decisions": decisions,
+        "uncertainty": uncertainty,
+    }
 
 
 # ---- follow-up suggestions (the "Follow-up" chips under each answer) --------
@@ -1174,6 +1193,7 @@ async def suggest_followups(user_message: str, answer: str) -> list[str]:
 @asynccontextmanager
 async def lifespan(app):
     from . import store
+
     store.init()  # schema + one-time legacy JSONL migration (7b-0)
     await _build_agent()
     yield

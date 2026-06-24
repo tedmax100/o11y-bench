@@ -35,10 +35,10 @@ _METRIC_RE = re.compile(r"\b([a-z_][a-z0-9_]*_(?:total|seconds|bucket|sum|count)
 
 
 class SLI(BaseModel):
-    kind: str                      # error | latency | throughput | saturation
-    promql: str                    # authoritative query (correct aggregation/unit)
-    objective: str = ""            # declared target, e.g. "p95 < 0.2s"
-    unit: str = ""                 # ratio | s | rps | …
+    kind: str  # error | latency | throughput | saturation
+    promql: str  # authoritative query (correct aggregation/unit)
+    objective: str = ""  # declared target, e.g. "p95 < 0.2s"
+    unit: str = ""  # ratio | s | rps | …
 
 
 class LogSignal(BaseModel):
@@ -46,15 +46,16 @@ class LogSignal(BaseModel):
     real `event=` values that mark failures. Declared because agents reliably get
     these wrong (use `{service=...}` instead of `{service_name=...}`, invent
     `event="error"` / `event="order_failed"` that don't exist)."""
-    selector: str                  # e.g. {service_name="payment-service"}
+
+    selector: str  # e.g. {service_name="payment-service"}
     error_events: list[str] = Field(default_factory=list)  # real event= values for failures
-    error_query: str = ""          # representative authoritative LogQL to surface failures
+    error_query: str = ""  # representative authoritative LogQL to surface failures
     note: str = ""
 
 
 class SignalContract(BaseModel):
     service: str
-    freshness_seconds: int = 60    # samples older than this → treat as stale
+    freshness_seconds: int = 60  # samples older than this → treat as stale
     slis: list[SLI] = Field(default_factory=list)
     supported_decisions: list[str] = Field(default_factory=list)
     exclusions: list[str] = Field(default_factory=list)

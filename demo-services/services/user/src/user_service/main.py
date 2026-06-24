@@ -20,8 +20,7 @@ from opentelemetry import metrics
 setup_stdout_json_logging(level=os.environ.get("LOG_LEVEL", "INFO"))
 
 _users: dict[str, dict] = {
-    f"u-{i}": {"id": f"u-{i}", "name": f"user-{i}", "tier": "standard"}
-    for i in range(1, 21)
+    f"u-{i}": {"id": f"u-{i}", "name": f"user-{i}", "tier": "standard"} for i in range(1, 21)
 }
 _flags = FeatureFlags(file_path=os.environ.get("FEATURE_FLAGS_PATH"))
 _log = get_logger("user_service")

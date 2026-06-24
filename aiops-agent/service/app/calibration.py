@@ -61,6 +61,7 @@ class CalibrationRecord(BaseModel):
 
 # ---- store (durable SQLite via app.store; `path` = db path) -----------------
 
+
 def load_records(path: Path | None = None) -> list[CalibrationRecord]:
     out: list[CalibrationRecord] = []
     for d in store.cal_load(path):
@@ -87,9 +88,14 @@ def record_run(findings: Any, run_id: str, path: Path | None = None) -> Calibrat
             services=list(getattr(findings, "services", []) or []),
         )
         store.cal_insert(
-            run_id=rec.run_id, ts=rec.ts, confidence=rec.confidence,
-            summary=rec.summary, hypothesis=rec.hypothesis,
-            suspected_version=rec.suspected_version, services=rec.services, path=path,
+            run_id=rec.run_id,
+            ts=rec.ts,
+            confidence=rec.confidence,
+            summary=rec.summary,
+            hypothesis=rec.hypothesis,
+            suspected_version=rec.suspected_version,
+            services=rec.services,
+            path=path,
         )
         return rec
     except Exception as e:
@@ -110,8 +116,12 @@ def label_run(
     """Fill in the verdict for the most recent record matching run_id (atomic
     UPDATE in the store). Returns True if a record was updated."""
     ok = store.cal_label(
-        run_id, correct, score=score, source=source,
-        error_dimension=error_dimension, correction_note=correction_note,
+        run_id,
+        correct,
+        score=score,
+        source=source,
+        error_dimension=error_dimension,
+        correction_note=correction_note,
         path=path,
     )
     if not ok:
@@ -120,6 +130,7 @@ def label_run(
 
 
 # ---- correctness sources (pluggable) ---------------------------------------
+
 
 def score_to_correct(score: float, threshold: float | None = None) -> bool:
     """o11y-bench grading produces a 0-1 score; a run counts as correct when it
@@ -143,13 +154,14 @@ def grade_against_truth(findings: Any, truth: dict) -> bool:
             return False
     want_ver = truth.get("version")
     if want_ver:
-        got_ver = (getattr(findings, "suspected_version", None) or "")
+        got_ver = getattr(findings, "suspected_version", None) or ""
         if want_ver.lower() not in got_ver.lower():
             return False
     return True
 
 
 # ---- calibration math (pure) -----------------------------------------------
+
 
 def compute_calibration(records: list[CalibrationRecord], n_bins: int = 10) -> dict[str, Any]:
     """Expected/Maximum Calibration Error + Brier score + reliability bins over
@@ -171,25 +183,34 @@ def compute_calibration(records: list[CalibrationRecord], n_bins: int = 10) -> d
     mce = 0.0
     for i in range(n_bins):
         lo, hi = i / n_bins, (i + 1) / n_bins
-        members = [
-            r for r in labeled
-            if (min(int(r.confidence * n_bins), n_bins - 1) == i)
-        ]
+        members = [r for r in labeled if (min(int(r.confidence * n_bins), n_bins - 1) == i)]
         if not members:
-            bins.append({"lo": lo, "hi": hi, "count": 0,
-                         "avg_confidence": None, "accuracy": None, "gap": None})
+            bins.append(
+                {
+                    "lo": lo,
+                    "hi": hi,
+                    "count": 0,
+                    "avg_confidence": None,
+                    "accuracy": None,
+                    "gap": None,
+                }
+            )
             continue
         avg_conf = sum(r.confidence for r in members) / len(members)
         acc = sum(1 for r in members if r.correct) / len(members)
         gap = abs(acc - avg_conf)
         ece += (len(members) / n) * gap
         mce = max(mce, gap)
-        bins.append({
-            "lo": lo, "hi": hi, "count": len(members),
-            "avg_confidence": round(avg_conf, 4),
-            "accuracy": round(acc, 4),
-            "gap": round(gap, 4),
-        })
+        bins.append(
+            {
+                "lo": lo,
+                "hi": hi,
+                "count": len(members),
+                "avg_confidence": round(avg_conf, 4),
+                "accuracy": round(acc, 4),
+                "gap": round(gap, 4),
+            }
+        )
 
     brier = sum((r.confidence - (1.0 if r.correct else 0.0)) ** 2 for r in labeled) / n
     overall_acc = sum(1 for r in labeled if r.correct) / n
@@ -210,12 +231,13 @@ def compute_calibration(records: list[CalibrationRecord], n_bins: int = 10) -> d
 
 def format_report(calib: dict[str, Any]) -> str:
     if not calib.get("labeled"):
-        return (f"No labeled runs yet ({calib.get('count', 0)} recorded, "
-                "0 with a correctness verdict). Label runs with "
-                "`python -m app.calibration label <run_id> --correct/--wrong`.")
+        return (
+            f"No labeled runs yet ({calib.get('count', 0)} recorded, "
+            "0 with a correctness verdict). Label runs with "
+            "`python -m app.calibration label <run_id> --correct/--wrong`."
+        )
     lines = [
-        f"Calibration over {calib['labeled']} labeled run(s) "
-        f"(of {calib['count']} recorded):",
+        f"Calibration over {calib['labeled']} labeled run(s) (of {calib['count']} recorded):",
         f"  ECE   = {calib['ece']}   (expected calibration error; 0 = perfect)",
         f"  MCE   = {calib['mce']}   (worst bin)",
         f"  Brier = {calib['brier']}",
@@ -235,6 +257,7 @@ def format_report(calib: dict[str, Any]) -> str:
 
 
 # ---- CLI -------------------------------------------------------------------
+
 
 def _main(argv: list[str] | None = None) -> int:
     import argparse

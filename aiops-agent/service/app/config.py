@@ -97,8 +97,8 @@ class Settings(BaseSettings):
     # runbook's preconditions still hold, and refuse actions whose computed blast
     # radius exceeds policy. All fail-closed — an unreadable dry-run aborts.
     execution_namespace_allowlist: list[str] = ["demo"]
-    max_blast_pods: int = 5          # affected-pod ceiling; over → abort
-    deny_singletons: bool = True     # single-replica targets are riskier → refuse
+    max_blast_pods: int = 5  # affected-pod ceiling; over → abort
+    deny_singletons: bool = True  # single-replica targets are riskier → refuse
     # Namespaces no action may ever touch, regardless of allowlist.
     protected_namespaces: list[str] = ["kube-system", "kube-public", "kube-node-lease"]
 
@@ -112,10 +112,10 @@ class Settings(BaseSettings):
     breaker_enabled: bool = True
     breaker_max_actions_per_window: int = 3
     breaker_window_seconds: int = 3600
-    breaker_fail_threshold: int = 2   # consecutive failures on a target → trip open
+    breaker_fail_threshold: int = 2  # consecutive failures on a target → trip open
 
     # --- Verify + rollback (step 7 後半 7b-4) ---------------------------------
-    verify_delay_seconds: int = 60    # settle window between execute and verify query
+    verify_delay_seconds: int = 60  # settle window between execute and verify query
     require_rollback_contract: bool = True  # no rollback contract → executor refuses
 
     # --- Design-alert capability (ARE gap-analysis §4.2 step 6 / v3 §6) -----
@@ -192,7 +192,7 @@ class Settings(BaseSettings):
     # or never reconciled) autonomy is narrowed (AUTO → PROPOSE), mirroring how
     # calibration error gates autonomy. "Confidently acting on a wrong map" is as
     # dangerous as "confidently wrong" — both must earn AUTO.
-    dq_min_score: float = 0.9               # declared/observed agreement floor for proven-good
+    dq_min_score: float = 0.9  # declared/observed agreement floor for proven-good
     dq_max_reconcile_age_seconds: int = 3600  # a reconcile older than this → DQ stale
     # Dependency-health blame propagation (s4): before the agent loop, run each
     # neighbour's error SLI live (read-only, off the agent budget) so the agent

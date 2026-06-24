@@ -86,9 +86,7 @@ async def impl_rollout_undo(args: dict) -> dict:
     annotations = dep.metadata.annotations or {}
     current_rev = int(annotations.get("deployment.kubernetes.io/revision", "0"))
 
-    selector = ",".join(
-        f"{k}={v}" for k, v in dep.spec.selector.match_labels.items()
-    )
+    selector = ",".join(f"{k}={v}" for k, v in dep.spec.selector.match_labels.items())
     rs_list = await asyncio.to_thread(
         apps_r.list_namespaced_replica_set, ns, label_selector=selector
     )
@@ -116,6 +114,7 @@ async def impl_rollout_undo(args: dict) -> dict:
     # returns snake_case which breaks strategic merge patch (merge key lookup
     # fails for e.g. "container_port" vs the expected "containerPort").
     from kubernetes import client as k8s_client
+
     sanitize = k8s_client.ApiClient().sanitize_for_serialization
     prev_template = sanitize(prev_rs.spec.template)
 
@@ -129,13 +128,19 @@ async def impl_rollout_undo(args: dict) -> dict:
     patch = {"spec": {"template": prev_template}}
     await asyncio.to_thread(
         apps_w.patch_namespaced_deployment,
-        name=deployment, namespace=ns, body=patch,
+        name=deployment,
+        namespace=ns,
+        body=patch,
     )
 
     prev_images = [c.image for c in prev_rs.spec.template.spec.containers]
     logger.warning(
         "rollout_undo: %s/%s rev %d→%d images=%s",
-        ns, deployment, current_rev, current_rev - 1, prev_images,
+        ns,
+        deployment,
+        current_rev,
+        current_rev - 1,
+        prev_images,
     )
     return {
         "action": "rollout_undo",
@@ -161,13 +166,12 @@ async def impl_scale(args: dict) -> dict:
     apps_w = await asyncio.to_thread(_load_write_api)
     await asyncio.to_thread(
         apps_w.patch_namespaced_deployment,
-        name=deployment, namespace=ns,
+        name=deployment,
+        namespace=ns,
         body={"spec": {"replicas": replicas}},
     )
 
-    logger.warning(
-        "scale: %s/%s %d→%d", ns, deployment, old_replicas, replicas
-    )
+    logger.warning("scale: %s/%s %d→%d", ns, deployment, old_replicas, replicas)
     return {
         "action": "scale",
         "deployment": deployment,

@@ -23,7 +23,7 @@ def test_trips_after_consecutive_failures(tmp_path, monkeypatch):
     monkeypatch.setattr(bk.settings, "breaker_fail_threshold", 2)
     monkeypatch.setattr(bk.settings, "breaker_max_actions_per_window", 100)  # isolate the trip
     bk.record_outcome("k8s.rollout_undo", "demo/x", success=False, path=p)
-    assert bk.check("k8s.rollout_undo", "demo/x", path=p)[0] is True   # 1 fail < threshold
+    assert bk.check("k8s.rollout_undo", "demo/x", path=p)[0] is True  # 1 fail < threshold
     bk.record_outcome("k8s.rollout_undo", "demo/x", success=False, path=p)
     ok, reason = bk.check("k8s.rollout_undo", "demo/x", path=p)
     assert ok is False and "breaker open" in reason
@@ -34,7 +34,7 @@ def test_success_resets_failure_streak(tmp_path, monkeypatch):
     monkeypatch.setattr(bk.settings, "breaker_fail_threshold", 2)
     monkeypatch.setattr(bk.settings, "breaker_max_actions_per_window", 100)
     bk.record_outcome("k8s.rollout_undo", "demo/x", success=False, path=p)
-    bk.record_outcome("k8s.rollout_undo", "demo/x", success=True, path=p)   # streak cleared
+    bk.record_outcome("k8s.rollout_undo", "demo/x", success=True, path=p)  # streak cleared
     bk.record_outcome("k8s.rollout_undo", "demo/x", success=False, path=p)  # streak = 1
     assert bk.check("k8s.rollout_undo", "demo/x", path=p)[0] is True
 
@@ -71,7 +71,7 @@ def test_reset_all_and_snapshot(tmp_path, monkeypatch):
     bk.record_outcome("k8s.rollout_undo", "demo/x", success=False, path=p)
     bk.record_outcome("k8s.scale", "demo/y", success=False, path=p)
     assert len(bk.snapshot(path=p)) == 2
-    assert bk.reset(None, path=p) == 2   # reset all
+    assert bk.reset(None, path=p) == 2  # reset all
     assert bk.snapshot(path=p) == []
 
 

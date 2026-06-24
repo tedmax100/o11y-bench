@@ -9,9 +9,16 @@ from app.signals.reconcile import Edge, TopologyDrift
 
 
 def _drift(**kw):
-    base = dict(topology_version="1.0.0", traces_sampled=50, declared_count=6,
-                observed_count=6, undeclared_edges=[], unobserved_edges=[],
-                dq_score=1.0, computed_ts=time.time())
+    base = dict(
+        topology_version="1.0.0",
+        traces_sampled=50,
+        declared_count=6,
+        observed_count=6,
+        undeclared_edges=[],
+        unobserved_edges=[],
+        dq_score=1.0,
+        computed_ts=time.time(),
+    )
     base.update(kw)
     return TopologyDrift(**base)
 

@@ -87,8 +87,19 @@ def data_end_time_utc() -> datetime:
 # -- OTLP / Loki write path (ported from upstream generator) -----------------
 
 
-def create_span(trace_id, span_id, parent, service, op, start_ns, dur_ns,
-                version, status_code, error=False, kind=2):
+def create_span(
+    trace_id,
+    span_id,
+    parent,
+    service,
+    op,
+    start_ns,
+    dur_ns,
+    version,
+    status_code,
+    error=False,
+    kind=2,
+):
     attrs = [
         {"key": "service.name", "value": {"stringValue": service}},
         {"key": "service.version", "value": {"stringValue": version}},
@@ -98,9 +109,14 @@ def create_span(trace_id, span_id, parent, service, op, start_ns, dur_ns,
         {"key": "http.status_code", "value": {"intValue": str(status_code)}},
     ]
     span = {
-        "traceId": trace_id, "spanId": span_id, "name": op, "kind": kind,
-        "startTimeUnixNano": str(start_ns), "endTimeUnixNano": str(start_ns + dur_ns),
-        "attributes": attrs, "status": {"code": 2 if error else 0},
+        "traceId": trace_id,
+        "spanId": span_id,
+        "name": op,
+        "kind": kind,
+        "startTimeUnixNano": str(start_ns),
+        "endTimeUnixNano": str(start_ns + dur_ns),
+        "attributes": attrs,
+        "status": {"code": 2 if error else 0},
     }
     if parent:
         span["parentSpanId"] = parent
@@ -115,18 +131,54 @@ def build_payment_trace(trace_id, ts, version, failed, dur_ms):
     spans = []
     root = rand_hex(16)
     root_dur = int(dur_ms * 1e6 * random.uniform(1.0, 1.2))
-    spans.append(create_span(trace_id, root, None, "webapp", f"POST {ROUTE}",
-                             start_ns, root_dur, "v5.2.0", http_status, error=False))
+    spans.append(
+        create_span(
+            trace_id,
+            root,
+            None,
+            "webapp",
+            f"POST {ROUTE}",
+            start_ns,
+            root_dur,
+            "v5.2.0",
+            http_status,
+            error=False,
+        )
+    )
     gw = rand_hex(16)
     gw_start = start_ns + int(2e6)
     gw_dur = int(root_dur * 0.9)
-    spans.append(create_span(trace_id, gw, root, "api-gateway", f"route {ROUTE}",
-                             gw_start, gw_dur, "v4.0.0", http_status, error=False))
+    spans.append(
+        create_span(
+            trace_id,
+            gw,
+            root,
+            "api-gateway",
+            f"route {ROUTE}",
+            gw_start,
+            gw_dur,
+            "v4.0.0",
+            http_status,
+            error=False,
+        )
+    )
     pay = rand_hex(16)
     pay_start = gw_start + int(1e6)
     pay_dur = int(gw_dur * 0.8)
-    spans.append(create_span(trace_id, pay, gw, SERVICE, f"handle POST {ROUTE}",
-                             pay_start, pay_dur, version, http_status, error=failed))
+    spans.append(
+        create_span(
+            trace_id,
+            pay,
+            gw,
+            SERVICE,
+            f"handle POST {ROUTE}",
+            pay_start,
+            pay_dur,
+            version,
+            http_status,
+            error=failed,
+        )
+    )
     return spans
 
 
@@ -135,20 +187,22 @@ def push_traces_batch(spans, retries=3):
         return
     by_service = {}
     for s in spans:
-        svc = next(a["value"]["stringValue"] for a in s["attributes"]
-                   if a["key"] == "service.name")
+        svc = next(a["value"]["stringValue"] for a in s["attributes"] if a["key"] == "service.name")
         # resource = service.name + service.version + deployment.environment
-        ver = next(a["value"]["stringValue"] for a in s["attributes"]
-                   if a["key"] == "service.version")
+        ver = next(
+            a["value"]["stringValue"] for a in s["attributes"] if a["key"] == "service.version"
+        )
         key = (svc, ver)
         by_service.setdefault(key, []).append(s)
     resource_spans = [
         {
-            "resource": {"attributes": [
-                {"key": "service.name", "value": {"stringValue": svc}},
-                {"key": "service.version", "value": {"stringValue": ver}},
-                {"key": "deployment.environment", "value": {"stringValue": DEPLOY_ENV}},
-            ]},
+            "resource": {
+                "attributes": [
+                    {"key": "service.name", "value": {"stringValue": svc}},
+                    {"key": "service.version", "value": {"stringValue": ver}},
+                    {"key": "deployment.environment", "value": {"stringValue": DEPLOY_ENV}},
+                ]
+            },
             "scopeSpans": [{"scope": {"name": "demo-o11y"}, "spans": sp}],
         }
         for (svc, ver), sp in by_service.items()
@@ -156,13 +210,15 @@ def push_traces_batch(spans, retries=3):
     payload = json.dumps({"resourceSpans": resource_spans}).encode()
     for attempt in range(retries):
         try:
-            req = urllib.request.Request(f"{TEMPO_URL}/v1/traces", data=payload,
-                                         headers={"Content-Type": "application/json"})
+            req = urllib.request.Request(
+                f"{TEMPO_URL}/v1/traces", data=payload, headers={"Content-Type": "application/json"}
+            )
             urllib.request.urlopen(req, timeout=10)
             return
         except urllib.error.HTTPError as exc:
             if exc.code == 503 and attempt < retries - 1:
-                time.sleep(0.5); continue
+                time.sleep(0.5)
+                continue
             return
         except Exception:
             return
@@ -185,16 +241,22 @@ def push_logs_batch(logs):
         req = urllib.request.Request(
             f"{LOKI_URL}/loki/api/v1/push",
             data=json.dumps({"streams": list(streams.values())}).encode(),
-            headers={"Content-Type": "application/json"})
+            headers={"Content-Type": "application/json"},
+        )
         urllib.request.urlopen(req, timeout=10)
     except Exception as exc:
         log(f"  Loki push error: {exc}")
 
 
 def build_log(ts, version, level, event, fields):
-    line = {"timestamp": ts.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ts.microsecond // 1000:03d}Z",
-            "level": level, "service_name": SERVICE, "git_version": version,
-            "event": event, **fields}
+    line = {
+        "timestamp": ts.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ts.microsecond // 1000:03d}Z",
+        "level": level,
+        "service_name": SERVICE,
+        "git_version": version,
+        "event": event,
+        **fields,
+    }
     md = {"level": level, "event": event, "service_name": SERVICE}
     if "trace_id" in fields:
         md["trace_id"] = fields["trace_id"]
@@ -202,8 +264,12 @@ def build_log(ts, version, level, event, fields):
         md["reason"] = str(fields["reason"])
     return {
         "ts_ns": int(ts.timestamp() * 1e9),
-        "labels": {"service_name": SERVICE, "git_repo": GIT_REPO,
-                   "git_version": version, "deployment_environment": DEPLOY_ENV},
+        "labels": {
+            "service_name": SERVICE,
+            "git_repo": GIT_REPO,
+            "git_version": version,
+            "deployment_environment": DEPLOY_ENV,
+        },
         "line": json.dumps(line),
         "metadata": md,
     }
@@ -212,9 +278,14 @@ def build_log(ts, version, level, event, fields):
 def wait_for_tempo(max_attempts=30):
     for attempt in range(max_attempts):
         try:
-            urllib.request.urlopen(urllib.request.Request(
-                f"{TEMPO_URL}/v1/traces", data=_OTLP_HEALTH_BODY,
-                headers={"Content-Type": "application/json"}), timeout=5)
+            urllib.request.urlopen(
+                urllib.request.Request(
+                    f"{TEMPO_URL}/v1/traces",
+                    data=_OTLP_HEALTH_BODY,
+                    headers={"Content-Type": "application/json"},
+                ),
+                timeout=5,
+            )
             return
         except Exception as exc:
             if attempt == max_attempts - 1:
@@ -226,7 +297,8 @@ def flush_tempo(max_attempts=5):
     req = urllib.request.Request(f"{TEMPO_QUERY_URL}/flush", data=b"", method="POST")
     for attempt in range(max_attempts):
         try:
-            urllib.request.urlopen(req, timeout=10); return
+            urllib.request.urlopen(req, timeout=10)
+            return
         except Exception as exc:
             if attempt == max_attempts - 1:
                 raise RuntimeError("Tempo flush failed") from exc
@@ -237,12 +309,19 @@ def wait_for_tempo_searchable(end_time, max_attempts=30):
     start_s = int((end_time - timedelta(hours=HOURS_OF_HISTORY)).timestamp())
     end_s = int(end_time.timestamp()) + 60
     import urllib.parse as up
-    q = up.urlencode({"q": f'{{ resource.service.name = "{SERVICE}" }}',
-                      "start": start_s, "end": end_s, "limit": 5})
+
+    q = up.urlencode(
+        {
+            "q": f'{{ resource.service.name = "{SERVICE}" }}',
+            "start": start_s,
+            "end": end_s,
+            "limit": 5,
+        }
+    )
     for attempt in range(max_attempts):
         try:
             with urllib.request.urlopen(f"{TEMPO_QUERY_URL}/api/search?{q}", timeout=10) as r:
-                if (json.load(r).get("traces")):
+                if json.load(r).get("traces"):
                     return
         except Exception:
             pass
@@ -271,8 +350,10 @@ def charge_outcome(ts, amount_cents, deploy_time):
 
 
 def metric_labels(version, status, reason):
-    base = (f'service_name="{SERVICE}",git_repo="{GIT_REPO}",'
-            f'deployment_environment="{DEPLOY_ENV}",git_version="{version}"')
+    base = (
+        f'service_name="{SERVICE}",git_repo="{GIT_REPO}",'
+        f'deployment_environment="{DEPLOY_ENV}",git_version="{version}"'
+    )
     out = f'{base},status="{status}"'
     if reason is not None:
         out += f',reason="{reason}"'
@@ -286,23 +367,29 @@ def generate_all():
     end_time = data_end_time_utc()
     start_time = end_time - timedelta(hours=HOURS_OF_HISTORY)
     deploy_time = end_time - timedelta(hours=3)
-    log(f"window {start_time:%Y-%m-%dT%H:%M:%SZ} .. {end_time:%Y-%m-%dT%H:%M:%SZ}; "
-        f"deploy {VERSION_OLD}->{VERSION_NEW} at {deploy_time:%H:%M:%S}")
+    log(
+        f"window {start_time:%Y-%m-%dT%H:%M:%SZ} .. {end_time:%Y-%m-%dT%H:%M:%SZ}; "
+        f"deploy {VERSION_OLD}->{VERSION_NEW} at {deploy_time:%H:%M:%S}"
+    )
     wait_for_tempo()
 
-    charge_counters = {}            # metric_labels-string -> cumulative count
+    charge_counters = {}  # metric_labels-string -> cumulative count
     # histogram per (version): cumulative bucket counts + sum + count
-    hist = {VERSION_OLD: {"buckets": [0] * len(HISTOGRAM_BUCKETS), "inf": 0, "sum": 0.0, "n": 0},
-            VERSION_NEW: {"buckets": [0] * len(HISTOGRAM_BUCKETS), "inf": 0, "sum": 0.0, "n": 0}}
+    hist = {
+        VERSION_OLD: {"buckets": [0] * len(HISTOGRAM_BUCKETS), "inf": 0, "sum": 0.0, "n": 0},
+        VERSION_NEW: {"buckets": [0] * len(HISTOGRAM_BUCKETS), "inf": 0, "sum": 0.0, "n": 0},
+    }
 
     log_batch, trace_batch = [], []
     metrics_file = "/tmp/metrics.txt"
     total_charges = total_traces = total_logs = 0
 
     import bisect
+
     mf = open(metrics_file, "w", buffering=1024 * 1024)
-    mf.write("# TYPE payment_charges_total counter\n"
-             "# TYPE payment_charge_duration_seconds histogram\n")
+    mf.write(
+        "# TYPE payment_charges_total counter\n# TYPE payment_charge_duration_seconds histogram\n"
+    )
 
     current = start_time
     last_minute = None
@@ -316,10 +403,19 @@ def generate_all():
             # deployment.started log at the boundary
             if not deploy_logged and current >= deploy_time:
                 deploy_logged = True
-                log_batch.append(build_log(current, VERSION_NEW, "INFO", "deployment.started",
-                                           {"message": f"deployment started: {SERVICE} "
-                                                       f"{VERSION_OLD} -> {VERSION_NEW}",
-                                            "version": VERSION_NEW}))
+                log_batch.append(
+                    build_log(
+                        current,
+                        VERSION_NEW,
+                        "INFO",
+                        "deployment.started",
+                        {
+                            "message": f"deployment started: {SERVICE} "
+                            f"{VERSION_OLD} -> {VERSION_NEW}",
+                            "version": VERSION_NEW,
+                        },
+                    )
+                )
                 total_logs += 1
 
             for _ in range(CHARGES_PER_MIN):
@@ -327,7 +423,7 @@ def generate_all():
                 amount = random.randint(100, 5000)
                 version, status, reason, level, event = charge_outcome(req_ts, amount, deploy_time)
                 failed = status in ("declined", "error")
-                dur_ms = (random.uniform(10, 30) if failed else random.uniform(30, 90))
+                dur_ms = random.uniform(10, 30) if failed else random.uniform(30, 90)
                 dur_s = dur_ms / 1000.0
                 trace_id = rand_trace_id()
                 order_id = "o-" + rand_hex(8)
@@ -346,14 +442,26 @@ def generate_all():
                 h["n"] += 1
 
                 # logs: requested + outcome
-                log_batch.append(build_log(req_ts, version, "INFO", "payment.requested",
-                                           {"order_id": order_id, "amount_cents": amount,
-                                            "trace_id": trace_id, "message": "charge requested"}))
+                log_batch.append(
+                    build_log(
+                        req_ts,
+                        version,
+                        "INFO",
+                        "payment.requested",
+                        {
+                            "order_id": order_id,
+                            "amount_cents": amount,
+                            "trace_id": trace_id,
+                            "message": "charge requested",
+                        },
+                    )
+                )
                 fields = {"order_id": order_id, "amount_cents": amount, "trace_id": trace_id}
                 if reason is not None:
                     fields["reason"] = reason
-                fields["message"] = ("charge authorized" if status == "authorized"
-                                     else f"charge {status}: {reason}")
+                fields["message"] = (
+                    "charge authorized" if status == "authorized" else f"charge {status}: {reason}"
+                )
                 if status in ("error",):
                     fields["status"] = 502
                 log_batch.append(build_log(req_ts, version, level, event, fields))
@@ -361,7 +469,9 @@ def generate_all():
 
                 # trace (sample non-failed at 30%; always emit failed so they're findable)
                 if failed or random.random() < 0.3:
-                    trace_batch.extend(build_payment_trace(trace_id, req_ts, version, failed, dur_ms))
+                    trace_batch.extend(
+                        build_payment_trace(trace_id, req_ts, version, failed, dur_ms)
+                    )
                     total_traces += 1
                 total_charges += 1
 
@@ -370,21 +480,25 @@ def generate_all():
         for lbl, val in charge_counters.items():
             mf.write(f"payment_charges_total{{{lbl}}} {val}{ts}")
         for version, h in hist.items():
-            vlbl = (f'service_name="{SERVICE}",git_repo="{GIT_REPO}",'
-                    f'deployment_environment="{DEPLOY_ENV}",git_version="{version}"')
+            vlbl = (
+                f'service_name="{SERVICE}",git_repo="{GIT_REPO}",'
+                f'deployment_environment="{DEPLOY_ENV}",git_version="{version}"'
+            )
             cum = 0
             for i, le in enumerate(HISTOGRAM_BUCKETS):
                 cum += h["buckets"][i]
                 mf.write(f'payment_charge_duration_seconds_bucket{{{vlbl},le="{le}"}} {cum}{ts}')
             cum += h["inf"]
             mf.write(f'payment_charge_duration_seconds_bucket{{{vlbl},le="+Inf"}} {cum}{ts}')
-            mf.write(f'payment_charge_duration_seconds_sum{{{vlbl}}} {h["sum"]:.3f}{ts}')
-            mf.write(f'payment_charge_duration_seconds_count{{{vlbl}}} {h["n"]}{ts}')
+            mf.write(f"payment_charge_duration_seconds_sum{{{vlbl}}} {h['sum']:.3f}{ts}")
+            mf.write(f"payment_charge_duration_seconds_count{{{vlbl}}} {h['n']}{ts}")
 
         if len(trace_batch) >= 200:
-            push_traces_batch(trace_batch); trace_batch = []
+            push_traces_batch(trace_batch)
+            trace_batch = []
         if len(log_batch) >= 5000:
-            push_logs_batch(log_batch); log_batch = []
+            push_logs_batch(log_batch)
+            log_batch = []
         current += timedelta(seconds=METRICS_INTERVAL)
 
     mf.write("# EOF\n")
@@ -394,16 +508,28 @@ def generate_all():
     if log_batch:
         push_logs_batch(log_batch)
 
-    log(f"  charges={total_charges} traces={total_traces} logs={total_logs} "
-        f"series={len(charge_counters)}")
+    log(
+        f"  charges={total_charges} traces={total_traces} logs={total_logs} "
+        f"series={len(charge_counters)}"
+    )
     log("  flushing Tempo + waiting for searchable...")
     flush_tempo()
     wait_for_tempo_searchable(end_time)
 
     log("  importing metrics into Prometheus TSDB via promtool...")
-    res = subprocess.run(["promtool", "tsdb", "create-blocks-from", "openmetrics",
-                          metrics_file, PROMETHEUS_DATA_DIR],
-                         capture_output=True, text=True, timeout=180)
+    res = subprocess.run(
+        [
+            "promtool",
+            "tsdb",
+            "create-blocks-from",
+            "openmetrics",
+            metrics_file,
+            PROMETHEUS_DATA_DIR,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
     if res.returncode != 0:
         log(f"  promtool failed rc={res.returncode}: {res.stderr[:500]}")
         raise SystemExit(1)

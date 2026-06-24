@@ -55,13 +55,13 @@ async def _sink_findings(alert: dict, fp: str, result: dict) -> None:
     annotation when grafana_url + grafana_token are set (best-effort)."""
     findings = result["findings"]
     uncertainty = result.get("uncertainty")
-    logger.info(
-        "headless RCA done fp=%s conf=%.2f: %s", fp, findings.confidence, findings.summary
-    )
+    logger.info("headless RCA done fp=%s conf=%.2f: %s", fp, findings.confidence, findings.summary)
     if uncertainty:
         logger.warning(
             "headless RCA uncertain fp=%s: missing_signals=%s recommended=%s",
-            fp, uncertainty.missing_signals, uncertainty.recommended_human_action,
+            fp,
+            uncertainty.missing_signals,
+            uncertainty.recommended_human_action,
         )
 
     if not (settings.grafana_url and settings.grafana_token):
@@ -110,8 +110,9 @@ async def _investigate_and_sink(alert: dict, fp: str) -> None:
         # later `label <fp>` ties the verdict back to this investigation.
         record_run(result["findings"], run_id=fp)
         for d in result.get("decisions") or []:
-            logger.info("governance fp=%s action=%s -> %s (%s)",
-                        fp, d.action, d.autonomy.value, d.reason)
+            logger.info(
+                "governance fp=%s action=%s -> %s (%s)", fp, d.action, d.autonomy.value, d.reason
+            )
         record_investigation(fp, alert, result)
         await _sink_findings(alert, fp, result)
     except Exception as e:
@@ -119,8 +120,10 @@ async def _investigate_and_sink(alert: dict, fp: str) -> None:
 
 
 async def reinvestigate(
-    fp: str, alert: dict,
-    error_dimension: str | None, correction_note: str | None,
+    fp: str,
+    alert: dict,
+    error_dimension: str | None,
+    correction_note: str | None,
 ) -> None:
     """Re-run RCA for an alert that was labeled Wrong, injecting the human
     correction as context so the agent knows what to reconsider."""

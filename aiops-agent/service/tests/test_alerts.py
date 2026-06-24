@@ -22,6 +22,7 @@ def _spec(**kw) -> AlertSpec:
 
 # ---- AlertSpec validation --------------------------------------------------
 
+
 def test_spec_defaults():
     s = _spec()
     assert s.comparison == "gt" and s.for_duration == "5m" and s.severity == "warning"
@@ -51,6 +52,7 @@ def test_spec_rejects_tiny_interval():
 
 # ---- build_alert_rule (pure transform; pin the payload shape) --------------
 
+
 def test_build_rule_three_stage_pipeline():
     payload = build_alert_rule(_spec(title="my rule"))
     assert payload["title"] == "my rule"
@@ -73,9 +75,14 @@ def test_build_rule_threshold_and_comparison():
 
 
 def test_build_rule_carries_labels_and_annotations():
-    payload = build_alert_rule(_spec(
-        severity="critical", service_name="payment-service",
-        summary="decline rate high", for_duration="10m"))
+    payload = build_alert_rule(
+        _spec(
+            severity="critical",
+            service_name="payment-service",
+            summary="decline rate high",
+            for_duration="10m",
+        )
+    )
     assert payload["labels"] == {"severity": "critical", "service_name": "payment-service"}
     assert payload["annotations"]["summary"] == "decline rate high"
     assert payload["for"] == "10m"
@@ -93,13 +100,14 @@ def test_build_rule_omits_service_label_when_absent():
 
 # ---- parse_alert_blocks (mirror of the plugin's splitQueryBlocks) ----------
 
+
 def test_parse_single_block():
-    text = '''Here's an alert:
+    text = """Here's an alert:
 
 ```alert
 {"title": "x", "expr": "sum(rate(y[5m]))", "threshold": 0.1}
 ```
-'''
+"""
     specs = parse_alert_blocks(text)
     assert len(specs) == 1 and specs[0].title == "x" and specs[0].threshold == 0.1
 
@@ -114,7 +122,7 @@ def test_parse_multiple_blocks():
 
 def test_parse_skips_malformed_block():
     text = (
-        '```alert\nnot json\n```\n'                                  # bad json
+        "```alert\nnot json\n```\n"  # bad json
         '```alert\n{"title": "ok", "expr": "e", "threshold": 1}\n```'  # good
     )
     specs = parse_alert_blocks(text)
@@ -133,6 +141,7 @@ def test_parse_empty_and_no_blocks():
 
 
 # ---- provision_alert: fail-closed gate -------------------------------------
+
 
 async def test_provision_refused_when_switch_off(monkeypatch):
     monkeypatch.setattr(alerts_mod.settings, "alert_provisioning_enabled", False)
@@ -158,12 +167,19 @@ async def test_provision_posts_to_grafana(monkeypatch):
     captured = {}
 
     class _Resp:
-        def raise_for_status(self): pass
-        def json(self): return {"uid": "abc123", "title": "t"}
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"uid": "abc123", "title": "t"}
 
     class _Client:
-        async def __aenter__(self): return self
-        async def __aexit__(self, *a): return False
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
         async def post(self, url, json, headers):
             captured["url"] = url
             captured["json"] = json

@@ -13,8 +13,10 @@ from app.signals.topology import Edge, Topology
 
 
 def _span(sid, parent, service):
-    return {"resource": {"attributes": [{"key": "service.name", "value": {"stringValue": service}}]},
-            "scopeSpans": [{"spans": [{"spanId": sid, "parentSpanId": parent, "name": "op"}]}]}
+    return {
+        "resource": {"attributes": [{"key": "service.name", "value": {"stringValue": service}}]},
+        "scopeSpans": [{"spans": [{"spanId": sid, "parentSpanId": parent, "name": "op"}]}],
+    }
 
 
 def _trace(*batches):
@@ -40,6 +42,7 @@ def _topo():
 
 
 # ---- edge extraction from OTLP traces --------------------------------------
+
 
 def test_edges_from_trace_call_boundary():
     # api-gateway span is the parent of payment-service span → one edge.
@@ -82,6 +85,7 @@ def test_edges_from_trace_root_and_orphans():
 
 # ---- diff math -------------------------------------------------------------
 
+
 def test_diff_perfect_alignment():
     t = _topo()
     observed = {("webapp", "api-gateway"), ("api-gateway", "payment-service")}
@@ -110,7 +114,9 @@ def test_diff_unobserved_declared_edge():
     t = _topo()
     observed = {("webapp", "api-gateway")}  # payment edge had no traffic
     drift = diff_edges(t, observed, traces_sampled=10)
-    assert [(e.caller, e.callee) for e in drift.unobserved_edges] == [("api-gateway", "payment-service")]
+    assert [(e.caller, e.callee) for e in drift.unobserved_edges] == [
+        ("api-gateway", "payment-service")
+    ]
     assert drift.dq_score == 1.0  # everything observed was declared
 
 
@@ -123,6 +129,7 @@ def test_diff_no_traffic_dq_none():
 
 # ---- drift surfaced in the injected context --------------------------------
 
+
 def _drift(**kw):
     base = dict(topology_version="1.0.0", traces_sampled=10, dq_score=1.0)
     base.update(kw)
@@ -132,7 +139,8 @@ def _drift(**kw):
 def test_context_marks_unobserved_declared_edge(monkeypatch):
     monkeypatch.setattr(ctx_mod, "get_topology", _topo)
     monkeypatch.setattr(
-        ctx_mod, "get_last_drift",
+        ctx_mod,
+        "get_last_drift",
         lambda: _drift(unobserved_edges=[Edge(caller="api-gateway", callee="payment-service")]),
     )
     ctx = build_signal_context(["api-gateway"])
@@ -142,7 +150,8 @@ def test_context_marks_unobserved_declared_edge(monkeypatch):
 def test_context_surfaces_undeclared_edge_and_dq(monkeypatch):
     monkeypatch.setattr(ctx_mod, "get_topology", _topo)
     monkeypatch.setattr(
-        ctx_mod, "get_last_drift",
+        ctx_mod,
+        "get_last_drift",
         lambda: _drift(
             dq_score=0.667,
             undeclared_edges=[Edge(caller="webapp", callee="payment-service")],

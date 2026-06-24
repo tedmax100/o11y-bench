@@ -16,14 +16,19 @@ from app.runbook import (
 
 
 def _book(**kw):
-    base = dict(id="payment-bad-deploy", trigger=Trigger(
-        alertname="payment-decline-rate-high", labels={"service_name": "payment-service"}))
+    base = dict(
+        id="payment-bad-deploy",
+        trigger=Trigger(
+            alertname="payment-decline-rate-high", labels={"service_name": "payment-service"}
+        ),
+    )
     base.update(kw)
     return Runbook(**base)
 
 
 class _FakeTool:
     """Mimics a langchain BaseTool: has .ainvoke(args) -> result."""
+
     def __init__(self, name, result=None, raises=None):
         self.name = name
         self._result = result
@@ -36,6 +41,7 @@ class _FakeTool:
 
 
 # ---- load ------------------------------------------------------------------
+
 
 def test_load_real_demo_runbook(tmp_path):
     # the shipped runbook must parse
@@ -57,6 +63,7 @@ def test_load_skips_malformed(tmp_path):
 
 # ---- match -----------------------------------------------------------------
 
+
 def test_match_by_explicit_runbook_id():
     books = [_book(id="other", trigger=Trigger()), _book()]
     m = match_runbook({}, {"runbook_id": "payment-bad-deploy"}, books)
@@ -66,14 +73,19 @@ def test_match_by_explicit_runbook_id():
 def test_match_by_trigger_labels_and_alertname():
     books = [_book()]
     m = match_runbook(
-        {"alertname": "payment-decline-rate-high", "service_name": "payment-service"}, {}, books)
+        {"alertname": "payment-decline-rate-high", "service_name": "payment-service"}, {}, books
+    )
     assert m and m.id == "payment-bad-deploy"
 
 
 def test_no_match_wrong_service():
     books = [_book()]
-    assert match_runbook(
-        {"alertname": "payment-decline-rate-high", "service_name": "order-service"}, {}, books) is None
+    assert (
+        match_runbook(
+            {"alertname": "payment-decline-rate-high", "service_name": "order-service"}, {}, books
+        )
+        is None
+    )
 
 
 def test_empty_trigger_never_matches_everything():
@@ -83,18 +95,32 @@ def test_empty_trigger_never_matches_everything():
 
 # ---- params + substitution -------------------------------------------------
 
+
 def test_incident_params_aliases_service():
     p = incident_params({"service": "payment-service", "git_version": "v2.5.0"}, {"sev": "warn"})
-    assert p["service_name"] == "payment-service" and p["git_version"] == "v2.5.0" and p["sev"] == "warn"
+    assert (
+        p["service_name"] == "payment-service"
+        and p["git_version"] == "v2.5.0"
+        and p["sev"] == "warn"
+    )
 
 
 def test_render_fills_params_and_flags_remediation():
     book = _book(
         title="t",
-        diagnostics=[Step(desc="check", action="k8s_deployment_status",
-                          args={"service": "{service_name}"}, expect="healthy")],
-        remediation=[Step(desc="rollback", action="k8s.rollout_undo",
-                          reversible=True, requires_approval=True)],
+        diagnostics=[
+            Step(
+                desc="check",
+                action="k8s_deployment_status",
+                args={"service": "{service_name}"},
+                expect="healthy",
+            )
+        ],
+        remediation=[
+            Step(
+                desc="rollback", action="k8s.rollout_undo", reversible=True, requires_approval=True
+            )
+        ],
     )
     out = render_runbook(book, {"service_name": "payment-service"})
     assert "payment-service" in out
@@ -102,6 +128,7 @@ def test_render_fills_params_and_flags_remediation():
 
 
 # ---- check evaluation ------------------------------------------------------
+
 
 def test_evaluate_check_variants():
     assert _evaluate_check(None, {"x": 1})[0] == "ran"
@@ -115,12 +142,18 @@ def test_evaluate_check_variants():
 
 # ---- diagnostics runner ----------------------------------------------------
 
+
 async def test_run_diagnostics_pass_and_check():
-    book = _book(diagnostics=[
-        Step(desc="version concentration", action="query_prometheus",
-             args={"expr": "sum by (git_version) (...)"},
-             check=DiagnosticCheck(nonempty=True)),
-    ])
+    book = _book(
+        diagnostics=[
+            Step(
+                desc="version concentration",
+                action="query_prometheus",
+                args={"expr": "sum by (git_version) (...)"},
+                check=DiagnosticCheck(nonempty=True),
+            ),
+        ]
+    )
     tools = {"query_prometheus": _FakeTool("query_prometheus", result={"data": [{"v": 1}]})}
     res = await run_diagnostics(book, {}, tools)
     assert len(res) == 1 and res[0].status == "pass"
@@ -135,10 +168,15 @@ async def test_run_diagnostics_skips_non_readonly_action():
 
 
 async def test_run_diagnostics_skips_unresolved_params():
-    book = _book(diagnostics=[
-        Step(desc="diff", action="github_compare",
-             args={"repo": "r", "base": "{prev_version}", "head": "{git_version}"}),
-    ])
+    book = _book(
+        diagnostics=[
+            Step(
+                desc="diff",
+                action="github_compare",
+                args={"repo": "r", "base": "{prev_version}", "head": "{git_version}"},
+            ),
+        ]
+    )
     tools = {"github_compare": _FakeTool("github_compare", result="ok")}
     res = await run_diagnostics(book, {"git_version": "v2.5.0"}, tools)  # prev_version missing
     assert res[0].status == "skipped" and "prev_version" in res[0].detail

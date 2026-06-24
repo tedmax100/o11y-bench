@@ -128,7 +128,9 @@ def get_topology() -> Topology:
         topo = Topology.model_validate(data)
         logger.info(
             "loaded topology v%s: %d nodes, %d edges",
-            topo.version, len(topo.nodes), len(topo.edges),
+            topo.version,
+            len(topo.nodes),
+            len(topo.edges),
         )
         return topo
     except Exception as e:  # missing file / bad yaml / schema mismatch
@@ -172,5 +174,7 @@ if __name__ == "__main__":  # pragma: no cover
     else:
         print(f"topology v{topo.version}: {topo.names()}")
         for n in topo.nodes:
-            print(f"  {n.name} tier-{n.tier} journeys={n.journeys} "
-                  f"upstream={topo.upstream(n.name)} downstream={topo.downstream(n.name)}")
+            print(
+                f"  {n.name} tier-{n.tier} journeys={n.journeys} "
+                f"upstream={topo.upstream(n.name)} downstream={topo.downstream(n.name)}"
+            )

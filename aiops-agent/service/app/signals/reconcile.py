@@ -35,6 +35,7 @@ logger = logging.getLogger("aiops_agent.signals.reconcile")
 
 class TopologyDrift(BaseModel):
     """Diff between the declared graph and what the live traces show."""
+
     topology_version: str = "0"
     traces_sampled: int = 0
     declared_count: int = 0
@@ -116,10 +117,12 @@ def set_last_drift(drift: TopologyDrift) -> None:
 
 # ---- live observation (network; off the RCA hot path) ----------------------
 
+
 async def _search_trace_ids(lookback: str, limit: int) -> list[str]:
     s, e = _parse_dt(lookback), _parse_dt("now")
     data = await _get_json(
-        settings.tempo_url, "/api/search",
+        settings.tempo_url,
+        "/api/search",
         # Skip sub-ms health probes (see tempo-probe-noise-filter); they carry no
         # cross-service edges and would burn the search limit.
         {"q": "{ trace:duration > 5ms }", "start": _epoch_s(s), "end": _epoch_s(e), "limit": limit},
@@ -154,7 +157,10 @@ async def reconcile(lookback: str = "now-1h", max_traces: int = 50) -> TopologyD
     set_last_drift(drift)
     logger.info(
         "reconcile: %d traces, dq=%s, %d undeclared, %d unobserved",
-        sampled, drift.dq_score, len(drift.undeclared_edges), len(drift.unobserved_edges),
+        sampled,
+        drift.dq_score,
+        len(drift.undeclared_edges),
+        len(drift.unobserved_edges),
     )
     return drift
 

@@ -24,11 +24,14 @@ def _rec(conf, correct):
 
 # ---- calibration math ------------------------------------------------------
 
+
 def test_perfect_calibration_is_zero_ece():
     # Two bins, each acc == conf → ECE/MCE = 0.
     recs = (
-        [_rec(0.1, False)] * 9 + [_rec(0.1, True)] * 1   # bin [0.1,0.2): acc 0.1
-        + [_rec(0.9, True)] * 9 + [_rec(0.9, False)] * 1  # bin [0.9,1.0): acc 0.9
+        [_rec(0.1, False)] * 9
+        + [_rec(0.1, True)] * 1  # bin [0.1,0.2): acc 0.1
+        + [_rec(0.9, True)] * 9
+        + [_rec(0.9, False)] * 1  # bin [0.9,1.0): acc 0.9
     )
     c = compute_calibration(recs, n_bins=10)
     assert c["labeled"] == 20
@@ -67,6 +70,7 @@ def test_empty():
 
 # ---- verdict sources -------------------------------------------------------
 
+
 def test_score_to_correct_threshold(monkeypatch):
     monkeypatch.setattr(cal.settings, "calibration_correct_threshold", 0.7)
     assert score_to_correct(0.7) is True
@@ -89,13 +93,19 @@ def test_grade_against_truth_service_in_summary_fallback():
 
 # ---- store round-trip ------------------------------------------------------
 
+
 def test_record_and_label_roundtrip(tmp_path, monkeypatch):
     p = tmp_path / "aiops.db"
     monkeypatch.setattr(cal.settings, "store_path", str(p))
     monkeypatch.setattr(cal.settings, "calibration_enabled", True)
 
-    findings = NS(confidence=0.82, summary="s", hypothesis="h",
-                  suspected_version="v2.5.0", services=["payment-service"])
+    findings = NS(
+        confidence=0.82,
+        summary="s",
+        hypothesis="h",
+        suspected_version="v2.5.0",
+        services=["payment-service"],
+    )
     rec = record_run(findings, run_id="fp-abc")
     assert rec is not None
     loaded = load_records(p)

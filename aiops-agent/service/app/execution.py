@@ -42,6 +42,7 @@ def _read_only_tools() -> dict:
     """The agent's all-read-only TOOLS, keyed by name. Imported lazily so the
     executor doesn't pull the LLM stack unless a precondition check needs it."""
     from .agent import TOOLS
+
     return {t.name: t for t in TOOLS}
 
 
@@ -77,6 +78,7 @@ def _eval_verify_check(check: dict, output: Any) -> tuple[bool, str]:
 
     # Fall back to DiagnosticCheck for contains/nonempty/min_rows
     from .runbook import DiagnosticCheck, _evaluate_check
+
     known = {k: v for k, v in check.items() if k in DiagnosticCheck.model_fields}
     dc = DiagnosticCheck(**known)
     status, detail = _evaluate_check(dc, output)
@@ -88,13 +90,20 @@ async def _verify_outcome(req: ActionRequest, path: Path | None) -> bool:
     if the symptom cleared. No verify spec → optimistically returns True (skip)."""
     rb = (
         next((b for b in load_runbooks() if b.id == req.runbook_id), None)
-        if req.runbook_id else None
+        if req.runbook_id
+        else None
     )
     step = next((s for s in (rb.remediation if rb else []) if s.action == req.action), None)
 
     if step is None or not step.verify:
-        audit.record("verify", "skip", request_id=req.request_id, fp=req.fp,
-                     detail={"reason": "no verify spec on remediation step"}, path=path)
+        audit.record(
+            "verify",
+            "skip",
+            request_id=req.request_id,
+            fp=req.fp,
+            detail={"reason": "no verify spec on remediation step"},
+            path=path,
+        )
         return True
 
     await asyncio.sleep(settings.verify_delay_seconds)
@@ -108,20 +117,36 @@ async def _verify_outcome(req: ActionRequest, path: Path | None) -> bool:
         tools = _read_only_tools()
         tool = tools.get(action_name)
         if tool is None:
-            audit.record("verify", "skip", request_id=req.request_id, fp=req.fp,
-                         detail={"reason": f"verify action {action_name!r} not in read-only tools"},
-                         path=path)
+            audit.record(
+                "verify",
+                "skip",
+                request_id=req.request_id,
+                fp=req.fp,
+                detail={"reason": f"verify action {action_name!r} not in read-only tools"},
+                path=path,
+            )
             return True
         out = await tool.ainvoke(v_args)
     except Exception as e:
-        audit.record("verify", "error", request_id=req.request_id, fp=req.fp,
-                     detail={"error": f"{type(e).__name__}: {e}"}, path=path)
+        audit.record(
+            "verify",
+            "error",
+            request_id=req.request_id,
+            fp=req.fp,
+            detail={"error": f"{type(e).__name__}: {e}"},
+            path=path,
+        )
         return False  # error → conservative fail → trigger rollback
 
     passed, detail = _eval_verify_check(check, out)
-    audit.record("verify", "pass" if passed else "fail", request_id=req.request_id, fp=req.fp,
-                 detail={"check": check, "detail": detail, "output_preview": str(out)[:300]},
-                 path=path)
+    audit.record(
+        "verify",
+        "pass" if passed else "fail",
+        request_id=req.request_id,
+        fp=req.fp,
+        detail={"check": check, "detail": detail, "output_preview": str(out)[:300]},
+        path=path,
+    )
     return passed
 
 
@@ -130,28 +155,50 @@ async def _auto_rollback(req: ActionRequest, path: Path | None) -> bool:
     if rollback succeeded. Fail-closed: no contract or no impl → False."""
     contract = req.rollback
     if not contract:
-        audit.record("rollback", "skip", request_id=req.request_id, fp=req.fp,
-                     detail={"reason": "no rollback contract on request"}, path=path)
+        audit.record(
+            "rollback",
+            "skip",
+            request_id=req.request_id,
+            fp=req.fp,
+            detail={"reason": "no rollback contract on request"},
+            path=path,
+        )
         return False
 
     rb_action = contract.get("action")
     rb_args = contract.get("args", {})
     spec = registry.get(rb_action) if rb_action else None
     if spec is None or spec.impl is None:
-        audit.record("rollback", "abort", request_id=req.request_id, fp=req.fp,
-                     detail={"reason": f"rollback action {rb_action!r} has no impl"}, path=path)
+        audit.record(
+            "rollback",
+            "abort",
+            request_id=req.request_id,
+            fp=req.fp,
+            detail={"reason": f"rollback action {rb_action!r} has no impl"},
+            path=path,
+        )
         return False
 
     try:
         result = await spec.impl(rb_args)
-        audit.record("rollback", "success", request_id=req.request_id, fp=req.fp,
-                     detail={"action": rb_action, "args": rb_args, "result": str(result)[:300]},
-                     path=path)
+        audit.record(
+            "rollback",
+            "success",
+            request_id=req.request_id,
+            fp=req.fp,
+            detail={"action": rb_action, "args": rb_args, "result": str(result)[:300]},
+            path=path,
+        )
         return True
     except Exception as e:
-        audit.record("rollback", "fail", request_id=req.request_id, fp=req.fp,
-                     detail={"action": rb_action, "error": f"{type(e).__name__}: {e}"},
-                     path=path)
+        audit.record(
+            "rollback",
+            "fail",
+            request_id=req.request_id,
+            fp=req.fp,
+            detail={"action": rb_action, "error": f"{type(e).__name__}: {e}"},
+            path=path,
+        )
         return False
 
 
@@ -181,27 +228,57 @@ async def _revalidate_preconditions(req: ActionRequest, path: Path | None) -> bo
     Aborts only on an explicit `fail` — an error/skip (e.g. a transient probe
     failure) is recorded but doesn't block a human-approved action."""
     if not req.runbook_id:
-        audit.record("precondition", "skip", request_id=req.request_id, fp=req.fp,
-                     detail={"reason": "no runbook linked"}, path=path)
+        audit.record(
+            "precondition",
+            "skip",
+            request_id=req.request_id,
+            fp=req.fp,
+            detail={"reason": "no runbook linked"},
+            path=path,
+        )
         return True
     rb = next((b for b in load_runbooks() if b.id == req.runbook_id), None)
     if rb is None or not rb.diagnostics:
-        audit.record("precondition", "skip", request_id=req.request_id, fp=req.fp,
-                     detail={"reason": f"runbook {req.runbook_id} has no diagnostics"}, path=path)
+        audit.record(
+            "precondition",
+            "skip",
+            request_id=req.request_id,
+            fp=req.fp,
+            detail={"reason": f"runbook {req.runbook_id} has no diagnostics"},
+            path=path,
+        )
         return True
     try:
         results = await run_diagnostics(rb, req.params, _read_only_tools())
     except Exception as e:
-        audit.record("precondition", "skip", request_id=req.request_id, fp=req.fp,
-                     detail={"error": f"{type(e).__name__}: {e}"}, path=path)
+        audit.record(
+            "precondition",
+            "skip",
+            request_id=req.request_id,
+            fp=req.fp,
+            detail={"error": f"{type(e).__name__}: {e}"},
+            path=path,
+        )
         return True
     failed = [r for r in results if r.status == "fail"]
     if failed:
-        audit.record("precondition", "abort", request_id=req.request_id, fp=req.fp,
-                     detail={"failed": [r.desc for r in failed]}, path=path)
+        audit.record(
+            "precondition",
+            "abort",
+            request_id=req.request_id,
+            fp=req.fp,
+            detail={"failed": [r.desc for r in failed]},
+            path=path,
+        )
         return False
-    audit.record("precondition", "ok", request_id=req.request_id, fp=req.fp,
-                 detail={"checked": len(results)}, path=path)
+    audit.record(
+        "precondition",
+        "ok",
+        request_id=req.request_id,
+        fp=req.fp,
+        detail={"checked": len(results)},
+        path=path,
+    )
     return True
 
 
@@ -211,20 +288,37 @@ async def _check_blast_radius(req: ActionRequest, path: Path | None) -> bool:
     cluster, or any error, aborts."""
     spec = registry.get(req.action)
     if spec is None or spec.dry_run is None:
-        audit.record("dry_run", "skip", request_id=req.request_id, fp=req.fp,
-                     detail={"reason": "no dry-run for action"}, path=path)
+        audit.record(
+            "dry_run",
+            "skip",
+            request_id=req.request_id,
+            fp=req.fp,
+            detail={"reason": "no dry-run for action"},
+            path=path,
+        )
         return True
     try:
         br = await spec.dry_run(req.args)
     except Exception as e:
-        audit.record("dry_run", "abort", request_id=req.request_id, fp=req.fp,
-                     detail={"error": f"{type(e).__name__}: {e}"}, path=path)
+        audit.record(
+            "dry_run",
+            "abort",
+            request_id=req.request_id,
+            fp=req.fp,
+            detail={"error": f"{type(e).__name__}: {e}"},
+            path=path,
+        )
         return False
     store.ar_update(req.request_id, blast_radius=br.model_dump(), path=path)
     ok, reason = blast_radius.evaluate_policy(br)
-    audit.record("dry_run", "ok" if ok else "abort", request_id=req.request_id, fp=req.fp,
-                 detail={"blast_radius": blast_radius.format_blast_radius(br), "reason": reason},
-                 path=path)
+    audit.record(
+        "dry_run",
+        "ok" if ok else "abort",
+        request_id=req.request_id,
+        fp=req.fp,
+        detail={"blast_radius": blast_radius.format_blast_radius(br), "reason": reason},
+        path=path,
+    )
     return ok
 
 
@@ -240,29 +334,53 @@ async def run(request_id: str, path: Path | None = None) -> dict:
     if not _claim(req.request_id, req.fp, path):
         return {"status": req.status, "outcome": "not in approved state"}
 
-    audit.record("execute", "start", request_id=req.request_id, fp=req.fp,
-                 detail={"action": req.action, "args": req.args}, path=path)
+    audit.record(
+        "execute",
+        "start",
+        request_id=req.request_id,
+        fp=req.fp,
+        detail={"action": req.action, "args": req.args},
+        path=path,
+    )
 
     # --- 1. precondition revalidation (7b-2) ---------------------------------
     if not await _revalidate_preconditions(req, path):
-        ar_store_transition(req.request_id, Status.EXECUTING, Status.ABORTED,
-                            outcome="precondition no longer holds", path=path)
+        ar_store_transition(
+            req.request_id,
+            Status.EXECUTING,
+            Status.ABORTED,
+            outcome="precondition no longer holds",
+            path=path,
+        )
         return {"status": Status.ABORTED.value, "outcome": "precondition no longer holds"}
 
     # --- 2. dry-run + blast-radius gate (7b-2) -------------------------------
     if not await _check_blast_radius(req, path):
-        ar_store_transition(req.request_id, Status.EXECUTING, Status.ABORTED,
-                            outcome="blast radius exceeds policy / dry-run unavailable", path=path)
+        ar_store_transition(
+            req.request_id,
+            Status.EXECUTING,
+            Status.ABORTED,
+            outcome="blast radius exceeds policy / dry-run unavailable",
+            path=path,
+        )
         return {"status": Status.ABORTED.value, "outcome": "blast radius exceeds policy"}
 
     # --- 3. idempotency + circuit breaker gate (7b-3) ------------------------
     target = ar.target_of(req.args)
     dup = store.ar_find_ran(req.idem_key, req.request_id, path)
     if dup:
-        audit.record("idempotency", "abort", request_id=req.request_id, fp=req.fp,
-                     detail={"superseded_by": dup, "idem_key": req.idem_key}, path=path)
+        audit.record(
+            "idempotency",
+            "abort",
+            request_id=req.request_id,
+            fp=req.fp,
+            detail={"superseded_by": dup, "idem_key": req.idem_key},
+            path=path,
+        )
         ar_store_transition(
-            req.request_id, Status.EXECUTING, Status.ABORTED,
+            req.request_id,
+            Status.EXECUTING,
+            Status.ABORTED,
             outcome=f"idempotent: target already acted on for this incident ({dup})",
             path=path,
         )
@@ -270,10 +388,21 @@ async def run(request_id: str, path: Path | None = None) -> dict:
 
     allowed, reason = breaker.check(req.action, target, path)
     if not allowed:
-        audit.record("breaker", "abort", request_id=req.request_id, fp=req.fp,
-                     detail={"reason": reason}, path=path)
-        ar_store_transition(req.request_id, Status.EXECUTING, Status.ABORTED,
-                            outcome=f"circuit breaker: {reason}", path=path)
+        audit.record(
+            "breaker",
+            "abort",
+            request_id=req.request_id,
+            fp=req.fp,
+            detail={"reason": reason},
+            path=path,
+        )
+        ar_store_transition(
+            req.request_id,
+            Status.EXECUTING,
+            Status.ABORTED,
+            outcome=f"circuit breaker: {reason}",
+            path=path,
+        )
         return {"status": Status.ABORTED.value, "outcome": f"circuit breaker: {reason}"}
 
     # --- 4. execute (kill-switched; refuses until 7b-4 wires an impl) ---------
@@ -283,37 +412,78 @@ async def run(request_id: str, path: Path | None = None) -> dict:
         # Expected terminal until 7b-4: the kill switch / missing impl refuses.
         # NOTHING RAN, so this must not feed the breaker (no record_outcome) or the
         # Learn loop — just a clean REFUSED.
-        ar_store_transition(req.request_id, Status.EXECUTING, Status.REFUSED,
-                            outcome=str(e), path=path)
-        audit.record("execute", "refuse", request_id=req.request_id, fp=req.fp,
-                     detail={"reason": str(e)}, path=path)
+        ar_store_transition(
+            req.request_id, Status.EXECUTING, Status.REFUSED, outcome=str(e), path=path
+        )
+        audit.record(
+            "execute",
+            "refuse",
+            request_id=req.request_id,
+            fp=req.fp,
+            detail={"reason": str(e)},
+            path=path,
+        )
         return {"status": Status.REFUSED.value, "outcome": str(e)}
     except Exception as e:  # the action RAN and errored
-        breaker.record_outcome(req.action, target, fp=req.fp,
-                               request_id=req.request_id, success=False, path=path)
-        ar_store_transition(req.request_id, Status.EXECUTING, Status.FAILED,
-                            outcome=f"{type(e).__name__}: {e}", path=path)
-        audit.record("execute", "fail", request_id=req.request_id, fp=req.fp,
-                     detail={"error": str(e)}, path=path)
+        breaker.record_outcome(
+            req.action, target, fp=req.fp, request_id=req.request_id, success=False, path=path
+        )
+        ar_store_transition(
+            req.request_id,
+            Status.EXECUTING,
+            Status.FAILED,
+            outcome=f"{type(e).__name__}: {e}",
+            path=path,
+        )
+        audit.record(
+            "execute",
+            "fail",
+            request_id=req.request_id,
+            fp=req.fp,
+            detail={"error": str(e)},
+            path=path,
+        )
         # execute errored → try rollback, but CE is not touched (§6.2 constraint 2)
-        ar_store_transition(req.request_id, Status.FAILED, Status.ROLLING_BACK,
-                            outcome="auto-rollback after execute failure", path=path)
+        ar_store_transition(
+            req.request_id,
+            Status.FAILED,
+            Status.ROLLING_BACK,
+            outcome="auto-rollback after execute failure",
+            path=path,
+        )
         rb_ok = await _auto_rollback(req, path)
         final = Status.ROLLED_BACK if rb_ok else Status.ROLLBACK_FAILED
-        ar_store_transition(req.request_id, Status.ROLLING_BACK, final,
-                            outcome="rolled back" if rb_ok else "rollback also failed", path=path)
+        ar_store_transition(
+            req.request_id,
+            Status.ROLLING_BACK,
+            final,
+            outcome="rolled back" if rb_ok else "rollback also failed",
+            path=path,
+        )
         return {"status": final.value, "outcome": str(e)}
 
-    audit.record("execute", "success", request_id=req.request_id, fp=req.fp,
-                 detail={"result": str(result)[:500]}, path=path)
+    audit.record(
+        "execute",
+        "success",
+        request_id=req.request_id,
+        fp=req.fp,
+        detail={"result": str(result)[:500]},
+        path=path,
+    )
 
     # --- 5. verify (closed-loop settle + symptom check) ----------------------
     verified = await _verify_outcome(req, path)
     if verified:
-        breaker.record_outcome(req.action, target, fp=req.fp,
-                               request_id=req.request_id, success=True, path=path)
-        ar_store_transition(req.request_id, Status.EXECUTING, Status.SUCCEEDED,
-                            outcome="executed and verified", path=path)
+        breaker.record_outcome(
+            req.action, target, fp=req.fp, request_id=req.request_id, success=True, path=path
+        )
+        ar_store_transition(
+            req.request_id,
+            Status.EXECUTING,
+            Status.SUCCEEDED,
+            outcome="executed and verified",
+            path=path,
+        )
         # Closed-loop 三: record ok execution for SOP decay detection.
         _rb_feedback("ok", req, path)
         # --- 7. Learn: verified → correct label (§6.2 constraint 1+3) --------
@@ -324,20 +494,36 @@ async def run(request_id: str, path: Path | None = None) -> dict:
     # §6.2 constraint 2: only verify failure (not execute failure) is RCA-wrongness
     # evidence; label AFTER rollback (whether it succeeded or not — the RCA was wrong
     # regardless of whether rollback worked).
-    breaker.record_outcome(req.action, target, fp=req.fp,
-                           request_id=req.request_id, success=False, path=path)
-    ar_store_transition(req.request_id, Status.EXECUTING, Status.VERIFY_FAILED,
-                        outcome="executed but symptom persists after verify window", path=path)
+    breaker.record_outcome(
+        req.action, target, fp=req.fp, request_id=req.request_id, success=False, path=path
+    )
+    ar_store_transition(
+        req.request_id,
+        Status.EXECUTING,
+        Status.VERIFY_FAILED,
+        outcome="executed but symptom persists after verify window",
+        path=path,
+    )
     # Closed-loop 三: record verify failure before rollback.
     _rb_feedback("verify_failed", req, path)
-    ar_store_transition(req.request_id, Status.VERIFY_FAILED, Status.ROLLING_BACK,
-                        outcome="auto-rollback triggered by verify failure", path=path)
+    ar_store_transition(
+        req.request_id,
+        Status.VERIFY_FAILED,
+        Status.ROLLING_BACK,
+        outcome="auto-rollback triggered by verify failure",
+        path=path,
+    )
     rb_ok = await _auto_rollback(req, path)
     final = Status.ROLLED_BACK if rb_ok else Status.ROLLBACK_FAILED
-    ar_store_transition(req.request_id, Status.ROLLING_BACK, final,
-                        outcome="rolled back after verify failure" if rb_ok
-                        else "rollback failed after verify failure",
-                        path=path)
+    ar_store_transition(
+        req.request_id,
+        Status.ROLLING_BACK,
+        final,
+        outcome="rolled back after verify failure"
+        if rb_ok
+        else "rollback failed after verify failure",
+        path=path,
+    )
     # Closed-loop 三: record rollback outcome.
     _rb_feedback("rollback" if rb_ok else "rollback_failed", req, path)
     # --- 7. Learn: verify failed → incorrect label ---------------------------
@@ -374,14 +560,28 @@ def _rb_feedback(outcome: str, req: ActionRequest, path: Path | None) -> None:
 # Small wrappers so the store coupling stays in one place and reads cleanly above.
 def _claim(request_id: str, fp: str, path: Path | None) -> bool:
     from . import store
+
     ok = store.ar_transition(request_id, Status.APPROVED.value, Status.EXECUTING.value, path=path)
     if not ok:
-        audit.record("execute", "abort", request_id=request_id, fp=fp,
-                     detail={"reason": "request not in approved state"}, path=path)
+        audit.record(
+            "execute",
+            "abort",
+            request_id=request_id,
+            fp=fp,
+            detail={"reason": "request not in approved state"},
+            path=path,
+        )
     return ok
 
 
-def ar_store_transition(request_id: str, expect: Status, to: Status, *,
-                        outcome: str | None = None, path: Path | None = None) -> bool:
+def ar_store_transition(
+    request_id: str,
+    expect: Status,
+    to: Status,
+    *,
+    outcome: str | None = None,
+    path: Path | None = None,
+) -> bool:
     from . import store
+
     return store.ar_transition(request_id, expect.value, to.value, outcome=outcome, path=path)

@@ -7,19 +7,36 @@ from app.governance import Autonomy, Decision
 
 
 def _findings():
-    return NS(summary="v2.5.0 validator declines odd cents", hypothesis="bad deploy",
-              confidence=0.95, suspected_version="v2.5.0", services=["payment-service"])
+    return NS(
+        summary="v2.5.0 validator declines odd cents",
+        hypothesis="bad deploy",
+        confidence=0.95,
+        suspected_version="v2.5.0",
+        services=["payment-service"],
+    )
 
 
 def _decision():
-    return Decision(action="k8s.rollout_undo", autonomy=Autonomy.PROPOSE, requires_human=True,
-                    confidence=0.95, reason="approval-gated", calibration_note="ok",
-                    reversible=True, requires_approval=True)
+    return Decision(
+        action="k8s.rollout_undo",
+        autonomy=Autonomy.PROPOSE,
+        requires_human=True,
+        confidence=0.95,
+        reason="approval-gated",
+        calibration_note="ok",
+        reversible=True,
+        requires_approval=True,
+    )
 
 
 def _alert():
-    return {"labels": {"alertname": "payment-decline-rate-high",
-                       "service_name": "payment-service", "git_version": "v2.5.0"}}
+    return {
+        "labels": {
+            "alertname": "payment-decline-rate-high",
+            "service_name": "payment-service",
+            "git_version": "v2.5.0",
+        }
+    }
 
 
 def _result():
@@ -41,7 +58,7 @@ def test_record_and_list(tmp_path, monkeypatch):
     assert r["decisions"][0]["action"] == "k8s.rollout_undo"
     assert r["decisions"][0]["autonomy"] == "propose"
     assert len(r["answer"]) <= 2000  # truncated
-    assert r["correct"] is None      # not labeled yet
+    assert r["correct"] is None  # not labeled yet
 
 
 def test_latest_per_fingerprint(tmp_path, monkeypatch):
@@ -50,7 +67,8 @@ def test_latest_per_fingerprint(tmp_path, monkeypatch):
     monkeypatch.setattr(inv.settings, "investigations_enabled", True)
 
     inv.record_investigation("fp-1", _alert(), _result())
-    r2 = _result(); r2["findings"].confidence = 0.30
+    r2 = _result()
+    r2["findings"].confidence = 0.30
     inv.record_investigation("fp-1", _alert(), r2)  # same fp, newer
     rows = inv.list_investigations(path=p)
     assert len(rows) == 1 and rows[0]["confidence"] == 0.30  # latest wins
@@ -71,6 +89,7 @@ def test_correctness_merged_from_calibration(tmp_path, monkeypatch):
     monkeypatch.setattr(inv.settings, "store_path", str(p))
     monkeypatch.setattr(inv.settings, "investigations_enabled", True)
     import app.calibration as cal
+
     monkeypatch.setattr(cal.settings, "calibration_enabled", True)
 
     inv.record_investigation("fp-1", _alert(), _result())

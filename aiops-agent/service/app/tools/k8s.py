@@ -40,13 +40,29 @@ logger = logging.getLogger("aiops_agent.k8s")
 # Event reasons that actually carry incident signal. A stable cluster emits a lot
 # of routine Normal events (Scheduled, Pulled, Created, Started) — surfacing those
 # is noise. These are the ones that explain a *failure*.
-_INTERESTING_EVENT_REASONS = frozenset({
-    "OOMKilling", "OOMKilled", "Killing", "BackOff", "CrashLoopBackOff",
-    "Failed", "FailedScheduling", "FailedMount", "FailedCreate",
-    "Unhealthy", "ProbeWarning", "ProgressDeadlineExceeded",
-    "Evicted", "Preempting", "NodeNotReady", "FailedKillPod",
-    "ErrImagePull", "ImagePullBackOff", "InspectFailed",
-})
+_INTERESTING_EVENT_REASONS = frozenset(
+    {
+        "OOMKilling",
+        "OOMKilled",
+        "Killing",
+        "BackOff",
+        "CrashLoopBackOff",
+        "Failed",
+        "FailedScheduling",
+        "FailedMount",
+        "FailedCreate",
+        "Unhealthy",
+        "ProbeWarning",
+        "ProgressDeadlineExceeded",
+        "Evicted",
+        "Preempting",
+        "NodeNotReady",
+        "FailedKillPod",
+        "ErrImagePull",
+        "ImagePullBackOff",
+        "InspectFailed",
+    }
+)
 
 # Set once the kubernetes client + config load successfully. None means we
 # haven't tried yet; an Exception cached here means config load failed and we
@@ -89,7 +105,7 @@ def _unavailable(detail: str) -> dict[str, Any]:
         "unavailable": True,
         "detail": detail,
         "note": "Kubernetes is not reachable from the agent; skip k8s checks for "
-                "this turn and rely on metrics/logs/traces.",
+        "this turn and rely on metrics/logs/traces.",
     }
 
 
@@ -113,6 +129,7 @@ def _selector() -> str:
 
 # ---- pod status ------------------------------------------------------------
 
+
 def _summarize_pod(pod) -> dict[str, Any]:
     st = pod.status
     statuses = st.container_statuses or []
@@ -132,7 +149,8 @@ def _summarize_pod(pod) -> dict[str, Any]:
                 f"{last.terminated.reason}"
                 + (
                     f"(exit {last.terminated.exit_code})"
-                    if last.terminated.exit_code is not None else ""
+                    if last.terminated.exit_code is not None
+                    else ""
                 )
             )
 
@@ -176,15 +194,14 @@ async def get_pod_status(service: str) -> dict[str, Any]:
 
 # ---- events ----------------------------------------------------------------
 
+
 async def get_k8s_events(service: str, limit: int = 20) -> dict[str, Any]:
     """Recent *interesting* k8s events for a service's objects (pods / rs /
     deployment). Routine Normal events are filtered out — only the reasons that
     explain a failure (OOM, BackOff, FailedScheduling, Unhealthy, …) are kept."""
     try:
         core, _ = await asyncio.to_thread(_load_client)
-        resp = await asyncio.to_thread(
-            core.list_namespaced_event, namespace=settings.k8s_namespace
-        )
+        resp = await asyncio.to_thread(core.list_namespaced_event, namespace=settings.k8s_namespace)
     except RuntimeError as e:
         return _unavailable(str(e))
     except Exception as e:
@@ -203,18 +220,21 @@ async def get_k8s_events(service: str, limit: int = 20) -> dict[str, Any]:
         if ev.type == "Normal" and ev.reason not in _INTERESTING_EVENT_REASONS:
             continue
         ts = (
-            ev.last_timestamp or ev.event_time
+            ev.last_timestamp
+            or ev.event_time
             or (ev.metadata.creation_timestamp if ev.metadata else None)
         )
-        events.append({
-            "type": ev.type,
-            "reason": ev.reason,
-            "object": f"{obj.kind}/{name}" if obj else name,
-            "message": (ev.message or "").strip(),
-            "count": ev.count,
-            "age": _age(ts),
-            "_ts": ts,
-        })
+        events.append(
+            {
+                "type": ev.type,
+                "reason": ev.reason,
+                "object": f"{obj.kind}/{name}" if obj else name,
+                "message": (ev.message or "").strip(),
+                "count": ev.count,
+                "age": _age(ts),
+                "_ts": ts,
+            }
+        )
 
     # Most recent first; drop the sort key before returning.
     events.sort(key=lambda e: e["_ts"] or datetime.min.replace(tzinfo=UTC), reverse=True)
@@ -229,6 +249,7 @@ async def get_k8s_events(service: str, limit: int = 20) -> dict[str, Any]:
 
 
 # ---- deployment / rollout status -------------------------------------------
+
 
 async def get_deployment_status(service: str) -> dict[str, Any]:
     """Deployment replica health + rollout conditions + current revision. A
@@ -248,14 +269,20 @@ async def get_deployment_status(service: str) -> dict[str, Any]:
         logger.warning("get_deployment_status(%s) failed: %s", service, e)
         status = getattr(e, "status", None)
         if status == 404:
-            return {"service": service, "namespace": settings.k8s_namespace,
-                    "found": False, "note": f"no Deployment named '{service}' in this namespace"}
+            return {
+                "service": service,
+                "namespace": settings.k8s_namespace,
+                "found": False,
+                "note": f"no Deployment named '{service}' in this namespace",
+            }
         return _unavailable(f"k8s API error: {type(e).__name__}: {e}")
 
     st = dep.status
     conditions = [
         {
-            "type": c.type, "status": c.status, "reason": c.reason,
+            "type": c.type,
+            "status": c.status,
+            "reason": c.reason,
             "message": (c.message or "").strip(),
         }
         for c in (st.conditions or [])
@@ -266,7 +293,8 @@ async def get_deployment_status(service: str) -> dict[str, Any]:
         "namespace": settings.k8s_namespace,
         "found": True,
         "git_version": (dep.spec.template.metadata.labels or {}).get("git_version")
-        if dep.spec and dep.spec.template and dep.spec.template.metadata else None,
+        if dep.spec and dep.spec.template and dep.spec.template.metadata
+        else None,
         "revision": annotations.get("deployment.kubernetes.io/revision"),
         "desired_replicas": dep.spec.replicas if dep.spec else None,
         "ready_replicas": st.ready_replicas or 0,
@@ -279,6 +307,7 @@ async def get_deployment_status(service: str) -> dict[str, Any]:
 
 # ---- agent-facing tools ----------------------------------------------------
 
+
 class ServiceArg(BaseModel):
     service: str = Field(description="Exact service_name, e.g. payment-service.")
 
@@ -286,9 +315,9 @@ class ServiceArg(BaseModel):
 k8s_pod_status_tool = StructuredTool(
     name="k8s_pod_status",
     description="Read a service's pod health from Kubernetes: phase, readiness, "
-                "restart counts, and crash reasons (CrashLoopBackOff, OOMKilled, "
-                "ImagePullBackOff). Use to tell a platform-level failure apart from "
-                "a code regression when an incident sits on a deploy boundary.",
+    "restart counts, and crash reasons (CrashLoopBackOff, OOMKilled, "
+    "ImagePullBackOff). Use to tell a platform-level failure apart from "
+    "a code regression when an incident sits on a deploy boundary.",
     args_schema=ServiceArg,
     coroutine=get_pod_status,
 )
@@ -296,9 +325,9 @@ k8s_pod_status_tool = StructuredTool(
 k8s_events_tool = StructuredTool(
     name="k8s_events",
     description="Recent failure-related Kubernetes events for a service (OOMKilling, "
-                "BackOff, FailedScheduling, Unhealthy, ProgressDeadlineExceeded). Use "
-                "to find infra-level causes: pod restarts, scheduling pressure, probe "
-                "failures, evictions.",
+    "BackOff, FailedScheduling, Unhealthy, ProgressDeadlineExceeded). Use "
+    "to find infra-level causes: pod restarts, scheduling pressure, probe "
+    "failures, evictions.",
     args_schema=ServiceArg,
     coroutine=get_k8s_events,
 )
@@ -306,9 +335,9 @@ k8s_events_tool = StructuredTool(
 k8s_deployment_status_tool = StructuredTool(
     name="k8s_deployment_status",
     description="Deployment rollout health for a service: desired vs available "
-                "replicas, rollout conditions (e.g. ProgressDeadlineExceeded), current "
-                "revision and git_version. Use to check whether a deploy actually "
-                "became healthy.",
+    "replicas, rollout conditions (e.g. ProgressDeadlineExceeded), current "
+    "revision and git_version. Use to check whether a deploy actually "
+    "became healthy.",
     args_schema=ServiceArg,
     coroutine=get_deployment_status,
 )
