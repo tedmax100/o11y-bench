@@ -12,6 +12,7 @@ import app.tools.query as q
 
 # ---- _parse_dt -------------------------------------------------------------
 
+
 def test_parse_dt_now():
     before = datetime.now(UTC)
     result = q._parse_dt("now")
@@ -65,6 +66,7 @@ def test_parse_dt_now_whitespace():
 
 # ---- now_override ----------------------------------------------------------
 
+
 def test_now_override_pins_clock():
     fixed = datetime(2025, 6, 1, 10, 0, 0, tzinfo=UTC)
     with q.now_override(fixed):
@@ -85,27 +87,35 @@ def test_now_override_none_restores_real_clock():
 
 # ---- _is_metric_logql ------------------------------------------------------
 
-@pytest.mark.parametrize("logql", [
-    'count_over_time({service_name="payment"} [5m])',
-    'sum(count_over_time({service_name="x"} [1h]))',
-    'rate({service_name="y"} [5m])',
-    'sum by (service_name) (count_over_time({app="z"} [10m]))',
-    'topk(5, count({job="x"} [1m]))',
-])
+
+@pytest.mark.parametrize(
+    "logql",
+    [
+        'count_over_time({service_name="payment"} [5m])',
+        'sum(count_over_time({service_name="x"} [1h]))',
+        'rate({service_name="y"} [5m])',
+        'sum by (service_name) (count_over_time({app="z"} [10m]))',
+        'topk(5, count({job="x"} [1m]))',
+    ],
+)
 def test_is_metric_logql_true(logql):
     assert q._is_metric_logql(logql) is True
 
 
-@pytest.mark.parametrize("logql", [
-    '{service_name="payment"} | json',
-    '{service_name="payment"} | event="payment.declined"',
-    '{service_name="payment"}',
-])
+@pytest.mark.parametrize(
+    "logql",
+    [
+        '{service_name="payment"} | json',
+        '{service_name="payment"} | event="payment.declined"',
+        '{service_name="payment"}',
+    ],
+)
 def test_is_metric_logql_false(logql):
     assert q._is_metric_logql(logql) is False
 
 
 # ---- _round_sig ------------------------------------------------------------
+
 
 def test_round_sig_basic():
     assert q._round_sig(123456.789, 4) == 123500.0
@@ -125,6 +135,7 @@ def test_round_sig_nan():
 
 
 # ---- _summarize_series_result ----------------------------------------------
+
 
 def _make_matrix(values: list[float]) -> dict:
     pairs = [[1000 + i * 60, str(v)] for i, v in enumerate(values)]
@@ -193,6 +204,7 @@ def test_summarize_empty_values():
 
 # ---- _selector -------------------------------------------------------------
 
+
 def test_selector_extracts_braces():
     assert q._selector('{service_name="payment"}') == '{service_name="payment"}'
 
@@ -207,6 +219,7 @@ def test_selector_none_when_no_braces():
 
 
 # ---- _loki_query_hint ------------------------------------------------------
+
 
 def test_loki_hint_missing_selector():
     exc = ToolException("returned 400: parse error")
@@ -229,6 +242,7 @@ def test_loki_hint_non_parse_error_unchanged():
 
 # ---- _tempo_query_hint -----------------------------------------------------
 
+
 def test_tempo_hint_injects_traceql_syntax():
     exc = ToolException("returned 400: parse error")
     result = q._tempo_query_hint('resource.service.name="payment"', exc)
@@ -242,6 +256,7 @@ def test_tempo_hint_non_parse_passthrough():
 
 
 # ---- async query functions (httpx mocked) ----------------------------------
+
 
 @pytest.mark.asyncio
 async def test_query_prometheus_range(monkeypatch):
@@ -260,9 +275,7 @@ async def test_query_prometheus_range(monkeypatch):
     mock = AsyncMock(return_value=fake_resp)
     monkeypatch.setattr(q, "_get_json", mock)
 
-    result = await q._query_prometheus(
-        'rate(http_requests_total[5m])', start="now-1h", end="now"
-    )
+    result = await q._query_prometheus("rate(http_requests_total[5m])", start="now-1h", end="now")
     assert result["resultType"] == "matrix_summary"
     mock.assert_awaited_once()
     _, path, _params = mock.call_args[0]
@@ -330,7 +343,7 @@ async def test_query_loki_parse_error_gets_hint(monkeypatch):
     monkeypatch.setattr(
         q,
         "_get_json",
-        AsyncMock(side_effect=ToolException('returned 400: parse error at position 0')),
+        AsyncMock(side_effect=ToolException("returned 400: parse error at position 0")),
     )
     with pytest.raises(ToolException) as exc_info:
         await q._query_loki_logs('event="foo"')

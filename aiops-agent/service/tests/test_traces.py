@@ -16,6 +16,7 @@ from app.traces import (
 
 # ---- _otlp_val -------------------------------------------------------------
 
+
 def test_otlp_val_string():
     assert _otlp_val({"stringValue": "hello"}) == "hello"
 
@@ -48,6 +49,7 @@ def test_otlp_val_unknown_returns_first_value():
 
 # ---- _flatten --------------------------------------------------------------
 
+
 def test_flatten_basic():
     attrs = [
         {"key": "service.name", "value": {"stringValue": "payment"}},
@@ -66,6 +68,7 @@ def test_flatten_none():
 
 
 # ---- _maybe_json -----------------------------------------------------------
+
 
 def test_maybe_json_parses_object():
     assert _maybe_json('{"key": "val"}') == {"key": "val"}
@@ -90,6 +93,7 @@ def test_maybe_json_invalid_json_unchanged():
 
 
 # ---- _truncate -------------------------------------------------------------
+
 
 def test_truncate_long_string():
     s = "a" * 700
@@ -117,6 +121,7 @@ def test_truncate_dict_recurses():
 
 # ---- _cost -----------------------------------------------------------------
 
+
 def test_cost_known_model():
     # gemini-2.5-flash: 0.30/M input, 2.50/M output
     c = _cost("gemini-2.5-flash", in_tok=1_000_000, out_tok=0, cache_tok=0)
@@ -139,6 +144,7 @@ def test_cost_zero_tokens():
 
 
 # ---- _node_kind ------------------------------------------------------------
+
 
 def test_node_kind_llm_by_name():
     assert _node_kind("ChatGoogleGenerativeAI.chat", {}) == "llm"
@@ -170,6 +176,7 @@ def test_node_kind_business():
 
 # ---- _node_label -----------------------------------------------------------
 
+
 def test_node_label_uses_run_name():
     assert _node_label("span", {"run_name": "RCA_Agent"}) == "RCA_Agent"
 
@@ -187,6 +194,7 @@ def test_node_label_falls_back_to_name():
 
 
 # ---- _normalize_trace ------------------------------------------------------
+
 
 def _make_span(
     span_id: str,

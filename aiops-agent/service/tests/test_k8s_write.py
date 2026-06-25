@@ -34,6 +34,7 @@ def _make_deployment(rev: int, labels: dict | None = None) -> SimpleNamespace:
 
 # ---- helpers ---------------------------------------------------------------
 
+
 def _patch_read_client(dep, rs_list_items):
     """Return a patch that makes k8s._load_client return fakes."""
     apps_r = MagicMock()
@@ -49,6 +50,7 @@ def _patch_write_api(write_api=None):
 
 
 # ---- impl_rollout_undo -----------------------------------------------------
+
 
 def _fake_template():
     return {
@@ -104,7 +106,10 @@ async def test_rollout_undo_uses_default_namespace(monkeypatch):
 
     write_api = MagicMock()
     mock_api_client = MagicMock()
-    mock_api_client.sanitize_for_serialization.return_value = {"metadata": {"annotations": {}}, "spec": {}}
+    mock_api_client.sanitize_for_serialization.return_value = {
+        "metadata": {"annotations": {}},
+        "spec": {},
+    }
 
     with _patch_read_client(dep, [curr_rs, prev_rs]):
         with patch.object(kw, "_load_write_api", return_value=write_api):
@@ -116,6 +121,7 @@ async def test_rollout_undo_uses_default_namespace(monkeypatch):
 
 
 # ---- impl_scale ------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_scale_patches_replicas():
@@ -169,6 +175,7 @@ async def test_scale_uses_default_namespace(monkeypatch):
 
 # ---- _load_write_api caching -----------------------------------------------
 
+
 def test_load_write_api_error_is_cached(tmp_path):
     """Once the write client fails to load, subsequent calls raise with the cached message."""
     # Reset module-level cache
@@ -177,7 +184,9 @@ def test_load_write_api_error_is_cached(tmp_path):
 
     with patch("pathlib.Path.exists", return_value=False):
         with patch("kubernetes.config.load_incluster_config", side_effect=Exception("not in k8s")):
-            with patch("kubernetes.config.load_kube_config", side_effect=Exception("no kubeconfig")):
+            with patch(
+                "kubernetes.config.load_kube_config", side_effect=Exception("no kubeconfig")
+            ):
                 with pytest.raises(RuntimeError, match="k8s write client unavailable"):
                     kw._load_write_api()
 
