@@ -4,17 +4,15 @@ cost model, and truncation. No live HTTP or LLM calls."""
 import pytest
 
 from app.traces import (
-    MODEL_PRICES,
     _cost,
     _flatten,
     _maybe_json,
-    _normalize_trace,
     _node_kind,
     _node_label,
+    _normalize_trace,
     _otlp_val,
     _truncate,
 )
-
 
 # ---- _otlp_val -------------------------------------------------------------
 

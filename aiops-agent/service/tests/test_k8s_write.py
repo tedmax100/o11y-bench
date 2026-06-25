@@ -2,14 +2,14 @@
 All kubernetes API calls are mocked; no cluster needed."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 import app.tools.k8s_write as kw
 
 
-def _make_rs(rev: int, images: list[str], name: str = None) -> SimpleNamespace:
+def _make_rs(rev: int, images: list[str], name: str | None = None) -> SimpleNamespace:
     """Build a minimal ReplicaSet mock with the revision annotation."""
     containers = [SimpleNamespace(image=img) for img in images]
     template_spec = SimpleNamespace(containers=containers)

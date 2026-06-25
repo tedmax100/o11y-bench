@@ -3,13 +3,12 @@ error hint injection, and the auto queryType routing. No live HTTP calls."""
 
 import math
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 from langchain_core.tools import ToolException
 
 import app.tools.query as q
-
 
 # ---- _parse_dt -------------------------------------------------------------
 
@@ -266,7 +265,7 @@ async def test_query_prometheus_range(monkeypatch):
     )
     assert result["resultType"] == "matrix_summary"
     mock.assert_awaited_once()
-    _, path, params = mock.call_args[0]
+    _, path, _params = mock.call_args[0]
     assert path == "/api/v1/query_range"
 
 
@@ -304,7 +303,7 @@ async def test_query_loki_metric_uses_instant(monkeypatch):
     monkeypatch.setattr(q, "_get_json", mock)
 
     await q._query_loki_logs('count_over_time({service_name="x"} [5m])')
-    _, path, params = mock.call_args[0]
+    _, path, _params = mock.call_args[0]
     # metric logql → instant endpoint
     assert path == "/loki/api/v1/query"
 
