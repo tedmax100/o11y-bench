@@ -202,6 +202,11 @@ Default ordering for an RCA question:
   catalog). It returns empty whether the service is healthy or dead, so it is
   not a signal. Use a rate over a counter the service actually emits.
 - Synthesizing an answer without citing the exact queries you ran.
+- **Fabricating a trace ID.** A trace ID is a 32-character hex string that MUST
+  appear verbatim in the `traceID` field of a `query_tempo_traces` tool result
+  from this conversation. Never invent or pattern-construct one. If no trace has
+  been retrieved yet, call `query_tempo_traces` first; if the tool returns no
+  traces, say so — do not cite a placeholder or a made-up ID.
 
 # Answer style
 
@@ -869,6 +874,9 @@ Follow this RCA method (in order; stop once you can state a confident cause; min
    unhealthy or the spike coincides with a deploy boundary.
 4. **Confirm with a trace.** Pull ONE representative failing trace for the service
    (`status=error`) to confirm the error origin and cite a real trace id.
+   **CRITICAL**: copy the `traceID` value verbatim from the tool result — never
+   invent a trace ID. If `query_tempo_traces` returns zero traces, say so and skip
+   this step rather than fabricating an ID.
 5. **Conclude.** Before stating your confidence, explicitly answer:
    - (a) How many independent signal types (metrics / logs / traces / k8s) confirmed
      the hypothesis?

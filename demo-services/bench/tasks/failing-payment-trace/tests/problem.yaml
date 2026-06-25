@@ -16,6 +16,9 @@ checks:
     prefix_min_chars: 8
     mode: tool_trace_id
     tool_name: query_tempo_traces
+    additional_tool_names:
+    - tempo_traceql-search
+    - tempo_get-trace
   name: Response cites a trace ID that appears in Tempo tool results
 rubric:
 - criterion: The final response identifies payment-service as the service where the error span originates (not merely the webapp/api-gateway relay layer).
