@@ -405,6 +405,33 @@ async def run(request_id: str, path: Path | None = None) -> dict:
         )
         return {"status": Status.ABORTED.value, "outcome": f"circuit breaker: {reason}"}
 
+    # --- 3b. rubric gate: LLM safety check for k8s mutations ------------------
+    # Only run when actions are live — no point blocking a kill-switched execute.
+    try:
+        from .rubric import check_k8s_write
+
+        context = getattr(req, "runbook_id", "") or ""
+        rubric_ok, rubric_reason = await check_k8s_write(req.action, req.args, context)
+        if not rubric_ok and settings.actions_enabled:
+            audit.record(
+                "rubric",
+                "abort",
+                request_id=req.request_id,
+                fp=req.fp,
+                detail={"action": req.action, "reason": rubric_reason},
+                path=path,
+            )
+            ar_store_transition(
+                req.request_id,
+                Status.EXECUTING,
+                Status.ABORTED,
+                outcome=f"rubric blocked: {rubric_reason}",
+                path=path,
+            )
+            return {"status": Status.ABORTED.value, "outcome": f"rubric blocked: {rubric_reason}"}
+    except Exception as _rubric_exc:
+        logger.warning("k8s write rubric check failed (best-effort): %s", _rubric_exc)
+
     # --- 4. execute (kill-switched; refuses until 7b-4 wires an impl) ---------
     try:
         result = await registry.execute(req.action, req.args)

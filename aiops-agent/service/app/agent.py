@@ -1033,6 +1033,29 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
 
     messages = result.get("messages", [])
     answer = _flatten_content(getattr(messages[-1], "content", None)) if messages else ""
+
+    # Rubric gate: verify any trace IDs in the answer actually exist in Tempo.
+    # If hallucinated, inject a correction and let the agent retry once.
+    try:
+        from .rubric import verify_trace_ids
+
+        trace_ok, trace_retry_prompt = await verify_trace_ids(answer)
+        if not trace_retry_prompt == "" and not trace_ok:
+            logger.info("rubric: trace ID hallucination detected — injecting correction (fp=%s)", thread_id)
+            with now_override(starts_dt):
+                result = await agent.ainvoke(
+                    {
+                        "messages": [{"role": "user", "content": trace_retry_prompt}],
+                        "tool_calls_used": 0,
+                        "budget": max(2, settings.webhook_tool_call_budget // 2),
+                    },
+                    config=config,
+                )
+            messages = result.get("messages", [])
+            answer = _flatten_content(getattr(messages[-1], "content", None)) if messages else answer
+    except Exception as _rubric_exc:
+        logger.warning("rubric trace check failed (best-effort): %s", _rubric_exc)
+
     findings = await extract_findings(messages)
 
     while (
@@ -1373,8 +1396,9 @@ async def stream_chat(
                 "output_preview": preview,
             }
 
-        elif kind == "on_chain_end" and name == "LangGraph":
-            # Fallback: if streaming tokens didn't fire, emit the final message text
+        elif kind == "on_chain_end" and name == "force_answer":
+            # force_answer uses ainvoke (not streaming), so on_chat_model_stream
+            # never fires. Capture the node's output message here instead.
             output = data.get("output", {})
             messages = output.get("messages", []) if isinstance(output, dict) else []
             if messages:
@@ -1383,10 +1407,42 @@ async def stream_chat(
                 if raw is None and isinstance(last, dict):
                     raw = last.get("content")
                 text = _flatten_content(raw)
-                if text:
-                    if not answer_parts:
+                if text and text not in answer_parts:
+                    answer_parts.append(text)
+                    yield {"type": "token", "text": text}
+
+        elif kind == "on_chain_end" and name == "LangGraph":
+            # Final fallback: emit last message if nothing was streamed at all.
+            if not answer_parts:
+                output = data.get("output", {})
+                messages = output.get("messages", []) if isinstance(output, dict) else []
+                if messages:
+                    last = messages[-1]
+                    raw = getattr(last, "content", None)
+                    if raw is None and isinstance(last, dict):
+                        raw = last.get("content")
+                    text = _flatten_content(raw)
+                    if text:
                         answer_parts.append(text)
-                    yield {"type": "final", "text": text}
+                        yield {"type": "final", "text": text}
+
+    # Rubric gate: verify any trace IDs in the accumulated answer exist in Tempo.
+    # If hallucinated, stream a correction token and note it in the answer.
+    try:
+        from .rubric import verify_trace_ids as _vt
+
+        _answer_so_far = "".join(answer_parts)
+        _trace_ok, _trace_retry = await _vt(_answer_so_far)
+        if not _trace_ok:
+            logger.warning("rubric(chat): trace ID hallucination — injecting correction")
+            _correction = (
+                "\n\n> **[注意]** 部分 trace ID 無法在 Tempo 中驗證，已移除。"
+                "請重新查詢 `query_tempo_traces` 取得真實 trace ID。"
+            )
+            answer_parts.append(_correction)
+            yield {"type": "token", "text": _correction}
+    except Exception as _re:
+        logger.warning("rubric(chat) trace check failed (best-effort): %s", _re)
 
     async for ev in _followups_and_done(message, answer_parts):
         yield ev
