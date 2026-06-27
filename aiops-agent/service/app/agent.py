@@ -530,6 +530,8 @@ class RcaState(TypedDict):
     messages: Annotated[list, add_messages]
     tool_calls_used: int
     budget: int
+    rubric_feedback: str        # correction prompt from rubric node; "" means passed
+    rubric_revision_count: int  # how many rubric-driven retries have happened this turn
 
 
 def _last_tool_calls(messages: list) -> list:
@@ -564,8 +566,15 @@ def _build_graph():
         # continuation reminder — the snapshot + tool results are already in
         # `messages`, so re-sending the ~4k prompt every loop is pure waste.
         sys = build_system_prompt() if state["tool_calls_used"] == 0 else CONTINUE_PROMPT
-        msgs = [SystemMessage(content=sys)] + state["messages"]
-        return {"messages": [await llm_with_tools.ainvoke(msgs)]}
+        extra = []
+        feedback = state.get("rubric_feedback", "")
+        if feedback:
+            extra = [HumanMessage(content=feedback)]
+        msgs = [SystemMessage(content=sys)] + state["messages"] + extra
+        return {
+            "messages": [await llm_with_tools.ainvoke(msgs)],
+            "rubric_feedback": "",  # consumed; clear so it doesn't re-inject next loop
+        }
 
     async def tools_node(state: RcaState):
         # Count the calls this AIMessage requested *before* ToolNode runs them,
@@ -623,23 +632,54 @@ def _build_graph():
         msgs = state["messages"] + [nudge]
         return {"messages": [await llm.ainvoke(msgs)]}
 
+    async def rubric_trace_node(state: RcaState):
+        """Verify trace IDs in the last agent answer against Tempo.
+        Writes rubric_feedback (non-empty = hallucination found) back to state.
+        """
+        from .rubric import verify_trace_ids
+
+        msgs = state["messages"]
+        answer = _flatten_content(getattr(msgs[-1], "content", None)) if msgs else ""
+        try:
+            ok, retry_prompt = await verify_trace_ids(answer)
+        except Exception as e:
+            logger.warning("rubric_trace_node: check failed (%s) — passing through", e)
+            ok, retry_prompt = True, ""
+        revision = state.get("rubric_revision_count", 0)
+        return {
+            "rubric_feedback": retry_prompt,
+            "rubric_revision_count": revision + (0 if ok else 1),
+        }
+
+    _MAX_RUBRIC_REVISIONS = 1
+
     def route_after_agent(state: RcaState) -> str:
         if not _last_tool_calls(state["messages"]):
-            return END  # model answered without (more) tools
+            return "rubric_trace"  # agent answered — run rubric before END
         if state["tool_calls_used"] >= state["budget"]:
             return "force_answer"
         return "tools"
+
+    def route_after_rubric(state: RcaState) -> str:
+        if state.get("rubric_feedback") and state.get("rubric_revision_count", 0) <= _MAX_RUBRIC_REVISIONS:
+            return "agent"  # hallucination detected — let agent retry with correction
+        return END
 
     graph = StateGraph(RcaState)
     graph.add_node("agent", agent_node)
     graph.add_node("tools", tools_node)
     graph.add_node("force_answer", force_answer_node)
+    graph.add_node("rubric_trace", rubric_trace_node)
     graph.add_edge(START, "agent")
     graph.add_conditional_edges(
-        "agent", route_after_agent, {"tools": "tools", "force_answer": "force_answer", END: END}
+        "agent", route_after_agent,
+        {"tools": "tools", "force_answer": "force_answer", "rubric_trace": "rubric_trace"},
     )
     graph.add_edge("tools", "agent")
-    graph.add_edge("force_answer", END)
+    graph.add_edge("force_answer", "rubric_trace")
+    graph.add_conditional_edges(
+        "rubric_trace", route_after_rubric, {"agent": "agent", END: END}
+    )
     return graph.compile(checkpointer=MemorySaver())
 
 
@@ -1027,34 +1067,14 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
                 "messages": turn_messages,
                 "tool_calls_used": 0,
                 "budget": settings.webhook_tool_call_budget,
+                "rubric_feedback": "",
+                "rubric_revision_count": 0,
             },
             config=config,
         )
 
     messages = result.get("messages", [])
     answer = _flatten_content(getattr(messages[-1], "content", None)) if messages else ""
-
-    # Rubric gate: verify any trace IDs in the answer actually exist in Tempo.
-    # If hallucinated, inject a correction and let the agent retry once.
-    try:
-        from .rubric import verify_trace_ids
-
-        trace_ok, trace_retry_prompt = await verify_trace_ids(answer)
-        if not trace_retry_prompt == "" and not trace_ok:
-            logger.info("rubric: trace ID hallucination detected — injecting correction (fp=%s)", thread_id)
-            with now_override(starts_dt):
-                result = await agent.ainvoke(
-                    {
-                        "messages": [{"role": "user", "content": trace_retry_prompt}],
-                        "tool_calls_used": 0,
-                        "budget": max(2, settings.webhook_tool_call_budget // 2),
-                    },
-                    config=config,
-                )
-            messages = result.get("messages", [])
-            answer = _flatten_content(getattr(messages[-1], "content", None)) if messages else answer
-    except Exception as _rubric_exc:
-        logger.warning("rubric trace check failed (best-effort): %s", _rubric_exc)
 
     findings = await extract_findings(messages)
 
@@ -1087,6 +1107,8 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
                     "messages": [{"role": "user", "content": pivot_msg}],
                     "tool_calls_used": 0,
                     "budget": settings.webhook_tool_call_budget,
+                    "rubric_feedback": "",
+                    "rubric_revision_count": 0,
                 },
                 config=config,
             )
@@ -1352,7 +1374,8 @@ async def stream_chat(
     async for event in agent.astream_events(
         # tool_calls_used resets to 0 each turn (overwrite reducer); messages
         # append to the thread history (add_messages reducer).
-        {"messages": turn_messages, "tool_calls_used": 0, "budget": settings.tool_call_budget},
+        {"messages": turn_messages, "tool_calls_used": 0, "budget": settings.tool_call_budget,
+         "rubric_feedback": "", "rubric_revision_count": 0},
         config=config,
         version="v2",
     ):
@@ -1425,24 +1448,6 @@ async def stream_chat(
                     if text:
                         answer_parts.append(text)
                         yield {"type": "final", "text": text}
-
-    # Rubric gate: verify any trace IDs in the accumulated answer exist in Tempo.
-    # If hallucinated, stream a correction token and note it in the answer.
-    try:
-        from .rubric import verify_trace_ids as _vt
-
-        _answer_so_far = "".join(answer_parts)
-        _trace_ok, _trace_retry = await _vt(_answer_so_far)
-        if not _trace_ok:
-            logger.warning("rubric(chat): trace ID hallucination — injecting correction")
-            _correction = (
-                "\n\n> **[注意]** 部分 trace ID 無法在 Tempo 中驗證，已移除。"
-                "請重新查詢 `query_tempo_traces` 取得真實 trace ID。"
-            )
-            answer_parts.append(_correction)
-            yield {"type": "token", "text": _correction}
-    except Exception as _re:
-        logger.warning("rubric(chat) trace check failed (best-effort): %s", _re)
 
     async for ev in _followups_and_done(message, answer_parts):
         yield ev
