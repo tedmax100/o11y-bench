@@ -2,3 +2,8 @@
 calibration.jsonl
 # Runtime headless-investigation store — not source.
 investigations.jsonl
+# Durable SQLite store (CE harness + investigations) that retired the JSONL files.
+aiops.db
+# Eval harness artifacts: per-run calibration store + saved regression baseline.
+app/eval/eval.db
+app/eval/baseline.json

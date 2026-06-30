@@ -1,0 +1,47 @@
+# aiops-agent eval fixtures — incidents the agent should be able to root-cause.
+#
+# Each fixture is a synthetic Grafana alert payload + the ground truth the
+# Findings are graded against (service required; version optional). `startsAt`
+# pins the agent's scenario clock: use an ISO-8601 UTC time that the incident's
+# data actually covers in your running stack, or the literal `now` for a live
+# incident you just triggered.
+#
+# (A) shared-stack workflow: bring up the demo o11y stack, trigger the payment
+# decline incident (POST odd-cent charges to payment :8001/charge per RUNBOOK),
+# then `python -m app.eval run`.
+
+- id: payment-decline-service
+  alert:
+    labels:
+      service_name: payment-service
+      alertname: PaymentHighDeclineRate
+    annotations:
+      summary: "payment-service decline rate elevated"
+      description: "Charge decline ratio for payment-service is above the SLO threshold."
+    startsAt: now
+  truth:
+    service: payment-service
+    # The decline spike is shipped by the new_validator flag in v2.5.0; grading
+    # requires BOTH the service AND this version to count as correct.
+    version: v2.5.0
+
+# Negative / inconclusive case: an alert fires for a service that is actually
+# HEALTHY (no incident in the data at this time). The correct behaviour is to
+# stay uncertain — NOT to confidently invent a culprit. This catches the
+# "always blames someone / confidently wrong" regression that a suite of only
+# positive fixtures would pass straight through. Point it at a quiet service /
+# window in your stack; trigger no load for it.
+- id: user-service-no-incident
+  alert:
+    labels:
+      service_name: user-service
+      alertname: UserServiceLatencyWarning
+    annotations:
+      summary: "user-service p95 latency warning"
+      description: "Possible latency elevation on user-service — investigate."
+    startsAt: now
+  expect: inconclusive
+  max_confidence: 0.6        # correct iff the agent hedges at/below this
+  forbid_services:           # …and never confidently blames a bystander
+    - payment-service
+    - order-service
