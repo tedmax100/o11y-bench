@@ -1,13 +1,13 @@
 """Unit tests for app/rubric.py — trace ID verification and k8s write rubric."""
 
+from unittest.mock import AsyncMock
+
+import httpx
 import pytest
 import respx
-import httpx
-from unittest.mock import AsyncMock, patch
 
 import app.rubric as rubric
-from app.rubric import verify_trace_ids, check_k8s_write, _tempo_trace_exists
-
+from app.rubric import _tempo_trace_exists, check_k8s_write, verify_trace_ids
 
 # ---------------------------------------------------------------------------
 # _tempo_trace_exists
@@ -50,6 +50,7 @@ async def test_tempo_exists_returns_false_on_empty_batches():
 @pytest.mark.asyncio
 async def test_tempo_exists_returns_true_on_network_error(monkeypatch):
     """Network failure → assume valid (never block on infra issues)."""
+
     async def _raise(*a, **kw):
         raise httpx.ConnectError("timeout")
 
@@ -109,6 +110,7 @@ async def test_verify_exception_in_tempo_check_passes_through(monkeypatch):
     """Exception propagating out of _tempo_trace_exists → treated as valid (best-effort).
     _tempo_trace_exists catches its own httpx errors and returns True, so this
     tests that verify_trace_ids also handles unexpected exceptions gracefully."""
+
     async def _raise(tid):
         raise Exception("unexpected error")
 
@@ -116,7 +118,7 @@ async def test_verify_exception_in_tempo_check_passes_through(monkeypatch):
     tid = "ffffffffffffffffffffffffffffffff"
     # verify_trace_ids should not raise even if _tempo_trace_exists throws
     try:
-        ok, prompt = await verify_trace_ids(f"See trace {tid}.")
+        ok, _prompt = await verify_trace_ids(f"See trace {tid}.")
         # If it catches internally, no missing → pass
         assert ok is True
     except Exception:
@@ -140,8 +142,9 @@ async def test_verify_deduplicates_repeated_ids(monkeypatch):
 
 
 def _mock_llm(verdict_ok: bool, reason: str = "ok"):
-    from app.rubric import _K8sRubricVerdict
     from langchain_core.runnables import RunnableLambda
+
+    from app.rubric import _K8sRubricVerdict
 
     async def _invoke(messages, **kw):
         return _K8sRubricVerdict(safe_to_proceed=verdict_ok, reason=reason)
@@ -163,9 +166,7 @@ async def test_k8s_write_allows_safe_rollout_undo(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_k8s_write_blocks_when_llm_says_unsafe(monkeypatch):
-    monkeypatch.setattr(
-        rubric, "_k8s_rubric_llm", lambda: _mock_llm(False, "replica count is 0")
-    )
+    monkeypatch.setattr(rubric, "_k8s_rubric_llm", lambda: _mock_llm(False, "replica count is 0"))
     ok, reason = await check_k8s_write(
         "k8s.scale",
         {"deployment": "payment-service", "replicas": 0},
@@ -193,7 +194,7 @@ async def test_k8s_write_passes_on_llm_exception(monkeypatch):
 async def test_k8s_write_empty_context_still_runs(monkeypatch):
     """No incident context provided → rubric still executes."""
     monkeypatch.setattr(rubric, "_k8s_rubric_llm", lambda: _mock_llm(True, "allowed"))
-    ok, reason = await check_k8s_write("k8s.rollout_undo", {"deployment": "svc"})
+    ok, _reason = await check_k8s_write("k8s.rollout_undo", {"deployment": "svc"})
     assert ok is True
 
 
@@ -209,7 +210,8 @@ async def test_rubric_gate_blocks_when_actions_enabled(monkeypatch):
 
     monkeypatch.setattr(ex.settings, "actions_enabled", True)
     monkeypatch.setattr(
-        rubric, "_k8s_rubric_llm",
+        rubric,
+        "_k8s_rubric_llm",
         lambda: _mock_llm(False, "replica count is 0"),
     )
     ok, reason = await check_k8s_write("k8s.scale", {"replicas": 0}, "")
@@ -227,7 +229,8 @@ async def test_rubric_does_not_block_when_actions_disabled(monkeypatch):
 
     monkeypatch.setattr(ex.settings, "actions_enabled", False)
     monkeypatch.setattr(
-        rubric, "_k8s_rubric_llm",
+        rubric,
+        "_k8s_rubric_llm",
         lambda: _mock_llm(False, "unsafe"),
     )
     rubric_ok, _ = await check_k8s_write("k8s.rollout_undo", {"deployment": "x"}, "")

@@ -28,6 +28,7 @@ aiops-agent 忠實實現了 ARE 的 **訊號平面 + 推論平面 與安全紀�
 | 紀律：信心分數 | ✅ 有（輸出層面） |
 | 紀律：幻覺傳播防禦 | ✅ 有（亮點） |
 | 紀律：校準誤差 CE | ◾ 已可量測（`app/calibration.py`，ECE/MCE/Brier）；尚未回饋去調節自主權 |
+| 紀律：離線評估／迴歸（agent×bench） | ✅ 有（`app/eval/`：對真 `run_headless` 跑 fixtures、pass@k、迴歸 diff、回灌 CE）|
 | 工作流：Incident Response | ◾ 只有「調查」半段 |
 | 工作流：Decision-Aware Delivery | ❌ 無 |
 | 工作流：Autonomous Chaos | ❌ 無 |
@@ -145,6 +146,10 @@ aiops-agent 忠實實現了 ARE 的 **訊號平面 + 推論平面 與安全紀�
 **2. ARE 補強：CE 量測 harness ✅ 已完成**
 把每次 headless run 的 `Findings.confidence` 落地，對錯**離線標記**後算 ECE / MCE / Brier / reliability bins。實作 `app/calibration.py`：兩階段（線上 `record_run` 記 pending、離線 `label_run` 補 verdict），correctness 來源**可插拔**且與 grader 解耦——`score_to_correct`（吃 o11y-bench 分數過門檻）或 `grade_against_truth`（demo 的 service/version ground-truth 比對）。webhook 路徑已 best-effort 接上（fingerprint 當 run_id）。CLI：`python -m app.calibration report | label <run_id> --correct/--wrong`。測試：10 個單元測試 pin 死校準數學 + store round-trip。它是 step 7「Tier 2 confidence 門檻」的**唯一前置**，且零行為改變。
 > 對齊：紀律—校準誤差（CE）；同時是 Learn 與 Governance 的共同前置。
+
+**2b. 評估補強：agent×bench 迴歸 harness ✅ 已完成**
+把評估從「被動等生產 webhook 觸發 + 人工標記」換成「主動、可重複、改完即測」。**關鍵區別**：o11y-bench 測的是*通用 model + MCP scaffold*（`agents/o11y_agent.py`），這個 harness 測的是**真 agent**——直接驅動 `app.agent.run_headless`（playbook / capability snapshot / discover-before-query / hypothesis loop / governance），所以改 prompt / playbook / 治理閘的退步它看得到，o11y-bench 看不到。實作 `app/eval/`（`harness.py` + `__main__.py` + `fixtures.yaml`）：載入 incident fixtures（合成 Grafana alert payload + ground truth，`startsAt: now` 支援 live 事故）→ 每個跑 N seeds（小模型非確定性，單跑不可信）→ 用既有 `grade_against_truth` 評分 → 出 pass@k + service/version 分維度命中率 + 跟 `baseline.json` 的迴歸 diff（退步標 ▼、exit code≠0 供 CI gate）。每次 run 同時 `cal_insert` + `cal_label`（source=`eval-harness`）回灌校準 store，於是 CE 的 ECE/Brier 不再只依賴「生產剛好爆了什麼」，得到**密集、無偏、可控**的標記。唯讀推論核心零改動；預設寫獨立 `eval.db`，不污染生產 `aiops.db`（`--store aiops.db` 才餵生產 CE）。CLI：`python -m app.eval run -n 5 [--save-baseline] [--store …]`（`run` 為預設子命令）。
+> 對齊：Ch19 Evaluation & Monitoring（pass@k / 迴歸偵測 / drift 量測基礎）；是 CE harness（#2）的**密集資料來源**，也是 Learn 閉環安全迭代的迴歸護欄。
 
 **3. v3 step 5：Tier 0/1 runbook ✅ 已完成**
 把 ARE 從「純推論」推向執行平面而**不跨進副作用**。實作 `app/runbook.py` + `runbooks/`（pyyaml，零外部新依賴）：

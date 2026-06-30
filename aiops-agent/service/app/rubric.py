@@ -78,7 +78,8 @@ async def verify_trace_ids(answer: str) -> tuple[bool, str]:
         f"The trace IDs {missing} you cited do not exist in Tempo. "
         "You MUST NOT invent trace IDs. Call `query_tempo_traces` again to find real traces, "
         "then cite the `traceID` value verbatim from the tool result. "
-        "If the query returns zero results, explicitly say no traces were found — do not substitute a made-up ID."
+        "If the query returns zero results, explicitly say no traces were found — "
+        "do not substitute a made-up ID."
     )
     return False, retry_prompt
 
@@ -131,9 +132,7 @@ async def check_k8s_write(action: str, args: dict, context: str = "") -> tuple[b
     Any exception → allow (best-effort, never block valid remediations).
     """
     prompt = (
-        f"Action: {action}\n"
-        f"Arguments: {args}\n"
-        f"Incident context: {context or '(none provided)'}"
+        f"Action: {action}\nArguments: {args}\nIncident context: {context or '(none provided)'}"
     )
     try:
         llm = _k8s_rubric_llm()
