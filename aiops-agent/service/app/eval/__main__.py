@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
+from . import stack as stackmod
 from .harness import (
     DEFAULT_BASELINE,
     DEFAULT_FIXTURES,
@@ -47,6 +49,25 @@ def _main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="overwrite the baseline with this run's correct rates",
     )
+    # --- reproducible-environment (Path A) ---
+    pr.add_argument(
+        "--stack",
+        action="store_true",
+        help="boot the prebuilt o11y-stack image (deterministic incident) and run "
+        "against it; pins every fixture clock to the stack's scenario time",
+    )
+    pr.add_argument("--image", default=stackmod.DEFAULT_IMAGE, help="stack image for --stack")
+    pr.add_argument(
+        "--scenario-time",
+        default=None,
+        help="O11Y_SCENARIO_TIME_ISO for the baked data (default: now); only with --stack",
+    )
+    pr.add_argument(
+        "--boot-timeout", type=float, default=180.0, help="seconds to wait for stack data"
+    )
+    pr.add_argument(
+        "--keep-stack", action="store_true", help="leave the container running after the run"
+    )
 
     # `run` is the default subcommand: `python -m app.eval -n 5` works the same
     # as `python -m app.eval run -n 5`. Only inject it when the first token isn't
@@ -66,7 +87,31 @@ def _main(argv: list[str] | None = None) -> int:
         print("no fixtures to run")
         return 1
 
-    summaries = asyncio.run(run_suite(fixtures, seeds=args.seeds, store_path=args.store))
+    scenario_time = None
+    booted = False
+    try:
+        if args.stack:
+            scenario_time = args.scenario_time or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            print(f"booting {args.image} (scenario time {scenario_time})…")
+            stackmod.boot(scenario_time, image=args.image)
+            booted = True
+            if not stackmod.wait_ready(timeout=args.boot_timeout):
+                print("  stack did not produce queryable incident data in time")
+                return 1
+            print("  stack ready; running against fixed data")
+
+        summaries = asyncio.run(
+            run_suite(
+                fixtures,
+                seeds=args.seeds,
+                store_path=args.store,
+                scenario_time=scenario_time,
+            )
+        )
+    finally:
+        if booted and not args.keep_stack:
+            stackmod.teardown()
+
     baseline = load_baseline(args.baseline)
     diff = regression_diff(summaries, baseline)
     print(format_report(summaries, diff, store_path=args.store))

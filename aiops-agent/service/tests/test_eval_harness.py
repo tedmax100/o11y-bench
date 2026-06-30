@@ -51,6 +51,11 @@ def test_resolved_alert_keeps_explicit_timestamp():
     assert fx.resolved_alert()["startsAt"] == "2026-04-04T10:05:00Z"
 
 
+def test_resolved_alert_pins_now_to_scenario_time():
+    fx = _fixture(alert={"startsAt": "now"})
+    assert fx.resolved_alert("2026-04-04T10:05:00Z")["startsAt"] == "2026-04-04T10:05:00Z"
+
+
 # ---- grade_run: culprit (positive) mode -------------------------------------
 
 

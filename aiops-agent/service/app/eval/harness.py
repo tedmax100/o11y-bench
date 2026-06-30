@@ -60,13 +60,15 @@ class Fixture(BaseModel):
     max_confidence: float = 0.6  # appropriately-hedged ceiling
     forbid_services: list[str] = Field(default_factory=list)
 
-    def resolved_alert(self) -> dict[str, Any]:
-        """Copy of the alert with `startsAt: now` resolved to the current UTC
-        time — convenient for a live demo incident you just triggered."""
+    def resolved_alert(self, now_iso: str | None = None) -> dict[str, Any]:
+        """Copy of the alert with `startsAt: now` resolved to a concrete UTC time.
+
+        `now_iso` pins it to a scenario clock (the provisioned stack's data-end);
+        omitted, it falls back to wall-clock now (a live incident you triggered)."""
         alert = copy.deepcopy(self.alert)
         starts = alert.get("startsAt")
         if isinstance(starts, str) and starts.strip().lower() == "now":
-            alert["startsAt"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            alert["startsAt"] = now_iso or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         return alert
 
 
@@ -122,13 +124,20 @@ def grade_run(findings: Any, fixture: Fixture) -> tuple[bool, bool, bool | None]
     return correct, service_hit, version_hit
 
 
-async def run_one(fixture: Fixture, seed: int, *, run_nonce: str, store_path: Path) -> RunResult:
+async def run_one(
+    fixture: Fixture,
+    seed: int,
+    *,
+    run_nonce: str,
+    store_path: Path,
+    scenario_time: str | None = None,
+) -> RunResult:
     """Run the real agent once and grade it. Failures are captured, not raised,
     so one bad run never sinks the batch."""
     # Unique thread_id so MemorySaver never shares state across seeds or runs.
     thread_id = f"eval-{fixture.id}-s{seed}-{run_nonce}"
     try:
-        result = await run_headless(fixture.resolved_alert(), thread_id=thread_id)
+        result = await run_headless(fixture.resolved_alert(scenario_time), thread_id=thread_id)
     except Exception as e:  # the harness must survive any agent error
         return RunResult(
             fixture_id=fixture.id,
@@ -225,14 +234,26 @@ def summarize(fixture_id: str, runs: list[RunResult]) -> FixtureSummary:
 
 
 async def run_suite(
-    fixtures: list[Fixture], *, seeds: int, store_path: Path
+    fixtures: list[Fixture],
+    *,
+    seeds: int,
+    store_path: Path,
+    scenario_time: str | None = None,
 ) -> list[FixtureSummary]:
     run_nonce = str(int(time.time()))
     summaries: list[FixtureSummary] = []
     for fixture in fixtures:
         runs: list[RunResult] = []
         for seed in range(seeds):
-            runs.append(await run_one(fixture, seed, run_nonce=run_nonce, store_path=store_path))
+            runs.append(
+                await run_one(
+                    fixture,
+                    seed,
+                    run_nonce=run_nonce,
+                    store_path=store_path,
+                    scenario_time=scenario_time,
+                )
+            )
         summaries.append(summarize(fixture.id, runs))
     return summaries
 

@@ -2,13 +2,15 @@
 #
 # Each fixture is a synthetic Grafana alert payload + the ground truth the
 # Findings are graded against (service required; version optional). `startsAt`
-# pins the agent's scenario clock: use an ISO-8601 UTC time that the incident's
-# data actually covers in your running stack, or the literal `now` for a live
-# incident you just triggered.
+# pins the agent's scenario clock: an ISO-8601 UTC time, or the literal `now`.
 #
-# (A) shared-stack workflow: bring up the demo o11y stack, trigger the payment
-# decline incident (POST odd-cent charges to payment :8001/charge per RUNBOOK),
-# then `python -m app.eval run`.
+# Reproducible run (recommended): `python -m app.eval --stack` boots the prebuilt
+# demo-services-o11y-stack image, which deterministically bakes the payment
+# v2.4.1→v2.5.0 decline incident, and pins every `now` here to that stack's
+# scenario clock — so every run queries the same fixed data.
+#
+# Live run: bring up your own stack, trigger the incident (POST odd-cent charges
+# to payment :8001/charge per RUNBOOK), then `python -m app.eval run`.
 
 - id: payment-decline-service
   alert:
