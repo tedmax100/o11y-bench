@@ -1,0 +1,96 @@
+name: AIOps Eval Harness
+
+# Runs the aiops-agent eval/regression harness (app/eval, --stack mode) against a
+# freshly-built, deterministic o11y-stack incident. NOT a per-PR gate: it calls
+# the agent's real LLM (needs the GOOGLE_API_KEY secret, costs money, ~minutes),
+# and small-N pass@k isn't yet a statistically sound merge blocker — so it runs
+# nightly + on demand and publishes a report artifact, rather than gating PRs.
+#
+# Prerequisites:
+#   - repo secret GOOGLE_API_KEY (the agent's Gemini key)
+#   - schedule only fires on the repository's default branch once merged; use the
+#     "Run workflow" button (workflow_dispatch) to run it from any branch meanwhile.
+
+on:
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "Runs per fixture (pass@k sample size)"
+        required: false
+        default: "3"
+  schedule:
+    - cron: "0 6 * * *" # 06:00 UTC nightly
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eval-harness-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  eval:
+    name: AIOps Eval (--stack)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Require GOOGLE_API_KEY
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+        run: |
+          if [ -z "${GOOGLE_API_KEY}" ]; then
+            echo "::error::GOOGLE_API_KEY secret is not set — the eval harness needs it to run the agent's LLM."
+            exit 1
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+          cache-python: true
+
+      # Two-stage image: the base o11y-stack, then the demo layer that swaps in the
+      # generator which bakes the payment v2.4.1→v2.5.0 decline incident.
+      - name: Build base o11y-stack image
+        run: >-
+          docker build --build-arg TARGETARCH=amd64
+          -t o11y-bench-o11y-stack:latest -f docker/Dockerfile docker
+
+      - name: Build demo-services o11y-stack image
+        run: >-
+          docker build -t demo-services-o11y-stack:latest
+          -f demo-services/o11y-stack/Dockerfile demo-services/o11y-stack
+
+      - name: Run eval against the baked stack
+        working-directory: aiops-agent/service
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          SEEDS: ${{ github.event.inputs.seeds || '3' }}
+        run: |
+          set -o pipefail
+          # --keep-stack so the container survives for log capture on failure;
+          # the cleanup step removes it (and stack.boot clears any stale one).
+          uv run python -m app.eval --stack --keep-stack -n "${SEEDS}" | tee eval-report.txt
+
+      - name: Stack logs on failure
+        if: failure()
+        run: docker logs aiops-eval-stack || true
+
+      - name: Clean up stack
+        if: always()
+        run: docker rm -f aiops-eval-stack || true
+
+      - name: Upload eval report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: eval-report
+          path: |
+            aiops-agent/service/eval-report.txt
+            aiops-agent/service/eval.db
+          if-no-files-found: warn
