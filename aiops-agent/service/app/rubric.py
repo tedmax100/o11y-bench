@@ -78,7 +78,8 @@ async def verify_trace_ids(answer: str) -> tuple[bool, str]:
         f"The trace IDs {missing} you cited do not exist in Tempo. "
         "You MUST NOT invent trace IDs. Call `query_tempo_traces` again to find real traces, "
         "then cite the `traceID` value verbatim from the tool result. "
-        "If the query returns zero results, explicitly say no traces were found — do not substitute a made-up ID."
+        "If the query returns zero results, explicitly say no traces were found — "
+        "do not substitute a made-up ID."
     )
     return False, retry_prompt
 

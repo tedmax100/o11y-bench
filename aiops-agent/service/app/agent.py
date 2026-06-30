@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, TypedDict
 
-from langchain_core.messages import SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -651,7 +651,7 @@ def _build_graph():
             "rubric_revision_count": revision + (0 if ok else 1),
         }
 
-    _MAX_RUBRIC_REVISIONS = 1
+    _max_rubric_revisions = 1
 
     def route_after_agent(state: RcaState) -> str:
         if not _last_tool_calls(state["messages"]):
@@ -661,7 +661,7 @@ def _build_graph():
         return "tools"
 
     def route_after_rubric(state: RcaState) -> str:
-        if state.get("rubric_feedback") and state.get("rubric_revision_count", 0) <= _MAX_RUBRIC_REVISIONS:
+        if state.get("rubric_feedback") and state.get("rubric_revision_count", 0) <= _max_rubric_revisions:
             return "agent"  # hallucination detected — let agent retry with correction
         return END
 
