@@ -50,6 +50,7 @@ async def test_tempo_exists_returns_false_on_empty_batches():
 @pytest.mark.asyncio
 async def test_tempo_exists_returns_true_on_network_error(monkeypatch):
     """Network failure → assume valid (never block on infra issues)."""
+
     async def _raise(*a, **kw):
         raise httpx.ConnectError("timeout")
 
@@ -109,6 +110,7 @@ async def test_verify_exception_in_tempo_check_passes_through(monkeypatch):
     """Exception propagating out of _tempo_trace_exists → treated as valid (best-effort).
     _tempo_trace_exists catches its own httpx errors and returns True, so this
     tests that verify_trace_ids also handles unexpected exceptions gracefully."""
+
     async def _raise(tid):
         raise Exception("unexpected error")
 
@@ -164,9 +166,7 @@ async def test_k8s_write_allows_safe_rollout_undo(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_k8s_write_blocks_when_llm_says_unsafe(monkeypatch):
-    monkeypatch.setattr(
-        rubric, "_k8s_rubric_llm", lambda: _mock_llm(False, "replica count is 0")
-    )
+    monkeypatch.setattr(rubric, "_k8s_rubric_llm", lambda: _mock_llm(False, "replica count is 0"))
     ok, reason = await check_k8s_write(
         "k8s.scale",
         {"deployment": "payment-service", "replicas": 0},
@@ -210,7 +210,8 @@ async def test_rubric_gate_blocks_when_actions_enabled(monkeypatch):
 
     monkeypatch.setattr(ex.settings, "actions_enabled", True)
     monkeypatch.setattr(
-        rubric, "_k8s_rubric_llm",
+        rubric,
+        "_k8s_rubric_llm",
         lambda: _mock_llm(False, "replica count is 0"),
     )
     ok, reason = await check_k8s_write("k8s.scale", {"replicas": 0}, "")
@@ -228,7 +229,8 @@ async def test_rubric_does_not_block_when_actions_disabled(monkeypatch):
 
     monkeypatch.setattr(ex.settings, "actions_enabled", False)
     monkeypatch.setattr(
-        rubric, "_k8s_rubric_llm",
+        rubric,
+        "_k8s_rubric_llm",
         lambda: _mock_llm(False, "unsafe"),
     )
     rubric_ok, _ = await check_k8s_write("k8s.rollout_undo", {"deployment": "x"}, "")

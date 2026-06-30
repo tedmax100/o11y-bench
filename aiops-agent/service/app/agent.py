@@ -530,7 +530,7 @@ class RcaState(TypedDict):
     messages: Annotated[list, add_messages]
     tool_calls_used: int
     budget: int
-    rubric_feedback: str        # correction prompt from rubric node; "" means passed
+    rubric_feedback: str  # correction prompt from rubric node; "" means passed
     rubric_revision_count: int  # how many rubric-driven retries have happened this turn
 
 
@@ -661,7 +661,10 @@ def _build_graph():
         return "tools"
 
     def route_after_rubric(state: RcaState) -> str:
-        if state.get("rubric_feedback") and state.get("rubric_revision_count", 0) <= _max_rubric_revisions:
+        if (
+            state.get("rubric_feedback")
+            and state.get("rubric_revision_count", 0) <= _max_rubric_revisions
+        ):
             return "agent"  # hallucination detected — let agent retry with correction
         return END
 
@@ -672,14 +675,13 @@ def _build_graph():
     graph.add_node("rubric_trace", rubric_trace_node)
     graph.add_edge(START, "agent")
     graph.add_conditional_edges(
-        "agent", route_after_agent,
+        "agent",
+        route_after_agent,
         {"tools": "tools", "force_answer": "force_answer", "rubric_trace": "rubric_trace"},
     )
     graph.add_edge("tools", "agent")
     graph.add_edge("force_answer", "rubric_trace")
-    graph.add_conditional_edges(
-        "rubric_trace", route_after_rubric, {"agent": "agent", END: END}
-    )
+    graph.add_conditional_edges("rubric_trace", route_after_rubric, {"agent": "agent", END: END})
     return graph.compile(checkpointer=MemorySaver())
 
 
@@ -1374,8 +1376,13 @@ async def stream_chat(
     async for event in agent.astream_events(
         # tool_calls_used resets to 0 each turn (overwrite reducer); messages
         # append to the thread history (add_messages reducer).
-        {"messages": turn_messages, "tool_calls_used": 0, "budget": settings.tool_call_budget,
-         "rubric_feedback": "", "rubric_revision_count": 0},
+        {
+            "messages": turn_messages,
+            "tool_calls_used": 0,
+            "budget": settings.tool_call_budget,
+            "rubric_feedback": "",
+            "rubric_revision_count": 0,
+        },
         config=config,
         version="v2",
     ):

@@ -56,17 +56,13 @@ def test_resolved_alert_keeps_explicit_timestamp():
 
 def test_grade_culprit_service_and_version_correct():
     fx = _fixture(truth={"service": "payment-service", "version": "v2.5.0"})
-    correct, svc, ver = grade_run(
-        _findings(services=["payment-service"], version="v2.5.0"), fx
-    )
+    correct, svc, ver = grade_run(_findings(services=["payment-service"], version="v2.5.0"), fx)
     assert (correct, svc, ver) == (True, True, True)
 
 
 def test_grade_culprit_version_miss_is_incorrect_but_service_still_hits():
     fx = _fixture(truth={"service": "payment-service", "version": "v2.5.0"})
-    correct, svc, ver = grade_run(
-        _findings(services=["payment-service"], version="v2.4.0"), fx
-    )
+    correct, svc, ver = grade_run(_findings(services=["payment-service"], version="v2.4.0"), fx)
     assert correct is False
     assert svc is True
     assert ver is False
@@ -104,9 +100,7 @@ def test_grade_inconclusive_overconfident_is_incorrect():
 
 def test_grade_inconclusive_blaming_forbidden_service_is_incorrect_even_if_hedged():
     fx = _fixture(expect="inconclusive", max_confidence=0.6, forbid_services=["payment-service"])
-    correct, _, _ = grade_run(
-        _findings(confidence=0.4, services=["payment-service"]), fx
-    )
+    correct, _, _ = grade_run(_findings(confidence=0.4, services=["payment-service"]), fx)
     assert correct is False
 
 

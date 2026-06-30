@@ -122,9 +122,7 @@ def grade_run(findings: Any, fixture: Fixture) -> tuple[bool, bool, bool | None]
     return correct, service_hit, version_hit
 
 
-async def run_one(
-    fixture: Fixture, seed: int, *, run_nonce: str, store_path: Path
-) -> RunResult:
+async def run_one(fixture: Fixture, seed: int, *, run_nonce: str, store_path: Path) -> RunResult:
     """Run the real agent once and grade it. Failures are captured, not raised,
     so one bad run never sinks the batch."""
     # Unique thread_id so MemorySaver never shares state across seeds or runs.
@@ -212,9 +210,7 @@ def summarize(fixture_id: str, runs: list[RunResult]) -> FixtureSummary:
     correct = sum(1 for r in runs if r.correct)
     svc = sum(1 for r in runs if r.service_hit)
     ver_runs = [r for r in runs if r.version_hit is not None]
-    ver_rate = (
-        sum(1 for r in ver_runs if r.version_hit) / len(ver_runs) if ver_runs else None
-    )
+    ver_rate = sum(1 for r in ver_runs if r.version_hit) / len(ver_runs) if ver_runs else None
     return FixtureSummary(
         fixture_id=fixture_id,
         n=n,
@@ -236,9 +232,7 @@ async def run_suite(
     for fixture in fixtures:
         runs: list[RunResult] = []
         for seed in range(seeds):
-            runs.append(
-                await run_one(fixture, seed, run_nonce=run_nonce, store_path=store_path)
-            )
+            runs.append(await run_one(fixture, seed, run_nonce=run_nonce, store_path=store_path))
         summaries.append(summarize(fixture.id, runs))
     return summaries
 
@@ -283,9 +277,7 @@ def format_report(
 ) -> str:
     lines: list[str] = []
     n_total = sum(s.n for s in summaries)
-    overall = (
-        sum(s.correct_rate * s.n for s in summaries) / n_total if n_total else 0.0
-    )
+    overall = sum(s.correct_rate * s.n for s in summaries) / n_total if n_total else 0.0
     lines.append(
         f"aiops-agent eval — {len(summaries)} fixture(s), {n_total} run(s), "
         f"overall correct {overall:.0%}"
@@ -316,9 +308,7 @@ def format_report(
         lines.append("  no change vs baseline.")
 
     # surface the first error so a broken stack is obvious, not silent zeros.
-    first_err = next(
-        (r for s in summaries for r in s.runs if r.error), None
-    )
+    first_err = next((r for s in summaries for r in s.runs if r.error), None)
     if first_err is not None:
         lines.append("")
         lines.append(f"  ! first error ({first_err.fixture_id}): {first_err.error}")

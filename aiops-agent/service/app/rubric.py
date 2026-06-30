@@ -132,9 +132,7 @@ async def check_k8s_write(action: str, args: dict, context: str = "") -> tuple[b
     Any exception → allow (best-effort, never block valid remediations).
     """
     prompt = (
-        f"Action: {action}\n"
-        f"Arguments: {args}\n"
-        f"Incident context: {context or '(none provided)'}"
+        f"Action: {action}\nArguments: {args}\nIncident context: {context or '(none provided)'}"
     )
     try:
         llm = _k8s_rubric_llm()
