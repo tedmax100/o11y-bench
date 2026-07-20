@@ -1,6 +1,6 @@
-# AIOps 30 天：設計 → 實作 → 應用
+# AIOps 33 天：設計 → 實作 → 應用
 
-定位轉變：這不是 30 篇解說文，是 30 個建構里程碑。每天先有一個對應到具體檔案/指令的產出（config、code diff、可跑的 demo），文章是紀錄「為什麼這樣設計、卡在哪裡」，不是憑空講概念。
+定位轉變：這不是 33 篇解說文，是 33 個建構里程碑。多數天先有一個對應到具體檔案/指令的產出（config、code diff、可跑的 demo），文章是紀錄「為什麼這樣設計、卡在哪裡」，不是憑空講概念。少數三天是「概念日」——先講清楚一個架構原語或設計模型，隔天立刻對照現有程式碼落地驗證，理論不憑空停留。
 
 範圍決策：
 - 治理篇（Operator/Weaver）：repo 目前沒有 Operator 落地，這段是獨立、可重現的教學工程，讀者跟著做能從零搭出 Operator+Weaver 治理環境。
@@ -70,83 +70,98 @@
 產出：刻意用 weaver 0.23.0 對含 `metric_requirement_level` 的 schema 跑 check，重現 hard error，記錄繞過/修法。
 文章角度：工具鏈本身要版控，不能盲目升級。
 
-**Day14 — 治理環境收尾：產出一份「新服務上線 checklist」**
-產出：把 Day1-13 的成果收斂成一份可執行 checklist（含 CI job 範本、registry 範本），存進 repo 文件。
-文章角度：治理篇總結，這份 checklist 就是可交付給團隊使用的產出。
+**Day14 — 概念日：機器可讀的「意圖」（Intent）**
+產出：無 code diff，寫清楚「意圖」跟傳統靜態規則的差異，用三個對照範例說明：
+- 日常營運意圖 vs. 傳統 CPU 門檻規則（意圖描述的是商業結果如 p99 延遲，不是資源數字）
+- 變更意圖（YAML：success_criteria / risk_tolerance / scope / constraints，附掛在 PR 上）
+- 穩定狀態意圖（YAML：conditions / allowed_degradation，供混沌工程/自我修復判斷「正常」跟「可接受降級」）
+文章角度：意圖不是寫在 wiki 裡的一段話，是版本控管、機器可解析、能被 pipeline/agent 直接消費的結構化宣告。
+
+**Day15 — 治理環境收尾：產出一份「新服務上線 checklist」，並把「意圖」納入必備欄位**
+產出：把 Day1-13 的成果收斂成一份可執行 checklist（含 CI job 範本、registry 範本），存進 repo 文件；新增一欄「服務是否宣告了 Day14 定義的變更意圖 / 穩定狀態意圖」。
+文章角度：治理篇總結，這份 checklist 就是可交付給團隊使用的產出，且把前一天的概念變成強制檢查項，而不是停在紙上。
 
 ---
 
-## 第二階段：AIOps 核心能力管線（Day 15–21）
+## 第二階段：AIOps 核心能力管線（Day 16–23）
 直接在 `aiops-agent/service/app/signals/` 現有基礎上動刀。
 
-**Day15 — 讀現況：畫出 signals 模組的實際資料流**
+**Day16 — 讀現況：畫出 signals 模組的實際資料流**
 產出：一張基於 `topology.py`/`context.py`/`compile.py` 實際 import 關係畫出的架構圖（不是憑印象畫）。
 文章角度：AIOps 九大能力總覽，並標出現有程式碼分別落在哪幾格。
 
-**Day16 — 補 s2：edge 對真實 Tempo call graph 做對帳**
+**Day17 — 補 s2：edge 對真實 Tempo call graph 做對帳**
 產出：擴充 `reconcile.py`，讓它不只對節點存在性（`validate_against_live`），也對 `topology.yaml` 宣告的 edge 跟 Tempo 實際 call graph 做 diff，輸出「宣告但不存在」與「存在但未宣告」的邊。
 文章角度：Context and topology mapping 是地基——用這個實作證明「圖不準，後面全部失真」。
 
-**Day17 — Ingest 端補：discovery.py 產生的服務清單餵進 reconcile**
-產出：串接 `tools/discovery.py` 的 `list_service_names()` 到 Day16 的 edge reconcile，做成一個可定期跑的腳本。
+**Day18 — Ingest 端補：discovery.py 產生的服務清單餵進 reconcile**
+產出：串接 `tools/discovery.py` 的 `list_service_names()` 到 Day17 的 edge reconcile，做成一個可定期跑的腳本。
 文章角度：資料進來之前，拓撲已經決定你能不能做有效聚合。
 
-**Day18 — dq.py 擴充：schema 對齊檢查串進 weaver.py**
+**Day19 — dq.py 擴充：schema 對齊檢查串進 weaver.py**
 產出：在 `dq.py` 加一項檢查，用 `signals/weaver.py` 現有的 weaver 整合，驗證進來的 telemetry attribute 是否符合 registry。
 文章角度：正式把第一階段的治理成果和 Signal Plane 串起來，enrichment 前提是 schema 對齊。
 
-**Day19 — context.py：把 edge reconcile 的噪音降下來**
+**Day20 — context.py：把 edge reconcile 的噪音降下來**
 產出：修改 `context.py` 注入的 decision-grade context，讓「宣告但無流量」的邊不要污染 agent 的關聯判斷。
 文章角度：拓撲關係如何在伺服器端把統計噪音先過濾掉，附 before/after 的 context 輸出對比。
 
-**Day20 — health.py：異常偵測順著圖走**
+**Day21 — health.py：異常偵測順著圖走**
 產出：檢查 `health.py`（342行，現有最大模組）目前的異常判斷邏輯是否用到 topology 的 upstream/downstream，如果沒有，加一個「用拓撲排序異常候選」的步驟。
 文章角度：異常偵測為什麼要順著圖走，用改前改後的判斷順序做對比。
 
-**Day21 — 收尾：把 s1-s4 的邊界寫成一份現況文件**
-產出：更新（或新建）`signals/` 目錄下的現況說明，明確標出哪些是 s1-s4 已完成、哪些是本階段新補的。
-文章角度：管線篇總結，指出學習迴路的終點是回頭改善拓撲圖本身，銜接下一階段。
+**Day22 — 概念日：情境豐富層（Context Enrichment Layer, CEL）**
+產出：無 code diff，講清楚 CEL 作為訊號平面與推理平面之間架構原語的三項職責（enrichment/correlation/projection）與一項安全特質（grounding／溯源），並對照「傳統聚合遙測 JSON」vs「決策級遙測 JSON」的具體資料形狀差異。
+文章角度：Prometheus 依然只做扁平 key-value 儲存，CEL 是即時拼圖者——為什麼代理需要的是情境覺知物件，不是單一數字。
+
+**Day23 — 收尾：把 s1-s4 的邊界對照 CEL 三職責寫成一份現況文件**
+產出：更新（或新建）`signals/` 目錄下的現況說明，明確標出哪些是 s1-s4 已完成、哪些是本階段新補的；額外新增一節，逐一對照 Day22 定義的 enrichment/correlation/projection/grounding，標出 `context.py`/`topology.py` 現況各自落在哪一項、哪一項還缺。
+文章角度：管線篇總結，用前一天的概念當檢查表，指出學習迴路的終點是回頭改善拓撲圖本身，銜接下一階段。
 
 ---
 
-## 第三階段：Agent 設計（Day 22–27）
+## 第三階段：Agent 設計（Day 24–29）
 
-**Day22 — agent.py 決策鏈梳理**
+**Day24 — agent.py 決策鏈梳理**
 產出：畫出 `agent.py`/`investigations.py` 目前 discover→query→hypothesize→verify 各步驟對應到哪些函式，標出斷點。
 文章角度：Agent 架構總覽，用真實程式碼骨架而非教科書圖。
 
-**Day23 — 重現一次 discover-before-query 失敗案例並修**
+**Day25 — 重現一次 discover-before-query 失敗案例並修**
 產出：用過往排查記憶裡的真實失敗（硬編碼 demo-services schema 假設）寫一個 regression case 進 `eval/fixtures.yaml`，跑 `eval/harness.py` 證明目前會/不會失敗。
 文章角度：不是空談原則，是用一個可重跑的 eval case 佐證。
 
-**Day24 — Agent 自身可觀測性：確認 agent 決策有沒有被 trace**
+**Day26 — Agent 自身可觀測性：確認 agent 決策有沒有被 trace**
 產出：檢查 `audit.py`/`execution.py` 是否已把每個工具呼叫寫進可回放的紀錄，缺的話補上。
 文章角度：觀測 agent 和 agent 做觀測同等重要。
 
-**Day25 — tools/query.py：修一個真實 API 怪癖**
+**Day27 — tools/query.py：修一個真實 API 怪癖**
 產出：從過往排查記憶挑一個具體怪癖（Prom metadata 為空 / Loki label 需要時間範圍 / Tempo tag 命名）在 `tools/query.py` 或 `tools/discovery.py` 裡補防呆，並寫一個測試。
 文章角度：工具好不好用直接決定 agent 表現上限，附 diff。
 
-**Day26 — Signal Plane 真正接進 agent 的決策路徑**
+**Day28 — Signal Plane 真正接進 agent 的決策路徑**
 產出：確認 `context.py` 產出的拓撲 context 有沒有被 `agent.py` 實際使用在 prompt/工具選擇上，沒有就補上這條連接。
 文章角度：本階段核心銜接——系統圖譜不是抽象口號，是 agent 架構裡真的在跑的一層，附 before/after 的 agent 輸出對比。
 
-**Day27 — 重現一次預算壓力下的幻覺並加防護**
+**Day29 — 重現一次預算壓力下的幻覺並加防護**
 產出：用 `eval/harness.py` 限縮 budget/turns 跑一次，重現 fast-path 或 trace-id 幻覺，然後加一個檢查（如 `breaker.py`）擋掉。
 文章角度：誠實揭露現實限制，用可重現的失敗案例代替空泛警語。
 
 ---
 
-## 第四階段：專案復盤與評測（Day 28–30）
+## 第四階段：專案復盤與評測（Day 30–33）
 
-**Day28 — Rubric 落地：跑一次完整 eval，看真實分數**
-產出：`rubric.py` + `eval/harness.py` 對目前 agent 跑一次完整評分，記錄各項得分細節（不是「大概怎樣」，是實際數字）。
-文章角度：為什麼要自建 benchmark，用這次實測分數當證據。
+**Day30 — 概念日：五大旗艦 SLO（The Five Flagships）**
+產出：無 code diff，講清楚 ARR / DQ-SLO / RL-SLO / AE-SLO / CE 各自的定義、需要採集的資料，以及彼此制衡的關係（高 ARR 低 DQ = 不安全自主性；低 RL-SLO 低 AE-SLO = 決策倉促；CE 緩慢上升 = 認知漂移的早期訊號）。
+文章角度：傳統 SLO 衡量「服務有沒有維持在線」，無法衡量「代理的決策好不好」——這五項指標是為了讓代理行為可觀察、可調校、可治理而設計的制衡系統。
 
-**Day29 — 復盤兩個真實失敗：2/9 分事件 + histogram bucket 假象值**
+**Day31 — Rubric 落地：把五大 SLO 對到現有評分項目，跑一次完整 eval**
+產出：`rubric.py` + `eval/harness.py` 對目前 agent 跑一次完整評分，記錄各項得分細節；額外寫一張對照表，標出 Day30 五項 SLO 哪些現有資料可以算出來（例如 RL-SLO＝訊號偵測到行動提交的 wall-clock，現有紀錄應該就有）、哪些完全缺資料（例如 CE 需要 agent 當下吐出信心分數，目前沒有這個輸出，誠實列為缺口而非硬湊）。
+文章角度：為什麼要自建 benchmark，用這次實測分數與 SLO 對照表當證據。
+
+**Day32 — 復盤兩個真實失敗：2/9 分事件 + histogram bucket 假象值**
 產出：把過往排查記憶裡的兩個具體 bug（demo-services schema 誤用、`*_duration_seconds` 用錯 bucket 導致 quantile 恆定為假象值）各寫一個 eval fixture，證明現在是否已修復。
 文章角度：evaluation 發現真問題，用兩個可驗證案例收尾，不流於空泛。
 
-**Day30 — 收尾：跑一次端到端 demo，畫出正向循環**
-產出：完整跑一次「治理 checklist（Day14）→ 拓撲 reconcile（Day16-21）→ agent 決策（Day22-27）→ rubric 評分（Day28-29）」全鏈路，錄一次 demo 或截圖每一步輸出。
-文章角度：把 30 天摺回一張圖，收尾整個系列，並指出評測結果如何反過來改善治理與拓撲（下一輪迭代的起點）。
+**Day33 — 收尾：跑一次端到端 demo，畫出正向循環**
+產出：完整跑一次「治理 checklist（Day15）→ 意圖宣告（Day14）→ 拓撲 reconcile／CEL 對照（Day17-23）→ agent 決策（Day24-29）→ 五大 SLO／rubric 評分（Day30-32）」全鏈路，錄一次 demo 或截圖每一步輸出。
+文章角度：把 33 天摺回一張圖，收尾整個系列，並指出評測結果如何反過來改善治理與拓撲（下一輪迭代的起點）。
