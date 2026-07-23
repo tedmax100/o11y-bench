@@ -1,0 +1,130 @@
+---
+title: "【Day5】annotation 做 auto-instrumentation：真實的 before/after trace 對比"
+series: "2026 鐵人賽：AIOps with OpenTelemetry"
+tags: [OpenTelemetry, Kubernetes, 鐵人賽]
+---
+# Day5：annotation 做 auto-instrumentation——真實的 before/after trace 對比
+
+Day4 裝完 Operator 之後，刻意留了一個空白：`Instrumentation` CR 宣告了，但沒有接上任何一個 Pod——五個服務仍然靠自己 Dockerfile 裡的 `opentelemetry-instrument uvicorn ...` 在跑。今天把這個空白填上：挑一個服務（`api-gateway`），把它從「自己在 Dockerfile 裡寫死 zero-code 指令」換成「靠 annotation 讓 Operator webhook 注入」，然後真的抓 before/after 的 trace 出來比對，誠實講兩者到底差在哪、哪裡沒有差。
+
+## 改動只有兩處
+
+**Dockerfile**：拿掉 `opentelemetry-instrument` 這個包裝指令，變回最單純的 `uvicorn`：
+
+```dockerfile
+# No `opentelemetry-instrument` wrapper here on purpose — the Operator's
+# webhook injects instrumentation via PYTHONPATH + an init container instead.
+CMD ["uvicorn", "api_gateway.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+**k8s manifest**：在 Pod template 加一個 annotation：
+
+```yaml
+template:
+  metadata:
+    annotations:
+      instrumentation.opentelemetry.io/inject-python: "python-instrumentation"
+```
+
+值填的是 Day4 那份 `Instrumentation` CR 的名字（同 namespace，所以不用寫 `demo/python-instrumentation`，直接寫 CR 名稱就夠）。除此之外，`23-api-gateway.yaml` 裡原本那一串 `OTEL_SERVICE_NAME`、`OTEL_EXPORTER_OTLP_ENDPOINT`、`OTEL_RESOURCE_ATTRIBUTES` 全部沒有動——這是刻意的，待會第一個要看的真實現象，就是這些值在 webhook 手裡到底會不會被蓋掉。
+
+rebuild image、重新 apply、重啟 deployment 之後：
+
+```
+$ kubectl -n demo get pods -l app=api-gateway
+NAME                           READY   STATUS     RESTARTS   AGE
+api-gateway-5866859f9b-9pnpg   0/1     Init:0/1   0          10s
+```
+
+`Init:0/1` 這一格，就是 Day3 講的「webhook 攔截 Pod 建立請求、把東西塞進 Pod spec」在真實世界的樣子——一個新出現的 init container，正在跑。
+
+## webhook 真的塞了什麼進去：完整看一次 Pod spec
+
+等 Pod Ready 之後，`kubectl get pod ... -o yaml` 把整份 spec 印出來，跟 Day4 一樣，不用猜，直接讀真實輸出。
+
+**Init container**：
+
+```yaml
+initContainers:
+  - name: opentelemetry-auto-instrumentation-python
+    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-python:0.64b0
+    command: ["cp", "-r", "/autoinstrumentation/.", "/otel-auto-instrumentation-python"]
+    volumeMounts:
+      - { mountPath: /otel-auto-instrumentation-python, name: opentelemetry-auto-instrumentation-python }
+```
+
+它做的事很單純：把一整包預先裝好的 Python auto-instrumentation 套件（`opentelemetry-distro` + 各種 instrumentor），複製到一個跟主容器共用的 `emptyDir` volume 裡，然後結束。它不執行任何 app 邏輯，純粹是「把檔案準備好」。
+
+**主容器（`gateway`）多出來的東西**，這才是真正有趣的部分：
+
+```
+PYTHONPATH = /otel-auto-instrumentation-python/opentelemetry/instrumentation/auto_instrumentation:/otel-auto-instrumentation-python
+```
+
+這一行解釋了「為什麼 Dockerfile 不用寫 `opentelemetry-instrument` 也能動」——Python 直譯器啟動時本來就會找 `PYTHONPATH` 裡的模組，`auto_instrumentation` 這個套件內部用的是 Python 的 `sitecustomize` 機制，直譯器一啟動就自動把 SDK 設好、把 FastAPI/httpx 的 instrumentor 掛上去，完全不需要在 `CMD` 裡包一層指令去手動觸發。跟 Day3 講的「有一個 admission webhook 在 Pod 建立的當下把東西注入進去」，在這裡具體對上了——只是 Python 語言注入的形式是 `PYTHONPATH`，不是像 Java 那樣的 `-javaagent`。
+
+再來是我原本猜測會被蓋掉、但實際上**沒有被蓋掉**的東西：
+
+```
+OTEL_SERVICE_NAME = api-gateway                                    # 我自己寫的值，原封不動
+OTEL_EXPORTER_OTLP_ENDPOINT = http://otel-collector.demo.svc:4318  # 我自己寫的值，原封不動
+```
+
+webhook 的邏輯是「補齊沒有的，不動已經存在的」——這兩個我在 `23-api-gateway.yaml` 裡本來就手動寫了，webhook 看到容器已經有這個 env var，就跳過，不覆蓋。
+
+真正被 webhook 動過手腳的，是 `OTEL_RESOURCE_ATTRIBUTES`。我原本寫的值是：
+
+```
+service.namespace=demo,deployment.environment=demo,service.version=$(GIT_VERSION),git_repo=$(GIT_REPO),git_version=$(GIT_VERSION)
+```
+
+注入之後變成：
+
+```
+service.namespace=demo,deployment.environment=demo,service.version=$(GIT_VERSION),git_repo=$(GIT_REPO),git_version=$(GIT_VERSION),k8s.container.name=gateway,k8s.deployment.name=api-gateway,k8s.namespace.name=demo,k8s.node.name=$(OTEL_RESOURCE_ATTRIBUTES_NODE_NAME),k8s.pod.name=$(OTEL_RESOURCE_ATTRIBUTES_POD_NAME),k8s.replicaset.name=api-gateway-5866859f9b,service.instance.id=demo.$(OTEL_RESOURCE_ATTRIBUTES_POD_NAME).gateway
+```
+
+不是覆蓋，是**在後面接上一段**——webhook 額外注入了 `OTEL_NODE_IP`、`OTEL_POD_IP`、`OTEL_RESOURCE_ATTRIBUTES_POD_NAME`、`OTEL_RESOURCE_ATTRIBUTES_NODE_NAME` 這幾個透過 Downward API 取值的 env var，再把 `k8s.pod.name`、`k8s.node.name`、`k8s.replicaset.name`、`service.instance.id` 這些原本我完全沒寫的 k8s 拓撲屬性，接在我自己那串資源屬性後面。這代表：**中央治理（Operator 知道要幫每個 Pod 補上 k8s 身份）跟團隊自訂（我自己的 `git_repo`/`git_version` join key）不是互斥的，是疊加的**——這也回答了 Day3 結尾提過的伏筆：Operator 幫 Collector/子資源維護的那些關係資訊，現在真的變成一條可以往下遊傳遞的訊號了。
+
+## before / after：對同一條下單流程，真的各截一次 trace
+
+在切換前後，各對 `webapp → api-gateway → order-service → user/payment-service` 這條下單流程送一次真實請求，把 `trace_id` 從 log 裡撈出來，直接查 Tempo 的 `/api/traces/{traceID}`。
+
+**Before**（`opentelemetry-instrument` 包裝指令，trace `e981d8a3...`）：
+
+```
+api-gateway   POST /api/orders   {http.route: /api/orders, user_id: u-1}
+order-service POST /api/orders   {http.route: /api/orders}
+user-service  GET /api/users/{user_id}/authcheck
+payment-service POST /charge
+webapp        POST /api/{path:path}
+```
+
+**After**（annotation 注入，trace `46f0a0df...`，這次故意送 `userId` 而不是 `user_id`）：
+
+```
+api-gateway   POST /api/orders   {http.route: /api/orders, userId: u-4}
+order-service POST /api/orders   {http.route: /api/orders}
+user-service  GET /api/users/{user_id}/authcheck
+payment-service POST /charge
+webapp        POST /api/{path:path}
+```
+
+兩條 trace 的服務數、span 數、`http.route` 完全一樣。span name 依然是 FastAPI 的 route template（`POST /api/orders`），不是「checkout」這種業務語意——**annotation 注入沒有讓這件事變得更好，也沒有變得更差，它跟 Day1 講的「span 沒有業務語意」這個壞味道完全無關**，因為兩種注入方式底層用的是同一套 FastAPI instrumentor，抓到的是同一層技術語意。
+
+而 Day4 加進 `api-gateway` 的那段「把呼叫端原始 key 寫進 span attribute」的程式碼——`before` trace 是 `user_id: u-1`，`after` trace 是 `userId: u-4`（因為這次我故意送了 `userId`）——**兩邊都正確地把呼叫端實際用的 key 標了上去，一模一樣**。
+
+## 誠實講：annotation 到底換到了什麼、沒換到什麼
+
+這是今天最容易被誤解的地方，值得講清楚：**annotation 注入換掉的是「誰負責遞送 instrumentation agent」，不是「自動抓到多少東西」。**
+
+- 換掉的：Dockerfile 不用再寫 `opentelemetry-instrument`，不用每個團隊自己記得要不要升級這個 wrapper 版本、要不要跟上新的 semantic convention——這件事現在是平台團隊透過 `Instrumentation` CR 中央宣告一次，所有掛上這個 annotation 的服務都吃到同一份版本、同一份設定。這正是 Day3 一路鋪陳的「各自安裝」變成「中央調和」——只是這次終於在 Day5 落地成一個看得到 diff 的真實案例。
+- 沒換掉的：FastAPI/httpx 這些通用函式庫的 auto-instrumentation，本來就只抓得到 HTTP method、route template、status code 這些**技術語意**層面的東西；`api-gateway` span 名稱依然是 `POST /api/orders`，不會自動變成「checkout」。想要業務語意，或想要「把呼叫端原始 key 標上去」這種特定的資安/治理需求，都得靠 Day4 那段手寫的程式碼——**annotation 換的是遞送機制，不是免費多送你語意**。這段程式碼不管用哪種注入方式都得自己寫，也都會照常運作，因為它呼叫的是 `trace.get_current_span().set_attribute(...)`，是 app 自己在跟 OTel API 對話，不是 auto-instrumentation 幫你做的事。
+
+換句話說，「annotation 覆蓋不到的地方」不是「這次少抓到了什麼東西」，而是「這東西從一開始，兩種注入方式都沒有幫你抓」——annotation 解決的是治理/維運層面的問題（誰維護版本、誰記得升級），不是資料豐富度的問題。這是這系列一路強調的「誠實」的具體一次示範：如果只截圖 before/after 的 trace 長得一樣，讀者可能會誤以為「反正一樣，那何必裝 Operator」；真正的價值在維運層面，不在單次 trace 的資料內容上，這件事必須講清楚，不能靠一張漂亮截圖含糊帶過。
+
+## 今天沒做的事
+
+只轉換了 `api-gateway` 一個服務，其餘四個（`payment`、`user`、`order`、`webapp`）依然是 Dockerfile 裡的 `opentelemetry-instrument`。這是刻意的——先讓一個服務完整跑過一次「annotation 注入 → 真的比對 trace → 誠實講差異」，確認整條路徑沒問題，再決定要不要把其餘四個一起搬過去（會在後面某一天回頭處理，不在今天的範圍內）。
+
+明天：Collector 三種部署模式（sidecar/daemonset/gateway）的真實 CPU/記憶體/延遲數字，以及一次真的把其中一種模式的 resource limit 調低到它開始丟資料的排查過程。
