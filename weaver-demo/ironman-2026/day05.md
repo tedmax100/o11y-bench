@@ -123,6 +123,43 @@ webapp        POST /api/{path:path}
 
 換句話說，「annotation 覆蓋不到的地方」不是「這次少抓到了什麼東西」，而是「這東西從一開始，兩種注入方式都沒有幫你抓」——annotation 解決的是治理/維運層面的問題（誰維護版本、誰記得升級），不是資料豐富度的問題。這是這系列一路強調的「誠實」的具體一次示範：如果只截圖 before/after 的 trace 長得一樣，讀者可能會誤以為「反正一樣，那何必裝 Operator」；真正的價值在維運層面，不在單次 trace 的資料內容上，這件事必須講清楚，不能靠一張漂亮截圖含糊帶過。
 
+## 延伸：annotation 注入不是 Python 專屬，公司環境的多語言案例
+
+今天的示範只用了 Python，靠 `PYTHONPATH` 這種 language-specific 的 auto-instrumentation 機制。但 annotation 驅動注入這件事本身是通用的，公司內部另一個環境（Java / PHP / 其他語言混跑）剛好把「同一套 annotation 機制，換一種語言會長什麼樣子」示範得很清楚，值得記錄——但先說明：這套設定當時**還沒有在真實叢集完整驗證過**（沒確認過 webhook 一定能成功注入），下面講的是設計，不是「已經跑通」的結論，跟這系列一貫的誠實態度一致。
+
+**Java：兩個 annotation 要一起加，缺一不可**
+
+Java 沒有走 `PYTHONPATH` 那種路，是 operator 提供的 `-javaagent`：
+
+```yaml
+annotations:
+  instrumentation.opentelemetry.io/inject-java: "opentelemetry-operator-system/java"
+  sidecar.opentelemetry.io/inject: "opentelemetry-operator-system/sidecar"
+```
+
+這裡的設計是 app 送 OTLP 到本機 sidecar（`localhost:4318`），sidecar 再轉發到中心化的後端——跟今天 `api-gateway` 直接送到叢集內 `otel-collector` Service 的拓撲不一樣，是「先進 sidecar，sidecar 再統一出口」。因為掛了 sidecar，一個 Pod 至少會有兩個 container，webhook 沒辦法保證猜對要幫哪個 container 注入 agent，所以還要多加一個：
+
+```yaml
+  instrumentation.opentelemetry.io/container-names: "<app container 名稱>"
+```
+
+這是今天「annotation 補齊沒有的、不動已經存在的」那段可以延伸的另一面——**沒填 `container-names` 不會報錯，只是 agent 沒被注入，資料悄悄不出現**。跟今天 `OTEL_SERVICE_NAME`/`OTEL_EXPORTER_OTLP_ENDPOINT` 不被覆蓋是「因為已存在所以被跳過」不同，這裡是「因為猜不到目標，直接放棄注入」，同樣是靜默、同樣容易被忽略，但成因不一樣，值得分開記。
+
+**PHP-FPM：annotation 注入不需要語言本身支援 auto-instrument**
+
+PHP 沒有 operator 支援的自動注入機制，能用的只有 sidecar 模式：
+
+```yaml
+annotations:
+  sidecar.opentelemetry.io/inject: "opentelemetry-operator-system/sidecar-php-fpm"
+```
+
+這證明了一件事：annotation 驅動注入的機制本身不依賴「這個語言有沒有 auto-instrumentation agent」——sidecar 模式只是幫你把一個 collector process 塞進同一個 Pod，網路層面能連到 `localhost` 就夠，app 端要自己用 SDK 把 OTLP 送過去、自己設好 `OTEL_SERVICE_NAME`。跟今天 Python annotation 注入（webhook 直接把 instrumentation 邏輯注入進 app process）是完全不同的兩種手段，殊途同歸都是「靠 annotation 觸發 webhook」。
+
+PHP-FPM 還有一個 Python 長駐 process 完全不會碰到的問題：每個 request 都是全新的短命 process，SDK 只能送 delta metrics，沒辦法像長駐 process 一樣自己維護 cumulative 狀態。這個環境的做法是在 sidecar 內用 `deltatocumulative` processor，把同一個 Pod 內多個短命 worker process 送出的 delta 值疊加成正確的 cumulative 值再送出去——這是「注入機制要配合語言的 process 生命週期」的具體案例，Python 因為是長駐 process 天生不會踩到。
+
+**這段延伸的誠實結論**：annotation 注入有兩種不同的實作手段（Python 這種「改寫 app process 本身」vs. sidecar 這種「旁邊塞一個轉發 process」），選哪種不是治理團隊說了算，是被語言本身的 process 模型決定的——有沒有 auto-instrumentation agent、是不是長駐 process，這兩個問題的答案，直接決定一個新語言加入時該走哪條路。
+
 ## 今天沒做的事
 
 只轉換了 `api-gateway` 一個服務，其餘四個（`payment`、`user`、`order`、`webapp`）依然是 Dockerfile 裡的 `opentelemetry-instrument`。這是刻意的——先讓一個服務完整跑過一次「annotation 注入 → 真的比對 trace → 誠實講差異」，確認整條路徑沒問題，再決定要不要把其餘四個一起搬過去（會在後面某一天回頭處理，不在今天的範圍內）。
