@@ -160,8 +160,41 @@ PHP-FPM 還有一個 Python 長駐 process 完全不會碰到的問題：每個 
 
 **這段延伸的誠實結論**：annotation 注入有兩種不同的實作手段（Python 這種「改寫 app process 本身」vs. sidecar 這種「旁邊塞一個轉發 process」），選哪種不是治理團隊說了算，是被語言本身的 process 模型決定的——有沒有 auto-instrumentation agent、是不是長駐 process，這兩個問題的答案，直接決定一個新語言加入時該走哪條路。
 
+## annotation 注入之後，collector 本身也可能是那個沒被觀測到的東西
+
+今天前面一路在講「annotation 注入了什麼、沒注入什麼」，都預設了一件事：只要 webhook 把 instrumentation 塞進去，資料就一定會安全送到後端。這個預設今天要親手戳破一次——把 `api-gateway` 現在指向的 `otel-collector`（`13-otel-collector.yaml` 那份獨立 Deployment）resource limit 主動調低，看著它被 `OOMKilled`，走一次「發現資料變少 → 定位是 collector 被壓垮」的排查。
+
+```yaml
+resources:
+  limits:
+    memory: "TODO：先跑一次正常負載記下平常用量，再往下調到明顯不夠"
+```
+
+重新對 `api-gateway` 送同一組流量，這次盯著三件事：
+
+1. `kubectl get pods -n demo -w`——等 `otel-collector` 那個 Pod 出現 `OOMKilled`。
+2. `kubectl describe pod otel-collector-... | grep -A5 "Last State"`——確認真的是 `OOMKilled`，不是 liveness probe 失敗或別的原因。
+3. Tempo 那邊查同一段時間的 trace 數量——這是「使用者視角」會先看到的症狀：不是報錯，是資料悄悄變少。
+
+```
+# TODO：真實 kubectl describe 輸出 + Tempo 查詢對照，貼這裡
+```
+
+排查順序刻意不是先查 app：
+
+1. **先確認不是 app 沒送**：查 app 容器的 log，確認 exporter 沒有報錯——如果 app 端已經在噴 `Failed to export`，問題出在連線層級，跟 collector 內部無關，排查方向完全不同。
+2. **再確認是不是 collector 收到了但沒送出去**：`kubectl port-forward` 到 collector 的 metrics endpoint，比對 `otelcol_receiver_accepted_spans` 跟 `otelcol_exporter_sent_spans` 這兩個數字——有落差代表資料卡在 collector 內部，不是 receiver 沒收到。
+3. **最後才看 Pod 本身健不健康**：`kubectl get pod`、`kubectl describe pod` 看重啟次數跟 `Last State` 的 `Reason`。
+
+```
+# TODO：實際跑三步的輸出貼上來，尤其是 otelcol_receiver_accepted_spans
+# vs otelcol_exporter_sent_spans 這組數字落差
+```
+
+這個順序刻意跟直覺相反——大部分人踩到「資料變少」的第一反應是去查 app，因為症狀是在 app 這邊的下游（dashboard 空的、trace 查不到）浮現的。但 app 端往往是無辜的：它已經把 span 送出去了，只是 collector 那端在半路把它吃掉。**症狀出現的地方，不一定是問題發生的地方**——這也是今天最想留下的一句話：annotation 注入解決的是「instrumentation 怎麼進到 app process」，不代表資料從此穩定送達；可觀測性系統本身的健康狀態，也需要被觀測，不能預設它永遠正常運作。這條線後面會在 Signal Plane 談資料可信度的那幾天再接上。
+
 ## 今天沒做的事
 
-只轉換了 `api-gateway` 一個服務，其餘四個（`payment`、`user`、`order`、`webapp`）依然是 Dockerfile 裡的 `opentelemetry-instrument`。這是刻意的——先讓一個服務完整跑過一次「annotation 注入 → 真的比對 trace → 誠實講差異」，確認整條路徑沒問題，再決定要不要把其餘四個一起搬過去（會在後面某一天回頭處理，不在今天的範圍內）。
+只轉換了 `api-gateway` 一個服務，其餘四個（`payment`、`user`、`order`、`webapp`）依然是 Dockerfile 裡的 `opentelemetry-instrument`。這是刻意的——先讓一個服務完整跑過一次「annotation 注入 → 真的比對 trace → 誠實講差異」，確認整條路徑沒問題，再決定要不要把其餘四個一起搬過去（會在後面某一天回頭處理，不在今天的範圍內）。OOMKilled 的排查也只做了一種部署形狀（獨立 Deployment 共用一份 collector），sidecar/daemonset 這類不同拓撲會不會有一樣的失效模式，留給之後有需要時再驗證，不在今天的範圍內硬湊。
 
-明天：Collector 三種部署模式（sidecar/daemonset/gateway）的真實 CPU/記憶體/延遲數字，以及一次真的把其中一種模式的 resource limit 調低到它開始丟資料的排查過程。
+明天：把這份 Operator 設定從 `kubectl apply` 搬進 GitOps，講 PR review 這類 CRD 改動時該看什麼。
