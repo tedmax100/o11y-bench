@@ -1,0 +1,3 @@
+[submodule "otel-aiops-agent"]
+	path = otel-aiops-agent
+	url = https://github.com/tedmax100/OTel_AIOps_Agent.git
