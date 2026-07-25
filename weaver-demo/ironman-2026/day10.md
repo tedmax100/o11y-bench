@@ -9,7 +9,9 @@ Day9 用 `weaver registry infer` 從真實流量反推出一份草稿，親眼�
 
 今天不做那段收斂，做的是它的前一步：**先讓機器有能力指出「這裡有兩個名字在講同一件事」**。因為如果連「哪裡出問題」都要靠人一個一個看，那份 793 行的草稿根本不會有人看完。
 
-Day8 已經示範過一次 Rego policy 攔下違規，但那條規則的內容一直沒有展開講（我把它推給了「Day10-11」）。今天把這筆帳還掉：從 policy 的輸入到 Finding 的輸出，整條路徑走一遍，順便把三個原本沒寫在任何文件裡、但一定會踩到的行為記下來。
+Day8 已經示範過一次 Rego policy 攔下違規，但那條規則的內容一直沒有展開講（我把它推給了「Day10-11」）。今天把這筆帳還掉：從 policy 的輸入到 Finding 的輸出，整條路徑走一遍。
+
+Rego 是這整套治理機制裡最陡的一段，所以中間會有一節專門講**weaver 實際用到的那一小塊 Rego**——兩個 package 各自看得到什麼（實測把 `input` 整包印出來對照）、哪些關鍵字真的會用到、哪些內建函式可用、以及為什麼網路上大部分 Rego 範例貼進來會直接被拒絕。文件沒寫、但一定會踩到的行為，也一併記下來。
 
 程式碼在 submodule 的 [`day10/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/day10)（一份刻意留著漂移的 registry ＋ 一份 `naming.rego`），這裡直接講重點跟真實輸出。
 
@@ -66,6 +68,197 @@ flowchart TB
 **第二，`package after_resolution` 這行決定規則什麼時候跑。** 還有一個 `before_resolution`，在 `ref` 展開之前跑，看得到原始的 YAML 結構。今天所有規則都用 `after_resolution`，因為命名檢查要看的是最終每個 group 上實際掛了哪些 attribute。
 
 **第三，只有 `deny` 這個名字會被收集。** 這點下面會用實測說明，因為它推翻了我原本的一個假設。
+
+## Rego 速成：weaver 只用到這門語言的一小塊
+
+Rego 是這整套治理機制裡學習曲線最陡的一段——它是宣告式的、沒有 for 迴圈、`not` 的語意跟你想的不一樣，而且網路上大部分範例是舊語法、貼進來會直接被拒絕。
+
+好消息是：**weaver 只用到 Rego 的一小塊**。把下面這些搞懂，寫得出 90% 會用到的規則。
+
+### 一份 weaver policy 的骨架
+
+```rego
+package after_resolution        # ① 決定「什麼時候跑」，名字不能亂取
+
+import rego.v1                  # ② 選用（引擎本來就是 v1），寫了比較清楚
+
+# ③ 主角：deny 是唯一會被收集的規則名
+deny contains my_finding(group.id, attr.name) if {
+	group := input.groups[_]                  # ④ 迭代
+	attr := group.attributes[_]
+	regex.match(`[a-z][A-Z]`, attr.name)      # ⑤ 條件（全部要成立）
+}
+
+# ⑥ 輔助函式：組出固定形狀的 violation 物件
+my_finding(group_id, attr_id) := violation if {
+	violation := {
+		"id":       "my_rule_id",
+		"type":     "semconv_attribute",
+		"category": "naming",
+		"group":    group_id,
+		"attr":     attr_id,
+	}
+}
+```
+
+六個位置各自的規矩：
+
+| | 元素 | 規矩 |
+|---|---|---|
+| ① | `package` | 只有 `before_resolution` / `after_resolution` 有效。**打錯不會報錯，會給你綠燈**（下面詳述） |
+| ② | `import rego.v1` | 選用。引擎本來就是 v1，但**舊語法會被拒絕** |
+| ③ | `deny` | 唯一會被收集的規則名。叫 `violation`、`warn`、`allow` 都不會有任何效果 |
+| ④ | `[_]` | 「對每一個都試一次」，不是「取第 0 個」 |
+| ⑤ | 規則主體 | 所有條件是 **AND**；要 OR 就寫成兩條同名規則 |
+| ⑥ | 輔助函式 | 純粹是為了可讀性，把物件直接寫在 `deny` 裡也可以 |
+
+### 兩個 package，看到的東西完全不一樣
+
+這是寫 weaver policy 最需要先搞清楚的一件事，也是決定「這條規則要寫在哪」的依據。實測把 `input` 整包印出來對照：
+
+```mermaid
+flowchart TB
+    Y["registry/model/*.yaml"] --> B["package before_resolution<br/><b>每個 YAML 檔各跑一次</b>"]
+    B --> B1["input.groups＝這個檔案裡的 group<br/>input.file_format＝'definition/1'<br/>attribute 保持你寫的樣子：<br/>inline 的有 id，引用的只有 ref"]
+    Y --> R["weaver_resolver<br/>展開 ref／extends"]
+    R --> A["package after_resolution<br/><b>整份 registry 只跑一次</b>"]
+    A --> A1["input.groups＝全部 group（本例 34 個）<br/>input.registry_url<br/>attribute 已展開，鍵是 name 不是 id"]
+```
+
+拿 Day8 那份有 5 個 YAML 檔、34 個 group 的 registry 實測，印出「每次呼叫看到幾個 group」：
+
+```
+# package before_resolution
+一次呼叫看到 4 個 group，format=definition/1     ← common.yaml
+一次呼叫看到 15 個 group，format=definition/1    ← events.yaml
+一次呼叫看到 6 個 group，format=definition/1     ← metrics.yaml
+一次呼叫看到 6 個 group，format=definition/1     ← genai.yaml
+一次呼叫看到 3 個 group，format=definition/1     ← spans.yaml
+
+# package after_resolution
+KEYS=["groups", "registry_url"] groups=34        ← 只有一次，全部都在
+```
+
+attribute 的形狀也不一樣。同一個 registry，`before_resolution` 看到的是**你手寫的原樣**：
+
+```
+group=registry.order   attrKeys=["annotations","brief","examples","id","note","requirement_level","stability","type"]
+group=span.order.create attrKeys=["annotations","ref"]        ← ref 還在，沒有被展開
+```
+
+`after_resolution` 看到的則是展開後的效果，`ref` 這個字根本不存在、鍵從 `id` 變成 `name`。
+
+所以選哪個 package 的判準很清楚：
+
+| 你想檢查的事 | 用哪個 | 為什麼 |
+|---|---|---|
+| 命名風格、撞名、缺 namespace | `after_resolution` | 要看**實際生效**的名字，含被 ref 進來的 |
+| metric label 的值域／基數（Day8） | `after_resolution` | `ref` 展開後才知道這個 metric 實際掛了什麼 |
+| 「不准 inline 定義，一律要用 ref」 | `before_resolution` | 只有展開前才分得出 inline 跟 ref |
+| 「每個檔案都要有某個 group」 | `before_resolution` | 它是**按檔案**跑的，天生就有檔案的概念 |
+| 跨檔案的一致性（例如全域撞名） | `after_resolution` | `before_resolution` 一次只看得到一個檔案 |
+
+最後一列特別容易踩：**`before_resolution` 看不到別的檔案**，所以任何「兩個東西撞在一起」的規則寫在那裡都不會成立。Day10 這條 `duplicate_concept` 之所以放 `after_resolution`，就是這個原因。
+
+### 真正會用到的關鍵字
+
+Rego 語言本身很大，但寫 weaver policy 反覆用到的其實就這幾個：
+
+| 關鍵字／語法 | 意思 | 典型用法 |
+|---|---|---|
+| `x := input.groups[_]` | **迭代**：對每個 group 各試一次 | 所有規則的第一行 |
+| `some g in input.groups` | 同上，較新的寫法，可讀性好一點 | 跟 `[_]` 二選一 |
+| `a := b` | 賦值（宣告新變數） | 慣用，優先於 `=` |
+| `not <表達式>` | 「這個表達式**無法成立**」 | `not contains(name, ".")` |
+| `every g in xs { … }` | 全稱：每一個都要滿足 | 「所有 metric 都必須有 unit」 |
+| `x in xs` | 成員判斷 | 白名單比對 |
+| `[e \| some g in xs]` | comprehension，把巢狀結構**攤平成集合** | 全域撞名檢查的關鍵 |
+| `default x := false` | 給規則一個預設值，避免 undefined | 布林旗標 |
+| 同名規則寫兩次 | **OR** | 「是 enum 或是 boolean 都算安全」 |
+
+其中最反直覺的兩個，值得單獨記：
+
+**`not` 不是布林取反，是「無法成立」。** 在有迭代的情境下差很多——`not group.attributes[_].name == "x"` 的意思是「不存在任何一個叫 x 的 attribute」，不是「每個都不叫 x」。單一布林值的情況（像 `contains()` 的回傳）才跟直覺一致。
+
+**要 OR 就寫兩條同名規則。** Rego 沒有 `||`，Day8 那條「enum 或 boolean 都算有界」就是這樣寫的：
+
+```rego
+bounded_label(attr) if is_object(attr.type)      # enum
+bounded_label(attr) if attr.type == "boolean"    # boolean
+```
+
+兩條都叫 `bounded_label`，任何一條成立就算成立。
+
+### 內建函式：實測都能用
+
+weaver 內嵌的是自己的 Rego 引擎，不是 OPA 本體，所以不能假設所有 OPA 內建函式都在。實測跑過一輪，寫 policy 會用到的都可用：
+
+| 類別 | 函式 |
+|---|---|
+| 字串 | `startswith` `endswith` `contains` `lower` `upper` `split` `replace` `sprintf` |
+| 正則 | `regex.match` |
+| 型別 | `is_object` `is_string` `is_array` `count` |
+| 物件 | `object.get`（可給預設值）`json.marshal` `walk` |
+| 版本 | `semver.compare` |
+
+`is_object` 是 Day8 那條值域規則的支點（enum 的 `type` 是物件、`"string"` 是字串），`semver.compare` 則在 Day14 比 registry 版本時會派上用場。
+
+### 語法版本：網路上的範例大多貼不動
+
+Rego 在 v1 改了語法，而 weaver 的引擎**只吃 v1**。舊寫法直接被拒絕：
+
+```rego
+# ❌ v0 寫法（2023 年以前的教學、大部分 StackOverflow 答案都長這樣）
+deny[f] {
+	input.groups[_].type == "span"
+	f := { ... }
+}
+```
+
+```
+× Invalid policy file, error: `if` keyword is required before rule body
+```
+
+這個錯誤訊息算好的——它直接告訴你缺 `if`。改成 v1 就好：
+
+```rego
+# ✅ v1 寫法
+deny contains f if {
+	input.groups[_].type == "span"
+	f := { ... }
+}
+```
+
+`import rego.v1` 這行實測**加不加都能跑**（引擎本來就是 v1），`import future.keywords` 也接受。建議還是寫上 `import rego.v1`，一來明示意圖，二來拿去給 OPA 或 `conftest` 跑時行為一致。
+
+### package 名字打錯：又一個假綠燈
+
+最後這個是今天測出來最陰的一件事。把 package 從 `after_resolution` 改成 `mypolicy`，其他一字不改：
+
+```
+$ weaver registry check -r registry -p policies
+✔ No `after_resolution` policy violation
+
+$ echo $?
+0
+```
+
+**綠燈、離開碼 0、沒有任何警告。** weaver 不會說「你這個 package 我不認得」，它只是安靜地不去執行它。
+
+更麻煩的是連 `--display-policy-coverage` 都**什麼都不印**：
+
+```
+$ weaver registry check -r registry -p policies --display-policy-coverage
+（coverage 區段完全空白）
+
+# 對照：package 正確時
+COVERAGE REPORT:
+policies/naming.rego has full coverage
+```
+
+反過來說，這就是驗證方式：**coverage 報告裡有沒有列出你那個 `.rego` 檔，就是「這份 policy 到底有沒有被執行」的探針**——地位等同 Day7 用 `registry stats` 的 group 數量當 registry 的探針。
+
+這是這系列第三次撞到同一個模式了（Day7 的 `-r .`、Day8 只比對名字的 policy、今天的 package 打錯）。共通結構是：**工具用「什麼都沒發生」來表達「你設定錯了」**，而「什麼都沒發生」跟「一切正常」在輸出上長得一模一樣。所以每接一個新的檢查機制，第一件事都該是問「我要怎麼確認它真的在跑」，而不是「它有沒有報錯」。
 
 ## 三條規則，一條比一條難
 
@@ -357,7 +550,7 @@ Day7 講過，LLM 犯錯的方式很隱蔽：它不會說「我不確定這兩�
 
 也沒有真的去修那份 registry。今天產出的是一張遷移清單，不是遷移本身；把 `userId` 收斂掉會動到 `o11y_shared` 跟五個服務，還會動到 Loki/Prometheus 的 label 跟既有的 dashboard，是刻意留到後面的事。
 
-`before_resolution` 這個 package 今天完全沒用到——它看得到 `ref` 展開前的原始結構，適合寫「不准直接 inline 定義、一律要用 ref」這類結構性規則，但今天三條規則都需要展開後的視野，所以沒有場景可以掛。
+`before_resolution` 只講了它看得到什麼、什麼時候該用它，沒有真的寫一條規則出來——今天三條規則都需要展開後的全域視野，硬塞一個 `before_resolution` 的例子會變成為了示範而示範。等 Day13 開始拆多檔案、多 registry 的時候，「不准 inline 定義、一律要用 ref」這類規則才會有真實的場景可以掛。
 
 三級嚴重度也只講到「check 這一階段沒有」，沒有展開 live-check 的 advice 系統實際怎麼寫——那要有真實流量才有東西可以 advise，留給 Day12。
 
