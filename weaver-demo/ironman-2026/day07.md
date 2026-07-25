@@ -7,7 +7,7 @@ tags: [OpenTelemetry, Weaver, 鐵人賽]
 
 今天不碰 `demo-services` 的程式碼，但會跑指令——不是對付正式服務，是對著幾份最小的示範 registry 跑 `weaver registry check`，把 `group` 的幾種 `type` 長什麼樣、寫錯會發生什麼事，一個一個真的驗證過一次。Day1 已經示範過一次「沒有治理會長成什麼樣子」（`userId` 混 `user.id`、span name 沒語意），Day8 開始要動手用 Weaver 去攔這些問題——但在動手之前，先把「為什麼要有 schema」「Weaver 這個工具內部到底在做什麼」這兩件事講清楚，讓接下來好幾天的動手做，是在對照一張已經畫好的地圖，而不是邊做邊發明新名詞。
 
-今天用到的六份範例 registry 跟真實跑出來的輸出都放在 submodule 的 [`day07/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/day07)（`examples/` 底下），這裡直接講重點跟真實輸出。
+今天用到的七份範例 registry 跟真實跑出來的輸出都放在 submodule 的 [`day07/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/day07)（`examples/` 底下），這裡直接講重點跟真實輸出。
 
 ## 為什麼 telemetry 需要 schema
 
@@ -52,16 +52,16 @@ groups:
         stability: development
 ```
 
-這份 YAML 不是紙上談兵，真的存成檔案、配一份 `manifest.yaml`，拿 `weaver registry check` 跑一次：
+這份 YAML 不是紙上談兵，真的存成檔案、配一份 `manifest.yaml`，拿 `weaver registry check` 跑一次（指令在 `day07/examples/` 底下跑，`-r` 後面接的是那份 registry 的目錄名——**不要寫成 `-r .`**，原因在本文最後一節「一個會騙人的綠燈」會專門講，那是我這次踩到最值得記一筆的坑）：
 
 ```
-$ weaver registry check -r .
+$ weaver registry check -r span-only
 Weaver Registry Check
-Checking registry `.`
-ℹ Found registry manifest: ./manifest.yaml
+Checking registry `span-only`
+ℹ Found registry manifest: span-only/manifest.yaml
 ✔ No `after_resolution` policy violation
 
-Total execution time: 0.006805446s
+Total execution time: 0.006877529s
 ```
 
 乾淨通過。值得一提：第一次寫這份 YAML 時漏掉了 `stability` 這個欄位，weaver 沒有直接判失敗，而是印出兩條警告——`Invalid stability on group ... does not contain a stability field` 跟 attribute 那條一模一樣的警告，離開碼還是 0（warning 不算 violation）。這是 weaver 自己內建的驗證規則，不需要額外寫 Rego policy 就會提醒；上面這份是補上 `stability: development` 之後的乾淨版本。`stability` 是 OpenTelemetry semconv 的標準欄位，標記這個定義目前處在 `development`（還會變動）還是 `stable`（承諾不再變動）——Day14 講 breaking change 時會更仔細講這個欄位的作用。
@@ -88,7 +88,7 @@ classDiagram
       +id: string
       +type: string
       +brief: string
-      +requirement_level: required|recommended|conditionally_required
+      +requirement_level: required|recommended|conditionally_required|opt_in
     }
 
     Manifest "1" --> "*" RegistryFile : 組成
@@ -123,19 +123,22 @@ groups:
 這份單獨拿去跑會失敗——`ref: app.outcome` 指到一個這個檔案裡完全沒定義的 attribute：
 
 ```
-$ weaver registry check -r .
+$ weaver registry check -r metric-dangling-ref
 Weaver Registry Check
-Checking registry `.`
-ℹ Found registry manifest: ./manifest.yaml
+Checking registry `metric-dangling-ref`
+ℹ Found registry manifest: metric-dangling-ref/manifest.yaml
 
 Diagnostic report:
 
   × The following attribute reference is not resolved for the group
   │ 'metric.app.orders.count'.
   │ Attribute reference: app.outcome
-  │ Provenance: ...
+  │ Provenance: Some(Provenance { schema_url: SchemaUrl { url: "https://
+  │ example.com/schemas/day7-metric-dangling-ref/0.1.0", name_range: 8..52,
+  │ version_range: 53..58 }, path: "metric-dangling-ref/metric.yaml" })
 
-exit=1
+$ echo $?
+1
 ```
 
 這正是今天前面「Weaver 內部」那張管線圖畫的 resolver 錯誤——沒有 Finding 結構，因為根本還沒輪到 checker。要讓這份檔案真的能跑，`app.outcome` 得在某個地方（同檔案或別的檔案都可以）先被定義出來，這件事下面 `attribute_group` 範例做完之後會補上。
@@ -159,9 +162,9 @@ groups:
 單獨測試乾淨通過：
 
 ```
-$ weaver registry check -r .
+$ weaver registry check -r attribute-group
 ✔ No `after_resolution` policy violation
-Total execution time: 0.006783746s
+Total execution time: 0.007216561s
 ```
 
 **`event`** —— 定義一個 log event，Day13 會實際寫一份：
@@ -185,7 +188,7 @@ groups:
 這份第一次寫的時候漏掉了 `payment.audit.action` 的 `brief`，跑出來直接是**硬錯誤**（跟前面 `span` 缺 `stability` 只印警告不一樣）：
 
 ```
-$ weaver registry check -r .
+$ weaver registry check -r event
 Diagnostic report:
 
   × Invalid attribute definition detected while resolving 'event.yaml'
@@ -218,9 +221,9 @@ groups:
 跟 `event` 一樣，第一版漏了 attribute 的 `brief` 也是直接失敗，補上之後乾淨通過：
 
 ```
-$ weaver registry check -r .
+$ weaver registry check -r entity
 ✔ No `after_resolution` policy violation
-Total execution time: 0.006537765s
+Total execution time: 0.007200653s
 ```
 
 不管 `type` 是哪一種，結構上都是「一個 group 底下掛一堆 attribute」，差別只在 `type` 決定了這份宣告在描述 signal 本身（`span`/`metric`/`event`）、還是純粹共用的一包屬性（`attribute_group`）或身份（`entity`）。`weaver_semconv` 這個 crate（見下一節）解析的就是這五種 `type` 各自的資料模型。
@@ -280,16 +283,197 @@ groups:
 兩個檔案、一份 `manifest.yaml`，放進同一個資料夾跑：
 
 ```
-$ weaver registry check -r .
+$ weaver registry check -r combined
 Weaver Registry Check
-Checking registry `.`
-ℹ Found registry manifest: ./manifest.yaml
+Checking registry `combined`
+ℹ Found registry manifest: combined/manifest.yaml
 ✔ No `after_resolution` policy violation
 
-Total execution time: 0.007498281s
+Total execution time: 0.007199971s
 ```
 
 這次乾淨通過——`weaver_resolver` 展開 `order.yaml` 裡的兩個 `ref` 時，去 `common.yaml` 找到了對應的定義，兩個檔案雖然分開寫，`weaver_semconv` 解析的單位卻是整份 `groups:` list 的總和，一個檔案裡有幾個 group、混了幾種 `type`，或者跨幾個檔案，對它來說沒有差別。真正決定「一個檔案該放哪些 group」的，是團隊自己的組織習慣（例如 Day8/Day6 那份 registry 是照 domain 拆檔案：`order.yaml`、`payment.yaml`、`common.yaml`），Weaver 本身不強制。
+
+## 往下一層：attribute 自己也有很多變化
+
+前面五種 `type` 講的是 group 這一層的變化。但實際寫 registry 時，花最多時間拿捏的其實是下一層——每一個 attribute 的 `type` 跟 `requirement_level` 要怎麼填。前面所有範例為了聚焦在 group，attribute 一律都寫 `type: string`，這會給人一個錯覺，好像 registry 只能描述字串。實際上不是。
+
+把常見的幾種變化寫成同一個 span 群組（完整檔案在 [`day07/examples/attr-types/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/day07/examples/attr-types)），一次看完：
+
+```yaml
+groups:
+  - id: span.order.submit
+    type: span
+    span_kind: server
+    brief: "送出訂單的 Span，示範各種 attribute type"
+    stability: development
+    attributes:
+      # 1) 純量：字串／整數／浮點／布林
+      - id: biz.order.id
+        type: string
+        brief: "訂單識別碼"
+        examples: ["ord-1001"]
+        requirement_level: required
+        stability: development
+      - id: app.order.item_count
+        type: int
+        brief: "訂單內的品項數量"
+        examples: [1, 3, 7]
+        requirement_level: recommended
+        stability: development
+      - id: app.order.amount
+        type: double
+        brief: "訂單金額（以主要貨幣單位計）"
+        examples: [99.5, 1200.0]
+        requirement_level: recommended
+        stability: development
+      - id: app.order.is_gift
+        type: boolean
+        brief: "是否為禮物訂單"
+        examples: [true, false]
+        requirement_level: opt_in
+        stability: development
+
+      # 2) 陣列
+      - id: app.order.sku_list
+        type: string[]
+        brief: "訂單內所有 SKU 的清單"
+        examples: [["sku-1", "sku-2"]]
+        requirement_level: opt_in
+        stability: development
+
+      # 3) enum：把合法值本身寫進 schema
+      - id: app.outcome
+        type:
+          members:
+            - id: created
+              value: "created"
+              brief: "訂單成功建立"
+              stability: development
+            - id: declined
+              value: "declined"
+              brief: "支付被拒絕"
+              stability: development
+            - id: timeout
+              value: "timeout"
+              brief: "下游逾時"
+              stability: development
+        brief: "業務操作的終態結果"
+        requirement_level: required
+        stability: development
+
+      # 4) template：一整族動態 key，共用同一個型別定義
+      - id: app.order.tag
+        type: template[string]
+        brief: "訂單上的自訂標籤，實際 key 形如 app.order.tag.<name>"
+        examples: ["vip"]
+        requirement_level: opt_in
+        stability: development
+
+      # 5) conditionally_required：條件寫成人看得懂的句子
+      - id: app.fail_reason
+        type: string
+        brief: "失敗原因"
+        examples: ["insufficient_funds"]
+        requirement_level:
+          conditionally_required: "當 app.outcome 不是 created 時必填"
+        stability: development
+```
+
+```
+$ weaver registry check -r attr-types
+✔ No `after_resolution` policy violation
+
+Total execution time: 0.007269841s
+```
+
+有三個地方值得特別停下來看：
+
+**`enum` 把「合法值」也納入治理範圍。** 前面 `common.yaml` 那個 `app.outcome` 只寫 `type: string` 加兩個 `examples`，意思是「這是個字串，長得像 `created`」——但沒有任何東西擋得住有人送 `CREATED`、`Created`、`success`。改寫成 `members` 之後，這三個值變成 schema 的一部分，而不只是文件裡的建議。這件事對 AIOps 的意義更直接：LLM agent 要下 `sum by (app_outcome)` 這種查詢時，`members` 是它唯一能事先知道「這個 label 只會有這三種值」的來源，否則它只能猜，而猜錯的方式通常是憑空生一個看起來很合理的 `success` 出來。
+
+**`template[string]` 是給「一整族 key」用的。** 像 `app.order.tag.vip`、`app.order.tag.wholesale` 這種 key 名本身是動態的，沒辦法一個一個列舉，但型別跟語意是共通的。`template[...]` 讓你定義一次，涵蓋整族。要小心的是這種欄位天生高基數，Day8 那條擋 metric label 的 policy 特別容易在這裡被觸發。
+
+**`requirement_level` 有四級，不是「必填/不必填」二選一。** 這是初次寫 registry 最容易草率帶過的欄位，但它決定了之後 `live-check` 拿真實流量對照時，缺了這個欄位到底算違規還是算正常：
+
+```mermaid
+flowchart TD
+    Q1{"這個欄位缺了，<br/>這筆遙測還有意義嗎？"}
+    Q1 -->|沒有意義| R["required<br/>一定要送"]
+    Q1 -->|有意義，但會少一塊| Q2{"缺的時候，<br/>是有條件的嗎？"}
+    Q2 -->|"是（例如只有失敗時才有）"| C["conditionally_required<br/>條件寫成人看得懂的句子"]
+    Q2 -->|否| Q3{"預設就該送，<br/>還是使用者自己開？"}
+    Q3 -->|預設就該送| RC["recommended<br/>絕大多數欄位都落在這"]
+    Q3 -->|"要自己開（高基數／隱私／成本）"| O["opt_in<br/>預設不送"]
+```
+
+`conditionally_required` 後面接的那個字串不是註解——它會被 `registry generate` 印進文件、也會被 `registry mcp` 餵給 LLM，所以請把條件寫成人（跟模型）看得懂的完整句子，而不是 `see note`。
+
+## 三種嚴格度：不是每個缺漏都同等對待
+
+前面已經零散提過兩次——`stability` 缺了只警告、`brief` 缺了直接失敗。這個差異值得單獨拉出來講，因為它決定了「什麼東西擋得住 CI、什麼東西擋不住」。把 `attr-types` 這份乾淨的範例分別弄壞三次，實際跑出來的結果是這樣：
+
+**缺 `stability`（group 層）——⚠ 警告，但離開碼是 0：**
+
+```
+$ weaver registry check -r s1
+✔ No `after_resolution` policy violation
+Diagnostic report:
+  ⚠ Invalid stability on group 'span.order.submit' detected while resolving
+  │ '"s1/attrs.yaml"'. This group does not contain a stability field.
+
+$ echo $?
+0
+```
+
+**缺 `brief`（attribute 層）——× 硬錯誤，離開碼 1：**
+
+```
+$ weaver registry check -r s2
+✔ No `after_resolution` policy violation
+Diagnostic report:
+  × Invalid attribute definition detected while resolving
+  │ '"s2/attrs.yaml"' (group_id='span.order.submit',
+  │ attribute_id='app.order.item_count'). This attribute is not deprecated and
+  │ does not contain a brief field.
+
+$ echo $?
+1
+```
+
+**缺 `examples`——完全不吭聲：**
+
+```
+$ weaver registry check -r s3
+✔ No `after_resolution` policy violation
+
+$ echo $?
+0
+```
+
+整理成一張圖，這三層的分工是：
+
+```mermaid
+flowchart LR
+    subgraph T1["第一級：硬錯誤（× / exit 1）"]
+      E1["attribute 缺 brief"]
+      E2["ref 指到不存在的 attribute"]
+      E3["type 寫成不合法的值"]
+    end
+    subgraph T2["第二級：警告（⚠ / exit 0）"]
+      W1["group 缺 stability"]
+      W2["attribute 缺 stability"]
+    end
+    subgraph T3["第三級：完全不管"]
+      N1["缺 examples"]
+      N2["缺 note"]
+      N3["命名風格（camelCase 也照收）"]
+    end
+    T1 -->|"CI 擋得住"| G["merge gate"]
+    T2 -.->|"CI 擋不住，<br/>要自己把 warning 當 error"| G
+    T3 -.->|"內建規則管不到，<br/>要靠 Rego policy"| G
+```
+
+第三級是最需要提醒的一層：**`weaver registry check` 的內建規則不管命名風格**。你寫 `userId` 當 attribute id，只要 `brief` 有填、`stability` 有填，它一樣給你綠燈——Day1 那個反面教材如果只靠內建規則，是攔不下來的。要攔命名風格、要攔「高基數欄位不准當 metric label」這種團隊自訂的規則，得自己寫 Rego policy，那正是 Day8 會第一次看到、Day10-11 會展開講的東西。換句話說：內建規則保證的是「這份 YAML 結構正確」，不是「這份 schema 設計得好」。
 
 OpenTelemetry 官方部落格在介紹 Weaver 時，用一句話點出這整件事的核心心態：*"treat telemetry like a public API. If you wouldn't break your app's API between releases, don't break your telemetry either."*（把 telemetry 當成公開 API 來對待——你不會隨便在兩次 release 之間打破 app 的 API，也不該隨便打破 telemetry。）這跟 Day1 的故事完全對得上：`userId` 改名這件事本身沒有錯，錯在沒有人把它當成一次「breaking change」來看待、審查、通知下游。semantic convention 就是這份「grammar」——OpenTelemetry 官方 registry 目前維護超過 900 個 attribute、涵蓋 70+ 個領域，由 9 個 special interest group 共同治理，這規模本身就說明了：光靠口頭約定或 wiki 文件是撐不住的，需要工具鏈介入。這也是為什麼官方把整套方法論稱為 **"observability by design"**——把 telemetry 的設計往左移（shift left）到開發階段，而不是等出事才回頭補。（來源：[OpenTelemetry 官方部落格](https://opentelemetry.io/blog/2025/otel-weaver/)）
 
@@ -322,16 +506,16 @@ Weaver 的原始碼是一個 cargo workspace（Rust 的 monorepo 概念），底
 
 ```mermaid
 flowchart LR
-    A["registry/*.yaml"] --> B["weaver_semconv\n解析 YAML → 資料模型"]
-    B --> C["weaver_resolver\n展開 ref／extends／imports"]
-    C -->|resolve 失敗| C1["resolver 錯誤\n（純文字診斷，沒有 Finding 結構）"]
-    C -->|resolve 成功：resolved schema| D["weaver_checker\n跑 Rego policy"]
-    D -->|有違規| D1["Finding\nid / level / context"]
+    A["registry/*.yaml"] --> B["weaver_semconv<br/>解析 YAML → 資料模型"]
+    B --> C["weaver_resolver<br/>展開 ref／extends／imports"]
+    C -->|resolve 失敗| C1["resolver 錯誤<br/>（純文字診斷，沒有 Finding 結構）"]
+    C -->|resolve 成功：resolved schema| D["weaver_checker<br/>跑 Rego policy"]
+    D -->|有違規| D1["Finding<br/>id / level / context"]
     D -->|沒有違規| E["resolved schema 可以往下用"]
-    E --> F["weaver_forge\n套 template"]
-    E --> G["weaver_emit\n發成 OTLP"]
-    E --> H["weaver_live_check\n對照真實流量"]
-    E --> I["weaver_mcp\n包成 MCP server"]
+    E --> F["weaver_forge<br/>套 template"]
+    E --> G["weaver_emit<br/>發成 OTLP"]
+    E --> H["weaver_live_check<br/>對照真實流量"]
+    E --> I["weaver_mcp<br/>包成 MCP server"]
 ```
 
 這張圖今天最重要的地方是 C 節點分岔出去的兩條路：`resolve` 失敗跟 `resolve` 成功之後 `check` 失敗，是兩種完全不同的錯誤，來自管線的不同階段。Day8 會實際跑出這兩種錯誤各自長什麼樣——如果 resolve 這一步就失敗（例如 `extends` 指到一個不存在的 group），你會先看到 resolver 的錯誤，而不是 checker 的 Finding，這兩種錯誤訊息長得不一樣，來源也不一樣。
@@ -354,6 +538,60 @@ flowchart LR
 | `weaver registry live-check` | 拿真實流量對照 registry，抓 runtime 才出現的違規 | Day12 |
 | `weaver registry mcp` | 啟動 MCP server，讓 agent 用自然語言查 registry | Day15 |
 | `weaver completion` | 產生 shell 自動補全設定 | 不特別示範 |
+
+## 一個會騙人的綠燈：`-r .` 這個坑
+
+最後講一個今天真的踩到、而且踩得很不舒服的坑——不舒服的點在於，它沒有報錯，它給你綠燈。
+
+前面所有範例我原本都是這樣跑的：`cd` 進那份 registry 的資料夾，然後 `weaver registry check -r .`。輸出長這樣，看起來完全正常：
+
+```
+$ cd span-only
+$ weaver registry check -r .
+Weaver Registry Check
+Checking registry `.`
+ℹ Found registry manifest: ./manifest.yaml
+✔ No `after_resolution` policy violation
+```
+
+它甚至老實地告訴你「找到 manifest 了」。問題是——它**一個 group 都沒讀進去**。用 `registry stats` 一問就現形：
+
+```
+$ cd span-only && weaver registry stats -r .
+  - 0 groups
+
+$ cd .. && weaver registry stats -r span-only
+  - 1 groups
+```
+
+同一份檔案，只差在 `-r` 後面寫 `.` 還是寫目錄名。把七份範例全部掃一次，結論一致（weaver 0.24.1）：
+
+| 範例 | `-r .` | `-r <目錄名>` |
+|---|---|---|
+| span-only | 0 groups，exit 0 ✔ | 1 group，exit 0 ✔ |
+| attribute-group | 0 groups，exit 0 ✔ | 1 group，exit 0 ✔ |
+| event | 0 groups，exit 0 ✔ | 1 group，exit 0 ✔ |
+| entity | 0 groups，exit 0 ✔ | 1 group，exit 0 ✔ |
+| combined | 0 groups，exit 0 ✔ | 3 groups，exit 0 ✔ |
+| attr-types | 0 groups，exit 0 ✔ | 1 group，exit 0 ✔ |
+| **metric-dangling-ref** | **0 groups，exit 0 ✔** | **診斷報告，exit 1 ✖** |
+
+最後一列是重點：那份**故意寫錯**的 registry，用 `-r .` 跑出來是綠燈。`-r ./` 也一樣，換成絕對路徑（`-r "$(pwd)"`）或任何不是 `.` 開頭的相對路徑（`-r ../span-only`）就正常。
+
+這件事的教訓比「記得別寫 `.`」大得多。一個永遠會過的檢查，比沒有檢查更危險——沒有檢查的時候，大家心裡知道這裡沒人把關；有一個永遠綠燈的檢查，團隊會真心相信「registry 是有被驗證過的」，然後把它接進 CI，變成一道每次都放行的閘門。這正好是這系列 Day1 那個故事的變形：問題不在於工具壞掉，而在於「以為有共識」跟「真的有共識」之間的落差沒有人去驗證。
+
+所以之後每天，任何一份 registry 第一次接進流程時，我都會多跑一次 `registry stats` 確認 group 數量對得上，把它當成「這個檢查真的有在檢查東西」的探針：
+
+```mermaid
+flowchart LR
+    A["weaver registry check"] --> B{"✔ 綠燈"}
+    B --> C{"registry stats<br/>group 數量 &gt; 0？"}
+    C -->|是| D["這是真的通過"]
+    C -->|"否"| E["假綠燈<br/>檢查根本沒讀到檔案"]
+    E --> F["先修指令／路徑，<br/>再談 schema 對不對"]
+```
+
+Day8 把這條探針用在真正的 `demo-services` registry 上，第一件事就是先確認它讀到了 34 個 group，再看檢查結果。
 
 ## 今天沒做的事
 

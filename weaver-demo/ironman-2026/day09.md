@@ -44,6 +44,35 @@ sequenceDiagram
     CLI->>Draft: 寫出累積結果
 ```
 
+這裡順便把第三種模式也先放進來對照，因為這三個指令很容易被搞混——它們都跟「registry 跟真實世界對不對得上」有關，但問的問題完全不同：
+
+| | `registry check`（Day8） | `registry infer`（今天） | `registry live-check`（Day12） |
+|---|---|---|---|
+| 輸入 | registry YAML | 真實 OTLP 流量 | registry YAML **＋** 真實 OTLP 流量 |
+| 輸出 | 通過／違規 | 一份 schema 草稿 | 真實流量違反 registry 的清單 |
+| 問的問題 | 「我寫的規範自不自洽？」 | 「我的系統現在到底在送什麼？」 | 「送出去的東西有沒有照規範？」 |
+| 執行方式 | 跑一次就結束 | 常駐監聽，累積 | 常駐監聽，比對 |
+| 需要事先有 registry 嗎 | 要 | **不用** | 要 |
+| 典型用途 | CI merge gate | 導入治理的第一天 | 上線後的持續稽核 |
+
+```mermaid
+flowchart TB
+    subgraph S1["現況（還沒有 registry）"]
+      I["registry infer<br/>從流量反推草稿"]
+    end
+    subgraph S2["有了 registry（靜態）"]
+      C["registry check<br/>驗證定義自不自洽"]
+    end
+    subgraph S3["有了 registry（對照 runtime）"]
+      L["registry live-check<br/>抓真實流量的違規"]
+    end
+    I -->|"人工審查、收斂"| C
+    C -->|"服務開始照著送"| L
+    L -.->|"發現規範漏了東西<br/>回頭補定義"| C
+```
+
+這張圖的順序就是導入治理的實際順序：**沒有 registry 的團隊從 `infer` 開始，有了 registry 之後靠 `check` 守住定義，服務跑起來之後靠 `live-check` 守住行為。** 今天做的是最左邊那一格，而且只做到「產出草稿」，中間那條「人工審查、收斂」的箭頭是明天的事。
+
 避開預設的 `4317` port——這是刻意的：4317 是很多本機工具（包括 coding agent 自己的遙測）預設會用的 port，Day12 會講一次真的因為這樣把自己的 OTLP 流量意外吃進去的踩坑記錄，今天先養成習慣，用一個不會撞的 port（`14317`）。
 
 ```bash
@@ -78,6 +107,99 @@ weaver registry infer -o /tmp/day9-infer --grpc-port 14317 --admin-port 18080 --
 
 `infer` 完全沒有「這兩個搞不好是同一件事」的判斷力——它看到兩個不同的字串鍵，就老老實實學成兩個不同的 attribute 定義，連 `brief` 都是空的（`infer` 沒辦法從資料本身推斷這個欄位的語意，只能推斷型別跟 example 值）。這正好demonstrate 了 Day7 提過的那件事：**schema 是團隊的共識，不是資料本身能自己講出來的東西**。`infer` 能幫你把「目前系統實際在送什麼」攤開來看，但看不看得出「這兩個其實是同一個概念、該收斂成一個」，還是得靠人。
 
+## 一個受控的往返實驗：先 emit，再 infer
+
+上面那份草稿是從「真實但混亂」的流量學來的，所以很難分辨哪些粗糙是**服務本身沒治理**造成的、哪些是 **`infer` 這個工具本身的能力上限**。這兩件事混在一起，會讓人對 `infer` 產生錯誤的期待。
+
+所以再做一次受控版本的實驗：拿 Day8 那份**已經治理好**的 registry（34 個 group、有 enum、有 brief、有 requirement_level），用 `weaver registry emit` 把它照著定義發成 OTLP，再讓 `infer` 從那些 OTLP 把 schema 反推回來。輸入是完美的，所以輸出跟輸入之間的落差，就純粹是 `infer` 的能力上限。
+
+```bash
+# 1) 起一個 infer 接收器（一樣避開 4317）
+weaver registry infer -o /tmp/d9probe --grpc-port 24317 --admin-port 28080 \
+  --inactivity-timeout 20 &
+
+# 2) 把 Day8 那份 registry 照定義發成 OTLP
+weaver registry emit -r day06/weaver/registry --endpoint http://localhost:24317
+
+# 3) 收工
+curl -X POST http://localhost:28080/stop
+```
+
+```
+✔ Emitted registry `day06/weaver/registry`
+
+Received stop signal: ADMIN_STOP
+OTLP receiver stopped. Accumulated: 4 resource attrs, 6 spans, 8 metrics, 15 events
+Generated registry file: "/tmp/d9probe/registry.yaml"
+✔ Registry infer completed
+```
+
+畫成圖，這趟往返是這樣：
+
+```mermaid
+flowchart LR
+    A["Day8 的 registry<br/>34 groups<br/>enum / brief / requirement_level"] -->|"weaver registry emit"| B["OTLP 線路上的位元組"]
+    B -->|"weaver registry infer"| C["反推出來的 registry.yaml<br/>793 行"]
+    A -.->|"落差 = infer 的能力上限"| C
+```
+
+八個 metric、15 個 event 一個不漏地回來了，metric 的 `instrument`、`unit`、`metric_name` 也都保住——因為這些東西本來就在 OTLP 的線路格式裡。真正掉的是另外一批東西。拿 `metric.app.orders.count` 這一個 group 前後對照最清楚：
+
+```yaml
+# 原始定義（common.yaml + metrics.yaml）
+      - id: app.outcome
+        stability: development
+        brief: >-
+          Terminal outcome of a business operation. Used as a metric/span
+          label. Distinct from the HTTP status code.
+        note: "Flat key in current code: `status` (on metrics)."
+        type:
+          members:                       # ← 13 個合法值寫在 schema 裡
+            - id: created
+              value: created
+              brief: Order created.
+            - id: declined
+              ...
+# 掛到 metric 上時：
+      - ref: app.outcome
+        requirement_level: required      # ← 必填
+```
+
+```yaml
+# infer 反推回來的同一個欄位
+  - id: app.outcome
+    type: string                         # ← enum 沒了，退化成 string
+    brief: ''                            # ← 語意沒了
+    examples: created                    # ← 13 個合法值只剩「這次剛好看到的那一個」
+    requirement_level: recommended        # ← required 沒了，一律 recommended
+    note: ''
+    stability: development
+```
+
+整理成一張表，`infer` 保得住什麼、保不住什麼，界線非常清楚：
+
+| 資訊 | 往返之後 | 為什麼 |
+|---|---|---|
+| group 的存在、名字 | ✅ 保住 | 直接寫在 OTLP 裡 |
+| metric 的 `instrument` / `unit` | ✅ 保住 | OTLP metric 的欄位 |
+| attribute 的名字、基本型別 | ✅ 保住 | 可以從值推斷 |
+| `examples` | ⚠️ 部分 | 只有「這次剛好流過去的值」 |
+| `brief` / `note` | ❌ 全空 | 語意不在線路上 |
+| `requirement_level` | ❌ 一律 `recommended` | 「必不必填」是承諾，不是觀察得到的事實 |
+| `enum` 的 `members` | ❌ 退化成 `string` | 只看到用過的值，看不到值域 |
+| group id 的組織方式 | ❌ 被弄亂 | 見下 |
+
+最後一列值得單獨看，因為它出乎意料地髒。原始的 span group 叫 `span.app.order.create`，反推回來變成 `span.span.app.order.create`——`infer` 在既有名字前面又加了一次 `span.` 前綴。更妙的是多出一個誰都沒定義過的 group：
+
+```
+- id: span.otel.weaver.emit
+  type: span
+```
+
+那是 `weaver registry emit` 自己送資料時產生的 span，被 `infer` 一視同仁地學了進去。這跟 Day7 提過、Day12 要展開講的 4317 撞 port 是同一類問題的縮小版：**`infer` 沒有能力分辨「這是我要治理的系統」跟「這是剛好也在送 OTLP 的東西」**，凡是流進那個 port 的，它全部當成觀察對象。
+
+這個受控實驗的結論，比早上那份混亂流量的草稿更有說服力：即使餵給 `infer` 的是一份完美的 registry，它也還原不出 `brief`、`requirement_level` 跟 `enum`——**因為這三樣東西從來就沒有被送上線路**。它們是團隊的決定，不是資料的屬性。Day7 那句「schema 是團隊的共識，不是資料本身能自己講出來的東西」，在這裡拿到了一個可以測量的版本。
+
 ## 草稿有多粗糙
 
 除了這個抓到的重點，這份自動生成的草稿本身也長得很「原始」，值得一併記一筆——這是評估「AI/工具自動生成的東西能不能直接拿去用」時該養成的習慣：
@@ -94,18 +216,45 @@ graph TB
         B1["span.post__api_orders"]
         B2["span.post__api_orders_http_receive"]
         B3["span.post__api_orders_http_send"]
-        B4["metric.orders_total\n（flat 命名）"]
+        B4["metric.orders_total<br/>（flat 命名）"]
     end
     subgraph After["Day6 手寫的目標 registry（一個群組，idiomatic 命名）"]
-        A1["span.order.create\nuser_id: string, required\nbrief 有寫"]
-        A2["metric.app.orders.count\n（namespaced 命名）"]
+        A1["span.order.create<br/>user_id: string, required<br/>brief 有寫"]
+        A2["metric.app.orders.count<br/>（namespaced 命名）"]
     end
     Before -.人工審查、收斂.-> After
 ```
 
 `infer` 給的是「觀察報告」，右邊才是「規範」——中間那段收斂，機器做不到，這也是為什麼 Day9 只產草稿、不直接拿去用。
 
+## 那這份草稿到底怎麼用
+
+講了一整天它有多粗糙，很容易讓人得到「那不如不要用」的結論。不是這樣。`infer` 的價值不在於產出可以直接提交的東西，而在於它是唯一能回答「**我的系統現在實際上在送什麼**」這個問題、又不用一個一個服務去翻程式碼的工具。把它放進一條有明確狀態轉換的流程裡，它的位置就很清楚了：
+
+```mermaid
+stateDiagram-v2
+    [*] --> 未治理: 現況
+    未治理 --> 觀察報告: weaver registry infer<br/>（機器做，幾分鐘）
+    觀察報告 --> 候選清單: 刪掉 auto-instrumentation 的碎片群組<br/>（機器做不到，但規則明確）
+    候選清單 --> 規範草案: 挑 canonical 命名<br/>補 brief / requirement_level / enum<br/>（純人工，最花時間）
+    規範草案 --> 正式規範: weaver registry check 通過<br/>（Day8 的內建規則 + Rego policy 當量尺）
+    正式規範 --> 有落差: weaver registry live-check<br/>對照真實流量（Day12）
+    有落差 --> 規範草案: 規範漏了東西 → 補定義
+    有落差 --> [*]: 程式碼沒照送 → 改程式碼
+    note right of 觀察報告
+      今天做到這裡
+      1852 行，brief 全空
+    end note
+    note right of 規範草案
+      明天從這裡開始
+    end note
+```
+
+值得注意的是「候選清單 → 規範草案」這一格為什麼機器做不到，而它前後兩格都做得到。前一格（刪掉 `span.post__api_orders_http_receive` 這種 ASGI 碎片）規則明確，寫個腳本就能過濾；後一格（跑 `check`）本來就是機器的工作。卡住的是中間那格——「`userId` 跟 `user_id` 該留哪一個」「這個欄位到底必不必填」，這些是**決定**，不是**推導**。今天那個受控往返實驗量測出來的三樣東西（`brief`、`requirement_level`、`enum` members），剛好就是這一格要人補的三樣東西，一個不多一個不少。
+
 ## 今天沒做的事
+
+那個 `emit` → `infer` 的往返實驗只是量測工具能力上限用的，沒有把反推回來的那份 `registry.yaml` 拿去取代任何東西——它連 group id 都被加上了重複前綴，本來就不是能用的產物。也沒有去追「為什麼 `infer` 會多加一次 `span.` 前綴」是設計如此還是 bug（`registry infer` 目前仍標記為 experimental，CLI 自己每次啟動都會印一行警告說格式跟選項還會變）。
 
 沒有把這份草稿修成正式規範——挑 `userId` 還是 `user_id`當作canonical寫法、補上每個 attribute 的 brief、決定哪些欄位該收斂進哪個 attribute_group，這些審查工作明天才做。也沒有把這份草稿拿去跑 `weaver registry check`看它會噴出多少違規（雖然上一段已經能預期會噴不少）——那個對照，留到明天處理命名漂移時一起做，才有一個「改之前」的基準可以比較。payment-service 今天也沒接進來（本機那個 port 剛好被另一個既有的 k3d demo cluster佔用），不影響今天要看的重點，因為 `userId`/`user_id` 這個壞味道發生在 `api-gateway`，跟 payment-service 無關。
 
