@@ -5,17 +5,19 @@ tags: [OpenTelemetry, Weaver, 鐵人賽]
 ---
 # Day8：Weaver 上手——第一次 `weaver registry check`
 
-Day7 講完 Weaver 內部的管線分工、也列完整張 CLI 速查表，但整天沒跑過一次指令。今天要把那張地圖兌現——但今天不是從零手寫一份範例 registry，而是回去挖 `demo-services` 這條線的程式碼倉庫（`OTel_AIOps_Agent`，本系列的 submodule），發現 Day6 那次提交其實已經先把 `weaver/` 目錄建好了：一份完整的 registry（`registry/model/*.yaml`）加一條自訂 Rego policy（`policies/biz_policies.rego`）。今天要做的事，就是第一次真的對它跑 `weaver registry check`，貼真實輸出，逐條對照 Day7 講的 crate 分工——到底是 `weaver_resolver` 先解析出問題，還是 `weaver_checker` 在報錯，這兩種錯誤長得完全不一樣。
+Day7 講完 Weaver 內部的管線分工、也列完整張 CLI 速查表，但整天沒跑過一次指令。今天要把那張地圖兌現——但今天不是從零手寫一份範例 registry，而是回去挖 Day6 留下來的東西：那次提交其實已經先把 `day06/weaver/` 建好了，一份完整的 registry（`registry/model/*.yaml`）加一條自訂 Rego policy（`policies/biz_policies.rego`）。今天要做的事，就是第一次真的對它跑 `weaver registry check`，貼真實輸出，逐條對照 Day7 講的 crate 分工——到底是 `weaver_resolver` 先解析出問題，還是 `weaver_checker` 在報錯，這兩種錯誤長得完全不一樣。
 
-程式碼跟這篇文章對應的完整說明在 submodule 的 [`day08/README.md`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/day08)（沿用 `day06/` 的 stack，沒有新增任何檔案），這裡直接講重點跟真實輸出。
+先說明一下這系列的檔案怎麼放，免得後面的路徑看起來很跳。這組服務在文章裡一直叫 `demo-services`（Day1 就是這樣介紹的），它在主 repo `o11y-bench/demo-services/` 底下持續演進；而 submodule [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 存的是**每一天當下那組 stack 的完整快照**，一天一個資料夾——所以服務程式碼的實際路徑是 `day06/services/{api-gateway,order,payment,user,webapp}`，不是 `demo-services/`。今天所有指令都在 submodule 的根目錄下跑，路徑一律從 `day06/` 開始寫。
+
+這篇文章對應的完整重現步驟在 [`day08/README.md`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/day08)（stack 沿用 `day06/`，只新增了後面那份修正版 policy），這裡直接講重點跟真實輸出。
 
 ## 這份 registry 是「目標命名」，不是抄現在的服務
 
-先講清楚一個容易誤會的地方：`weaver registry check` 檢查的對象是 registry 這份 schema 定義本身自不自洽，不是拿它去比對 `demo-services` 現在實際跑出來的資料。翻開 `weaver/registry/model/common.yaml` 開頭的註解就寫得很白：
+先講清楚一個容易誤會的地方：`weaver registry check` 檢查的對象是 registry 這份 schema 定義本身自不自洽，不是拿它去比對 `demo-services` 現在實際跑出來的資料。翻開 `day06/weaver/registry/model/common.yaml` 開頭的註解就寫得很白：
 
 > 這份 registry 是**目標標準**——用的是 idiomatic、有 namespace 的命名（`app.*` 給低基數的流程屬性、`biz.*` 給業務識別碼），但現在的服務其實還在送 flat key（`status`、`reason`、`user_id`…）。
 
-也就是說，`user_id` 在這份 registry 裡的目標寫法是 `biz.user.id`，`status`（metric label 上代表業務結果的那個）目標寫法是 `app.outcome`——每一個 attribute 定義下面都有一行 `note`，老實記著「現在程式碼裡的 flat key 叫什麼」。這個落差本身就是一張遷移清單，`weaver/README.md` 整理成一張完整對照表，節錄幾行：
+也就是說，`user_id` 在這份 registry 裡的目標寫法是 `biz.user.id`，`status`（metric label 上代表業務結果的那個）目標寫法是 `app.outcome`——每一個 attribute 定義下面都有一行 `note`，老實記著「現在程式碼裡的 flat key 叫什麼」。這個落差本身就是一張遷移清單，`day06/weaver/README.md` 整理成一張完整對照表，節錄幾行：
 
 | 現在程式碼裡的 flat key | registry 裡的目標 attribute | 訊號 |
 |---|---|---|
@@ -35,13 +37,13 @@ Day7 講完 Weaver 內部的管線分工、也列完整張 CLI 速查表，但�
 Day7 最後踩到那個 `-r .` 的假綠燈之後，養成了一個習慣：任何一份 registry 第一次接進流程時，先用 `registry stats` 確認它到底讀進了幾個 group，再去看檢查結果。先做這一步：
 
 ```bash
-weaver registry stats -r weaver/registry
+weaver registry stats -r day06/weaver/registry
 ```
 
 ```
 Weaver Registry Stats
-Computing stats for registry `weaver/registry`
-ℹ Found registry manifest: weaver/registry/manifest.yaml
+Computing stats for registry `day06/weaver/registry`
+ℹ Found registry manifest: day06/weaver/registry/manifest.yaml
 Resolved Telemetry Schema Stats:
 Registry
   - 34 groups
@@ -78,13 +80,13 @@ flowchart TB
 ## 第一次真的跑：乾淨到有點意外
 
 ```bash
-weaver registry check -r weaver/registry
+weaver registry check -r day06/weaver/registry
 ```
 
 ```
 Weaver Registry Check
-Checking registry `weaver/registry`
-ℹ Found registry manifest: weaver/registry/manifest.yaml
+Checking registry `day06/weaver/registry`
+ℹ Found registry manifest: day06/weaver/registry/manifest.yaml
 ✔ No `after_resolution` policy violation
 
 Total execution time: 0.021600395s
@@ -93,13 +95,13 @@ Total execution time: 0.021600395s
 加上自訂的 `biz_policies.rego`（禁止 `biz.*` 這種高基數業務識別碼被拿去當 metric label）：
 
 ```bash
-weaver registry check -r weaver/registry -p weaver/policies
+weaver registry check -r day06/weaver/registry -p day06/weaver/policies
 ```
 
 ```
 Weaver Registry Check
-Checking registry `weaver/registry`
-ℹ Found registry manifest: weaver/registry/manifest.yaml
+Checking registry `day06/weaver/registry`
+ℹ Found registry manifest: day06/weaver/registry/manifest.yaml
 ✔ No `after_resolution` policy violation
 
 Total execution time: 0.021600395s
@@ -149,7 +151,7 @@ Shared Catalog (after resolution and deduplication):
 
 ## 用一份丟棄式的複製，看兩種錯誤長什麼樣
 
-乾淨的輸出沒辦法示範 Finding 長什麼樣子，所以在 `/tmp` 複製一份、故意弄壞兩次——這兩步都只在本機操作，repo 裡的 `weaver/` 本身完全沒被動過。
+乾淨的輸出沒辦法示範 Finding 長什麼樣子，所以在 `/tmp` 複製一份、故意弄壞兩次——這兩步都只在本機操作，repo 裡的 `day06/weaver/` 本身完全沒被動過。
 
 **第一種：resolver 階段的錯誤。** 在 `metric.app.orders.count` 這個 metric 群組裡塞一行指到不存在的屬性：`- ref: app.nonexistent_attr`，再跑一次 check：
 
@@ -354,7 +356,7 @@ $ echo $?
 我選了第二條，因為 model id 會隨供應商更新而變，寫死成 enum 反而會讓每次換模型都變成一次 registry 改版。加上白名單之後：
 
 ```
-$ weaver registry check -r weaver/registry -p weaver/policies
+$ weaver registry check -r day06/weaver/registry -p day06/weaver/policies
 ✔ No `after_resolution` policy violation
 
 $ echo $?

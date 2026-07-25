@@ -53,3 +53,10 @@
 ## 對應的程式碼放 submodule
 
 可執行的範例、policy、registry 放 `otel-aiops-agent/dayNN/`（submodule），文章只貼重點片段跟真實輸出，並在開頭連過去。submodule 的 `dayNN/README.md` 寫完整重現步驟。
+
+**submodule 的佈局要寫對**（曾經寫錯過）：
+
+- submodule 裡**沒有** `demo-services/` 這個目錄。它存的是每一天當下那組 stack 的**完整快照**，一天一個資料夾：`dayNN/services/{api-gateway,order,payment,user,webapp}`、`dayNN/shared/`、`dayNN/k8s/`、`dayNN/weaver/`。
+- `demo-services/` 是**主 repo** `o11y-bench/` 底下的目錄，是這組服務持續演進的地方。文章裡用 `demo-services` 稱呼這組服務沒問題（Day1 就是這樣介紹的），但**不要說它在 submodule 裡**，也不要寫成 submodule 的路徑。
+- 文章裡的指令一律假設在 submodule 根目錄下跑，路徑從 `dayNN/` 開始寫（`-r day06/weaver/registry`），不要寫裸的 `weaver/registry`——那在根目錄下不存在。
+- 貼路徑之前先 `ls` 確認一次。這類錯誤讀者一照做就會撞到。
