@@ -61,7 +61,8 @@ v3 的調整：
 | `docs/usage.md` | 完整 CLI 指令表：check/generate/diff/emit/stats/json-schema/infer/package/live-check/mcp/completion | Day7（速查表）、Day8、Day9、Day14 |
 | `docs/registry.md` | Registry 是什麼、group 類型(metric/span/event/attribute_group)、`ref`/`extends` 重用機制 | Day13 |
 | `docs/define-your-own-telemetry-schema.md` | `manifest.yaml`、`dependencies`、`schema_url`、10 層深度限制、自訂 registry 路徑格式(本地/git/GitHub release) | Day13 |
-| `docs/validate.md` | Rego policy、Finding 結構(id/message/level/context/signal_type)、三級嚴重度(information/improvement/violation) | Day10、Day11 |
+| `docs/validate.md` | Rego policy、Finding 結構(id/message/level/context/signal_type) | Day10、Day11 |
+| 三級嚴重度(information/improvement/violation) | **實測修正**：這是 `live-check` 的 advice 系統，不是 `registry check` 的 policy。check 階段只有 `deny` 會被收集、`level` 恆為 `violation`、`signal_type`/`signal_name` 恆為 `null` | Day10（說明為什麼沒有）、**Day12**（實際展開） |
 | `docs/weaver-config.md` | `weaver.yaml` 設定：template_syntax/comment_formats/templates(filter+application_mode)、設定檔載入順序與優先權 | Day16 |
 | `docs/codegen.md` | Jinja template + JQ filter 生成文件/型別安全建構子的流程 | Day16 |
 | `docs/schema-changes.md` | `diff` 的變更分類（added/renamed/updated/obsoleted/removed） | Day14 |
@@ -84,9 +85,9 @@ v3 的調整：
 https://opentelemetry.io/blog/2025/otel-weaver/
 - **Day8** Weaver 上手：第一次 `weaver registry check`——回到 Day7 的速查表，對 Day1 的服務跑第一次 check，貼真實違規輸出，逐條對照輸出格式跟 Day7 講的 crate 分工（是 `weaver_resolver` 先解析、還是 `weaver_checker` 在報錯）。
 - **Day9** `weaver registry infer`：從 Day1 那支亂長服務的 OTLP 流量反推一份 schema 草稿——治理不是只能從一張白紙手寫 schema，也可以先用 `infer` 生成起點，再人工修正欄位命名/型別/required 與否；順便講清楚「自動生成的草稿」跟「團隊審過的規範」之間還差什麼審查。
-- **Day10** 命名漂移，用 weaver 抓出來——改一個 attribute（`userId` → `user.id`），對照 `validate.md` 的 Finding 結構（`id/message/level/context/signal_type`）與三級嚴重度（`information/improvement/violation`），講清楚同一個漂移在沒有 weaver 的世界怎麼悄悄擴散、有 weaver 的世界在哪一步被攔下來、攔下來時到底輸出了什麼。
+- **Day10**（已寫）命名漂移，用 Rego policy 抓出來——先講清楚命名漂移為什麼靠 code review 擋不住（review 看得到這個 PR 改了什麼，看不到系統目前已經有什麼），再把 `weaver_checker` 這一格放大：resolved schema → Rego `input` → Finding。三條逐步加難的規則（camelCase／正規化後撞名 `userId <-> user_id`／缺 namespace），實跑 9 個違規、exit 1，順便把 Day8 欠的 Rego 語法（`[_]` 迭代、集合收集、`a < b` 去對稱重複）還掉。**三個實測修正**：(1) 三級嚴重度在 check 階段不存在，只有 `deny` 會被收集，改用規則名稱分級一個 Finding 都不產生——那套屬於 live-check 的 advice，移到 Day12；(2) violation 物件的 `type` 只能是 `semconv_attribute`，寫別的值整份 policy 檔被拒絕且錯誤訊息誤導；(3) Rego 物件到 Finding 的欄位是錯位的（你寫的 `type` 變成 Finding 的 `id`，整個物件變成 `context`），CI 上要抓 `context.id`。
 - **Day11** weaver check 進 CI Gate——完整可貼上用的 GitHub Actions workflow，搭配 `--diagnostic-format gh_workflow_command` 讓違規直接變成 PR 上的 annotation，附一個真的被擋下來的 PR 截圖。
-- **Day12** weaver live-check 接上 collector——補 CI 的盲點（靜態檢查看不到 runtime 才出現的違規），附 port collision 踩坑記錄（預設 4317 意外吃到自己 coding agent 的 OTLP 遙測，裡面有 PII——別用預設 port）。
+- **Day12** weaver live-check 接上 collector——補 CI 的盲點（靜態檢查看不到 runtime 才出現的違規），附 port collision 踩坑記錄（預設 4317 意外吃到自己 coding agent 的 OTLP 遙測，裡面有 PII——別用預設 port）。**這天要接住 Day10 移過來的三級嚴重度**：`--advice-policies` 的 advice 系統才是 `information`/`improvement`/`violation` 真正生效的地方，也是 Finding 的 `signal_type`/`signal_name` 會被填上的地方（check 階段恆為 `null`，因為靜態定義沒有「哪一筆遙測」這個概念）。
 - **Day13**（合併自訂 semconv ＋ multi-registry）從零定義一組 `payment-events.yaml` 過 check，再疊一層 team-specific registry 在 base 之上——用 `registry.md` 的 group 類型/`ref`/`extends` 講屬性怎麼設計不重複定義，用 `define-your-own-telemetry-schema.md` 的 `manifest.yaml`/`dependencies`/`schema_url`/10 層深度限制講多團隊分層會撞在哪、Weaver 怎麼解。
 - **Day14** 重現一次真實 breaking change——weaver 0.23.0 對合法欄位 hard error 的真實踩坑，講清楚三層驗證模型（always-error/future-gated/info）與 `weaver registry diff` 的變更分類（added/renamed/updated/obsoleted/removed），升級前該怎麼測。
 - **Day15** `weaver registry mcp`：讓 AI agent 直接用自然語言查 registry——這是全系列第一次把 Weaver 跟 AI agent 具體接在一起。內建 `search`/`get`/`live_check` 三個 MCP tool，示範用 coding agent 問「這個 service 該用哪個 attribute 記付款金額」、以及讓 agent 對一段沒過 CI 的程式碼自動改到符合規範。這天是全系列 AIOps 軸線正式登場的起點：治理資產（registry）本身變成一個 agent 可以呼叫的工具，而不是一份人看的文件。
