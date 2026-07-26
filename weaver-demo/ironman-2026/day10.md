@@ -1,557 +1,648 @@
 ---
-title: "【Day10】命名漂移：用 Rego policy 把它攔下來"
+title: "【Day10】weaver registry mcp：讓 agent 直接查 registry"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
-tags: [OpenTelemetry, Weaver, Rego, 鐵人賽]
+tags: [OpenTelemetry, Weaver, MCP, 鐵人賽]
 ---
-# Day10：命名漂移——用 Rego policy 把它攔下來
+# Day10：`weaver registry mcp`——讓 agent 直接查 registry
 
-Day9 用 `weaver registry infer` 從真實流量反推出一份草稿，親眼看到 `userId` 跟 `user_id` 被當成兩個完全不相干的 attribute 學了進去。那份草稿停在「觀察報告」這一格，中間那段收斂——挑哪一個當 canonical、補 brief、決定必不必填——機器做不到。
+前面十四天做出來的東西，全部是給兩種對象用的：**人**（registry 是一份文件、`diff` 是一份 release note）跟 **CI**（policy 是一道 gate）。今天要加第三種對象。
 
-今天不做那段收斂，做的是它的前一步：**先讓機器有能力指出「這裡有兩個名字在講同一件事」**。因為如果連「哪裡出問題」都要靠人一個一個看，那份 793 行的草稿根本不會有人看完。
+先把場景拉回一個很具體的當下。一個工程師要在 payment service 上加一個欄位，記下這筆交易是被哪種方式支付的。他會怎麼做？
 
-Day8 已經示範過一次 Rego policy 攔下違規，但那條規則的內容一直沒有展開講（我把它推給了「Day10-11」）。今天把這筆帳還掉：從 policy 的輸入到 Finding 的輸出，整條路徑走一遍。
+照經驗，他不會去翻 registry。他會做兩件事之一：打開隔壁那個服務的程式碼，看看那邊怎麼命名，複製過來；或者直接問 coding agent「幫我在這個 span 上加一個記錄支付方式的 attribute」。前者產出的是 `paymentMethod`（因為隔壁那個服務三年前是這樣寫的），後者產出的是 `payment.method_type` 或 `payment_method`——LLM 會給你一個看起來很合理的名字，而它合理的依據是它讀過的公開程式碼，不是你們的 registry。
 
-Rego 是這整套治理機制裡最陡的一段，所以中間會有一節專門講**weaver 實際用到的那一小塊 Rego**——兩個 package 各自看得到什麼（實測把 `input` 整包印出來對照）、哪些關鍵字真的會用到、哪些內建函式可用、以及為什麼網路上大部分 Rego 範例貼進來會直接被拒絕。文件沒寫、但一定會踩到的行為，也一併記下來。
+**這就是 Day1 那份命名漂移報告的生產機制。** 不是有人故意違規，是在「要決定一個欄位叫什麼」的那三十秒裡，registry 不在現場。
 
-程式碼在 submodule 的 [`day10/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/day10)（一份刻意留著漂移的 registry ＋ 一份 `naming.rego`），這裡直接講重點跟真實輸出。
+Day7 那道 CI gate 會擋下他，這是好事，但要注意 gate 介入的時間點：**他已經寫完、測完、開了 PR 之後。** 從平台工程的角度看，這是最貴的一種介入方式——一次來回至少半小時，而且被擋下來的人當下的感受是「這個平台在跟我作對」，即使規則完全正確。
 
-## 命名漂移為什麼靠 code review 擋不住
+所以今天要做的事，是把同一份治理資產搬到那三十秒裡面去：**`weaver registry mcp` 讓 registry 從「一份文件、一道門」變成「一個 agent 可以呼叫的工具」。** 這是全系列 AIOps 軸線正式登場的起點，也是 paved road 這個概念第一次有具體形狀——不是路上多一道關卡，是預設那條路上有路標。
 
-先回到 Day1 那個場景，把它講得更精確一點。
+程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`day15/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/day15)：一支不需要 LLM 就能驅動 MCP server 的探針腳本（`mcp_probe.py`）、兩份 before/after 的 instrumentation 範例、一支把**真實送出的 span** 轉成 live-check 樣本的腳本（`run_and_extract.py`），以及最後一輪才長出來的 `team-retry/` registry。registry 主要用 Day9 那份 `base-v2`，環境是 weaver `0.24.1`。
 
-前端工程師送 `userId`，後端在 FastAPI 那層加了 alias 悄悄轉成 `user_id`——這個 PR 的標題是「支援新的下單欄位」，測試會過，功能正常。**它在 review 的時候，不會以「命名問題」的形式出現在任何人面前**，它出現的形式是「一個功能開發的 PR」。
+## 結構：八個工具，三種職責
 
-這是命名漂移跟一般 bug 最大的差別。一般 bug 有失敗訊號：測試紅了、服務掛了、使用者抱怨了。命名漂移的訊號是零——兩個名字都合法、都能跑、都送得出去、Grafana 都查得到。它唯一的症狀要等到很久以後才出現：某天有人要做一個跨服務的查詢，才發現要嘛全部改名重新部署，要嘛在查詢語法裡手動兼容五種寫法。
+先修正一件事。官方文件跟部落格提到這個 server 時，講的是 `search`／`get`／`live_check` 三個 tool。實測 `0.24.1`，`tools/list` 回來的是**八個**：
 
-那為什麼不靠 review 就好？因為 review 這件事有一個結構性的限制：**review 的人看得到這個 PR 改了什麼，看不到整個系統目前已經有什麼**。一個 reviewer 要抓到「這個新的 `userId` 跟三個月前另一個服務的 `user_id` 撞了」，他得先記得那個 `user_id` 存在。服務數量一多，這件事就從「認真一點就做得到」變成「不可能」。
+```
+$ python3 day15/mcp_probe.py day14/base-v2      # 只跑 initialize + tools/list
+browse_namespace | ['prefix']            | required= None
+get_attribute    | ['key']               | required= ['key']
+get_entity       | ['type']              | required= ['type']
+get_event        | ['name']              | required= ['name']
+get_metric       | ['name']              | required= ['name']
+get_span         | ['type']              | required= ['type']
+live_check       | ['output', 'samples'] | required= ['samples']
+search           | ['limit', 'query', 'stability', 'type'] | required= None
+```
 
-Day2 講「缺語意」的三種樣子時，第一種就是這個：**同一個概念，兩個名字**。當時的結論是「語意是一份共同的約定，不是任何一個服務單獨能決定的東西」。今天要做的，就是把這份約定從「大家心裡都知道」變成「一份機器每次 PR 都會核對的規格」——關鍵不在於規則多聰明，而在於**它有整份 registry 的視野，而人沒有**。
-
-## 結構：一條 policy 從輸入到輸出
-
-在寫規則之前，先把 `weaver registry check -p policies` 這條路徑上的資料流搞清楚。Day7 那張 crate 分工圖畫的是整個 Weaver，今天放大 `weaver_checker` 這一格：
+`get` 被拆成了五個（attribute／entity／event／metric／span，剛好對應 registry 的 group 類型），另外多了一個 `browse_namespace`。八個工具照職責分成三組，而這三組剛好對應一個工程師在寫 instrumentation 時的三個動作：
 
 ```mermaid
 flowchart TB
-    A["registry/*.yaml<br/>你寫的定義"] --> B["weaver_resolver<br/>展開 ref／extends"]
-    B --> C["resolved schema<br/>（一份扁平化的 JSON）"]
-    C --> D["Rego runtime<br/>把它綁成變數 input"]
-    D --> E["package after_resolution<br/>底下所有 deny 規則"]
-    E --> F["每個 deny 產出的物件"]
-    F --> G["Finding<br/>id / level / message / context<br/>signal_type / signal_name"]
-    G --> H{"有任何 Finding？"}
-    H -->|有| I["印出診斷報告<br/>exit 1"]
-    H -->|沒有| J["✔ No policy violation<br/>exit 0"]
+    Q["「我要記支付方式，<br/>該用哪個 attribute？」"]
+
+    subgraph D["① 發現：有沒有現成的"]
+      S["search<br/>關鍵字 AND 比對＋分數"]
+      B["browse_namespace<br/>逐層展開命名空間"]
+    end
+
+    subgraph U["② 理解：這個欄位怎麼用"]
+      G["get_attribute / get_event<br/>get_metric / get_span / get_entity<br/>type、examples、enum members<br/>stability、deprecated、provenance"]
+    end
+
+    subgraph V["③ 驗證：我寫出來的合不合規"]
+      L["live_check<br/>丟樣本進去、拿 Finding 回來"]
+    end
+
+    Q --> D --> U --> V
+    V -->|"有 violation"| U
+    V -->|"clean"| C["寫進程式碼"]
 ```
 
-有三件事值得從這張圖裡讀出來。
+第三組是今天最關鍵的一組，因為它讓整件事變成一個**閉環**：agent 不只是查資料，它可以把自己剛寫出來的東西送回去驗證，然後根據結果改。前兩組只是把文件變得比較好查，第三組才讓 agent 有辦法自己知道對不對。
 
-**第一，Rego 看到的不是你寫的 YAML，是 resolved schema。** 這個差別很重要：你在 YAML 裡寫的 `- ref: app.outcome`，到了 Rego 眼中已經是一個完整展開的 attribute 物件了，`ref` 這個字根本不存在。實際長這樣：
-
-```json
-{
-  "id": "metric.app.orders.count",
-  "type": "metric",
-  "attributes": [
-    {
-      "name": "app.outcome",
-      "type": { "members": [ { "id": "created", "value": "created" }, ... ] },
-      "brief": "Terminal outcome of a business operation.",
-      "requirement_level": "required"
-    }
-  ]
-}
-```
-
-注意 attribute 的鍵是 `name` 不是 `id`（group 才是 `id`）——這是寫第一條規則時最容易卡住的地方。而 Day8 那條「值域有界」規則的支點 `is_object(attr.type)`，也是因為在這裡 enum 的 `type` 是物件、字串欄位的 `type` 是字串 `"string"`。
-
-**第二，`package after_resolution` 這行決定規則什麼時候跑。** 還有一個 `before_resolution`，在 `ref` 展開之前跑，看得到原始的 YAML 結構。今天所有規則都用 `after_resolution`，因為命名檢查要看的是最終每個 group 上實際掛了哪些 attribute。
-
-**第三，只有 `deny` 這個名字會被收集。** 這點下面會用實測說明，因為它推翻了我原本的一個假設。
-
-## Rego 速成：weaver 只用到這門語言的一小塊
-
-Rego 是這整套治理機制裡學習曲線最陡的一段——它是宣告式的、沒有 for 迴圈、`not` 的語意跟你想的不一樣，而且網路上大部分範例是舊語法、貼進來會直接被拒絕。
-
-好消息是：**weaver 只用到 Rego 的一小塊**。把下面這些搞懂，寫得出 90% 會用到的規則。
-
-### 一份 weaver policy 的骨架
-
-```rego
-package after_resolution        # ① 決定「什麼時候跑」，名字不能亂取
-
-import rego.v1                  # ② 選用（引擎本來就是 v1），寫了比較清楚
-
-# ③ 主角：deny 是唯一會被收集的規則名
-deny contains my_finding(group.id, attr.name) if {
-	group := input.groups[_]                  # ④ 迭代
-	attr := group.attributes[_]
-	regex.match(`[a-z][A-Z]`, attr.name)      # ⑤ 條件（全部要成立）
-}
-
-# ⑥ 輔助函式：組出固定形狀的 violation 物件
-my_finding(group_id, attr_id) := violation if {
-	violation := {
-		"id":       "my_rule_id",
-		"type":     "semconv_attribute",
-		"category": "naming",
-		"group":    group_id,
-		"attr":     attr_id,
-	}
-}
-```
-
-六個位置各自的規矩：
-
-| | 元素 | 規矩 |
-|---|---|---|
-| ① | `package` | 只有 `before_resolution` / `after_resolution` 有效。**打錯不會報錯，會給你綠燈**（下面詳述） |
-| ② | `import rego.v1` | 選用。引擎本來就是 v1，但**舊語法會被拒絕** |
-| ③ | `deny` | 唯一會被收集的規則名。叫 `violation`、`warn`、`allow` 都不會有任何效果 |
-| ④ | `[_]` | 「對每一個都試一次」，不是「取第 0 個」 |
-| ⑤ | 規則主體 | 所有條件是 **AND**；要 OR 就寫成兩條同名規則 |
-| ⑥ | 輔助函式 | 純粹是為了可讀性，把物件直接寫在 `deny` 裡也可以 |
-
-### 兩個 package，看到的東西完全不一樣
-
-這是寫 weaver policy 最需要先搞清楚的一件事，也是決定「這條規則要寫在哪」的依據。實測把 `input` 整包印出來對照：
+跟 CI gate 對照一下時間軸，就能看出這兩件事不是替代關係：
 
 ```mermaid
-flowchart TB
-    Y["registry/model/*.yaml"] --> B["package before_resolution<br/><b>每個 YAML 檔各跑一次</b>"]
-    B --> B1["input.groups＝這個檔案裡的 group<br/>input.file_format＝'definition/1'<br/>attribute 保持你寫的樣子：<br/>inline 的有 id，引用的只有 ref"]
-    Y --> R["weaver_resolver<br/>展開 ref／extends"]
-    R --> A["package after_resolution<br/><b>整份 registry 只跑一次</b>"]
-    A --> A1["input.groups＝全部 group（本例 34 個）<br/>input.registry_url<br/>attribute 已展開，鍵是 name 不是 id"]
+sequenceDiagram
+    participant Dev as 工程師
+    participant Agent as coding agent
+    participant MCP as weaver registry mcp
+    participant CI as CI gate（Day7）
+
+    Note over Dev,MCP: 寫程式碼的那三十秒
+    Dev->>Agent: 「加一個記錄支付方式的 attribute」
+    Agent->>MCP: search / get_attribute
+    MCP-->>Agent: payment.method, string, examples=["credit_card"]
+    Agent->>MCP: live_check（我打算送出這些 attribute）
+    MCP-->>Agent: findings
+    Agent-->>Dev: 改好的程式碼＋為什麼用這個名字
+
+    Note over Dev,CI: 開 PR 之後
+    Dev->>CI: push
+    CI-->>Dev: ✔ 或 ×（這道門還在，而且必須還在）
 ```
 
-拿 Day8 那份有 5 個 YAML 檔、34 個 group 的 registry 實測，印出「每次呼叫看到幾個 group」：
+**MCP 是建議層，CI 才是門。** 這個分工不能反過來——理由後面那節會講，因為它同時是一個平台工程決定跟一個安全決定。
+
+## 操作：不需要 LLM 也能測 MCP server
+
+先講一件實務上很有用的事。這個 server 走 **stdio 上的 JSON-RPC**，所以你不需要接任何 LLM 就能完整測它——`day15/mcp_probe.py` 就是一支六十行的 python，spawn 一個 `weaver registry mcp`、送 `initialize`、送 `tools/list`、再送你指定的 `tools/call`，把回應原封不動印出來。
+
+這件事對治理很重要：**你要能在沒有 LLM 的情況下驗證這個工具回答了什麼**，否則你永遠分不清「agent 講錯」跟「registry 教錯」。今天後面幾個坑，全部是靠這支腳本挖出來的，一次 LLM 呼叫都沒用到。
+
+握手長這樣：
 
 ```
-# package before_resolution
-一次呼叫看到 4 個 group，format=definition/1     ← common.yaml
-一次呼叫看到 15 個 group，format=definition/1    ← events.yaml
-一次呼叫看到 6 個 group，format=definition/1     ← metrics.yaml
-一次呼叫看到 6 個 group，format=definition/1     ← genai.yaml
-一次呼叫看到 3 個 group，format=definition/1     ← spans.yaml
-
-# package after_resolution
-KEYS=["groups", "registry_url"] groups=34        ← 只有一次，全部都在
-```
-
-attribute 的形狀也不一樣。同一個 registry，`before_resolution` 看到的是**你手寫的原樣**：
-
-```
-group=registry.order   attrKeys=["annotations","brief","examples","id","note","requirement_level","stability","type"]
-group=span.order.create attrKeys=["annotations","ref"]        ← ref 還在，沒有被展開
-```
-
-`after_resolution` 看到的則是展開後的效果，`ref` 這個字根本不存在、鍵從 `id` 變成 `name`。
-
-所以選哪個 package 的判準很清楚：
-
-| 你想檢查的事 | 用哪個 | 為什麼 |
-|---|---|---|
-| 命名風格、撞名、缺 namespace | `after_resolution` | 要看**實際生效**的名字，含被 ref 進來的 |
-| metric label 的值域／基數（Day8） | `after_resolution` | `ref` 展開後才知道這個 metric 實際掛了什麼 |
-| 「不准 inline 定義，一律要用 ref」 | `before_resolution` | 只有展開前才分得出 inline 跟 ref |
-| 「每個檔案都要有某個 group」 | `before_resolution` | 它是**按檔案**跑的，天生就有檔案的概念 |
-| 跨檔案的一致性（例如全域撞名） | `after_resolution` | `before_resolution` 一次只看得到一個檔案 |
-
-最後一列特別容易踩：**`before_resolution` 看不到別的檔案**，所以任何「兩個東西撞在一起」的規則寫在那裡都不會成立。Day10 這條 `duplicate_concept` 之所以放 `after_resolution`，就是這個原因。
-
-### 真正會用到的關鍵字
-
-Rego 語言本身很大，但寫 weaver policy 反覆用到的其實就這幾個：
-
-| 關鍵字／語法 | 意思 | 典型用法 |
-|---|---|---|
-| `x := input.groups[_]` | **迭代**：對每個 group 各試一次 | 所有規則的第一行 |
-| `some g in input.groups` | 同上，較新的寫法，可讀性好一點 | 跟 `[_]` 二選一 |
-| `a := b` | 賦值（宣告新變數） | 慣用，優先於 `=` |
-| `not <表達式>` | 「這個表達式**無法成立**」 | `not contains(name, ".")` |
-| `every g in xs { … }` | 全稱：每一個都要滿足 | 「所有 metric 都必須有 unit」 |
-| `x in xs` | 成員判斷 | 白名單比對 |
-| `[e \| some g in xs]` | comprehension，把巢狀結構**攤平成集合** | 全域撞名檢查的關鍵 |
-| `default x := false` | 給規則一個預設值，避免 undefined | 布林旗標 |
-| 同名規則寫兩次 | **OR** | 「是 enum 或是 boolean 都算安全」 |
-
-其中最反直覺的兩個，值得單獨記：
-
-**`not` 不是布林取反，是「無法成立」。** 在有迭代的情境下差很多——`not group.attributes[_].name == "x"` 的意思是「不存在任何一個叫 x 的 attribute」，不是「每個都不叫 x」。單一布林值的情況（像 `contains()` 的回傳）才跟直覺一致。
-
-**要 OR 就寫兩條同名規則。** Rego 沒有 `||`，Day8 那條「enum 或 boolean 都算有界」就是這樣寫的：
-
-```rego
-bounded_label(attr) if is_object(attr.type)      # enum
-bounded_label(attr) if attr.type == "boolean"    # boolean
-```
-
-兩條都叫 `bounded_label`，任何一條成立就算成立。
-
-### 內建函式：實測都能用
-
-weaver 內嵌的是自己的 Rego 引擎，不是 OPA 本體，所以不能假設所有 OPA 內建函式都在。實測跑過一輪，寫 policy 會用到的都可用：
-
-| 類別 | 函式 |
-|---|---|
-| 字串 | `startswith` `endswith` `contains` `lower` `upper` `split` `replace` `sprintf` |
-| 正則 | `regex.match` |
-| 型別 | `is_object` `is_string` `is_array` `count` |
-| 物件 | `object.get`（可給預設值）`json.marshal` `walk` |
-| 版本 | `semver.compare` |
-
-`is_object` 是 Day8 那條值域規則的支點（enum 的 `type` 是物件、`"string"` 是字串），`semver.compare` 則在 Day14 比 registry 版本時會派上用場。
-
-### 語法版本：網路上的範例大多貼不動
-
-Rego 在 v1 改了語法，而 weaver 的引擎**只吃 v1**。舊寫法直接被拒絕：
-
-```rego
-# ❌ v0 寫法（2023 年以前的教學、大部分 StackOverflow 答案都長這樣）
-deny[f] {
-	input.groups[_].type == "span"
-	f := { ... }
+$ python3 day15/mcp_probe.py day14/base-v2
+=== initialize
+{
+  "result": {
+    "protocolVersion": "2024-11-05",
+    "capabilities": { "tools": {} },
+    "serverInfo": { "name": "rmcp", "version": "1.6.0" },
+    "instructions": "MCP server for OpenTelemetry semantic conventions. Use 'search'
+                     to find conventions, 'get_*' tools to get details, and
+                     'live_check' to validate samples."
+  }
 }
 ```
 
-```
-× Invalid policy file, error: `if` keyword is required before rule body
-```
+`instructions` 那一段值得注意：它會被塞進 agent 的 context，是 server 對 agent 的第一句話。也就是說**這個 server 對 agent 的「使用說明」是寫在工具本身裡的**，不是寫在你們的 wiki 裡——這件事在後面第一個坑會變成重點。
 
-這個錯誤訊息算好的——它直接告訴你缺 `if`。改成 v1 就好：
-
-```rego
-# ✅ v1 寫法
-deny contains f if {
-	input.groups[_].type == "span"
-	f := { ... }
-}
-```
-
-`import rego.v1` 這行實測**加不加都能跑**（引擎本來就是 v1），`import future.keywords` 也接受。建議還是寫上 `import rego.v1`，一來明示意圖，二來拿去給 OPA 或 `conftest` 跑時行為一致。
-
-### package 名字打錯：又一個假綠燈
-
-最後這個是今天測出來最陰的一件事。把 package 從 `after_resolution` 改成 `mypolicy`，其他一字不改：
-
-```
-$ weaver registry check -r registry -p policies
-✔ No `after_resolution` policy violation
-
-$ echo $?
-0
-```
-
-**綠燈、離開碼 0、沒有任何警告。** weaver 不會說「你這個 package 我不認得」，它只是安靜地不去執行它。
-
-更麻煩的是連 `--display-policy-coverage` 都**什麼都不印**：
-
-```
-$ weaver registry check -r registry -p policies --display-policy-coverage
-（coverage 區段完全空白）
-
-# 對照：package 正確時
-COVERAGE REPORT:
-policies/naming.rego has full coverage
-```
-
-反過來說，這就是驗證方式：**coverage 報告裡有沒有列出你那個 `.rego` 檔，就是「這份 policy 到底有沒有被執行」的探針**——地位等同 Day7 用 `registry stats` 的 group 數量當 registry 的探針。
-
-這是這系列第三次撞到同一個模式了（Day7 的 `-r .`、Day8 只比對名字的 policy、今天的 package 打錯）。共通結構是：**工具用「什麼都沒發生」來表達「你設定錯了」**，而「什麼都沒發生」跟「一切正常」在輸出上長得一模一樣。所以每接一個新的檢查機制，第一件事都該是問「我要怎麼確認它真的在跑」，而不是「它有沒有報錯」。
-
-## 三條規則，一條比一條難
-
-拿一份刻意保留漂移的最小 registry 當靶子（`day10/registry/`），裡面同時放了 `userId`、`user_id`、`status`、`biz.order.id` 四個 attribute：
-
-```yaml
-groups:
-  - id: registry.order
-    type: attribute_group
-    stability: development
-    brief: "訂單相關屬性——刻意保留命名漂移"
-    attributes:
-      - id: userId                 # 前端工程師照 JS 慣例寫的
-        type: string
-        stability: development
-        brief: "下單使用者的識別碼（前端送進來的寫法）"
-        examples: ["u-5"]
-      - id: user_id                # 後端照 Python 慣例寫的
-        type: string
-        stability: development
-        brief: "下單使用者的識別碼（後端內部的寫法）"
-        examples: ["u-4"]
-      - id: status                 # 沒有 namespace 的裸名字
-        type: string
-        stability: development
-        brief: "訂單狀態"
-        examples: ["created"]
-      - id: biz.order.id           # 命名合規的對照組
-        type: string
-        stability: development
-        brief: "訂單識別碼"
-        examples: ["ord-1001"]
-```
-
-先跑一次不帶 policy 的 check，確認基準：
-
-```
-$ weaver registry check -r registry
-✔ No `after_resolution` policy violation
-
-$ weaver registry stats -r registry
-  - 2 groups
-```
-
-2 個 group（不是 0，Day7 那個假綠燈的探針習慣），乾淨通過。**weaver 的內建規則對 `userId` 完全沒有意見**——它有 `brief`、有 `stability`、型別合法，該有的都有。這正是 Day7 講的第三級：內建規則保證「這份 YAML 結構正確」，不保證「這份 schema 設計得好」。
-
-### 規則一：抓 camelCase
-
-最直覺的一條。resolved schema 裡每個 attribute 的 `name` 拿去比對正則：
-
-```rego
-package after_resolution
-
-import rego.v1
-
-deny contains camel_case_attribute(group.id, attr.name) if {
-	group := input.groups[_]
-	attr := group.attributes[_]
-	regex.match(`[a-z][A-Z]`, attr.name)
-}
-
-camel_case_attribute(group_id, attr_id) := violation if {
-	violation := {
-		"id": "camel_case_attribute",
-		"type": "semconv_attribute",
-		"category": "naming",
-		"group": group_id,
-		"attr": attr_id,
-	}
-}
-```
-
-`input.groups[_]` 那個底線是 Rego 的核心語法：它不是「取第 0 個」，是**「對所有 group 都試一次」**。兩層 `[_]` 疊起來，就是「對每一個 group 的每一個 attribute 都試一次」，任何一組讓後面條件成立的，就產出一個 violation。這也是 Rego 讀起來跟一般程式語言最不一樣的地方——沒有 for 迴圈，迭代是宣告出來的。
-
-```
-$ weaver registry check -r registry -p policies
-✔ All `after_resolution` policies checked (2 violations found)
-
-  - Message : id=camel_case_attribute, category=naming, group=registry.order,   attr=userId
-  - Message : id=camel_case_attribute, category=naming, group=span.order.create, attr=userId
-
-$ echo $?
-1
-```
-
-抓到了，但**同一個 `userId` 被報了兩次**——一次在定義它的 `registry.order`，一次在 `ref` 它的 `span.order.create`。這不是 bug，是前面講的「Rego 看到的是 resolved schema」的直接後果：`ref` 已經被展開，那個 attribute 現在真的同時存在於兩個 group 裡。實務上這反而有用，因為它告訴你這個壞名字的**影響範圍**有多大——改名要動幾個地方，數字就在那裡。
-
-### 規則二：抓「同一個概念，兩個名字」
-
-這是今天真正的目標，也是 formatter 或一般 linter 永遠做不到的一條。`userId` 跟 `user_id` 分開看都沒問題（如果團隊規範就是 camelCase，`userId` 甚至是對的），問題只在它們**同時存在**。
-
-作法是正規化之後比對：把底線跟點拿掉、轉小寫，`userId`、`user_id`、`user.id` 都會變成 `userid`。
-
-```rego
-normalized(name) := lower(replace(replace(name, "_", ""), ".", ""))
-
-all_attr_names contains attr.name if {
-	group := input.groups[_]
-	attr := group.attributes[_]
-}
-
-deny contains duplicate_concept(a, b) if {
-	a := all_attr_names[_]
-	b := all_attr_names[_]
-	a < b                              # 只報一次，不要 (a,b) 跟 (b,a) 各報一次
-	normalized(a) == normalized(b)
-}
-```
-
-`all_attr_names` 那三行是 Rego 裡很常用的一個模式：先用一條規則把散落在巢狀結構裡的東西**收集成一個集合**，後面的規則就可以在這個扁平集合上做兩兩比對。沒有這一步，你會發現很難在一條規則裡同時拿到「兩個不同 group 裡的兩個 attribute」。
-
-`a < b` 這行也值得說一句。少了它，同一組會被報兩次（`userId <-> user_id` 跟 `user_id <-> userId`），而且 `a` 跟自己比也會成立。字串比大小在這裡不是為了排序，純粹是拿來**去掉對稱重複**的一個慣用手法。
-
-```
-  - Message : id=duplicate_concept, category=naming, group=(registry-wide), attr=userId <-> user_id
-```
-
-這一條抓到的東西，是 Day1 那個壞味道第一次以**機器可讀的形式**被指出來。而且注意它的 `group` 欄位是 `(registry-wide)`——這個違規不屬於任何一個 group，它是整份 registry 的性質。這正是前面說的「規則有整份 registry 的視野，而人沒有」的具體樣子。
-
-### 規則三：強制 namespace
-
-最後一條最簡單，但影響最大：attribute id 必須至少有一個點。
-
-```rego
-deny contains missing_namespace(group.id, attr.name) if {
-	group := input.groups[_]
-	attr := group.attributes[_]
-	not contains(attr.name, ".")
-}
-```
-
-`not` 在 Rego 裡的行為要小心：它是「這個表達式無法成立」而不是「布林值取反」，在有 `[_]` 迭代的情境下這兩者不一樣。這裡因為 `contains` 回傳單一布林值，用起來跟直覺一致。
-
-三條規則一起跑，這份 registry 總共噴出 9 個違規：
-
-```
-$ weaver registry check -r registry -p policies
-✔ All `after_resolution` policies checked (9 violations found)
-
-  - id=missing_namespace,     group=registry.order,     attr=status
-  - id=missing_namespace,     group=span.order.create,  attr=status
-  - id=camel_case_attribute,  group=registry.order,     attr=userId
-  - id=missing_namespace,     group=registry.order,     attr=userId
-  - id=camel_case_attribute,  group=span.order.create,  attr=userId
-  - id=missing_namespace,     group=span.order.create,  attr=userId
-  - id=duplicate_concept,     group=(registry-wide),    attr=userId <-> user_id
-  - id=missing_namespace,     group=registry.order,     attr=user_id
-  - id=missing_namespace,     group=span.order.create,  attr=user_id
-
-$ echo $?
-1
-```
-
-四個 attribute 裡只有 `biz.order.id` 完全乾淨——它有 namespace、是 snake_case、沒有跟任何人撞名。這份輸出就是一張可以直接開工的遷移清單，而它是機器產的，不是誰花一個下午對著 793 行草稿看出來的。
-
-## Finding 的完整結構
-
-`--diagnostic-format json` 可以把 Finding 的原始結構印出來，這是接 CI（明天的事）之前一定要先看懂的東西：
+要接上真的 coding agent，一份 `.mcp.json` 就夠了：
 
 ```json
 {
-  "diagnostic": {
-    "message": "Policy violation: id=missing_namespace, category=naming, group=registry.order, attr=status, provenance: registry",
-    "ansi_message": "  × Policy violation: id=missing_namespace, ..."
-  },
-  "error": {
-    "type": "policy_violation",
-    "provenance": "registry",
-    "violation": {
-      "type": "PolicyFinding",
-      "id": "semconv_attribute",
-      "level": "violation",
-      "message": "id=missing_namespace, category=naming, group=registry.order, attr=status",
-      "context": {
-        "id": "missing_namespace",
-        "category": "naming",
-        "group": "registry.order",
-        "attr": "status"
-      },
-      "signal_name": null,
-      "signal_type": null
+  "mcpServers": {
+    "semconv": {
+      "command": "weaver",
+      "args": ["registry", "mcp", "-r", "day14/base-v2", "--include-unreferenced", "true"]
     }
   }
 }
 ```
 
-對照一下我在 Rego 裡寫的那個物件，會發現一個**很容易搞混的對應關係**：
+`--include-unreferenced true` 那個參數為什麼是必要的，是今天第四個坑，先記著。
 
-| Rego 裡寫的 | 跑出來變成 | 說明 |
-|---|---|---|
-| `"type": "semconv_attribute"` | Finding 的 **`id`** | 不是 `type`！這是最反直覺的一條 |
-| 整個物件 | Finding 的 **`context`** | 包含你寫的 `id`、`category`、`group`、`attr` |
-| `"id": "missing_namespace"` | `context.id`，以及 `message` 的開頭 | 這是**你的**規則 id |
-| （沒得寫） | `level`，恆為 `"violation"` | 見下一節 |
-| （沒得寫） | `signal_type` / `signal_name`，恆為 `null` | 見下一節 |
-
-所以同一個字 `id`，在 Rego 裡跟在 Finding 裡指的是兩個不同的東西。實務上你在 CI 上要抓的是 `context.id`（`missing_namespace`），不是頂層的 `id`（`semconv_attribute`，所有 Finding 都一樣）。
-
-## 三個實測出來的行為（文件沒寫）
-
-寫這三條規則的過程中，撞到三件事，每一件都會讓人卡上一段時間，所以完整記下來。
-
-### 一、`level` 寫了也沒用——check 只有一種嚴重度
-
-OpenTelemetry Weaver 的文件裡有一套三級嚴重度：`information` / `improvement` / `violation`。很自然會想在 Rego 裡這樣寫，讓「camelCase」只算建議、「撞名」才算違規：
-
-```rego
-f := {"id": "...", "type": "semconv_attribute", "category": "naming",
-      "group": g.id, "attr": "x", "level": "improvement"}
-```
-
-實測結果：**`level` 這個欄位被完全忽略，輸出永遠是 `Level: violation`。** 三種值試過都一樣。
-
-再退一步，試著用規則名稱來分級（`deny` 之外再定義 `violation`、`improvement`、`information` 三組規則），結果更乾脆——**只有 `deny` 會被收集**，另外三個名字寫了等於沒寫，一個 Finding 都不會產生。
-
-那那套三級嚴重度是哪裡來的？答案在 `live-check`：
+### 發現：search 回來的東西比預期多
 
 ```
-$ weaver registry live-check --help
-      --advice-policies <ADVICE_POLICIES>
-          Advice policies directory. Set this to override the default policies
-```
-
-`registry check` 跟 `registry live-check` 用的是兩套不同的 policy 機制。前者只有 `deny`、只有 `violation` 一級；三級嚴重度屬於後者的 **advice** 系統，那也是 `signal_type` / `signal_name` 這兩個欄位會被填上的地方（check 階段永遠是 `null`，因為靜態定義沒有「哪一筆遙測」這個概念）。這條線 Day12 講 live-check 時會走一次。
-
-實務上的結論：**在 `registry check` 這一階段，policy 是一個二元的閘門——違規就是違規，沒有「建議」這種中間狀態。** 想要分級，只能靠拆成兩個資料夾、跑兩次 check，一次的離開碼進 CI 當硬性擋，另一次只印出來給人看。
-
-### 二、`type` 只能是 `semconv_attribute`，寫錯會整份 policy 被丟掉
-
-我原本以為 violation 物件的 `type` 是給人分類用的自由字串，所以在寫 span 相關規則時很自然地寫了 `"type": "semconv_span"`。結果：
-
-```
-  × Invalid policy file 'registry', error: Violation evaluation error:
-  │ invalid type: map, expected A policy violation)
-  help: Check the policy file for syntax errors.
-```
-
-這個錯誤訊息有兩個地方會誤導人。第一，它說「檢查語法錯誤」，但語法完全沒問題——問題是那個字串的值。第二，它說 `Invalid policy file 'registry'`，指的是 registry 而不是那個 `.rego` 檔名，很難據此定位。
-
-實測所有值：
-
-| `type` 的值 | 結果 |
-|---|---|
-| `semconv_attribute` | ✅ 唯一可用 |
-| `semconv_metric` / `semconv_span` / `semconv_event` | ❌ 整份 policy 檔被拒絕 |
-| `semconv_group` / `semconv_registry` / 任何自訂字串 | ❌ 整份 policy 檔被拒絕 |
-
-而且必填欄位少一個也是同樣下場（整份被拒絕，不是那一條規則失效）：`id`、`type`、`category`、`group`、`attr` 五個一個都不能少。多寫的欄位則會被安靜忽略（這就是為什麼 `level` 寫了沒反應）。
-
-所以 violation 物件的合約，實際上是這樣一個固定形狀：
-
-```rego
+$ ... '[{"name":"search","arguments":{"query":"payment"}}]'
 {
-	"id":       "<你的規則 id，自由命名>",
-	"type":     "semconv_attribute",     # 固定，唯一合法值
-	"category": "<自由分類字串>",
-	"group":    "<group id，或任何你想放的字串>",
-	"attr":     "<attribute 名稱，或任何你想放的字串>",
+  "count": 7,
+  "results": [
+    { "key": "payment.method", "type": "string", "examples": ["credit_card"],
+      "brief": "支付方式", "score": 80, "result_type": "attribute", ... },
+    { "key": "payment.outcome", "score": 80, "result_type": "attribute",
+      "type": { "members": [
+        { "id": "authorized", "value": "authorized", "brief": "授權成功" },
+        { "id": "declined",   "value": "declined",   "brief": "被拒絕" },
+        { "id": "pending_review", "value": "pending_review", "brief": "轉人工審核" } ] } },
+    { "name": "payment.authorized", "result_type": "event", "score": 80, ... },
+    ...
+  ]
 }
 ```
 
-`group` 跟 `attr` 雖然名字這樣叫，但 weaver 不會去驗證它們真的存在——規則二那個 `(registry-wide)` 跟 `userId <-> user_id` 就是硬塞進去的字串，照樣正常輸出。這給了一點彈性，但也代表**打錯字不會有人提醒你**。
+兩個重點。第一，**enum 的 `members` 是整組帶出來的**——Day5 說過那是 LLM 唯一能事先知道 label 值域的來源，今天它終於有了消費者：agent 在寫 `set_attribute("payment.outcome", ...)` 的那一刻，就知道合法值只有這三個，不需要猜、也不需要去 grep 歷史資料。
 
-### 三、`--display-policy-coverage`：確認規則真的被執行過
+第二，每一筆有 `score`，而且 `result_type` 混合了 attribute 跟 event。分數不是裝飾，後面第二個坑會看到它在做一件很重要的事。
 
-Day7 那個 `-r .` 假綠燈的教訓是「檢查通過不代表檢查有在做事」。policy 這一層有對應的探針：
+`type` 跟 `stability` 兩個 filter 都實測有效：
 
 ```
-$ weaver registry check -r registry -p policies --display-policy-coverage
-COVERAGE REPORT:
-policies/naming.rego has full coverage
+$ ... '[{"name":"search","arguments":{"query":"payment","type":"event"}}]'
+{ "count": 2, ... }        # 只回 payment.authorized / payment.refunded，且每個 event 內嵌它的 attribute 清單
+
+$ ... '[{"name":"search","arguments":{"query":"gateway","stability":"stable"}}]'
+{ "count": 0, "results": [], "total": 0 }    # 我們整份 registry 都是 development
 ```
 
-一條規則如果從來沒有被觸發過（例如條件寫錯，永遠不成立），這裡會看得出來。寫完一條新規則之後，最好的驗證方式還是**先故意寫一份會違規的 registry，確認它真的噴出來**，再把規則放進 CI——不然你接進 CI 的可能是一條永遠沉默的規則，那跟 Day8 那個「規則寫得比問題窄」是同一類問題的另一個版本。
+`stability: "stable"` 這個 filter 對正在寫程式碼的 agent 是有意義的——「只給我不會再變的欄位」。但注意在自訂 registry 上它幾乎一定回 0 筆，因為自己寫的東西通常都還是 `development`（Day8 那份 base 也是）。**這是一個在官方 semconv 上很好用、在自訂 registry 上會讓 agent 以為什麼都沒有的參數。**
 
-## 回到 AIOps：這件事對 agent 的影響
+### 理解：`get_attribute` 把 Day9 的 deprecation 交代帶出來了
 
-最後把今天的東西接回主軸。
+```
+$ ... '[{"name":"get_attribute","arguments":{"key":"payment.id"}}]'
+{
+  "key": "payment.id",
+  "type": "string",
+  "examples": ["pay-1001"],
+  "brief": "支付交易識別碼",
+  "stability": "development",
+  "deprecated": {
+    "reason": "renamed",
+    "renamed_to": "payment.transaction_id",
+    "note": "Replaced by `payment.transaction_id`."
+  },
+  "provenance": { "path": "day14/base-v2/model/payment-events.yaml" }
+}
+```
 
-一個 RCA agent 拿到「使用者 `u-5` 的訂單失敗了」這個問題，它要做的第一件事是把使用者 id 對應到查詢條件。如果系統裡 `userId` 跟 `user_id` 並存，它面對的是三個都不好的選項：查 `userId` 漏掉一半資料、查 `user_id` 漏掉另一半、或者兩個都查然後自己合併——而第三個選項要成立，前提是**它得先知道這兩個欄位是同一件事**，而這件事沒有寫在任何地方。
+這一筆輸出把 Day9 的兩個結論同時兌現了。**結構化的 `deprecated` 終於有了第二個消費者**——Day9 說它的價值是「讓下一層有東西可以查」，當時的下一層是 Rego policy，今天多了一層：agent 拿到的不只是「這個欄位存在」，而是「這個欄位已經改名了，新名字叫什麼」。這是那條「`deprecated` 不准寫成字串」的第二層規則，第二次證明自己值得。
 
-Day7 講過，LLM 犯錯的方式很隱蔽：它不會說「我不確定這兩個欄位是不是同一件事」，它會自信地選一個查下去，然後基於半份資料做出一個看起來很合理的結論。這比查不到資料還糟——查不到會報錯，查到一半不會。
+`provenance` 那一格也不是裝飾：它告訴 agent 這個定義來自哪個檔案。當 agent 要解釋「我為什麼用這個名字」時，它可以指出出處，而不是說「根據我的理解」。**可追溯的答案跟聽起來很有信心的答案，在治理上是兩件完全不同的事。**
 
-今天那條 `duplicate_concept` 規則的價值就在這裡：它不只是「幫團隊維持整潔」，它是在**把一個 agent 必然會踩、而且踩了不會報錯的坑，提前在 PR 階段清掉**。Day1 說每個決定在當下都是局部最優解，時間拉長才變成全域的爛攤子——policy 做的事，就是把「全域」這個視野，在每一次局部決定發生的當下就補上去。
+### 驗證：`live_check` 是今天真正的重點
+
+`live_check` 收一組 telemetry sample，回一組 Finding。樣本格式支援 attribute／span／span_event／span_link／resource／metric／log，最小單位是單一 attribute：
+
+```
+$ ... '[{"name":"live_check","arguments":{"output":"findings_only","samples":[
+     {"attribute":{"name":"paymentId","type":"string","value":"pay-1001"}},
+     {"attribute":{"name":"payment.id","type":"string","value":"pay-1001"}},
+     {"attribute":{"name":"payment.transaction_id","type":"string","value":"pay-1001"}},
+     {"attribute":{"name":"payment.outcome","type":"string","value":"DECLINED"}},
+     {"attribute":{"name":"payment.retry_count","type":"int","value":2}}
+   ]}}]'
+```
+
+五個樣本，回來的 Finding 幾乎是前面十四天的總複習：
+
+```json
+{
+  "findings": [
+    { "name": "paymentId", "findings": [
+      { "id": "missing_attribute", "level": "violation",
+        "message": "Attribute 'paymentId' does not exist in the registry." },
+      { "id": "missing_namespace", "level": "improvement",
+        "message": "Attribute key 'paymentId' must include a namespace (e.g. '{namespace}.{attribute_key}')" },
+      { "id": "invalid_format", "level": "violation",
+        "message": "Attribute key 'paymentId' does not match name formatting rules." } ] },
+
+    { "name": "payment.id", "findings": [
+      { "id": "deprecated", "level": "violation",
+        "message": "Attribute 'payment.id' is deprecated; reason = 'renamed', note = 'Replaced by `payment.transaction_id`.'." },
+      { "id": "not_stable", "level": "improvement",
+        "message": "Attribute 'payment.id' is not stable; stability = development." } ] },
+
+    { "name": "payment.transaction_id", "findings": [
+      { "id": "not_stable", "level": "improvement", ... } ] },
+
+    { "name": "payment.outcome", "findings": [
+      { "id": "not_stable", "level": "improvement", ... },
+      { "id": "undefined_enum_variant", "level": "information",
+        "message": "Enum attribute 'payment.outcome' has value 'DECLINED' which is not documented." } ] },
+
+    { "name": "payment.retry_count", "findings": [
+      { "id": "missing_attribute", "level": "violation",
+        "message": "Attribute 'payment.retry_count' does not exist in the registry." },
+      { "id": "extends_namespace", "level": "information",
+        "message": "Attribute key 'payment.retry_count' collides with existing namespace 'payment'" } ] }
+  ],
+  "samples_with_findings": 5,
+  "total_samples_checked": 5
+}
+```
+
+逐條對回前面幾天：`paymentId` 那三條就是 Day6 那條 camelCase／缺 namespace 的 Rego 規則，只是這次不用自己寫；`payment.id` 那條 `deprecated` 正是 Day9 結尾「下游還在用被改名的欄位」那個綠燈，在這裡變成 `violation`；`payment.retry_count` 是 Day9 從 v1 到 v2 被刪掉的那個欄位——**registry 的版本演進，第一次直接反映成對程式碼的一句話**。
+
+`undefined_enum_variant` 那一條要單獨講。`DECLINED` 大寫送進去，registry 裡寫的是 `declined`，這種大小寫不符是我在真實 RCA 任務上實際踩過的坑（agent 用 `level="ERROR"` 去撈 Loki，資料裡是 `INFO`，於是它得到零筆結果然後往「系統正常」的方向推理）。`live_check` 抓到了，很好——但它的 level 只有 **`information`**。這是今天最值得放在心上的一格：**對人來說「值域大小寫不符」確實只是個小提醒，對後面要拿這個欄位去查詢的 agent 來說，它是會讓整條推理鏈歸零的錯誤。** 內建 advice 的分級是照通用情境定的，不是照你的 agent 的脆弱點定的。這一格的修法是 Day7 那個 `--advice-policies`（`registry mcp` 也吃這個參數），今天沒做，留給後面。
+
+三個 level（`violation`／`improvement`／`information`）在這裡完整出現，也正好補上 Day7 那條線：Day6 發現三級嚴重度在 `check` 階段不存在、Day7 證明它屬於 `live-check` 的 advice 系統，今天是它第一次**被 agent 消費**。而 agent 要對哪些 level 動作，是一個得由平台團隊決定的事——因為看下一節那份「改好的」程式碼就知道，`clean` 不等於零 Finding。
+
+### 閉環：讓 agent 自己修掉不合規的程式碼
+
+`day15/samples/` 放了兩份程式碼。before 是那種很典型、每一行都情有可原的寫法：
+
+```python
+        span.set_attribute("paymentId", f"pay-{order_id}")      # 沒有 namespace、camelCase
+        span.set_attribute("payment.gateway", "stripe")          # base 0.2.0 已 obsoleted
+        span.set_attribute("payment.outcome", outcome.upper())    # 值域大小寫不符
+        span.set_attribute("payment.retry_count", retries)        # base 0.2.0 已移除
+```
+
+四行、四種不同的問題，而且沒有一行是「寫錯」——`paymentId` 是隔壁服務的慣例、`payment.gateway` 半年前是對的、`.upper()` 是為了 dashboard 好看、`retry_count` 是上一版 registry 有的欄位。**這正是治理要處理的東西的真實長相：不是違規，是過時。**
+
+上面那份 `live_check` 輸出的五個樣本，就是這四個欄位（加一個對照組）。但這裡要多做一步，而這一步是今天最值得抄走的做法：**不要手打樣本，從真的送出去的 span 上抽。**
+
+`day15/run_and_extract.py` 做的就是這件事——它設一個 `InMemorySpanExporter`、載入 handler、真的呼叫 `charge()` 兩次（一筆成功、一筆被拒），然後把收到的 span 轉成 weaver 的樣本格式：
+
+```
+$ python3 day15/run_and_extract.py before
+span name=charge kind=internal
+  paymentId = 'pay-1001'  (str)
+  payment.gateway = 'stripe'  (str)
+  payment.outcome = 'AUTHORIZED'  (str)
+  payment.retry_count = 0  (int)
+span name=charge kind=internal
+  paymentId = 'pay-1002'  (str)
+  payment.gateway = 'stripe'  (str)
+  payment.outcome = 'DECLINED'  (str)
+  payment.retry_count = 2  (int)
+```
+
+**這支腳本不知道 handler 裡寫了哪些欄位名。** 它讀的是 exporter 收到的東西，所以接下來被檢查的，就是程式碼真的送出的東西——中間沒有一層「我以為它會送這些」的轉述。加上 `--samples` 就變成可以直接餵給 weaver 的 JSON，而 `live-check` 收 stdin：
+
+```
+$ python3 day15/run_and_extract.py before --samples \
+    | weaver registry live-check -r day14/base-v2 --input-source stdin
+
+Span charge `internal`
+    paymentId = pay-1001
+        - [violation] Attribute 'paymentId' does not exist in the registry.
+        - [improvement] Attribute key 'paymentId' must include a namespace (e.g. '{namespace}.{attribute_key}')
+        - [violation] Attribute key 'paymentId' does not match name formatting rules.
+    payment.gateway = stripe
+        - [violation] Attribute 'payment.gateway' is deprecated; reason = 'obsoleted', note = '金流商改由 server.address 表達，不再需要獨立欄位'.
+        - [improvement] Attribute 'payment.gateway' is not stable; stability = development.
+    payment.outcome = AUTHORIZED
+        - [improvement] Attribute 'payment.outcome' is not stable; stability = development.
+        - [information] Enum attribute 'payment.outcome' has value 'AUTHORIZED' which is not documented.
+    payment.retry_count
+        - [violation] Attribute 'payment.retry_count' does not exist in the registry.
+        - [information] Attribute key 'payment.retry_count' collides with existing namespace 'payment'
+...
+Samples
+  - total: 10
+  - by highest advice level:
+    - no advice: 2
+    - improvement: 2
+    - violation: 6
+
+Advisories given
+  - total: 18
+  - advice type:
+    - deprecated: 2
+    - extends_namespace: 2
+    - invalid_format: 2
+    - missing_attribute: 4
+    - missing_namespace: 2
+    - not_stable: 4
+    - undefined_enum_variant: 2
+
+$ echo $?
+1
+```
+
+跟前面 MCP 版本的結果一致（同一套 advice 引擎），但多了兩樣東西：**exit code**（`live-check` 會回 1，所以它也可以當 CI 的一道門，這是 MCP 那條路沒有的），以及**統計摘要**——`by highest advice level` 那三行是「有幾個樣本最嚴重到哪一級」，跟下面 `advice type` 的分佈合起來，是一份可以貼到 PR 上的量化報告。
+
+agent 拿到這些 Finding 之後要做的判斷只有三件，而且每一件的答案都已經在別的 MCP 回應裡了：`missing_attribute` 要換成什麼（`search` 找替代品）、`deprecated` 換成什麼（`renamed_to` 就寫在 Finding 裡）、`undefined_enum_variant` 的合法值是什麼（`members` 在 `search` 結果裡）。改完的版本：
+
+```python
+        span.set_attribute("payment.transaction_id", f"pay-{order_id}")  # renamed_to 指定的新名字
+        span.set_attribute("payment.method", "credit_card")              # 取代 payment.gateway
+        span.set_attribute("payment.outcome", outcome)                   # enum members 裡的原樣值
+        # payment.retry_count 在 registry 裡已不存在：改記在 span event 上，不再當 attribute
+        if retries:
+            span.add_event("payment.retried", {"retry.count": retries})
+```
+
+### 跑第二輪：手打樣本會漏掉你自己剛加的東西
+
+再跑一次同一條管線，這次是 after：
+
+```
+$ python3 day15/run_and_extract.py after --samples \
+    | weaver registry live-check -r day14/base-v2 --input-source stdin
+
+Span charge `internal`
+    payment.transaction_id = pay-1001
+        - [improvement] Attribute 'payment.transaction_id' is not stable; stability = development.
+    payment.method = credit_card
+        - [improvement] Attribute 'payment.method' is not stable; stability = development.
+    payment.outcome = authorized
+        - [improvement] Attribute 'payment.outcome' is not stable; stability = development.
+
+Span charge `internal`
+    ...
+    Span event payment.retried
+        retry.count = 2
+            - [violation] Attribute 'retry.count' does not exist in the registry.
+
+$ echo $?
+1
+```
+
+**還是 exit 1**，而且原因是一個我自己剛加進去的欄位：`retry.count`。
+
+這一格值得停下來看，因為它正是「從真實 span 抽樣本」跟「手打樣本」的差別。這篇文章第一版是用手打的樣本清單驗證的——我列了改好之後的三個 attribute，得到「只剩 `not_stable`」的漂亮結果。但那份清單裡沒有 `retry.count`，因為**我打的是我腦子裡那份改動，不是程式碼真的送出的東西**。那行 `add_event` 就是把一個欄位從 attribute 搬到 span event 上，名字也順手改了，而我在驗證的時候完全忘了它的存在。
+
+**「把欄位搬到別的地方」在治理上不是搬移，是新增。** 這是這個坑的一般形式，而它會發生在每一個「重構一下遙測結構」的 PR 裡：搬去 span event、搬去 resource attribute、拆成兩個欄位、合併成一個 JSON——這些在寫的人眼裡是同一份資料換個位置，在 registry 眼裡全部是沒有定義的新欄位。手打樣本永遠抓不到這種東西，因為手會打的正是你記得的那部分。
+
+### 跑第三輪：合規的修法是改 registry，不是改程式碼
+
+那 `retry.count` 該怎麼辦？有兩條路，而選哪一條是一個治理決定，不是編碼決定。
+
+第一條是把它刪掉——`add_event` 拿掉，這個訊號就不記了。程式碼一改就綠，但你損失了一個真的有用的訊號（重試次數對排查支付失敗很有價值）。**用「讓 CI 變綠」當理由刪掉遙測，是治理最容易造成的損害。**
+
+第二條是承認它是一個新欄位，然後**把它定義出來**。base 之所以移除 `payment.retry_count`，是因為平台團隊認為重試次數不該是 payment 的 attribute；那團隊要保留這個訊號，正確的做法就是 Day8 那套分層——在自己這一層定義，而且用自己的 namespace，不要重新定義一個 base 已經拿掉的名字（Day8 第二個陷阱：那會製造一個沒有人用的孤兒）：
+
+```yaml
+# day15/team-retry/manifest.yaml
+name: payment-team
+schema_url: https://example.com/schemas/payment-team/0.1.0
+dependencies:
+  - name: payments-base
+    registry_path: day14/base-v2
+
+# day15/team-retry/model/retry.yaml
+groups:
+  - id: registry.retry
+    type: attribute_group
+    stability: development
+    brief: "重試相關的團隊自訂屬性"
+    attributes:
+      - id: retry.count
+        type: int
+        stability: development
+        brief: "這筆請求已經重試過幾次（不含首次嘗試）"
+        examples: [2]
+
+  - id: event.payment.retried
+    type: event
+    name: payment.retried
+    stability: development
+    brief: "一次支付重試"
+    attributes:
+      - ref: retry.count
+        requirement_level: required
+```
+
+```
+$ weaver registry check -r day15/team-retry
+✔ No `after_resolution` policy violation
+
+$ python3 day15/run_and_extract.py after --samples \
+    | weaver registry live-check -r day15/team-retry --input-source stdin --include-unreferenced true
+
+Span charge `internal`
+    payment.transaction_id = pay-1001
+        - [improvement] Attribute 'payment.transaction_id' is not stable; stability = development.
+    payment.method = credit_card
+        - [improvement] Attribute 'payment.method' is not stable; stability = development.
+    payment.outcome = authorized
+        - [improvement] Attribute 'payment.outcome' is not stable; stability = development.
+Span charge `internal`
+    ...
+    Span event payment.retried
+        retry.count = 2
+            - [improvement] Attribute 'retry.count' is not stable; stability = development.
+
+$ echo $?
+0
+```
+
+**exit 0，但 Finding 沒有歸零——剩下六條 `improvement`。** 因為整份 registry 都是 `development`，每個欄位都會拿到一條 `not_stable`。這件事決定了這個閉環能不能自動化：如果你叫 agent「改到沒有 Finding 為止」，它會追一個永遠達不到的目標，然後開始做一些你不會喜歡的事（把欄位改掉、把 event 註解掉、或宣稱已經修好）。**正確的指示是「改到 `violation` 歸零為止」**，而這句話得由平台團隊寫進 agent 的指令裡——工具不會幫你決定哪一級算失敗，這跟 Day9 第二層那個「CI 要不要加 `--future`」是完全同一種決定。好消息是 `live-check` 的 exit code 已經幫你把界線畫在同一個地方（只有 `violation` 會讓它回 1），所以「照 exit code 走」是一個站得住腳的預設。
+
+三輪跑完，這個閉環的完整形狀是：
+
+```mermaid
+flowchart TB
+    C1["① before：四個過時的欄位"] -->|"run_and_extract → live-check"| F1["6 violations<br/>exit 1"]
+    F1 -->|"照 Finding 改程式碼"| C2["② after：改用 MCP 查到的名字<br/>順手把 retry 搬到 span event"]
+    C2 -->|"同一條管線"| F2["1 violation：retry.count<br/>搬移＝新增<br/>exit 1"]
+    F2 -->|"治理決定：定義它，不是刪掉它"| R["③ team-retry registry<br/>自己那一層定義 retry.count"]
+    R -->|"同一條管線"| F3["0 violation<br/>6 improvement（都是 not_stable）<br/>exit 0"]
+```
+
+而第三輪那個轉折是今天最重要的一句話：**閉環的出口有兩個，一個是改程式碼，一個是改 registry。** 一個只會改程式碼的 agent（或工程師），碰到「這個欄位還沒被定義」時只有一條路——把它刪掉，讓 gate 變綠。這正是治理做壞掉的樣子：規則沒有被違反，但系統的可觀測性被規則吃掉了一塊。
+
+### 順便發現的：`live_check` 只認得 attribute
+
+上面那些輸出裡有一件事一直沒被提到：**span 的名字從來沒有被檢查過。**
+
+`base-v2` 裡沒有任何 `type: span` 的 group，而我們送進去的 span 叫 `charge`——一個 registry 裡完全不存在的名字。用一個更誇張的名字驗證：
+
+```
+$ echo '[{"span":{"name":"totally.unknown.span","kind":"internal","attributes":[
+      {"name":"payment.method","type":"string","value":"credit_card"}]}}]' \
+    | weaver registry live-check -r day14/base-v2 --input-source stdin
+
+Span totally.unknown.span `internal`
+    payment.method = credit_card
+        - [improvement] Attribute 'payment.method' is not stable; stability = development.
+
+Samples
+  - by highest advice level:
+    - no advice: 2
+    - improvement: 1
+```
+
+`totally.unknown.span` 得到的 advice 是**零條**。同樣的道理，第二輪那個 `payment.retried` event 在還沒被定義的時候，被抓到的是它裡面的 `retry.count`，**event 的名字本身沒有被說一句話**。
+
+所以 advice 系統的覆蓋範圍是：**未定義的 attribute 是 `violation`，未定義的 signal 名稱是沉默。** 這個不對稱在實務上的意義是，`live-check` 抓不到「多了一個沒人宣告的 span」或「span 名字打錯字」——而後者在真實系統裡很常見（`chekout` 這種 typo 會產生一條全新的、永遠不會被 dashboard 查到的 span）。要抓這種東西，得靠 Day15 那個拓撲對帳（拿真實 Tempo 的 call graph 去對宣告過的服務與操作），不是靠 registry 的 advice。這也是為什麼那一天要單獨存在。
+
+## 四個實測出來的坑
+
+### 一、`search` 是關鍵字 AND 比對，不是語意搜尋
+
+這是今天最容易讓人失望的一個，而它直接打在「用自然語言查 registry」這個賣點上。
+
+```
+$ ... '[{"name":"search","arguments":{"query":"how do I record the payment amount"}}]'
+{ "count": 0, "results": [], "total": 0 }
+```
+
+零筆。而同一份 registry 上：
+
+| query | count | 說明 |
+|---|---|---|
+| `payment` | 7 | 所有 `payment.*` 加兩個 event |
+| `pay` | 7 | 前綴比對，分數同樣是 80 |
+| `transaction` | 1 | 只中 `payment.transaction_id` |
+| `交易` | 3 | **中文也會比對到 `brief`** |
+| `outcome` | 1 | key 比對 |
+| `payment method` | 1 | 兩個詞都在 → 中 |
+| `payment amount` | 0 | `amount` 不存在 → 整句落空 |
+| `how do I record the payment amount` | 0 | 同上 |
+
+規律很清楚：**多個詞是 AND，任何一個詞找不到就是零筆。** `payment amount` 明明有一半命中，回來的卻不是「payment 相關的有這些、amount 沒有」，而是什麼都沒有。
+
+要公平地說，這件事工具自己講了。`search` 的 tool description 裡明明白白寫著 `Query terms are AND-matched (all must appear)` 跟 `Use short queries like 'http.request', 'db system'`。所以嚴格說這不是 bug，是**契約寫在工具描述裡，而遵守契約的責任在 agent 身上**。
+
+這個責任的分配方式，是 MCP 這類介面跟傳統 API 最不一樣的地方，也是平台團隊要習慣的新事情：**tool description 就是介面契約，而它的執行者是一個會不會照做要看機率的東西。** 傳統 API 的參數格式寫錯會直接報錯，這裡不會——agent 送一整句自然語言進去，會得到一個語法完全正確、`isError: false`、`count: 0` 的回應。零筆結果的意思是「沒有這個欄位」還是「你的查法不對」，工具不會告訴你。
+
+實務上的處理方式有兩層。工具那一層你改不動（description 是 weaver 寫死的），能改的是**你自己給 agent 的指令**：在專案的 `CLAUDE.md`／system prompt 裡寫明「查 semconv 時一次只查一到兩個關鍵字，零筆時換一個詞再試，不要把整句問題丟進去」。這聽起來很土，但它是目前唯一有效的做法，而且它有一個很重要的副作用——**它把「agent 會怎麼用這個工具」變成一份可以 review、可以版本控制的文件**，而不是每個人各自碰運氣。
+
+### 二、`browse_namespace` 不標 deprecated，`search` 會標而且會降權
+
+這一個比第一個危險，因為它不會給你零筆，它會給你一個看起來完全合理的錯答案。
+
+`base-v2` 裡有五個 attribute，其中 `payment.id` 已經改名、`payment.gateway` 已經 obsoleted。`browse_namespace` 看到的是：
+
+```json
+{
+  "prefix": "payment",
+  "attributes": [
+    { "key": "payment.gateway",        "brief": "處理這筆交易的金流商代號",   "stability": "development" },
+    { "key": "payment.id",             "brief": "支付交易識別碼",             "stability": "development" },
+    { "key": "payment.method",         "brief": "支付方式",                   "stability": "development" },
+    { "key": "payment.outcome",        "brief": "支付的終態結果",             "stability": "development" },
+    { "key": "payment.transaction_id", "brief": "支付交易識別碼（改名後的正式欄位）", "stability": "development" }
+  ],
+  "total_attribute_count": 5,
+  "max_depth": 1
+}
+```
+
+**五個等權的候選，沒有任何一個字提到有兩個已經退役。** 而 `payment.id` 跟 `payment.transaction_id` 的 `brief` 幾乎一樣，前者還比較短、比較像正式名稱。一個 agent（或一個人）從這份清單裡挑「支付交易識別碼」該用哪個，挑錯的機率不低於一半。
+
+同一份 registry，`search "payment"` 的結果卻是對的：
+
+| key | score | 有沒有 `deprecated` |
+|---|---|---|
+| `payment.method` | 80 | — |
+| `payment.outcome` | 80 | — |
+| `payment.transaction_id` | 80 | — |
+| `payment.authorized`（event） | 80 | — |
+| `payment.refunded`（event） | 80 | — |
+| `payment.gateway` | **8** | `reason: obsoleted` |
+| `payment.id` | **8** | `reason: renamed`, `renamed_to: payment.transaction_id` |
+
+**分數從 80 掉到 8，而且 deprecation 整包帶出來。** `search` 不只知道哪些欄位退役了，還主動把它們排到最後面——這是一個設計得很好的行為，只要 agent 用的是 `search`。
+
+所以同一個 server、同一份 registry，兩個工具給出兩種真相。這件事的實務結論很直接：**在給 agent 的指令裡指定用 `search`，並且要求它在寫下任何欄位名之前先 `get_attribute` 確認一次。** `browse_namespace` 適合人拿來探索一個陌生的命名空間，不適合當成挑欄位的依據。
+
+再往上拉一層看，這是 Day9 那句「deprecation 是一個宣告，不是一個通知」在 agent 介面上的重演。平台團隊該做的事都做了——`deprecated` 寫得完整、`renamed_to` 指得清楚、`note` 也寫了。**但這些資訊要真的抵達使用者，取決於他走進來的是哪一個入口，而入口的行為不一致。** 治理資產的品質不只看它記了什麼，還要看每一條讀取路徑會不會把它讀漏。
+
+### 三、查不到的東西回 `isError: false` 加一句散文
+
+```
+$ ... '[{"name":"get_attribute","arguments":{"key":"payment.amount"}}]'
+{
+  "result": {
+    "content": [ { "type": "text", "text": "Attribute 'payment.amount' not found in registry" } ],
+    "isError": false
+  }
+}
+```
+
+注意 `isError` 是 **false**。從 MCP 協定的角度，這次呼叫成功了；「找不到」是一個正常的結果，而且是**一句自然語言**，不是一個結構化的 `{"found": false}`。
+
+這件事對 agent 的影響，比它看起來大。一個結構化的 `found: false` 是一個 agent 幾乎不可能誤讀的訊號；一句散文則要經過同一個會做創意解釋的推理過程。而根據 Day6 那個模式——**LLM 犯錯的方式很隱蔽，它不會說「我不確定」，它會選一個然後往下推理**——最可能的失敗長相不是它讀不懂那句話,而是它讀懂了、然後決定「registry 裡沒有這個欄位，那我自己取一個合理的名字吧」。於是你得到 `payment.amount`，一個從來沒有被定義過、但在 agent 的說明裡被講得像是查到的欄位。
+
+我在自己的 RCA agent 上踩過形狀一樣的坑：工具回了空結果，agent 沒有停下來說查不到，而是沿著一個自己編出來的前提往下走。**空結果跟編造之間的距離，比想像中短。**
+
+所以這裡的處理方式跟第一個坑一樣落在指令那一層，而且是一條硬規則：**任何欄位名要寫進程式碼之前，必須先出現在某一次 `get_attribute` 的成功回應裡；`not found` 就是停下來問人，不准自己命名。** 這條規則的另一半在 CI——就算 agent 真的編了一個名字出來，Day7 那道 gate 會擋住它。這也正是「MCP 是建議層、CI 才是門」的具體理由：**建議層的可靠度是機率性的，所以門不能拆。**
+
+### 四、分層 registry 在 MCP 上預設是空的
+
+Day8 那個 `--include-unreferenced` 的坑，在這裡有一個更嚴重的版本。
+
+拿 Day8 那份 team registry（自己一個 event，其他 attribute 全部 `ref` base 的）掛上 MCP server：
+
+```
+$ python3 day15/mcp_probe.py day13/team '[
+    {"name":"browse_namespace","arguments":{}},
+    {"name":"get_attribute","arguments":{"key":"payment.outcome"}},
+    {"name":"search","arguments":{"query":"checkout"}}]'
+
+browse_namespace {} -> { "sub_namespaces": [], "attributes": [], "total_attribute_count": 0, "max_depth": 0 }
+
+get_attribute {"key":"payment.outcome"} -> Attribute 'payment.outcome' not found in registry
+
+search {"query":"checkout"} -> { "count": 1, "results": [ { "attributes": [
+    { "key": "payment.id", "brief": "支付交易識別碼", "requirement_level": "required", ... },
+    { "key": "payment.outcome", "type": { "members": [ ... ] }, "requirement_level": "required", ... } ] ... } ] }
+```
+
+三個回應互相矛盾：`browse_namespace` 說這份 registry 有 **0 個 attribute**，`get_attribute` 說 `payment.outcome` **不存在**，而 `search` 回來的那個 event **內嵌了 `payment.outcome` 的完整定義，連 enum members 都在**。
+
+原因就是 Day8 那個預設值：`--include-unreferenced` 預設 `false`，依賴裡的 attribute 不算這份 registry 的內容。當時的症狀只是 `stats` 少算幾個 group，影響是「CI 探針的數字要想清楚」；搬到 MCP 上，症狀變成 **agent 問它要用的那個欄位存不存在，得到「不存在」**。而它下一步會做什麼，第三個坑已經講過了。
+
+修法就是掛 server 的時候加上那個參數：
+
+```
+$ python3 day15/mcp_probe.py day13/team '[{"name":"get_attribute","arguments":{"key":"payment.outcome"}}]' \
+    --include-unreferenced true
+
+{
+  "key": "payment.outcome",
+  "type": { "members": [ { "id": "authorized", ... }, { "id": "declined", ... } ] },
+  "brief": "支付的終態結果",
+  "stability": "development",
+  "provenance": {
+    "source": "https://example.com/schemas/payments-base/0.1.0",
+    "path": "day13/base/model/payment-events.yaml"
+  }
+}
+```
+
+而這一步順手回答了 Day9 留下的那個問題：**「agent 讀到的定義是哪一版？」——`provenance.source` 就是答案。** 那個 `https://example.com/schemas/payments-base/0.1.0` 是 base 的 `manifest.yaml` 裡的 `schema_url`，跨層引用時會被帶進 provenance（沒有分層的單一 registry 只有 `path`，沒有 `source`）。
+
+所以 Day8 那句「`schema_url` 裡那個 `0.1.0` 還只是個裝飾」，到今天為止已經兌現兩次：Day9 用它當 `diff` 的版本標籤，今天它是 agent 唯一能看到的版本資訊。**一個只有寫下去、沒有人讀的欄位，跟一個藏著兩個下游功能的欄位，在 YAML 裡長得一模一樣。** 這也是為什麼 registry 範本裡那些「看起來沒用」的欄位不該被省略——你不知道哪一個下游會需要它。
+
+## 平台工程：這個 server 該由誰跑
+
+技術上這是一行指令的事，但「誰跑、跑哪一份、怎麼更新」這三個問題決定了它是一個平台能力還是一個個人技巧。
+
+**誰維護。** 這個 server 沒有中央部署的必要（走 stdio，跟著開發者的 agent 一起啟動），但**它的設定必須是平台團隊發佈的**。理由就是上面第四個坑：漏掉 `--include-unreferenced true`，agent 得到的答案是「這個欄位不存在」；而這個參數該不該加，取決於這份 registry 有沒有分層——這是產品團隊不該需要知道的事。所以交付物是一份帶進 repo 的 `.mcp.json`（跟 Day7 那份 workflow 一樣，屬於平台團隊維護、產品團隊只是取用的東西），不是一段貼在 wiki 裡的指令。
+
+**產品團隊要付多少成本。** 這是今天這個機制最漂亮的地方：接上它要做的事是零——`.mcp.json` 已經在 repo 裡，agent 啟動時自己會發現它。沒有新概念要學、沒有新指令要記，甚至不需要知道 registry 存在。對照 Day7 那道 gate（被擋了才知道有規則），這是同一份治理資產的兩種投遞方式，而**成本差在「使用者需不需要先知道它存在」**。這正是 paved road 的判準：不是規則變寬鬆了，是使用者不必為了合規多做動作。
+
+**失敗的時候能不能自救。** 這一項今天答得不好，得誠實記著。`count: 0` 跟 `not found` 都是「成功但沒東西」，訊息裡沒有任何一句提示下一步（要不要換關鍵字、要不要看命名空間、這份 registry 是不是掛錯了）。所以自救的能力得靠外部補：agent 指令裡寫明零筆時的重試策略，以及一句「連續查不到就停下來問人」。**這是一個平台團隊要自己補文件的洞，跟 Day9 第一層那個誤導的錯誤訊息是同一類成本。**
+
+**強制、預設、還是建議。** MCP 是**建議**層，而且必須留在建議層。這不只是因為 LLM 不可靠（雖然那是主要理由），還因為一道靠 LLM 判斷的 gate 是不可重現的——同一份程式碼今天過、明天不過，而你沒有辦法解釋為什麼。Day7 那道 CI gate 的價值正在於它的判斷是確定性的。**把 MCP 加進來之後，門的位置沒有變，變的是走到門前的人手上有沒有地圖。**
+
+**演進的責任在哪一邊。** 這一項今天有一個真正的進展。Day9 的結論是 deprecation 只是宣告、不是通知，下游沒有任何訊號；今天 registry 一改版，所有掛著這個 server 的 agent **下一次查詢就會拿到新的定義**，不需要任何人去通知任何人。這是「通知」這件事第一次有了機制——但只有一半：它是**拉取式**的，只有在有人剛好要改那段程式碼、而且剛好透過 agent 去查的時候才會發生。已經寫好、沒有人再碰的程式碼，還是躺在那裡用著舊欄位。另一半（主動掃出「誰還在用舊欄位」）仍然是 Day9 那條 `deprecated_usage.rego` 的工作。**拉取式的通知會讓活躍的程式碼自己跟上，存量則需要另外一套機制去清。**
+
+## 回到 AIOps：兩種 agent，同一份 registry
+
+今天這個 agent 是 **coding agent**，它消費 registry 的時機是 build time——寫程式碼的那三十秒。而這個系列後面要做的 RCA agent 消費的是 decision time——線上出事的那三十秒。兩者用的是同一份 registry，但問的問題完全不同：
+
+| | coding agent（今天） | RCA agent（Series 2） |
+|---|---|---|
+| 時機 | build time | decision time |
+| 問的問題 | 「這個概念該用哪個欄位名」 | 「這個欄位有哪些合法值、我該怎麼查」 |
+| 最需要的欄位 | `key`、`deprecated.renamed_to`、`examples` | `type.members`（值域）、`unit`、`requirement_level` |
+| 錯誤的後果 | 一個命名漂移，CI 會擋 | 一條推理鏈靜默歸零，沒有人會擋 |
+
+最後一列是重點。今天這個 agent 犯錯有兩層保險（`live_check` 會說、CI 會擋），所以 MCP 對它來說是「讓事情更順」；而 decision time 的 agent 犯錯**沒有任何一道門**——它查了一個大小寫不符的 enum 值、得到零筆結果、然後回報「系統正常」，這個過程從頭到尾都是綠燈。
+
+這也是為什麼 `undefined_enum_variant` 只有 `information` 這件事今天要特別點出來：**內建 advice 的分級是照「人寫程式碼」的情境定的。** 同一個問題對兩種 agent 的嚴重度差一整級，而調整這個分級是平台團隊的工作（`--advice-policies`），不是工具的預設值能替你做的決定。
+
+往回看整條線，今天算是把 Day1 到 Day9 的治理資產第一次接上了消費端：Day5 的 `enum members` 有了讀者、Day8 的 `schema_url` 有了用途、Day9 的 `deprecated` 有了第二個消費者、Day7 的三級 advice 有了 agent 這個新的受眾。**治理資產的價值不在於它被寫下來，在於有多少條路徑會去讀它**——而每接上一個消費端，前面那些「看起來只是為了整齊」的規則就多一個具體的理由。
 
 ## 今天沒做的事
 
-沒有把這三條規則接進 CI——離開碼已經是 1 了，但真正變成「PR 上的紅字」還需要 GitHub Actions 的 workflow 跟 `--diagnostic-format gh_workflow_command`，那是明天整天的事。
+沒有量測 agent 的遵守率。今天證明的是「工具會給出正確答案」，完全沒有證明「agent 真的會去用它、而且照著用」。第一個坑那條「一次只查一兩個關鍵字」的指令，實際上有多少比例的對話會照做？agent 在 `live_check` 回報 `violation` 之後，是真的改名字，還是把那行註解掉？這些都是 Day24 那個 eval harness 該回答的問題，而且它們需要的正是那種「同一個任務跑很多次、看分佈」的量測方式，不是一次示範。**在有那份數字之前，今天所有結論的正確說法都是「這個工具讓對的事情變得可能」，不是「這樣就不會漂移了」。**
 
-也沒有真的去修那份 registry。今天產出的是一張遷移清單，不是遷移本身；把 `userId` 收斂掉會動到 `o11y_shared` 跟五個服務，還會動到 Loki/Prometheus 的 label 跟既有的 dashboard，是刻意留到後面的事。
+沒有把 `--advice-policies` 接上去。`registry mcp` 吃這個參數，也就是說 Day7 那套自訂 advice 可以直接套進 agent 的驗證迴路裡——最想做的一條是把 `undefined_enum_variant` 從 `information` 升到 `violation`，因為對後面的 decision-time agent 來說它就是致命的。沒做的原因是那會變成一整篇「怎麼設計給 agent 的 advice 分級」，而那個題目的前提是先有 Day24 的數字證明哪一級真的會影響結果，不然只是換一個我自己的主觀分級去取代工具的主觀分級。
 
-`before_resolution` 只講了它看得到什麼、什麼時候該用它，沒有真的寫一條規則出來——今天三條規則都需要展開後的全域視野，硬塞一個 `before_resolution` 的例子會變成為了示範而示範。等 Day13 開始拆多檔案、多 registry 的時候，「不准 inline 定義、一律要用 ref」這類規則才會有真實的場景可以掛。
+沒有同時掛多份 registry。真實情況通常是「官方 semconv ＋ 自己的 registry」兩份都要查，而今天只掛一份自訂的——後果在文章裡看得到：`search "gateway"` 加上 `stability: "stable"` 回零筆，因為自訂 registry 裡沒有任何 stable 的東西。同時掛兩個 MCP server 技術上可行（`.mcp.json` 裡列兩筆），但 agent 要怎麼決定先查哪一份、兩邊都有同名欄位時聽誰的，這是一個新問題，而它其實是 Day8 那個分層問題在 agent 介面上的翻版。
 
-三級嚴重度也只講到「check 這一階段沒有」，沒有展開 live-check 的 advice 系統實際怎麼寫——那要有真實流量才有東西可以 advise，留給 Day12。
+沒有測遠端 transport。今天全部走 stdio，server 跟 agent 在同一台機器上。如果要做成中央服務（例如讓 CI 或線上的 agent 也查得到），要面對的是認證、快取、以及「registry 更新之後多久生效」這些完全不同的問題。
 
-明天：把今天這三條規則接進 GitHub Actions，讓違規直接變成 PR 上的 annotation，附一個真的被擋下來的 PR。從「本機跑得出來」到「沒有人能繞過」，中間差的就是這一步。
+明天：機器可讀的「意圖」——今天讓 agent 讀懂了「這個欄位是什麼」，但它還讀不到「這個系統現在應該處於什麼狀態、這次變更打算改變什麼」。三個對照範例（日常營運意圖、變更意圖、穩定狀態意圖），以及用 template engine 從 schema 生出型別安全的常數，讓「意圖機器可讀」這件事有一個具體的程式碼收口。

@@ -1,218 +1,200 @@
-
 ---
-title: "【Day4】安裝 OTel Operator：拆解真實的 CRD 實作"
+title: "【Day4】annotation 做 auto-instrumentation：真實的 before/after trace 對比"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
 tags: [OpenTelemetry, Kubernetes, 鐵人賽]
 ---
-# Day4：安裝 OTel Operator——拆解真實的 CRD 實作
+# Day4：annotation 做 auto-instrumentation——真實的 before/after trace 對比
 
-Day3 把 Operator pattern 的詞彙站穩了：CRD、Controller、reconciliation loop、`OpenTelemetryCollector` 負責部署行為、`Instrumentation` 負責注入行為。今天要做的事很單純——把這些詞彙對回真實的東西：真的裝一次 Operator，把 `demo-services` 手寫的 Collector Deployment 換成一份 Operator 管理的 CR，再宣告一份 `Instrumentation` CR，然後逐欄位對照 `kubectl get otelcol,instrumentation -o yaml` 的真實輸出，指認哪一段屬於「部署行為」、哪一段屬於「注入行為」。
+Day3 裝完 Operator 之後，刻意留了一個空白：`Instrumentation` CR 宣告了，但沒有接上任何一個 Pod——五個服務仍然靠自己 Dockerfile 裡的 `opentelemetry-instrument uvicorn ...` 在跑。今天把這個空白填上：挑一個服務（`api-gateway`），把它從「自己在 Dockerfile 裡寫死 zero-code 指令」換成「靠 annotation 讓 Operator webhook 注入」，然後真的抓 before/after 的 trace 出來比對，誠實講兩者到底差在哪、哪裡沒有差。
 
-在動手之前，先誠實交代一件事：這篇文章開始寫之前，我回頭盤點了一下 `demo-services` 現在的狀態，發現兩個問題——一個是這系列自己欠的債，一個是純粹的意外。順手一起處理掉，過程本身也值得記一筆。
+## 改動只有兩處
 
-## 動手前，先還兩筆債
+**Dockerfile**：拿掉 `opentelemetry-instrument` 這個包裝指令，變回最單純的 `uvicorn`：
 
-**債務一：Day1 的壞味道，之前只寫在文章裡，程式碼裡其實沒有。** Day1 講的「`userId` 跟 `user_id` 並存」，回頭檢查 `order-service` 的 `CreateOrderRequest`，欄位一路都乾乾淨淨只有 `user_id`——這個壞味道當時只存在於敘述裡，沒有真的種進程式碼。如果放著不管，Day10 的 `weaver registry infer`、Day11 的漂移偵測，到時候會沒有真實素材可以抓，變成自己講的故事自己圓不回來。所以在裝 Operator 之前，先把它種成真的：
-
-- `order-service` 的 `CreateOrderRequest` 加一個 `Field(alias="userId")` + `populate_by_name=True`——FastAPI 這層現在會**同時接受** `userId` 或 `user_id` 當 request key，兩者都會被正確解析成 `req.user_id`，呼叫端完全感覺不到差異。
-- `api-gateway` 的 `/api/orders` 是一個「thin proxy」，本來就不會把 body 解析成 order-service 的 model——它只是把原始 bytes 轉發出去。我讓它多做一件事：peek 一眼原始 JSON body，把**呼叫端實際用的那個 key**（`userId` 或 `user_id`，不做任何正規化）直接寫進這次請求的 log 跟 span attribute。
-- `scripts/load.sh`（負責產生流量的腳本，扮演「前端工程師」的角色）現在有 1/4 的機率送 `userId`，其餘送 `user_id`。
-
-這三個改動合起來，重現的正是 Day1 講的那個故事：`order-service` 有 alias 悄悄接住兩種拼法，但**沒有經過這層轉換的服務**（這裡是 `api-gateway`），會把呼叫端原始送來的拼法，原封不動地寫進自己的 telemetry。實際跑一輪流量，`api-gateway` 的 log 立刻就長這樣——同一個 `http.request_received` 事件,同一支程式碼路徑，屬性名稱卻不一樣：
-
-```json
-{"event": "http.request_received", "path": "/api/orders", "user_id": "u-2"}
-{"event": "http.request_received", "path": "/api/orders", "userId": "u-5"}
+```dockerfile
+# No `opentelemetry-instrument` wrapper here on purpose — the Operator's
+# webhook injects instrumentation via PYTHONPATH + an init container instead.
+CMD ["uvicorn", "api_gateway.main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
-這不是我編出來的範例輸出，是真的對跑在 k3d 裡的 `demo-services` 送了 12 筆 `/api/orders` 請求、直接從 `kubectl logs deploy/api-gateway` 撈出來的兩行。這份漂移，會在 Day10 用 `weaver registry infer` 反推 schema 時再被挖出來一次。
-
-**債務二：一個跟這系列完全無關、但擋住整個 stack 的語法錯誤。** 為了跑上面那個實驗，我照著 README 跑 `./scripts/up.sh`，結果五個服務全部 `CrashLoopBackOff`。查下去發現 `shared/src/o11y_shared/flags.py` 裡有一行：
-
-```python
-except json.JSONDecodeError, OSError:
-```
-
-這是 Python 2 的例外語法，Python 3 里從語法層級就直接是 `SyntaxError`——不是這次改動造成的，是這份共用套件從很早以前就帶著的一個既有 bug，只是因為 CI 的 eval harness 走的是另一條完全不碰 k8s stack 的路徑（一個自包含的 Docker image，跑合成資料，不會真的 import 到這個模組的這條分支），從來沒被實際跑過 k3d 的人踩到過。順手改成 `except (json.JSONDecodeError, OSError):`——一行修正，跟今天的主題無關，但不修，後面什麼都跑不起來。
-
-這兩筆債都不是今天的主角，只是「要在真實環境裡動手」這件事,本來就會先撞見這些；記下來，是因為它們本身就是「有截圖有 diff」這個系列承諺的一部分。
-
-## 裝 Operator：一次性的安裝，換來持續的調和
-
-OTel Operator 官方發布 Helm chart，這是最直接的安裝方式：
-
-```bash
-helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
-helm repo update
-
-helm install opentelemetry-operator open-telemetry/opentelemetry-operator \
-  --namespace opentelemetry-operator-system --create-namespace \
-  --set admissionWebhooks.certManager.enabled=false \
-  --set admissionWebhooks.autoGenerateCert.enabled=true
-```
-
-`admissionWebhooks` 這兩個設定值得停一下：Operator 的 webhook（就是 Day3 提過、`Instrumentation` CR 背後真正動手改 Pod spec 的那個 admission webhook）跑在 HTTPS 上，需要一張憑證。正式環境通常會裝 cert-manager 幫忙簽發、輪替；這裡圖簡單，讓 Helm chart 自己產生一張 self-signed 憑證（`autoGenerateCert.enabled=true`），一年後過期要手動處理——這是一個刻意的取捨，不是「更好的做法」，只是「demo 環境夠用的做法」。
-
-裝完之後，集群裡多了四個 CRD：
-
-```
-$ kubectl get crd | grep opentelemetry
-instrumentations.opentelemetry.io
-opampbridges.opentelemetry.io
-opentelemetrycollectors.opentelemetry.io
-targetallocators.opentelemetry.io
-```
-
-正好對上 Day3 最後提過的四種 CR——今天只會碰前兩種。
-
-## 把手寫的 Collector Deployment，换成一份 CR
-
-`demo-services/k8s/13-otel-collector.yaml` 原本是一份純手寫的 `Deployment` + `Service` + `ConfigMap`：pipeline 設定寫在 ConfigMap 裡，Deployment 掛載它，Service 開兩個 port。這是 Day3 說的「一次性部署」——它會把 Collector 跑起來，但沒有任何東西持續盯著它。
-
-換成 CR 之後，同一份 pipeline 設定原封不動地搬進 `spec.config`：
+**k8s manifest**：在 Pod template 加一個 annotation：
 
 ```yaml
-apiVersion: opentelemetry.io/v1beta1
-kind: OpenTelemetryCollector
-metadata:
-  name: otel
-  namespace: demo
-spec:
-  mode: deployment
-  replicas: 1
-  image: otel/opentelemetry-collector-contrib:0.111.0
-  config:
-    receivers:
-      otlp:
-        protocols:
-          http: { endpoint: 0.0.0.0:4318 }
-          grpc: { endpoint: 0.0.0.0:4317 }
-    processors:
-      batch: { timeout: 5s }
-      resource:
-        attributes:
-          - { key: service, from_attribute: service.name, action: insert }
-    exporters:
-      otlp/tempo: { endpoint: tempo.demo.svc:4317, tls: { insecure: true } }
-      prometheusremotewrite:
-        endpoint: http://prometheus.demo.svc:9090/api/v1/write
-        target_info: { enabled: false }
-        resource_to_telemetry_conversion: { enabled: true }
-      otlphttp/loki: { endpoint: http://loki.demo.svc:3100/otlp, tls: { insecure: true } }
-    service:
-      pipelines:
-        traces: { receivers: [otlp], processors: [batch], exporters: [otlp/tempo] }
-        metrics: { receivers: [otlp], processors: [batch], exporters: [prometheusremotewrite] }
-        logs: { receivers: [otlp], processors: [resource, batch], exporters: [otlphttp/loki] }
+template:
+  metadata:
+    annotations:
+      instrumentation.opentelemetry.io/inject-python: "python-instrumentation"
 ```
 
-這裡有一個命名上的小細節，決定了這次遷移能不能做到「其他東西都不用改」：**這個 CR 故意叫 `otel`,不叫 `otel-collector`。** Operator 幫 CR 建立子資源時，Service 的命名規則是 `<CR 名稱>-collector`——如果 CR 叫 `otel-collector`，生出來的 Service 就會變成 `otel-collector-collector`，一個多餘的疊字。叫 `otel`，生出來的 Service 名稱正好就是 `otel-collector`——而 `demo-services` 裡另外五個服務的 `OTEL_EXPORTER_OTLP_ENDPOINT`，本來就全部寫死指向 `http://otel-collector.demo.svc:4318`。這代表遷移這一步，五個 app 的 k8s manifest **一行都不用改**。
+值填的是 Day3 那份 `Instrumentation` CR 的名字（同 namespace，所以不用寫 `demo/python-instrumentation`，直接寫 CR 名稱就夠）。除此之外，`23-api-gateway.yaml` 裡原本那一串 `OTEL_SERVICE_NAME`、`OTEL_EXPORTER_OTLP_ENDPOINT`、`OTEL_RESOURCE_ATTRIBUTES` 全部沒有動——這是刻意的，待會第一個要看的真實現象，就是這些值在 webhook 手裡到底會不會被蓋掉。
 
-`kubectl apply -f 13-otel-collector.yaml` 之後：
+rebuild image、重新 apply、重啟 deployment 之後：
 
 ```
-$ kubectl -n demo get otelcol,svc
-NAME                                           MODE         VERSION   READY   IMAGE
-opentelemetrycollector.opentelemetry.io/otel   deployment   0.156.0   1/1     otel/opentelemetry-collector-contrib:0.111.0
-
-NAME                                 TYPE        PORT(S)
-service/otel-collector               ClusterIP   4317/TCP,4318/TCP
-service/otel-collector-headless      ClusterIP   4317/TCP,4318/TCP
-service/otel-collector-monitoring    ClusterIP   8888/TCP
+$ kubectl -n demo get pods -l app=api-gateway
+NAME                           READY   STATUS     RESTARTS   AGE
+api-gateway-5866859f9b-9pnpg   0/1     Init:0/1   0          10s
 ```
 
-猜對了：`otel-collector` 這個名字真的自動生出來了。而且是三個 Service，不是一個——`headless` 是給 StatefulSet 場景（`mode: statefulset`）用的，`monitoring` 是 Collector 自身的 Prometheus metrics endpoint（`8888` port），這兩個是這份手寫 YAML 從來沒有過的東西，是 Operator 幫忙補上的。
+`Init:0/1` 這一格，就是 Day3 講的「webhook 攔截 Pod 建立請求、把東西塞進 Pod spec」在真實世界的樣子——一個新出現的 init container，正在跑。
 
-剩下一個 NodePort（原本讓 host 上的 xk6 腳本能直接打 Collector）沒辦法用同一招解決——Operator 生出來的 Service 是 ClusterIP，selector 也是 Operator 自己管的，不能手動加一個 NodePort 進去改它。解法是另外寫一個 NodePort Service，selector 對準 Operator 幫 Collector Pod 貼的 label：
+## webhook 真的塞了什麼進去：完整看一次 Pod spec
+
+等 Pod Ready 之後，`kubectl get pod ... -o yaml` 把整份 spec 印出來，跟 Day3 一樣，不用猜，直接讀真實輸出。
+
+**Init container**：
 
 ```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: otel-collector-nodeport
-  namespace: demo
-spec:
-  type: NodePort
-  selector:
-    app.kubernetes.io/managed-by: opentelemetry-operator
-    app.kubernetes.io/instance: demo.otel
-    app.kubernetes.io/component: opentelemetry-collector
-  ports:
-    - { port: 4318, targetPort: 4318, nodePort: 30003, name: otlp-http }
+initContainers:
+  - name: opentelemetry-auto-instrumentation-python
+    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-python:0.64b0
+    command: ["cp", "-r", "/autoinstrumentation/.", "/otel-auto-instrumentation-python"]
+    volumeMounts:
+      - { mountPath: /otel-auto-instrumentation-python, name: opentelemetry-auto-instrumentation-python }
 ```
 
-這組 label 不是猜的——是從 `kubectl get otelcol otel -o yaml` 的 `status.scale.selector` 欄位裡原封不動抄出來的（下一節會看到完整輸出）。
+它做的事很單純：把一整包預先裝好的 Python auto-instrumentation 套件（`opentelemetry-distro` + 各種 instrumentor），複製到一個跟主容器共用的 `emptyDir` volume 裡，然後結束。它不執行任何 app 邏輯，純粹是「把檔案準備好」。
 
-## 逐欄位拆真實的 `kubectl get otelcol -o yaml`
-
-裝完、跑起來之後，完整印出這份 CR：
+**主容器（`gateway`）多出來的東西**，這才是真正有趣的部分：
 
 ```
-$ kubectl -n demo get otelcol otel -o yaml
+PYTHONPATH = /otel-auto-instrumentation-python/opentelemetry/instrumentation/auto_instrumentation:/otel-auto-instrumentation-python
 ```
 
-輸出裡，`spec` 底下大致分成兩塊，剛好對應 Day3 講的「這是宣告期望狀態的句子」：
+這一行解釋了「為什麼 Dockerfile 不用寫 `opentelemetry-instrument` 也能動」——Python 直譯器啟動時本來就會找 `PYTHONPATH` 裡的模組，`auto_instrumentation` 這個套件內部用的是 Python 的 `sitecustomize` 機制，直譯器一啟動就自動把 SDK 設好、把 FastAPI/httpx 的 instrumentor 掛上去，完全不需要在 `CMD` 裡包一層指令去手動觸發。跟 Day3 講的「有一個 admission webhook 在 Pod 建立的當下把東西注入進去」，在這裡具體對上了——只是 Python 語言注入的形式是 `PYTHONPATH`，不是像 Java 那樣的 `-javaagent`。
 
-- **我自己寫的部分**：`spec.config`（收進來的 pipeline 設定，一字不改地照抄原本的 ConfigMap）、`spec.mode: deployment`、`spec.replicas: 1`、`spec.image`。
-- **Operator 自動補上預設值的部分**：`spec.upgradeStrategy: automatic`、`spec.managementState: managed`、`spec.ipFamilyPolicy: SingleStack`、一整段 `spec.targetAllocator`（`allocationStrategy: consistent-hashing`、`collectorNotReadyGracePeriod: 30s` 之類）。我從來沒有寫過 target allocator 的任何一行設定，但因為 CRD 的 schema 定義了預設值，`kubectl apply` 之後這些欄位全部自動補齊、寫回 etcd。這正是「CRD 描述期望狀態」這句話字面上的意思——你交出去的是一份不完整的期望，API server 用 schema 幫你補完，而不是你要自己知道每一個欄位該填什麼。
+再來是我原本猜測會被蓋掉、但實際上**沒有被蓋掉**的東西：
 
-最值得停下來看的是 `status` 這一段——這是 Day3 講的「controller 上一次調和之後的結果」，字面意義上的**機器可讀狀態**：
+```
+OTEL_SERVICE_NAME = api-gateway                                    # 我自己寫的值，原封不動
+OTEL_EXPORTER_OTLP_ENDPOINT = http://otel-collector.demo.svc:4318  # 我自己寫的值，原封不動
+```
+
+webhook 的邏輯是「補齊沒有的，不動已經存在的」——這兩個我在 `23-api-gateway.yaml` 裡本來就手動寫了，webhook 看到容器已經有這個 env var，就跳過，不覆蓋。
+
+真正被 webhook 動過手腳的，是 `OTEL_RESOURCE_ATTRIBUTES`。我原本寫的值是：
+
+```
+service.namespace=demo,deployment.environment=demo,service.version=$(GIT_VERSION),git_repo=$(GIT_REPO),git_version=$(GIT_VERSION)
+```
+
+注入之後變成：
+
+```
+service.namespace=demo,deployment.environment=demo,service.version=$(GIT_VERSION),git_repo=$(GIT_REPO),git_version=$(GIT_VERSION),k8s.container.name=gateway,k8s.deployment.name=api-gateway,k8s.namespace.name=demo,k8s.node.name=$(OTEL_RESOURCE_ATTRIBUTES_NODE_NAME),k8s.pod.name=$(OTEL_RESOURCE_ATTRIBUTES_POD_NAME),k8s.replicaset.name=api-gateway-5866859f9b,service.instance.id=demo.$(OTEL_RESOURCE_ATTRIBUTES_POD_NAME).gateway
+```
+
+不是覆蓋，是**在後面接上一段**——webhook 額外注入了 `OTEL_NODE_IP`、`OTEL_POD_IP`、`OTEL_RESOURCE_ATTRIBUTES_POD_NAME`、`OTEL_RESOURCE_ATTRIBUTES_NODE_NAME` 這幾個透過 Downward API 取值的 env var，再把 `k8s.pod.name`、`k8s.node.name`、`k8s.replicaset.name`、`service.instance.id` 這些原本我完全沒寫的 k8s 拓撲屬性，接在我自己那串資源屬性後面。這代表：**中央治理（Operator 知道要幫每個 Pod 補上 k8s 身份）跟團隊自訂（我自己的 `git_repo`/`git_version` join key）不是互斥的，是疊加的**——這也回答了 Day3 結尾提過的伏筆：Operator 幫 Collector/子資源維護的那些關係資訊，現在真的變成一條可以往下遊傳遞的訊號了。
+
+## before / after：對同一條下單流程，真的各截一次 trace
+
+在切換前後，各對 `webapp → api-gateway → order-service → user/payment-service` 這條下單流程送一次真實請求，把 `trace_id` 從 log 裡撈出來，直接查 Tempo 的 `/api/traces/{traceID}`。
+
+**Before**（`opentelemetry-instrument` 包裝指令，trace `e981d8a3...`）：
+
+```
+api-gateway   POST /api/orders   {http.route: /api/orders, user_id: u-1}
+order-service POST /api/orders   {http.route: /api/orders}
+user-service  GET /api/users/{user_id}/authcheck
+payment-service POST /charge
+webapp        POST /api/{path:path}
+```
+
+**After**（annotation 注入，trace `46f0a0df...`，這次故意送 `userId` 而不是 `user_id`）：
+
+```
+api-gateway   POST /api/orders   {http.route: /api/orders, userId: u-4}
+order-service POST /api/orders   {http.route: /api/orders}
+user-service  GET /api/users/{user_id}/authcheck
+payment-service POST /charge
+webapp        POST /api/{path:path}
+```
+
+兩條 trace 的服務數、span 數、`http.route` 完全一樣。span name 依然是 FastAPI 的 route template（`POST /api/orders`），不是「checkout」這種業務語意——**annotation 注入沒有讓這件事變得更好，也沒有變得更差，它跟 Day1 講的「span 沒有業務語意」這個壞味道完全無關**，因為兩種注入方式底層用的是同一套 FastAPI instrumentor，抓到的是同一層技術語意。
+
+而 Day3 加進 `api-gateway` 的那段「把呼叫端原始 key 寫進 span attribute」的程式碼——`before` trace 是 `user_id: u-1`，`after` trace 是 `userId: u-4`（因為這次我故意送了 `userId`）——**兩邊都正確地把呼叫端實際用的 key 標了上去，一模一樣**。
+
+## 誠實講：annotation 到底換到了什麼、沒換到什麼
+
+這是今天最容易被誤解的地方，值得講清楚：**annotation 注入換掉的是「誰負責遞送 instrumentation agent」，不是「自動抓到多少東西」。**
+
+- 換掉的：Dockerfile 不用再寫 `opentelemetry-instrument`，不用每個團隊自己記得要不要升級這個 wrapper 版本、要不要跟上新的 semantic convention——這件事現在是平台團隊透過 `Instrumentation` CR 中央宣告一次，所有掛上這個 annotation 的服務都吃到同一份版本、同一份設定。這正是 Day3 一路鋪陳的「各自安裝」變成「中央調和」——只是這次終於在 Day4 落地成一個看得到 diff 的真實案例。
+- 沒換掉的：FastAPI/httpx 這些通用函式庫的 auto-instrumentation，本來就只抓得到 HTTP method、route template、status code 這些**技術語意**層面的東西；`api-gateway` span 名稱依然是 `POST /api/orders`，不會自動變成「checkout」。想要業務語意，或想要「把呼叫端原始 key 標上去」這種特定的資安/治理需求，都得靠 Day3 那段手寫的程式碼——**annotation 換的是遞送機制，不是免費多送你語意**。這段程式碼不管用哪種注入方式都得自己寫，也都會照常運作，因為它呼叫的是 `trace.get_current_span().set_attribute(...)`，是 app 自己在跟 OTel API 對話，不是 auto-instrumentation 幫你做的事。
+
+換句話說，「annotation 覆蓋不到的地方」不是「這次少抓到了什麼東西」，而是「這東西從一開始，兩種注入方式都沒有幫你抓」——annotation 解決的是治理/維運層面的問題（誰維護版本、誰記得升級），不是資料豐富度的問題。這是這系列一路強調的「誠實」的具體一次示範：如果只截圖 before/after 的 trace 長得一樣，讀者可能會誤以為「反正一樣，那何必裝 Operator」；真正的價值在維運層面，不在單次 trace 的資料內容上，這件事必須講清楚，不能靠一張漂亮截圖含糊帶過。
+
+## 延伸：annotation 注入不是 Python 專屬，公司環境的多語言案例
+
+今天的示範只用了 Python，靠 `PYTHONPATH` 這種 language-specific 的 auto-instrumentation 機制。但 annotation 驅動注入這件事本身是通用的，公司內部另一個環境（Java / PHP / 其他語言混跑）剛好把「同一套 annotation 機制，換一種語言會長什麼樣子」示範得很清楚，值得記錄——但先說明：這套設定當時**還沒有在真實叢集完整驗證過**（沒確認過 webhook 一定能成功注入），下面講的是設計，不是「已經跑通」的結論，跟這系列一貫的誠實態度一致。
+
+**Java：兩個 annotation 要一起加，缺一不可**
+
+Java 沒有走 `PYTHONPATH` 那種路，是 operator 提供的 `-javaagent`：
 
 ```yaml
-status:
-  conditions:
-    - lastTransitionTime: "2026-07-23T09:02:15Z"
-      message: Successfully reconciled
-      observedGeneration: 1
-      reason: Reconciled
-      status: "True"
-      type: Ready
-  observedGeneration: 1
-  scale:
-    replicas: 1
-    selector: app.kubernetes.io/component=opentelemetry-collector,app.kubernetes.io/instance=demo.otel,app.kubernetes.io/managed-by=opentelemetry-operator,app.kubernetes.io/name=otel-collector,app.kubernetes.io/part-of=opentelemetry,app.kubernetes.io/version=0.111.0
-    statusReplicas: 1/1
+annotations:
+  instrumentation.opentelemetry.io/inject-java: "opentelemetry-operator-system/java"
+  sidecar.opentelemetry.io/inject: "opentelemetry-operator-system/sidecar"
 ```
 
-`observedGeneration: 1` 對上 `metadata.generation: 1`——這兩個數字相等，代表 controller 已經看過、處理過「這一版」的期望狀態；如果我改一次 `spec.config`，`metadata.generation` 會跳到 2，而在 controller 完成這一輪 reconcile 之前，`status.observedGeneration` 會暫時停在 1，兩者出現落差的這段時間，就是「現實還沒追上期望」的真實窗口。`status.conditions[0].reason: Reconciled` 跟 `message: Successfully reconciled` 則是那句「這是不是一段結構化、機器可讀的狀態描述」的直接證據——不是一張給人看的圖，是一個可以被 agent 直接讀、直接拿來回答「這個 Collector 現在到底跟不跟得上它該有的設定」這個問題的欄位。這正是 Day3 最後一節埋的伏筆：這欄位不只是給人 debug 用，它本身就有資格成為 Signal Plane 的一條輸入。
-
-## `Instrumentation` CR：宣告了，但今天故意不接上去
-
-同一批，也套用了一份 `Instrumentation` CR：
+這裡的設計是 app 送 OTLP 到本機 sidecar（`localhost:4318`），sidecar 再轉發到中心化的後端——跟今天 `api-gateway` 直接送到叢集內 `otel-collector` Service 的拓撲不一樣，是「先進 sidecar，sidecar 再統一出口」。因為掛了 sidecar，一個 Pod 至少會有兩個 container，webhook 沒辦法保證猜對要幫哪個 container 注入 agent，所以還要多加一個：
 
 ```yaml
-apiVersion: opentelemetry.io/v1alpha1
-kind: Instrumentation
-metadata:
-  name: python-instrumentation
-  namespace: demo
-spec:
-  exporter:
-    endpoint: http://otel-collector.demo.svc:4318
-  propagators: [tracecontext, baggage]
-  python:
-    env:
-      - name: OTEL_EXPORTER_OTLP_PROTOCOL
-        value: http/protobuf
+  instrumentation.opentelemetry.io/container-names: "<app container 名稱>"
 ```
 
-`kubectl get instrumentation python-instrumentation -o yaml` 印出來的東西，比我寫的這幾行多得多——Operator 的 admission webhook 在建立這個物件的當下，自動把 `spec.python.image`、`spec.java.image`、`spec.nodejs.image`……每一種語言的 auto-instrumentation 映像檔預設值都補齊了，連我完全沒打算用的 `dotnet`、`go`、`apacheHttpd`、`nginx` 都各自有一組預設的 `resourceRequirements`（`limits.cpu: 500m` 之類）。這跟前面 `spec.targetAllocator` 的預設值補齊是同一件事——**這份 CR 的 schema，遠比我實際填寫的那幾行豐富**，這也是為什麼 Day3 反覆強調「CRD 是一種期望狀態的宣告」而不是「一份設定檔」：設定檔沒填的地方是空的，CRD 沒填的地方，是 schema 幫你決定的。
+這是今天「annotation 補齊沒有的、不動已經存在的」那段可以延伸的另一面——**沒填 `container-names` 不會報錯，只是 agent 沒被注入，資料悄悄不出現**。跟今天 `OTEL_SERVICE_NAME`/`OTEL_EXPORTER_OTLP_ENDPOINT` 不被覆蓋是「因為已存在所以被跳過」不同，這裡是「因為猜不到目標，直接放棄注入」，同樣是靜默、同樣容易被忽略，但成因不一樣，值得分開記。
 
-但今天特意不做一件事：**沒有把任何一個服務的 Pod annotation 加上 `instrumentation.opentelemetry.io/inject-python: "demo/python-instrumentation"`。** 現在五個服務的 Dockerfile，`CMD` 依然是 `opentelemetry-instrument uvicorn ...`——這是 Day1 壞味道三講的「各自安裝」的具體樣子：每個服務自己在映像檔裡打包了 zero-code 指令，各自決定要不要更新、要不要對齊版本。這份 `Instrumentation` CR 現在只是「宣告」，還沒有任何一個 Pod 真的透過 admission webhook 被它改過 spec——如果現在就把 annotation 也加上去，會變成兩套注入機制同時作用在同一個 Pod 上，反而製造出一個新的、自己找的麻煩。
+**PHP-FPM：annotation 注入不需要語言本身支援 auto-instrument**
 
-留白，是因為這正是 Day5 要做的實驗：把某一個服務的 annotation 換上去，同時从它的 Dockerfile 拿掉手動的 `opentelemetry-instrument`，實地對比 before/after 的 trace 差在哪裡、annotation 覆蓋不到的地方（比如目前這幾支服務自己開的 business metrics/span）又是什麼樣子。今天只確認一件事：Operator 的 webhook 確實已經在運作、確實已經知道 Python 該用哪個 auto-instrumentation 映像檔——但「把某個服務接上去」這個動作，故意留到明天才做。
+PHP 沒有 operator 支援的自動注入機制，能用的只有 sidecar 模式：
 
-## 部署行為 vs 注入行為，今天實際看到的分工
+```yaml
+annotations:
+  sidecar.opentelemetry.io/inject: "opentelemetry-operator-system/sidecar-php-fpm"
+```
 
-回到 Day3 那張分工圖，現在可以填上真實看到的內容：
+這證明了一件事：annotation 驅動注入的機制本身不依賴「這個語言有沒有 auto-instrumentation agent」——sidecar 模式只是幫你把一個 collector process 塞進同一個 Pod，網路層面能連到 `localhost` 就夠，app 端要自己用 SDK 把 OTLP 送過去、自己設好 `OTEL_SERVICE_NAME`。跟今天 Python annotation 注入（webhook 直接把 instrumentation 邏輯注入進 app process）是完全不同的兩種手段，殊途同歸都是「靠 annotation 觸發 webhook」。
 
-|                    | `OpenTelemetryCollector`（部署行為）                                   | `Instrumentation`（注入行為）               |
-| ------------------ | ------------------------------------------------------------------------ | --------------------------------------------- |
-| 今天做的事         | 把手寫 Deployment 換成 CR，Operator 接手持續調和                         | 宣告一份 CR，但沒有接上任何 Pod               |
-| 真實可觀察到的效果 | `otel-collector` Service 自動生成、三個 port 就緒、原有 5 個服務零改動 | Operator webhook 自動補齊各語言預設映像檔版本 |
-| 對應的「現況」訊號 | `status.conditions[type=Ready]`、`status.observedGeneration`         | 目前無 Pod 引用它，所以還沒有能觀察的注入效果 |
-| Day5 要接著做的事  | （不變，持續調和中）                                                     | 挑一個服務接上 annotation，比較 before/after  |
+PHP-FPM 還有一個 Python 長駐 process 完全不會碰到的問題：每個 request 都是全新的短命 process，SDK 只能送 delta metrics，沒辦法像長駐 process 一樣自己維護 cumulative 狀態。這個環境的做法是在 sidecar 內用 `deltatocumulative` processor，把同一個 Pod 內多個短命 worker process 送出的 delta 值疊加成正確的 cumulative 值再送出去——這是「注入機制要配合語言的 process 生命週期」的具體案例，Python 因為是長駐 process 天生不會踩到。
 
-今天完全沒有動到任何一個服務原本的 auto-instrumentation 設定，五個服務仍然靠自己 Dockerfile 裡的 `opentelemetry-instrument` 在跑——這是刻意的：先確認 Operator 本身站穩、Collector 遷移沒有破壞任何東西，再讓 Day5 去動「誰負責注入」這個更敏感的變數。
+**這段延伸的誠實結論**：annotation 注入有兩種不同的實作手段（Python 這種「改寫 app process 本身」vs. sidecar 這種「旁邊塞一個轉發 process」），選哪種不是治理團隊說了算，是被語言本身的 process 模型決定的——有沒有 auto-instrumentation agent、是不是長駐 process，這兩個問題的答案，直接決定一個新語言加入時該走哪條路。
 
-明天：annotation 覆蓋不改代碼的 before/after trace 對比，以及誠實講清楚它覆蓋不到的地方。
+## annotation 注入之後，collector 本身也可能是那個沒被觀測到的東西
+
+今天前面一路在講「annotation 注入了什麼、沒注入什麼」，都預設了一件事：只要 webhook 把 instrumentation 塞進去，資料就一定會安全送到後端。這個預設今天要親手戳破一次——把 `api-gateway` 現在指向的 `otel-collector`（`13-otel-collector.yaml` 那份獨立 Deployment）resource limit 主動調低，看著它被 `OOMKilled`，走一次「發現資料變少 → 定位是 collector 被壓垮」的排查。
+
+```yaml
+resources:
+  limits:
+    memory: "TODO：先跑一次正常負載記下平常用量，再往下調到明顯不夠"
+```
+
+重新對 `api-gateway` 送同一組流量，這次盯著三件事：
+
+1. `kubectl get pods -n demo -w`——等 `otel-collector` 那個 Pod 出現 `OOMKilled`。
+2. `kubectl describe pod otel-collector-... | grep -A5 "Last State"`——確認真的是 `OOMKilled`，不是 liveness probe 失敗或別的原因。
+3. Tempo 那邊查同一段時間的 trace 數量——這是「使用者視角」會先看到的症狀：不是報錯，是資料悄悄變少。
+
+```
+# TODO：真實 kubectl describe 輸出 + Tempo 查詢對照，貼這裡
+```
+
+排查順序刻意不是先查 app：
+
+1. **先確認不是 app 沒送**：查 app 容器的 log，確認 exporter 沒有報錯——如果 app 端已經在噴 `Failed to export`，問題出在連線層級，跟 collector 內部無關，排查方向完全不同。
+2. **再確認是不是 collector 收到了但沒送出去**：`kubectl port-forward` 到 collector 的 metrics endpoint，比對 `otelcol_receiver_accepted_spans` 跟 `otelcol_exporter_sent_spans` 這兩個數字——有落差代表資料卡在 collector 內部，不是 receiver 沒收到。
+3. **最後才看 Pod 本身健不健康**：`kubectl get pod`、`kubectl describe pod` 看重啟次數跟 `Last State` 的 `Reason`。
+
+```
+# TODO：實際跑三步的輸出貼上來，尤其是 otelcol_receiver_accepted_spans
+# vs otelcol_exporter_sent_spans 這組數字落差
+```
+
+這個順序刻意跟直覺相反——大部分人踩到「資料變少」的第一反應是去查 app，因為症狀是在 app 這邊的下游（dashboard 空的、trace 查不到）浮現的。但 app 端往往是無辜的：它已經把 span 送出去了，只是 collector 那端在半路把它吃掉。**症狀出現的地方，不一定是問題發生的地方**——這也是今天最想留下的一句話：annotation 注入解決的是「instrumentation 怎麼進到 app process」，不代表資料從此穩定送達；可觀測性系統本身的健康狀態，也需要被觀測，不能預設它永遠正常運作。這條線後面會在 Signal Plane 談資料可信度的那幾天再接上。
+
+## 今天沒做的事
+
+只轉換了 `api-gateway` 一個服務，其餘四個（`payment`、`user`、`order`、`webapp`）依然是 Dockerfile 裡的 `opentelemetry-instrument`。這是刻意的——先讓一個服務完整跑過一次「annotation 注入 → 真的比對 trace → 誠實講差異」，確認整條路徑沒問題，再決定要不要把其餘四個一起搬過去（會在後面某一天回頭處理，不在今天的範圍內）。OOMKilled 的排查也只做了一種部署形狀（獨立 Deployment 共用一份 collector），sidecar/daemonset 這類不同拓撲會不會有一樣的失效模式，留給之後有需要時再驗證，不在今天的範圍內硬湊。
+
+明天：回到 Weaver 本身。今天證明了「資料會不會送到」是一個獨立的問題，明天處理另一個——資料送出來了，但**每個欄位叫什麼、代表什麼、必不必填，由誰決定**。先講清楚 telemetry 為什麼需要 schema（那是團隊共識，不是資料庫 schema），再跑第一次 `weaver registry check`，最後用 `infer` 從這支服務的真實流量反推一份草稿，看看 `userId`／`user_id` 這兩套並存的命名會不會被一起學進去。

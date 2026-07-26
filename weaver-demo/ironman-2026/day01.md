@@ -22,7 +22,7 @@ tags: [OpenTelemetry, AIOps, 鐵人賽]
 
 系列走到後面，我們也會提供實測數據，直接比較「品質不太好的遙測資料」跟「高品質且一致的遙測資料」，餵給同一個 AIOps agent 分析、排查、給出處理建議時，兩者拿到的分數差多少——不只是講道理，是真的跑出數字來。
 
-還有一件事，光是把 log/metrics/trace 三者做到一致，也還不夠。即使 trace ID、span ID 能把三種訊號關聯起來，這三者關聯得起來，不代表它們合起來就講得出一個完整的故事。實務上常見的情況是：你給 LLM 一條 trace，再丟幾個零星的 metrics 數字，然後讓它自己去查幾條 log——但「查哪幾條 log」、「這個異常前後該看哪個時間窗的 metrics」，這些串連的邏輯，其實是 LLM 自己腦補、自己去撈出來的，不是你的遙測資料本身就把這個故事準備好給它。換句話說，資料**一致**跟資料**足夠支撐一次決策**，是兩件不同的事——一致解決的是「大家講的是不是同一種語言」，但「這些訊號合起來夠不夠讓 agent 不用腦補就能下判斷」，是後面 Signal Plane、決策級遙測（decision-level telemetry）要處理的問題，我們會在 Day19 之後的 Signal Plane 篇章、以及 Day25 的 CEL（情境豐富層）具體展開。
+還有一件事，光是把 log/metrics/trace 三者做到一致，也還不夠。即使 trace ID、span ID 能把三種訊號關聯起來，這三者關聯得起來，不代表它們合起來就講得出一個完整的故事。實務上常見的情況是：你給 LLM 一條 trace，再丟幾個零星的 metrics 數字，然後讓它自己去查幾條 log——但「查哪幾條 log」、「這個異常前後該看哪個時間窗的 metrics」，這些串連的邏輯，其實是 LLM 自己腦補、自己去撈出來的，不是你的遙測資料本身就把這個故事準備好給它。換句話說，資料**一致**跟資料**足夠支撐一次決策**，是兩件不同的事——一致解決的是「大家講的是不是同一種語言」，但「這些訊號合起來夠不夠讓 agent 不用腦補就能下判斷」，是後面 Signal Plane、決策級遙測（decision-level telemetry）要處理的問題，我們會在 Day15 之後的 Signal Plane 篇章、以及 Day21 的 CEL（情境豐富層）具體展開。
 
 ## 服務長什麼樣子
 
@@ -53,7 +53,7 @@ GET /api/orders/{order_id}
 POST /api/orders
 ```
 
-這對 debug 單一 request 夠用，但拉不出「這是一次下單流程」的語意——trace 裡看不到「這是 checkout 這個業務動作」，只看得到 HTTP method 加 path template。等到 Day19 我們要畫 `topology.py` 的服務拓撲圖、要讓 agent 讀 trace 判斷「這個異常出現在哪個業務動作」時，span name 只有 HTTP 路徑會是第一個卡住的地方——agent 要嘛自己猜路徑對應哪個業務語意，要嘛就只能瞎猜。
+這對 debug 單一 request 夠用，但拉不出「這是一次下單流程」的語意——trace 裡看不到「這是 checkout 這個業務動作」，只看得到 HTTP method 加 path template。等到 Day15 我們要畫 `topology.py` 的服務拓撲圖、要讓 agent 讀 trace 判斷「這個異常出現在哪個業務動作」時，span name 只有 HTTP 路徑會是第一個卡住的地方——agent 要嘛自己猜路徑對應哪個業務語意，要嘛就只能瞎猜。
 
 ![image](https://hackmd.io/_uploads/BJ4oAvREMe.png)
 
@@ -85,6 +85,6 @@ POST /api/orders
 
 接下來 33 天，這個服務不會被丟掉，而是會被反覆拿出來對照、一層一層被治理工具修正——你可以把後面每一天，都看成是在回頭處理今天埋下的某一個坑：
 
-Day2 會先退一步，不急著動手，把「AIOps 到底要解決什麼問題」的地圖先畫出來，讓今天這三個壞味道，各自對得上地圖上的哪一格。接著 Day3-4 會正式介紹 OTel Operator——CRD 加 controller 這套機制，怎麼把「各自安裝、各自維護」這個壞味道三的根因，變成一件由平台團隊中央宣告、持續調和的事，而不再是每個部門各憑本事。到了 Day10，會拿 `weaver registry infer` 直接對這個服務的 OTLP 流量反推一份 schema 草稿，你會看到自動生成的結果，是不是連 `userId`/`user_id` 這兩套並存的命名都一起學了進去。緊接著 Day11-12，會真的手動改一個 attribute 名稱，示範 `weaver check` 到底在哪一步、用什麼樣的格式把這種漂移攔下來，並且把它接進 CI Gate——這一步，正是在回答「沒有人會發現版本漂移」這句話該怎麼被打破。再往後，Day19 開始的 Signal Plane 那八天，則會回頭處理 span name 沒有語意這件事，怎麼具體影響 agent 讀 trace 判斷業務語意的能力，以及光靠 trace ID/span ID 串起三種訊號，為什麼還不足以讓 agent 不腦補就能下決策。
+Day2 會先退一步，不急著動手，把「AIOps 到底要解決什麼問題」的地圖先畫出來，讓今天這三個壞味道，各自對得上地圖上的哪一格。接著 Day3 會正式介紹 OTel Operator——CRD 加 controller 這套機制，怎麼把「各自安裝、各自維護」這個壞味道三的根因，變成一件由平台團隊中央宣告、持續調和的事，而不再是每個部門各憑本事。到了 Day5，會拿 `weaver registry infer` 直接對這個服務的 OTLP 流量反推一份 schema 草稿，你會看到自動生成的結果，是不是連 `userId`/`user_id` 這兩套並存的命名都一起學了進去。緊接著 Day6-7，會真的手動改一個 attribute 名稱，示範 `weaver check` 到底在哪一步、用什麼樣的格式把這種漂移攔下來，並且把它接進 CI Gate——這一步，正是在回答「沒有人會發現版本漂移」這句話該怎麼被打破。再往後，Day14 開始的 Signal Plane 那八天，則會回頭處理 span name 沒有語意這件事，怎麼具體影響 agent 讀 trace 判斷業務語意的能力，以及光靠 trace ID/span ID 串起三種訊號，為什麼還不足以讓 agent 不腦補就能下決策。
 
 今天不用記住任何工具名稱，只需要記住一件事：**接下來要學的所有治理機制，都是在回答同一個問題——這個壞味道要在流程的哪一步、被誰攔下來。** 明天先把「AIOps 是什麼、不是什麼」講清楚，再繼續往下走。

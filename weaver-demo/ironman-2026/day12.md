@@ -1,285 +1,183 @@
 ---
-title: "【Day12】live-check：補上 CI 看不到的那一半"
+title: "【Day12】可測試性：不用 LLM，也能驗證治理資產還有效"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
-tags: [OpenTelemetry, Weaver, 鐵人賽]
+tags: [OpenTelemetry, Weaver, eval, 鐵人賽]
 ---
-# Day12：`live-check`——補上 CI 看不到的那一半
+# Day12：可測試性——不用 LLM，也能驗證治理資產還有效
 
-Day11 那道 gate 現在是全綠的。registry 自洽、policy 全過、CI 會自己跑、離開碼是 0。
+前面十天做出了一堆東西：四條 Rego policy、一道 CI gate、一份分層 registry、一個 MCP server、一組 template、一支意圖編譯器。這些全部是**程式碼**，而它們共同的問題是：**沒有任何東西在測它們。**
 
-而此時此刻，`api-gateway` 正在送 `user_id`，`order-service` 正在送 `status`，`orders_total` 這個 metric 名字跟 registry 裡的 `app.orders.count` 一個字都對不上。
+這件事在治理上比在一般開發上更危險，理由是這系列反覆撞到的那個家族的問題。回想一下清單：`-r .` 讀到 0 個 group 還給綠燈（Day5）、policy 只比對名字前綴（Day5）、`--diagnostic-stdout` 不加就沒有 annotation（Day7）、`--advice-policies` 是覆蓋不是疊加（Day7）、`diff` 對型別改變完全靜音（Day9）、`browse_namespace` 不標 deprecated（Day10）、我自己的 checklist 漏掉 `shippingStatus`（Day13 會講）。
 
-**這兩件事同時為真，而且不衝突。** Day8 第一次跑 check 拿到綠燈時就講過一次，今天要把它變成可以量測的東西。
+**這七件事的共同點是：壞掉的時候，症狀是「一切看起來很順利」。** 一份壞掉的 policy 不會報錯，它會給你綠燈。所以「跑一次看看有沒有過」這種驗證方式，對治理資產是無效的——**你要驗證的不是它會不會通過，是它還會不會擋。**
 
-程式碼跟樣本檔在 submodule 的 [`day12/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/day12)，這裡直接講重點跟真實輸出。
+而接上 agent 之後這件事又多一層。今天要處理的第二個問題是：**當 agent 表現不好的時候，你怎麼知道是 agent 的問題，還是你餵給它的東西本來就是錯的？**
 
-## CI 的盲點：定義對，不代表行為對
+程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`testability/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/testability)（一支 `regress.sh`，21 條斷言，跑完不到十秒、一次 LLM 呼叫都沒有）。
 
-`weaver registry check` 檢查的問題是「**這份定義自不自洽**」。它從頭到尾只讀 YAML，不知道你的服務存不存在、有沒有在跑、送了什麼。所以「registry 寫得很漂亮」跟「服務照著送」之間，有一整片它看不到的地帶。
+## 四個做法，一個原則
 
-這片地帶裡有三種不同的落差，而且處理方式完全不同：
+今天的內容不是新工具，是把前面十天散落的四個做法收斂成方法論。它們共用一個原則：**確定性的部分要先被測到滿，才有辦法歸因非確定性的部分。**
 
 ```mermaid
-flowchart TD
-    Q{"registry 有定義<br/>vs<br/>線上有在送"}
-    Q -->|"registry 有，線上沒送"| A["定義了但沒人用<br/>→ 規範寫太早，或功能沒上<br/>→ 看 registry coverage"]
-    Q -->|"線上有送，registry 沒定義"| B["未治理的欄位<br/>→ user_id / status / orders_total<br/>→ violation"]
-    Q -->|"兩邊都有，但值不合法"| C["值域漂移<br/>→ app.outcome 送出 CREATED<br/>→ 只有 information"]
-    Q -->|"兩邊都有，值也對"| D["✅ 真正對齊"]
+flowchart TB
+    subgraph D["確定性的部分（今天全部測掉）"]
+      D1["registry／policy 會不會擋"]
+      D2["MCP 回答什麼"]
+      D3["意圖編不編得過"]
+      D4["真實 span 合不合規"]
+    end
+    subgraph N["非確定性的部分（Series 2 的 eval）"]
+      N1["agent 會不會照工具描述查"]
+      N2["agent 拿到 Finding 之後會不會真的改"]
+      N3["同一個任務跑十次的分佈"]
+    end
+    D --> Q{"agent 答錯了"}
+    N --> Q
+    Q -->|"確定性全綠"| A1["問題在 agent／prompt"]
+    Q -->|"有一條紅"| A2["問題在治理資產<br/>agent 只是誠實地反映了它"]
 ```
 
-第二種是最直覺的——Day1 埋的那些壞味道都在這一類。但第一種跟第三種同樣重要，而且**只有拿真實流量去比對才看得出來**：
+右邊那個分岔就是今天真正的產出。**沒有左邊那組斷言，「agent 表現不好」這句話沒有辦法被歸因**——你會花一整天調 prompt，而真正的原因是 registry 裡有兩個矛盾的定義。
 
-- 第一種（定義了沒人用）是治理的反向風險。一份 200 個 attribute 的 registry，如果實際只有 20 個在用，那份規範的可信度是有問題的——它描述的是一個想像中的系統。
-- 第三種（值域漂移）正是 Day2 講的「同一個名字，語意隨時間漂移」。欄位名沒變、schema 沒變、CI 全綠，但值悄悄多了一種。這種漂移連 `registry diff` 都看不出來，因為 registry 根本沒動。
+### 做法一：不接 LLM，也要能驗證 agent 拿到什麼
 
-`live-check` 要回答的就是這三個問題。
+Day10 那個 MCP server 是走 **stdio 上的 JSON-RPC**，所以完全不需要 LLM 就能驅動它：`day15/mcp_probe.py` 就是一支六十行的 python，spawn 一個 `weaver registry mcp`、送 `initialize`、送 `tools/list`、再送你指定的 `tools/call`，把回應原封不動印出來。
 
-## 不用把服務跑起來也能重現
+這件事的價值不在方便，在**歸因**：如果你只能透過對話測 MCP，那「agent 講錯」跟「registry 教錯」永遠分不開。Day10 那四個坑全部是靠這支腳本挖出來的——`search` 是關鍵字 AND 不是語意搜尋、`browse_namespace` 不標 deprecated、`not found` 回 `isError: false`、分層 registry 預設是空的——**一次 LLM 呼叫都沒有用到**。
 
-Day9 的 `infer` 是一個常駐的 OTLP 接收器，要先把服務跑起來才有東西可看。`live-check` 預設也是這樣，但它多了一個對寫文章跟寫 CI 都很有用的選項：
+而其中最後一個坑特別能說明問題：分層 registry 沒帶 `--include-unreferenced true` 時，`browse_namespace` 回報 0 個 attribute、`get_attribute` 回報「不存在」。如果只用對話測，你看到的現象是「agent 說找不到那個欄位」——**這個現象跟「agent 幻覺」長得一模一樣**，而真相是工具真的回答了「不存在」。
 
-```
---input-source <INPUT_SOURCE>
-    Where to read the input telemetry from. {file path} | stdin | otlp [default: otlp]
-```
-
-**可以直接餵一個 JSON 檔**。這代表「線上流量長什麼樣」可以被固定成一份檔案，變成一個可重複、可進 CI、不需要任何服務在跑的測試——這件事的價值等一下會回頭講。
-
-樣本格式官方文件沒有明講，是試出來的。第一次我照直覺寫成一個物件：
-
-```
-× Fatal error during ingest. Failed to parse JSON from file ...:
-│ invalid type: map, expected a sequence at line 1 column 1
-```
-
-要的是陣列。包成陣列之後，第二個錯誤更有用：
-
-```
-× Fatal error during ingest. Failed to parse JSON from file ...:
-│ unknown variant `name`, expected one of `attribute`, `span`,
-│ `span_event`, `span_link`, `resource`, `metric`, `log`
-```
-
-錯誤訊息直接把**支援的七種樣本型別**列出來了。所以格式是「一個陣列，每個元素用型別當外層的鍵」：
-
-```json
-[
-  {"span": {"name":"POST /api/orders","kind":"server","attributes":[
-    {"name":"user_id","value":"u-5"},
-    {"name":"order_id","value":"ord-1001"},
-    {"name":"status","value":"created"},
-    {"name":"userId","value":"u-7"}
-  ]}},
-  {"span": {"name":"span.app.order.create","kind":"server","attributes":[
-    {"name":"biz.user.id","value":"u-5"},
-    {"name":"app.outcome","value":"created"}
-  ]}},
-  {"span": {"name":"span.app.order.create","kind":"server","attributes":[
-    {"name":"app.outcome","value":"CREATED"}
-  ]}},
-  {"metric": {"name":"orders_total","instrument":"counter","unit":"{order}"}}
-]
-```
-
-這四個樣本刻意各代表一種情況：第一個是 Day1 的現況（flat key 加 `userId`/`user_id` 並存），第二個完全照 registry 寫，第三個名字對但值是 `CREATED` 不是 `created`，第四個是 metric 名字沒治理。
+所以這條斷言長這樣，而它是整組測試裡我最想留的一條：
 
 ```bash
-weaver registry live-check -r day06/weaver/registry --input-source day12/samples/drift.json
+run_case 0 "MCP 對分層 registry 答得出東西（total_attribute_count > 0）" \
+  "$PY day15/mcp_probe.py day13/team '[{\"name\":\"browse_namespace\",\"arguments\":{}}]' \
+     --include-unreferenced true | grep -qE 'total_attribute_count[^0-9]+[1-9]'"
 ```
 
-## 真實輸出：三種嚴重度終於登場
+### 做法二：樣本要從真實輸出抽，不能手打
+
+這一條是我自己被抓到的，所以印象最深。
+
+Day10 要示範「agent 照 Finding 修好 instrumentation」的閉環，我寫了 before／after 兩份程式碼，然後**手打**了一份 live-check 樣本清單去驗證。after 那份的結果很漂亮：只剩 `not_stable`，violation 歸零。
+
+後來把它改成從真實送出的 span 抽樣本——`run_and_extract.py` 設一個 `InMemorySpanExporter`、真的呼叫 `charge()`、把 exporter 收到的 span 轉成樣本，**這支腳本不知道 handler 裡寫了哪些欄位名**。結果：
 
 ```
-Span POST /api/orders `server`
-    user_id = u-5
-        - [violation] Attribute 'user_id' does not exist in the registry.
-        - [improvement] Attribute key 'user_id' must include a namespace (e.g. '{namespace}.{attribute_key}')
-    order_id = ord-1001
-        - [violation] Attribute 'order_id' does not exist in the registry.
-        - [improvement] Attribute key 'order_id' must include a namespace (e.g. '{namespace}.{attribute_key}')
-    status = created
-        - [violation] Attribute 'status' does not exist in the registry.
-        - [improvement] Attribute key 'status' must include a namespace (e.g. '{namespace}.{attribute_key}')
-    userId = u-7
-        - [violation] Attribute 'userId' does not exist in the registry.
-        - [improvement] Attribute key 'userId' must include a namespace (e.g. '{namespace}.{attribute_key}')
-        - [violation] Attribute key 'userId' does not match name formatting rules.
-
-Span span.app.order.create `server`
-    biz.user.id = u-5
-        - [improvement] Attribute 'biz.user.id' is not stable; stability = development.
-    app.outcome = created
-        - [improvement] Attribute 'app.outcome' is not stable; stability = development.
-
-Span span.app.order.create `server`
-    app.outcome = CREATED
-        - [improvement] Attribute 'app.outcome' is not stable; stability = development.
-        - [information] Enum attribute 'app.outcome' has value 'CREATED' which is not documented.
-
-Metric orders_total `counter`, `{order}`
-    - [violation] Metric does not exist in the registry.
-```
-
-Day10 找了半天沒找到的那套 `information` / `improvement` / `violation`，就在這裡。當時的結論是「`registry check` 的 policy 只有 `deny`、`level` 恆為 `violation`，三級嚴重度屬於 live-check 的 advice 系統」——現在它以最直接的方式證實了。
-
-而且這個分級不是裝飾，它**決定離開碼**：
-
-```
-# 有 violation 的樣本
-$ weaver registry live-check ... --input-source drift.json ; echo $?
+$ python3 day15/run_and_extract.py after --samples \
+    | weaver registry live-check -r day14/base-v2 --input-source stdin
+    ...
+    Span event payment.retried
+        retry.count = 2
+            - [violation] Attribute 'retry.count' does not exist in the registry.
+$ echo $?
 1
-
-# 只有 improvement / information 的樣本
-$ weaver registry live-check ... --input-source clean.json ; echo $?
-0
 ```
 
-這就補上了 Day10 那個「check 只是二元閘門」的缺口。同一套機制，違規會擋、建議不會擋，你可以在 CI 上要求「不准有 violation」，同時讓 improvement 只是一份看板上的技術債清單。
+**還是 exit 1，而原因是一個我自己剛加進去的欄位。** 我手打的那份清單裡沒有 `retry.count`，因為我打的是**我腦子裡那份改動**，不是程式碼真的送出的東西——那行 `add_event` 把一個欄位從 attribute 搬到 span event 上、名字也順手改了，而我在驗證的時候完全忘了它的存在。
 
-### 六種內建 advice type
+一般化之後這條教訓很硬：**手打的樣本永遠只涵蓋你記得的那部分，而你會忘記的正是你剛剛動過的地方。** 而「把欄位搬到別的地方」在 registry 眼裡不是搬移，是新增——所以每一個「重構一下遙測結構」的 PR 都是這個坑的候選人。
 
-報告最後會把 advice 依型別統計，這幾個就是內建的全部：
+### 做法三：每一條規則都要有一個「本來就該紅」的 fixture
 
-| advice type | 等級 | 意思 | 對應到這系列的哪個坑 |
-|---|---|---|---|
-| `missing_attribute` | violation | 這個 attribute 在 registry 裡不存在 | Day1 的 flat key（`user_id`/`status`）|
-| `missing_metric` | violation | 這個 metric 在 registry 裡不存在 | `orders_total` vs `app.orders.count` |
-| `invalid_format` | violation | 名字不符合命名規則 | `userId`——Day10 那條 camelCase 規則的內建版 |
-| `missing_namespace` | improvement | 名字沒有 namespace | Day10 規則三的內建版 |
-| `not_stable` | improvement | 用到還在 `development` 的定義 | Day8 stats 顯示的 `development: 100%` |
-| `undefined_enum_variant` | information | enum 送出一個沒定義過的值 | Day2 的「語意隨時間漂移」 |
+一條從來沒有紅過的規則，等於一條沒有被測試過的規則。所以前面每一天都留了一份故意壞掉的東西，而它們現在全部是測試資料：
 
-有兩件事值得停下來看。
-
-**第一，`missing_namespace` 跟 `invalid_format` 是內建的。** Day10 我親手寫了 Rego 去抓 camelCase 跟缺 namespace——live-check 這邊不用寫就有了。這不代表 Day10 白做：那三條規則跑在 **PR 階段的定義上**（擋的是「別把壞名字寫進 registry」），這裡跑在 **runtime 的真實資料上**（抓的是「程式碼實際送了壞名字」）。同樣一條規則，守在兩個不同的時間點，攔到的是不同的東西。
-
-**第二，`not_stable` 對「完全正確」的資料也會叫。** 上面那個一字不差照 registry 送的 `biz.user.id`，一樣拿到一條 improvement——因為整份 registry 都還是 `development`（Day8 那張 stats 表的最後一列：`development: 55 (100%)`）。這條 advice 的意思不是「你送錯了」，而是「你正在依賴一個還沒承諾穩定的定義」。它會一直叫到 Day14 開始把定義標成 `stable` 為止，所以它本質上是一份**技術債的即時提醒**，不是錯誤。
-
-### Registry coverage：一個很少被問的問題
-
-報告最後還有一個容易被滑過去的數字：
-
-```
-Registry coverage
-  - total seen: 3.77%
-```
-
-這是前面那三種落差裡的**第一種**——這份 registry 定義的東西，實際上只有 3.77% 在這批流量裡出現過。
-
-這個數字單獨看沒有意義（樣本只有四筆），但接上真實流量之後它會變成一個很有用的治理指標。一份 registry 如果長期 coverage 只有 20%，代表兩件事之一：要嘛規範寫得太早、涵蓋了一堆還沒實作的東西；要嘛有一整塊服務根本沒把遙測送到這裡來。兩種都是「這份規範描述的不是真實系統」的訊號，而且**除了 live-check 沒有別的方法會告訴你**。
-
-## 兩個坑
-
-### 一、預設 port 是 4317，會吃到別人的遙測
-
-`live-check` 不給 port 參數時，實測直接綁在 `0.0.0.0:4317`：
-
-```
-$ ss -tlnp | grep weaver
-LISTEN 0 128 0.0.0.0:4317 0.0.0.0:* users:(("weaver",pid=626467,fd=3))
-LISTEN 0 128 0.0.0.0:4320 0.0.0.0:* users:(("weaver",pid=626467,fd=10))
-```
-
-4317 是 OTLP/gRPC 的標準 port，也就是**本機所有 OTel 相關工具的預設值**。Day9 提過一次要避開它，今天講清楚為什麼。
-
-我第一次跑 live-check 時，報告裡出現了一批我完全沒印象的 span 和 log。追下去才發現：那是我當下正在用的 coding agent 自己的遙測——它也設定了 OTLP 輸出到預設的 4317，而 live-check 就在那裡等著。更糟的是，那些 log 裡帶著 `user.email` 這種 PII，就這樣進了報告。
-
-三個層面的問題：**污染**（報告裡混進不屬於這個系統的資料，統計數字全部失真）、**PII**（那份報告如果存檔、進 CI artifact、貼進 issue，就是一次資料外洩）、**看不出來**（live-check 不會告訴你「這批資料來自另一個程序」，它一視同仁地收）。
-
-這跟 Day9 那個 `span.otel.weaver.emit`（emit 自己的 span 被 infer 學進去）是同一件事的放大版：**OTLP 接收器沒有能力分辨「我要治理的系統」跟「剛好也在送資料的東西」**。
-
-所以習慣是：跑 live-check 或 infer 一律指定一個不會撞的 port，而且綁在 localhost：
-
-```bash
-weaver registry live-check -r day06/weaver/registry \
-  --otlp-grpc-address 127.0.0.1 --otlp-grpc-port 14317 --admin-port 14320
-```
-
-順帶一提 `--admin-port` 預設是 4320，`/stop` 端點掛在上面，預設不活動 10 秒就會自己停。
-
-### 二、`--advice-policies` 是覆蓋，不是疊加
-
-想加一條自己的 advice 規則時，會很自然地以為 `--advice-policies` 是「再加上這個目錄的規則」。它不是。help 寫得其實很誠實，只是很容易看過去：
-
-```
---advice-policies <ADVICE_POLICIES>
-    Advice policies directory. Set this to override the default policies
-```
-
-**override**。實測：同一份樣本，加上一個內容不生效的 advice 目錄，前後對照——
-
-```
-# 不給 --advice-policies
-  - advice type:
-    - invalid_format: 1
-    - missing_attribute: 4
-    - missing_metric: 1
-    - missing_namespace: 4
-    - not_stable: 3
-    - undefined_enum_variant: 1
-
-# 給了一個沒有有效規則的目錄
-  - advice type:
-    - missing_attribute: 4
-    - missing_metric: 1
-    - not_stable: 3
-    - undefined_enum_variant: 1
-```
-
-`invalid_format` 跟 `missing_namespace` **消失了**，五條 advice 不見，而且沒有任何警告。
-
-這個對照還順便揭露了一件事：內建的六種 advice 其實分成兩層。`missing_attribute`、`missing_metric`、`not_stable`、`undefined_enum_variant` 是寫死在 weaver 裡的，`--advice-policies` 動不到；而 `invalid_format` 跟 `missing_namespace` 是用 Rego 實作的**預設 advice policy**，一旦你指定了自己的目錄，它們就被整個換掉。
-
-於是這變成這系列第四次撞到同一個模式了：
-
-| 天 | 現象 | 真正的意思 |
+| fixture | 故意壞在哪 | 該擋住的是 |
 |---|---|---|
-| Day7 | `-r .` 給綠燈 | 一個 group 都沒載入 |
-| Day8 | policy 給綠燈 | 規則只比對名字前綴，沒在看基數 |
-| Day10 | package 打錯給綠燈 | 這份 policy 從來沒被執行 |
-| Day12 | advice 少了兩種 | 預設 advice policy 被你的目錄覆蓋掉了 |
+| `day17/services/shipping-v0` | camelCase、缺 stability、inline 定義、沒有意圖 | 命名／分層 policy、checklist |
+| `day14/breaking` | 一個規格有、weaver 不收的欄位 | 第一層 hard error |
+| `day14/future` | 缺 stability／examples、字串式 deprecated | 第二層 `--future` |
+| `day14/base-v3` | 型別 `int` → `string` | 第三層（`diff` 對此靜音） |
+| `day14/base-v4` | enum 少一個 member | 第三層（`diff` 也靜音） |
+| `day14/team-on-v2` | 下游還在 ref 被改名的欄位 | `deprecated_usage.rego` |
+| `day16/intent/steady-state-broken.yaml` | 指到不存在的維度 | 意圖編譯器 |
+| `day16/intent/steady-state-broken2.yaml` | enum 值大小寫不符 | 意圖編譯器 |
 
-**四次的共通點都是：工具用「安靜」表達「你設定錯了」。** 所以每次接上一個新機制，第一件事都該是先量一個基準（幾個 group、幾條 advice、coverage 多少），之後任何一次數字掉下來，才有東西可以比。
+最後兩個特別值得說，因為它們不是我編的壞例子，是**我自己的 agent 實際犯過的兩種錯**：`payment.status` 是那種「這個欄位應該叫這個名字」的合理猜測，`AUTHORIZED` 大寫則是真實 RCA 任務上的坑——agent 用 `level="ERROR"` 去撈 Loki，資料裡全是 `INFO`，於是它得到零筆結果然後往「系統正常」推理下去。
 
-## 把它接進 CI：從「跑一次看看」到「不會再退步」
+**把 agent 犯過的錯變成 fixture，是這整套方法裡投資報酬率最高的一件事**，因為它讓同一個坑第二次出現時是紅燈，而不是一次新的除錯。
 
-前面提到 `--input-source` 吃檔案這件事的價值，在這裡兌現。
+### 做法四：先量一個基準，數字掉下來才有東西可比
 
-把一組代表性的遙測樣本存成檔案進 repo，live-check 就從「臨時跑一次的診斷工具」變成一個**回歸測試**：
+`stats` 的 group 數、live-check 的 advice 條數與 coverage、MCP 的 `total_attribute_count`——這些數字單獨看都沒什麼意義，但它們是唯一能發現「安靜失效」的方式。Day7 那道 CI 探針（`groups > 0`）就是最小版本。
 
-```mermaid
-flowchart LR
-    A["samples/*.json<br/>固定的遙測樣本"] --> B["weaver registry live-check<br/>--input-source samples/drift.json"]
-    R["registry/*.yaml"] --> B
-    B --> C{"有 violation？"}
-    C -->|有| D["exit 1<br/>CI 擋下"]
-    C -->|"只有 improvement<br/>／information"| E["exit 0<br/>但數字進報告"]
-    E --> F["advice 數量、coverage<br/>當成趨勢指標追蹤"]
+原則：**任何自動化檢查都該有一個「我確實檢查了 N 個東西」的斷言**，而不是只看它有沒有報錯。
+
+## 把四個做法變成一支腳本
+
+`testability/regress.sh` 是表格驅動的：每一行是「預期離開碼 + 說明 + 指令」。跑一次：
+
+```
+$ ./testability/regress.sh
+治理資產回歸測試（無 LLM）
+
+── 規範本身：定義層的規則還擋得住嗎（Day5-6）
+  ✔ 命名 policy 抓到 camelCase／缺 namespace                 exit=1
+  ✔ 命名 policy 對乾淨的 registry 放行                       exit=0
+  ✔ 分層 policy 抓到 signal group 裡 inline 定義的 attribute  exit=1
+
+── 三層驗證模型：每一層都還在它該在的位置（Day9）
+  ✔ 第一層 hard error：metric_requirement_level 進不去        exit=1
+  ✔ 第二層預設不擋（三個 ⚠、exit 0）                          exit=0
+  ✔ 第二層加 --future 就擋                                    exit=1
+  ✔ 第三層：attribute 直接消失（v1→v2）                       exit=1
+  ✔ 第三層：型別 int→string（diff 靜音的那一格）              exit=1
+  ✔ 第三層：enum member 被拿掉（diff 也靜音）                 exit=1
+  ✔ 下游還在用 deprecated 欄位                                exit=1
+
+── 消費端：agent 查得到、意圖編得過（Day10-11）
+  ✔ MCP 對分層 registry 答得出東西（total_attribute_count > 0） exit=0
+  ✔ 生成物產得出來（含繼承的定義）                            exit=0
+  ✔ 穩定狀態意圖編得過                                        exit=0
+  ✔ 變更意圖編得過                                            exit=0
+  ✔ 意圖指到不存在的維度 → 擋                                 exit=1
+  ✔ 意圖用了 enum 裡沒有的值（大小寫）→ 擋                    exit=1
+
+── 真實遙測：程式碼實際送出的東西（Day10）
+  ✔ before 的四個欄位有 violation                             exit=1
+  ✔ after 仍有 violation：retry.count 是新增，不是搬移         exit=1
+  ✔ 把 retry.count 定義出來之後才乾淨                          exit=0
+
+── checklist 自己（Day13）
+  ✔ 照抄一半的服務要被擋                                      exit=1
+  ✔ 補完的服務要放行                                          exit=0
+
+✔ 21/21 全部符合預期
 ```
 
-這樣一來，「哪些欄位還沒遷移」不再是一份會過期的 wiki 文件，而是一個每次 PR 都會重算的數字。而且方向是雙向的：改壞 registry 會讓樣本噴出新的 violation，改進服務則會讓 violation 數量下降——**遷移進度變成可以看著它歸零的東西**。
+**21 條裡有 12 條的預期離開碼是 1。** 這個比例是刻意的，也是今天最重要的一個設計決定：**這組測試主要在測「它還會不會擋」，不是「它會不會通過」。** 一組全部預期 exit 0 的測試，在治理資產上幾乎沒有價值——因為所有「安靜失效」的壞法都會讓它繼續全綠。
 
-這也是 CI 這條線上，繼 Day11 之後的第二層：Day11 守的是「別把壞定義寫進來」，今天守的是「別讓實際行為離規範更遠」。
+跑完不到十秒，不需要 cluster、不需要 API key、不需要網路。**這件事本身就是一個設計約束**：一份需要環境才能跑的測試，會變成一份沒有人在本機跑的測試。
 
-## 回到 AIOps：agent 需要的是哪一種保證
+## 平台工程：治理資產的擁有者，要能證明它還有效
 
-把今天的東西接回主軸。
+**誰維護這組測試。** 跟 policy 同一批人——它們是同一份資產的兩面。這也帶出一個實際的工作習慣：**新增一條規則的時候，順手在對應的 fixture 裡種一個違規**。Day13 那個 `shipping-v0` 就是這樣長出來的，而它已經抓到過一次真的（我的 enum 檢查漏掉 `shippingStatus`）。
 
-Day10 講過 agent 面對 `userId`/`user_id` 並存時會怎麼腦補。但那時談的是**registry 裡有兩個名字**。今天的角度不一樣：registry 裡只有 `biz.user.id` 一個名字，寫得乾乾淨淨，CI 全綠——**而線上一筆 `biz.user.id` 都沒有**。
+**為什麼這件事對平台團隊比對產品團隊重要。** 產品團隊的程式碼壞掉，他們自己會知道（服務掛了、測試紅了）。**平台團隊的 policy 壞掉，沒有人會知道**——所有人的 CI 都變綠，大家會覺得治理做得很好。一道靜靜失效的 gate 比沒有 gate 更糟，因為它讓所有人以為有人在看。
 
-對一個要讀 registry 來決定查詢條件的 agent 來說，這是更危險的一種情況。Day15 會讓 agent 透過 MCP 直接查 registry，如果那份 registry 描述的是一個「應然」而不是「實然」的系統，agent 會非常有信心地產生一個語法完全正確、但查不到任何資料的查詢——然後根據空結果做出「這個服務沒有問題」的結論。
+**這組測試也是一份可以拿出去講的東西。** 當有人問「你們的治理有沒有在運作」，答案不該是「我們有 CI」，而是「這 21 條斷言每天在跑，其中 12 條是在確認規則還擋得住」。**前者描述你裝了什麼，後者描述它現在還有效。**
 
-**空結果跟「沒有問題」在資料上長得一模一樣**，這又是同一個家族的問題，只是這次踩到的是 agent 而不是工程師。
+**沒有做成 gate。** 這組測試自己不該進 merge gate 擋別人的 PR——它該在治理資產自己的 repo 裡跑（改 policy、改範本、升級 weaver 的時候）。這跟 Day9 那個「平台團隊要先讓自己被同一套規則擋住」是同一件事。
 
-所以 registry coverage 這個數字，對 AIOps 來說的意義比對人來說大得多：**它衡量的是「這份規範可不可以被信任成系統的描述」**。人看到查詢沒結果會起疑、會換個欄位再試一次；agent 不會，它會把空結果當成一個事實。這也是為什麼 live-check 不能只是一個上線前跑一次的工具，而該是持續在跑的東西——它守的是 registry 這份治理資產本身的可信度。
+## 回到 AIOps：這是 eval harness 的前身
+
+今天這 21 條斷言全部是確定性的：同樣的輸入永遠同樣的離開碼。而 agent 不是這樣——同一個問題問十次，可能有八次照著工具描述查、兩次把整句自然語言丟進 `search` 然後得到零筆。**所以 agent 的品質不能用「跑一次看看」來驗證，只能用分佈來描述。**
+
+那正是後面 eval harness 要做的事，而今天這組測試是它的前提。三個具體的銜接點：
+
+**一、fixture 可以直接升級成 eval case。** 那份「意圖指到不存在的維度」的 YAML，現在測的是編譯器會不會擋；同一份東西可以拿去問 agent「這份意圖對不對」，測的就變成 agent 會不會發現。**輸入完全一樣，被測的對象換了。**
+
+**二、意圖檔案是現成的 ground truth。** Day11 那份意圖已經把「什麼情況該告警、嚴重度多少」寫成機器可讀的判準了。這代表 eval 不需要人工標註「這次算不算 incident」——**意圖已經回答了**。這條線會在 Series 2 講校準的時候變成主題。
+
+**三、確定性的斷言是歸因的前提。** 前面那張圖的右半邊：agent 答錯的時候，先看這 21 條。全綠，問題在 agent；有一條紅，agent 只是誠實地反映了你餵給它的東西是錯的。**我自己在 RCA 任務上拿到 2/9 分的那一次，事後回頭看，有一部分根本不是 agent 的問題**——它查不到資料是因為它照著一份跟真實資料不一致的 schema 在查（Day7 那個「空結果跟沒有問題長得一模一樣」）。如果當時有這組斷言，那一天會少浪費很多時間。
 
 ## 今天沒做的事
 
-沒有真的把 live-check 接上 collector 常駐。今天全部用 `--input-source` 的檔案模式，好處是可重現、可進 CI、不會吃到別人的遙測；接上 collector 讓它長時間收線上流量是另一種用法，需要處理取樣、報告輪替、以及上面那個 PII 問題，留到有實際場景時再展開。
+沒有跑任何 LLM，也沒有量任何分佈。今天證明的是「工具會給出正確答案」，完全沒有證明「agent 真的會去用它、而且照著用」。Day10 那條「一次只查一兩個關鍵字」的指令，實際上有多少比例的對話會照做？這需要跑很多次、看分佈，而那是 eval harness 的工作。**在有那份數字之前，所有結論的正確說法都是「這讓對的事情變得可能」，不是「這樣就不會出錯了」。**
 
-沒有寫出一條自訂的 advice policy。試了幾個 package 名字都沒有讓自訂規則生效，而只憑猜測寫一段「應該是這樣」的 Rego 貼上來，違背這系列只貼真實輸出的原則。已經確認的是 `--advice-policies` 會覆蓋掉預設的兩條 Rego advice——**怎麼正確地寫一條新的，還沒解出來，之後補**。
+沒有把這支腳本接進 CI。它現在是手動跑的。要進 CI 得先決定一件事：weaver 版本要不要釘死在腳本裡（釘死的話，升級 weaver 就必須改這支腳本；不釘死，某天上游改行為會讓它整組變紅）——而這正是 Day9 那個「跨版本矩陣」該負責的事，兩者要一起設計。
 
-也沒有處理那張 flat key 遷移表。今天只是把「還差多少」變成一個機器每次都會重算的數字，真正動 `o11y_shared` 跟五個服務，還是後面的事。
+沒有測 template 生成物的內容，只測了「產得出來」。Day11 講過生成物的 diff 能補上 `diff` 的靜音區，那件事該有一條斷言（例如「`ATTRIBUTE_TYPES` 裡 `payment.retry_count` 必須是 `int`」），但那需要先決定生成物要不要 commit 進版控——我認為要，理由 Day11 說過，只是這組測試還沒跟上這個決定。
 
-明天：從零定義一組自己的 semantic convention（`payment-events.yaml`），再疊一層 team-specific registry 在 base 之上——`manifest.yaml` 的 `dependencies`、`schema_url`、多團隊分層會撞在哪，以及 `before_resolution` 那個 package 終於有場景可以用了。
+明天：第一階段的最後一天，把這十二天的結論壓成一份新服務上線 checklist——會自己跑的那種，十三項檢查、每一項都真的執行一次工具。而今天這組斷言會在那裡多一個用途：**checklist 自己也是需要被測試的程式碼。**

@@ -1,410 +1,253 @@
 ---
-title: "【Day13】自訂 semconv 與多 registry 分層"
+title: "【Day13】新服務上線 checklist——第一階段收尾"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
-tags: [OpenTelemetry, Weaver, 鐵人賽]
+tags: [OpenTelemetry, Weaver, 平台工程, 鐵人賽]
 ---
-# Day13：自訂 semconv 與多 registry 分層
+# Day13：新服務上線 checklist——治理環境收尾
 
-前面六天都在同一份 registry 上打轉——那份 registry 是 Day6 就準備好的，我只是拿它來跑各種指令。今天要做兩件之前刻意跳過的事：**從零寫一份自己的 semantic convention**，然後**把它疊成多層**。
+十三天前那份 `demo-services` 是故意寫壞的：`userId` 混著 `user.id`、span name 沒有語意、沒有人知道哪個欄位才是對的。中間十一天，我們一件一件把工具鏈疊起來——Operator、registry、policy、CI gate、live-check、分層、breaking change、MCP、意圖。
 
-第二件事才是重點。Day1 那段診斷說得很清楚：問題不是「有人沒跟上版本」，而是每個部門的 OTel 都是各自安裝、各自維護的。但反過來，如果為了統一而要求全公司共用一份 registry、任何一個團隊要加一個欄位都得去改那份中央檔案，那份 registry 會在三個月內變成一個沒有人敢動、也沒有人跟得上的東西。
+今天是第一階段的最後一天，要做的事只有一件：**把這十二天的結論壓縮成一份下一個服務可以直接照著走的東西。**
 
-**治理的難處從來不是「要不要統一」，而是「哪一層統一、哪一層放手」。** 今天要看的就是 Weaver 用什麼機制表達這件事，以及——照這系列的慣例——它在哪些地方會安靜地讓你以為你做到了。
+而「可以直接照著走」這句話有一個很高的標準。一份 markdown 上的勾選清單不算——那種東西的命運是被複製到 Confluence，然後在第三個服務上線的時候就跟現實脫節了。今天要做的 checklist 是**會自己跑的**：一支腳本、十三項檢查、每一項都真的去執行一次工具，失敗的那幾項直接告訴你下一步該做什麼。
 
-程式碼在 submodule 的 [`day13/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/day13)（五份 registry ＋ 兩條 policy），這裡直接講重點跟真實輸出。
+程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`day17/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/day17)：一組新服務範本（registry／intent／`.mcp.json`／CI workflow）、一支 `verify_onboarding.py`，以及兩份 shipping 服務——一份是「照抄了一半」的真實樣子，一份是補完的版本。
 
-## 先從零寫一份 base registry
+## 先回頭看一次這十二天疊了什麼
 
-分層之前，先有一層。這是一份完全從空白開始的支付領域 registry，只有一個 `manifest.yaml` 加一個 model 檔：
-
-```yaml
-# base/manifest.yaml
-name: payments-base
-description: 支付領域的共用 semantic convention（平台團隊維護）
-schema_url: https://example.com/schemas/payments-base/0.1.0
-```
-
-```yaml
-# base/model/payment-events.yaml
-groups:
-  - id: registry.payment
-    type: attribute_group          # ← 屬性池，不是 signal
-    stability: development
-    brief: "支付領域的共用屬性"
-    attributes:
-      - id: payment.id
-        type: string
-        stability: development
-        brief: "支付交易識別碼"
-        examples: ["pay-1001"]
-      - id: payment.outcome
-        type:
-          members:                 # ← Day7 講的 enum，值域寫進 schema
-            - id: authorized
-              value: authorized
-              brief: "授權成功"
-              stability: development
-            - id: declined
-              value: declined
-              brief: "被拒絕"
-              stability: development
-        stability: development
-        brief: "支付的終態結果"
-
-  - id: event.payment.authorized
-    type: event
-    name: payment.authorized
-    stability: development
-    brief: "支付授權成功"
-    attributes:
-      - ref: payment.id            # ← 只 ref，不重複定義
-        requirement_level: required
-      - ref: payment.outcome
-        requirement_level: required
-```
-
-```
-$ weaver registry check -r day13/base
-✔ No `after_resolution` policy violation
-
-$ weaver registry stats -r day13/base
-  - 2 groups
-```
-
-這份的結構就是 Day8 那份大 registry 的縮小版，也是寫任何 registry 都該有的骨架：**`attribute_group` 當屬性池，signal group 只用 `ref` 去引用**。屬性定義一次、被多個 signal 共用，改一次全部生效。今天後面會看到，這個「只 ref、不 inline」的習慣在分層之後從「比較整潔」升級成「必要」。
-
-## 分層：`dependencies` 怎麼寫
-
-現在加第二層。結帳團隊要定義自己的 `checkout.completed` 事件，但裡面的支付欄位應該沿用平台團隊那份，不該自己再造一次：
-
-```yaml
-# team/manifest.yaml
-name: checkout-team
-description: 結帳團隊在 payments-base 之上的擴充
-schema_url: https://example.com/schemas/checkout-team/0.1.0
-dependencies:
-  - name: payments-base
-    registry_path: day13/base
-```
-
-```yaml
-# team/model/checkout.yaml
-groups:
-  - id: event.checkout.completed
-    type: event
-    name: checkout.completed
-    stability: development
-    brief: "結帳完成（團隊自訂事件，重用 base 的支付屬性）"
-    attributes:
-      - ref: payment.id            # ← 這兩個都是 base 定義的
-        requirement_level: required
-      - ref: payment.outcome
-        requirement_level: required
-```
-
-```
-$ weaver registry check -r day13/team
-ℹ Found registry manifest: day13/team/manifest.yaml
-ℹ No registry manifest found: ... （第一次會踩坑，見下）
-✔ No `after_resolution` policy violation
-```
-
-跑得起來之後，有一件事值得先看：這份 team registry「有幾個 group」？
-
-```
-$ weaver registry stats -r day13/team
-  - 1 groups
-
-$ weaver registry stats -r day13/team --include-unreferenced true
-  - 3 groups
-    - 1 AttributeGroups
-    - 2 Events
-```
-
-**預設只算團隊自己宣告的那一個。** base 的兩個 group 有被載入、`ref` 也解得到，但它們不算是這份 registry 的內容——除非加上 `--include-unreferenced true`，才會把依賴裡的東西也一起算進來。
-
-這個差別對 Day11 那個 CI 探針有直接影響：如果你的 gate 檢查「group 數 > 0」，在分層架構下要先想清楚你期待的是哪一個數字，不然這個探針會在某次重構之後失去意義。
+在講 checklist 之前，先把第一階段的形狀畫出來，因為 checklist 的每一項都是從這張圖上某一格長出來的。
 
 ```mermaid
 flowchart TB
-    subgraph L1["第一層：平台團隊"]
-      B["payments-base<br/>registry.payment（屬性池）<br/>event.payment.authorized"]
+    subgraph P1["① 環境：讓遙測穩定地產生（Day3-4）"]
+      O["OTel Operator<br/>CRD 宣告期望狀態<br/>annotation 注入 auto-instrumentation<br/>設定進 GitOps"]
     end
-    subgraph L2["第二層：產品團隊"]
-      T["checkout-team<br/>event.checkout.completed"]
+    subgraph P2["② 規範：讓欄位有一個權威定義（Day5、Day8）"]
+      R["registry<br/>attribute_group 當屬性池<br/>signal 只用 ref<br/>多層 dependencies"]
     end
-    T -->|"dependencies:<br/>registry_path"| B
-    T -.->|"ref: payment.id<br/>ref: payment.outcome"| B
+    subgraph P3["③ 執行：讓規範擋得住（Day6-7、Day9）"]
+      G["Rego policy（命名／分層／breaking change）<br/>CI gate（釘版本、annotation、假綠燈探針）<br/>live-check（runtime 的違規）"]
+    end
+    subgraph P4["④ 消費：讓規範被真的用到（Day10-12）"]
+      M["MCP server（agent 查得到）<br/>codegen（程式碼不手打字串）<br/>意圖（什麼算正常）"]
+    end
 
-    S1["registry stats -r team<br/>→ 1 group（只算自己宣告的）"]
-    S2["registry stats -r team --include-unreferenced true<br/>→ 3 groups（連依賴一起算）"]
-    T --> S1
-    T --> S2
+    O --> R --> G --> P4
+    P4 -.->|"回饋：查不到／編不過<br/>就是規範有洞"| R
 ```
 
-## 四個實測出來的陷阱
+四層的順序不是隨便排的，它是一條**因果鏈**：
 
-分層這件事，Weaver 提供的機制很簡潔，但每一個環節都有一個「你以為它會這樣、它其實不是」的地方。四個都是實際撞到的。
+**沒有 ①，遙測時有時無。** Day4 那個把 collector 壓到 `OOMKilled` 的實驗就是這一格的反面——annotation 注入了不代表資料穩定送達，而「資料悄悄變少」是後面所有分析的地基被挖空。
 
-### 一、`registry_path` 是相對於「你在哪裡跑」，不是相對於 manifest
+**沒有 ②，欄位名是各團隊的方言。** Day1 的命名漂移、Day8 的孤兒定義（團隊以為自己覆寫了 `payment.id`，其實製造了一個沒人引用的定義）都在這一格。
 
-最直覺的寫法是 `registry_path: ../base`——manifest 在 `team/` 底下，base 在隔壁，相對路徑當然是 `../base`。實測：
+**沒有 ③，規範是一份沒有人遵守的文件。** 這一格最重要的教訓全部關於「安靜失效」：Day5 的 `-r .` 假綠燈、Day7 那三個不會讓你看到錯誤訊息的 CI 陷阱、Day9 那個 `diff` 對型別改變完全靜音。**規範的敵人不是違規，是「看起來過了」。**
 
-| `registry_path` | 在哪裡跑 | `-r` 給什麼 | 結果 |
-|---|---|---|---|
-| `../base` | repo 根目錄 | `day13/team` | ❌ 找不到 |
-| `day13/base` | repo 根目錄 | `day13/team` | ✅ 通過 |
-| `base` | `day13/` | `team` | ✅ 通過 |
-| `../base` | `day13/` | `team` | ❌ 找不到 |
+**沒有 ④，前面三層是自嗨。** 這是最容易被跳過的一層，也是這系列跟一般 Weaver 教學最不一樣的地方：registry 寫得再漂亮，如果工程師決定欄位名的那三十秒裡它不在現場（Day10），漂移還是會發生。
 
-**基準點是當下的工作目錄，不是 manifest 檔案的位置。** 也就是說 `manifest.yaml` 這份檔案**不是自足的**——同一份檔案，`cd` 到不同地方跑會得到不同結果。
+而第四層那條虛線是今天要特別強調的：**消費端會反過來檢查規範的品質。** Day10 那個「agent 查不到繼承來的欄位」暴露的是 `--include-unreferenced` 的預設值；Day11 那個「意圖編譯失敗」暴露的是欄位名寫錯。這兩件事本來都不會有人發現。
 
-這件事的實務影響比看起來大：你在本機 `cd day13 && weaver registry check -r team` 跑得好好的，CI 從 repo 根目錄跑就爆掉；或者更糟，反過來——CI 好好的，同事在自己的目錄結構下永遠跑不動。
+## 十三項檢查，每一項都對應某一天的一個坑
 
-錯誤訊息本身還算清楚（會告訴你它去哪裡找了）：
+`verify_onboarding.py` 的設計原則只有兩條：**每一項都真的跑一次工具**（不是檢查檔案存不存在就算過），以及**失敗訊息要包含下一步**（Day9 那個結論：一道擋人的 gate 如果不能讓被擋的人自己走出去，維護成本會隨團隊數線性成長）。
+
+先看一個「照抄了一半」的服務。這不是我編的壞例子，是真實會發生的樣子——有人拿了範本，改了服務名，但 `stability` 忘了補、狀態欄位順手寫成 `shippingStatus`、event 裡直接 inline 定義了一個 attribute、`schema_url` 沒有版本號，然後意圖跟 `.mcp.json` 根本沒動：
 
 ```
-ℹ Found registry manifest: day13/team/manifest.yaml
-ℹ No registry manifest found: ../base/manifest.yaml
+$ python3 day17/verify_onboarding.py day17/services/shipping-v0
+新服務上線 checklist：day17/services/shipping-v0
 
-  × The following error occurred during the processing of semantic convention
-  │ file: IO error for operation on ../base: No such file or directory
+  ✔ [Day8     ] registry 存在（manifest.yaml）            day17/services/shipping-v0/registry
+  ✗ [Day9/10  ] schema_url 帶版本號                       https://example.com/schemas/shipping-telemetry
+  ✔ [Day5     ] registry check 通過                     exit=0
+  ✗ [Day9     ] registry check --future 通過（未來會變嚴的規則）  exit=1，2 條診斷
+  ✗ [Day6/8   ] policy 通過：命名（Day6）                    exit=1
+  ✗ [Day6/8   ] policy 通過：分層（Day8）                    exit=1
+  ✔ [Day5/7   ] 假綠燈探針：group 數 > 0                     2 groups
+  ✗ [Day5/10  ] 狀態類欄位都宣告了 enum members                0 個 enum，可疑：shippingStatus
+  ✗ [Day11    ] 有宣告穩定狀態意圖                             找不到 intent/steady-state.yaml
+  ✗ [Day11    ] 意圖的 why / first_check 有填              （沒有意圖檔案）
+  ✗ [Day10    ] 有 .mcp.json（registry 可被 agent 查）      找不到 .mcp.json
+  ✔ [Day10    ] MCP 真的答得出來（browse 有東西）                total_attribute_count=2
+  ✗ [Day7     ] 有 CI gate workflow                    找不到 semconv-gate.yml
+
+✗ 9/13 項未通過，下一步：
+  - schema_url 帶版本號
+      → 結尾補上版本，例如 .../shipping-telemetry/0.1.0——diff 拿它當版本標籤，MCP 的 provenance.source 也是它
+  - registry check --future 通過（未來會變嚴的規則）
+      → 通常是缺 stability、string 缺 examples、或 deprecated 寫成字串
+  - policy 通過：命名（Day6）
+      → id=camel_case_attribute, category=naming, group=registry.shipping, attr=shippingStatus；id=missing_namespace, category=naming, group=registry.shipping, attr=shippingStatus
+  - policy 通過：分層（Day8）
+      → id=inline_attribute_in_signal_group, category=layering, group=event.shipping.completed, attr=shipping.carrier
+  - 狀態類欄位都宣告了 enum members
+      → 把它改成 type.members，那是 LLM 唯一能事先知道值域的來源
+  - 有宣告穩定狀態意圖
+      → 複製 day17/starter/intent/ 過去；why 跟 first_check 不要留空
+  - 意圖的 why / first_check 有填
+      → 
+  - 有 .mcp.json（registry 可被 agent 查）
+      → 複製 day17/starter/.mcp.json 過去
+  - 有 CI gate workflow
+      → 複製 day17/starter/ci/semconv-gate.yml
+
+$ echo $?
+1
 ```
 
-所以慣例只能是：**路徑一律寫成相對於 repo 根目錄，並且在 README／CI 裡明講「所有 weaver 指令都從 repo 根目錄跑」**。這也跟 Day7 那個 `-r .` 的坑疊在一起——`-r` 不能用 `.`，`registry_path` 又綁 cwd，兩個限制合起來，「固定從 repo 根目錄跑」幾乎是唯一不會出事的用法。
+**注意第三行：`registry check` 是綠的。** 這份 registry 完全合法，用 Day5 那套標準來看它沒有任何問題。九項失敗全部落在「合法但不夠好」的區間裡——而那個區間，正是這十二天真正在處理的東西。
 
-### 二、重複定義不是覆寫，是製造一個沒有人用的孤兒
-
-這是今天最危險的一個。
-
-一個很自然的需求：團隊覺得 base 的 `payment.id` 定成 `string` 不合用，想在自己這層改成 `int`。直覺做法就是在自己的 registry 裡重新定義一次同名的 attribute：
-
-```yaml
-# team-collision/model/checkout.yaml
-  - id: registry.checkout_override
-    type: attribute_group
-    stability: development
-    brief: "團隊重新定義了一個 base 已經有的 attribute，型別還不一樣"
-    attributes:
-      - id: payment.id
-        type: int                  # ← 想覆寫成整數
-        stability: development
-        brief: "團隊版：把它改成整數"
-        examples: [1001]
-```
+補完之後（`shipping-v1`）：
 
 ```
-$ weaver registry check -r day13/team-collision
-✔ No `after_resolution` policy violation
+$ python3 day17/verify_onboarding.py day17/services/shipping-v1
+
+
+  ✔ [Day8     ] registry 存在（manifest.yaml）            day17/services/shipping-v1/registry
+  ✔ [Day9/10  ] schema_url 帶版本號                       https://example.com/schemas/shipping-telemetry/0.1.0
+  ✔ [Day5     ] registry check 通過                     exit=0
+  ✔ [Day9     ] registry check --future 通過（未來會變嚴的規則）  exit=0，0 條診斷
+  ✔ [Day6/8   ] policy 通過：命名（Day6）                    exit=0
+  ✔ [Day6/8   ] policy 通過：分層（Day8）                    exit=0
+  ✔ [Day5/7   ] 假綠燈探針：group 數 > 0                     6 groups
+  ✔ [Day5/10  ] 狀態類欄位都宣告了 enum members                5 個 enum
+  ✔ [Day11    ] 意圖編譯得過（欄位名對得上 registry）               exit=0
+  ✔ [Day11    ] 意圖的 why / first_check 有填（不是範本佔位字）     已填寫
+  ✔ [Day10    ] 有 .mcp.json 且設定正確                     registry=✔ include-unreferenced=✔
+  ✔ [Day10    ] MCP 真的答得出來（browse 有東西）                total_attribute_count=8
+  ✔ [Day7     ] CI gate 包含四個必要元素                      齊全
+
+✔ 13/13 項全部通過，這個服務可以上線了
 
 $ echo $?
 0
 ```
 
-**綠燈。** 沒有「重複定義」的警告，沒有「覆寫」的提示，什麼都沒有。
+`6 groups` 跟 `total_attribute_count=8` 這兩個數字比 v0 大，是因為 v1 有 `dependencies` 指向平台團隊那份 base，繼承的東西被算進來了（都帶了 `--include-unreferenced true`）。順帶一提，**這個旗標到今天為止已經在四個地方各咬過一次**：Day8 的 `stats` 數字、Day10 的 MCP 查不到欄位、Day11 的生成物少東西、今天 checklist 裡的兩項。一個預設值能製造四種不同的困惑，這件事本身就值得寫進範本的註解裡。
 
-但它到底覆寫了嗎？寫一條 debug 用的 Rego，把 resolved schema 裡所有叫 `payment.id` 的定義印出來：
+### 幾項值得單獨說的檢查
+
+**「MCP 真的答得出來」跟「有 `.mcp.json`」是兩項，不是一項。** 這是 Day10 第四個坑教出來的：設定檔存在、格式正確、路徑也對，但如果漏了 `--include-unreferenced true`，agent 問任何一個繼承來的欄位都會得到「不存在」。所以 checklist 不能只檢查設定，得真的把 server 叫起來問一個問題，看 `total_attribute_count` 是不是 0。**「設定對」跟「答得出來」之間有一整個坑的距離。**
+
+**「意圖的 `why` 有填」是一項獨立的檢查，而且它檢查的是佔位字有沒有被清掉：**
+
+```python
+placeholders = [p for p in ("寫清楚：", "因為這很重要", "<service>", "<team>") if p in text]
+```
+
+這一項看起來很笨，但它處理的是 Day11 那個誠實的顧慮：意圖最容易失敗的方式不是沒寫，是**照著範本填了一堆廢話**。範本裡故意寫了「寫清楚：低於這條線時，哪一群使用者會受到什麼影響」這種句子當佔位字——一旦它留在檔案裡，這一項就會紅。抓不到「因為這很重要」這種真人寫的廢話，但至少抓得到「完全沒動過範本」。
+
+**「狀態類欄位都宣告了 enum members」是唯一一項需要語意猜測的檢查**，它去找名字結尾是 `status`／`state`／`outcome`／`result`／`kind`／`type` 但型別是純字串的欄位。理由是 Day5 到 Day10 反覆講的那件事：`members` 是 LLM 唯一能事先知道值域的來源，一個 `type: string` 的狀態欄位對 agent 來說等於沒有資訊。
+
+而這一項在我寫的第一版裡有一個洞，值得完整記下來。
+
+## 我自己的 checklist 有一個洞
+
+第一版的判斷是這樣寫的：
+
+```python
+elif any(name.endswith(f".{w}") for w in ("status", "state", "outcome", ...)):
+```
+
+拿它去跑 `shipping-v0`，那一項是**綠的**：
 
 ```
-group=event.checkout.completed      type=string  brief=支付交易識別碼
-group=event.payment.authorized      type=string  brief=支付交易識別碼
-group=registry.checkout_override    type=int     brief=團隊版：把它改成整數
-group=registry.payment              type=string  brief=支付交易識別碼
+  ✔ [Day5/10  ] 狀態類欄位都宣告了 enum members                0 個 enum
 ```
 
-真相是：**兩份定義並存，而所有 `ref: payment.id` 都解到 base 那份 `string`。** 團隊那份 `int` 定義存在於 resolved schema 裡，但沒有任何東西引用它——它是一個孤兒。
+`0 個 enum` 而且沒有任何可疑欄位——但 v0 明明有一個 `shippingStatus`，一個型別是 `string` 的狀態欄位，正是這項檢查存在的理由。
 
-後果分三層。**團隊以為改成功了**，實際上每一個 signal 上的 `payment.id` 還是 `string`。**下游拿到的是矛盾的資料**——`registry generate` 產出的程式碼、`registry mcp` 餵給 LLM 的定義、`live-check` 拿去比對的規範，看到的是同一個名字的兩種型別。而**沒有任何一個階段會報錯**。
+原因是我比對的是 `.status` 這個字尾，而 `shippingStatus` 沒有點。**那個欄位躲過這項檢查的原因，剛好就是它另外違反了兩條命名規則。** 換句話說：一個「命名壞掉」的欄位，會順便躲過「值域宣告」的檢查。
 
-正確的做法是什麼？Weaver 沒有提供「覆寫」這個動作，因為那本來就不該被允許——`payment.id` 的語意是平台團隊定的，某個團隊單方面把它改成 int，這件事在治理上就是錯的。真正該走的路是回頭跟平台團隊談：要嘛改 base 的定義（所有人一起改），要嘛在自己的 namespace 下定義一個新的欄位（`checkout.payment_ref`）。**分層機制的價值不是讓你能覆寫，是讓你不需要覆寫。**
+這個洞在 v0 上不致命，因為命名那一項會紅，那個欄位還是會被抓到。但把它換一個寫法就不一樣了——`shippingstatus`（全小寫、沒有點）也一樣沒有點、也一樣躲過 enum 檢查，而它會不會被命名 policy 抓到取決於那條 policy 抓的是 camelCase 還是缺 namespace。**兩道檢查各有一個洞，而兩個洞剛好對得上的時候，就會有東西整個穿過去。**
 
-### 三、依賴不會遞移
+修法是把 Day6 那個正規化搬過來——先把分隔符去掉再比字尾：
 
-三層是很現實的結構：平台 → 事業群 → 小隊。試著把它疊起來：
+```python
+elif any(
+    re.sub(r"[._]", "", name).lower().endswith(w)
+    for w in ("status", "state", "outcome", "result", "kind", "type")
+):
+```
+
+```
+  ✗ [Day5/10  ] 狀態類欄位都宣告了 enum members                0 個 enum，可疑：shippingStatus
+```
+
+這件事的一般教訓比這個 bug 重要：**checklist 本身也是一份會有 bug 的程式碼，而它的 bug 只會在「本來就有問題的服務」上顯現。** 一份永遠只跑在健康服務上的 checklist，等於從來沒有被測試過。所以 `shipping-v0` 這份「壞掉的服務」不是文章的教材，是這支腳本的**測試資料**，得跟腳本一起維護——這也是為什麼我把它 commit 進範例 repo 而不是寫成文章裡的一段範例。
+
+## 範本：把 checklist 的每一項變成可以複製的東西
+
+checklist 只會告訴你缺什麼，不會告訴你怎麼補。所以 `day17/starter/` 是配套的另一半，四份範本，每一份裡面的註解都指回它對應的那一天：
+
+```
+day17/starter/
+  registry/manifest.yaml        schema_url 帶版本、dependencies 路徑相對於 repo 根目錄
+  registry/model/telemetry.yaml attribute_group 屬性池 + signal 只用 ref + enum 展開 members
+  intent/steady-state.yaml      why / first_check 用「寫清楚：」當佔位字，逼你動它
+  .mcp.json                     帶 --include-unreferenced true
+  ci/semconv-gate.yml           版本釘死 + sha256 + diagnostic-stdout + 假綠燈探針 + failure() 補印
+```
+
+CI 範本裡那五個必要元素，checklist 會逐一檢查存在性：
+
+```python
+required = {
+    "版本釘死": "WEAVER_VERSION" in text,
+    "sha256 驗證": "sha256sum" in text,
+    "--diagnostic-stdout": "--diagnostic-stdout" in text,
+    "group 數探針": "stats" in text,
+    "failure() 補印": "if: failure()" in text,
+}
+```
+
+這是很粗糙的字串比對（把 workflow 註解掉它照樣算過），但它抓的是真實會發生的事：**有人為了讓 CI 快一點，把某個步驟刪掉。** 那五項每一項都是踩過的坑，刪掉任何一項的後果都是 gate 安靜失效，而不是變慢。範本裡那段註解就是為了讓下一個想刪的人先看到理由。
+
+還有一件範本沒辦法幫你的事，寫在 workflow 最後一行：
 
 ```yaml
-# division/manifest.yaml —— 事業群疊在 base 上
-dependencies:
-  - name: payments-base
-    registry_path: day13/base
-
-# squad/manifest.yaml —— 小隊疊在事業群上
-dependencies:
-  - name: commerce-division
-    registry_path: day13/division
+# 別忘了：required status check 不在這個 YAML 裡，要去 branch protection 設（Day7 最後那段）
 ```
 
-小隊的事件同時用到兩層的東西：
+**這是整份 checklist 唯一一項自動化檢查不到的東西**，因為它不在 repo 裡，在 GitHub 的設定裡。Day7 說它是最容易被忘記的一步，今天再說一次：workflow 跑得出來不等於擋得住。
 
-```yaml
-  - id: event.checkout.completed
-    type: event
-    attributes:
-      - ref: payment.id          # 來自第一層 base
-      - ref: commerce.channel    # 來自第二層 division
-```
+## 平台工程：checklist 是清單，不是門
 
-```
-$ weaver registry check -r day13/squad
-ℹ Found registry manifest: day13/squad/manifest.yaml
-ℹ Found registry manifest: day13/division/manifest.yaml
-ℹ Found registry manifest: day13/base/manifest.yaml      ← 三份都載入了
+今天這個東西很容易被誤用成一道新的 gate，所以要把它的位置講清楚。
 
-  × The following attribute reference is not resolved for the group
-  │ 'event.checkout.completed'.
-  │ Attribute reference: payment.id
+**checklist 不該是 merge gate。** 十三項裡面只有前六項（registry check、`--future`、policy、探針）適合擋 PR——那些是確定性的、訊息也講得清楚該改什麼。後面幾項（有沒有意圖、`why` 有沒有填、`.mcp.json` 在不在）**應該是上線前的一次對話，不是每個 PR 都要過的門**。Day11 講過理由：擋一個「你還沒想清楚什麼算正常」的 PR，只會讓人隨便填一個數字進去。
 
-$ echo $?
-1
-```
+實際的用法是三個場合，強度各不相同：
 
-注意那三行：**weaver 確實把三份 manifest 都讀進來了**，但 `ref: payment.id` 還是解不到。把那一行 `ref` 拿掉、只留 `commerce.channel`（直接依賴的那一層），立刻就通過。
-
-也就是說：**`ref` 只看得到直接依賴，看不到依賴的依賴。** manifest 鏈會被走完，但可見範圍只有一層。
-
-解法是把用到的每一層都列成直接依賴：
-
-```yaml
-# squad/manifest.yaml
-dependencies:
-  - name: commerce-division
-    registry_path: day13/division
-  - name: payments-base          # ← 隔一層的也要自己列
-    registry_path: day13/base
-```
-
-```
-$ weaver registry check -r day13/squad
-✔ No `after_resolution` policy violation
-```
-
-這個限制值得放在心上：它代表**依賴關係不能只描述「我疊在誰上面」，還得把所有實際用到的層都列出來**。層數一多，每個小隊的 manifest 都會長出一份完整的祖先清單，而這份清單沒有列全時的症狀是 resolver 錯誤——好在這個錯誤是硬的、擋得住的，不像前一個陷阱那樣安靜。
-
-### 四、但把所有層都列出來，會撞到重複載入
-
-修好第三個問題之後，跑一次 `--include-unreferenced true`：
-
-```
-$ weaver registry stats -r day13/squad --include-unreferenced true
-
-  × The attribute id `payment.outcome` is declared multiple times in the
-  │ following groups: ["registry.payment", "registry.payment"]
-
-  × The attribute id `payment.id` is declared multiple times in the following
-  │ groups: ["registry.payment", "registry.payment"]
-```
-
-`["registry.payment", "registry.payment"]`——同一個 group 出現兩次。因為 base 被載入了兩次：一次是 squad 直接列的，一次是透過 division 傳進來的。
-
-所以第三跟第四個陷阱合起來是一個兩難：
-
-| 做法 | 一般 `check` | `--include-unreferenced true` |
+| 場合 | 誰跑 | 沒過會怎樣 |
 |---|---|---|
-| 只列直接依賴（division） | ❌ 隔層的 `ref` 解不到 | — |
-| 兩層都列（division + base） | ✅ 通過 | ❌ 重複載入，硬錯誤 |
+| 新服務上線審查 | 服務團隊自己跑，結果貼進 PR | 對話的起點，不是拒絕的理由 |
+| 每個 PR 的 CI | 自動 | 前六項擋，後面幾項不擋 |
+| 每季一次全服務掃描 | 平台團隊對所有服務跑一輪 | 產出一份「治理現況」清單 |
 
-實務上這代表：**分層架構下要謹慎使用 `--include-unreferenced`**，而它正是前面用來看「依賴裡有什麼」的那個旗標。兩層以內沒事（`team` 那份就好好的），三層以上而且有共同祖先時就會撞到。
+第三個場合是這支腳本我自己最想用的用途。它不需要任何新工具——`for dir in services/*; do python3 day17/verify_onboarding.py $dir; done`，就是一份平台團隊手上的治理儀表板。而它回答的是一個平常沒有人回答得出來的問題：**我們有幾個服務宣告了意圖？有幾個服務的 registry 是 agent 查得到的？** 這兩個數字比「有幾個服務通過 CI」有用得多，因為它們衡量的是**能力覆蓋率**，不是合規率。
 
-這也解釋了為什麼真實世界的 semconv 分層通常很淺——不是因為大家不想分細，是因為工具鏈在深層依賴上還很脆。
+**誰維護這份 checklist。** 平台團隊，而且要接受它會一直改——每次踩到新的坑就多一項。今天這十三項有一個共同點：**沒有一項是我從文件上讀來的**，全部是前十二天實際撞到之後才知道要檢查的。所以這份清單的長度會成長，而成長本身是健康的訊號。反過來說，一份三年沒改過的 checklist 幾乎一定已經跟現實脫節了。
 
-## 用 policy 把前兩個坑補起來
+**產品團隊要付多少成本。** 補完 `shipping-v0` 到 `shipping-v1` 的實際工作量：registry 補 `stability`／`examples`／把 `shippingStatus` 改成 `shipping.status` 加 enum members、把 inline 的 `shipping.carrier` 改成 `ref`、`schema_url` 加版本號、複製三份範本、然後寫那份意圖。前面全部是機械性的（訊息已經告訴你改哪一行），**唯一真正花時間的是意圖那份 YAML 裡的 `why`**——而那正是唯一產品團隊以外沒有人寫得出來的東西。這個比例是刻意的：**平台團隊該把所有機械性的部分做成範本跟訊息，讓團隊的時間全部花在只有他們能回答的問題上。**
 
-第三、四個陷阱會硬報錯，擋得住。第一、二個是安靜的，得自己寫規則。
+## 第一階段給了你什麼
 
-### `before_resolution` 終於有場景了
+如果只帶三件東西離開這個階段，我會選這三個：
 
-Day10 講兩個 package 的差別時說過，`before_resolution` 適合寫「不准 inline 定義、一律要用 ref」這類規則，但當時沒有場景可以掛。今天有了：**inline 定義正是第二個陷阱的成因**。
+**一份跑得動的治理管線。** 不是概念，是 `day17/` 底下那些檔案：registry 範本、五個必要元素齊全的 CI workflow、四條 Rego policy（命名、分層、breaking change、deprecated 使用）、一份 `.mcp.json`、一支會自己跑的 checklist。抄回去改個服務名就能開始用。
 
-```rego
-package before_resolution
+**一套判斷「安靜失效」的直覺。** 這個階段最值錢的東西不是任何一個指令，是一組反覆出現的模式：`-r .` 綠燈但什麼都沒檢查（Day5）、annotation 落不到行上（Day7）、重複定義製造孤兒（Day8）、`diff` 對型別改變靜音（Day9）、`browse_namespace` 不標 deprecated（Day10）、`not found` 回 `isError: false`（Day10）、我自己的 checklist 漏掉 `shippingStatus`（今天）。**這七件事的共同點是：出錯的時候沒有人會知道。** 而學會預期這種形狀的失敗，比記住任何一個 flag 都重要。
 
-import rego.v1
-
-signal_group_types := {"event", "span", "metric"}
-
-deny contains inline_attribute_in_signal(group.id, attr.id) if {
-	group := input.groups[_]
-	group.type in signal_group_types
-	attr := group.attributes[_]
-	attr.id            # inline 定義才有 id；ref 進來的只有 ref
-}
-```
-
-`attr.id` 那一行是整條規則的支點，而且**只有 `before_resolution` 寫得出來**——Day10 實測過，`before_resolution` 看到的 attribute 保持手寫原樣（inline 的有 `id`，引用的只有 `ref`），而 `after_resolution` 的 `ref` 已經展開，鍵統一變成 `name`，根本分不出來誰是 inline 寫的。
-
-照 Day10 的教訓，規則寫完要**故意讓它失敗一次**，確認它真的會動：
-
-```
-# 在 event group 裡故意 inline 定義一個 checkout.cart_size
-- Message : id=inline_attribute_in_signal_group, category=layering,
-            group=event.checkout.completed, attr=checkout.cart_size
-```
-
-### 撞名檢查：跨 registry 的版本
-
-Day10 那條 `duplicate_concept` 抓的是「正規化之後撞名」（`userId` vs `user_id`）。分層之後需要另一種：**同一個名字，兩種型別**。
-
-```rego
-package after_resolution
-
-import rego.v1
-
-type_name(t) := t if is_string(t)
-type_name(t) := "enum" if is_object(t)
-
-types_of(name) := {type_name(a.type) |
-	some g in input.groups
-	some a in g.attributes
-	a.name == name
-}
-
-deny contains conflicting_definition(name) if {
-	some g in input.groups
-	some a in g.attributes
-	name := a.name
-	count(types_of(name)) > 1
-}
-```
-
-`types_of` 是 Day10 講的 comprehension 用法：把散在各 group 的同名 attribute 攤平成一個型別集合，集合大小 > 1 就是衝突。`type_name` 那兩行則是 Day10 講的「同名規則寫兩次 = OR」，順便處理 enum 的 `type` 是物件、其他是字串這件事（Day8 那條值域規則的同一個支點）。
-
-```
-$ weaver registry check -r day13/team-collision -p day13/policies
-✔ All `after_resolution` policies checked (1 violations found)
-
-  - Message : id=conflicting_attribute_definition, category=layering,
-              group=(cross-registry), attr=payment.id
-
-$ echo $?
-1
-```
-
-原本安靜的綠燈，現在會擋。三份 registry 加上這兩條 policy 的最終行為：
-
-| registry | groups | check + policy |
-|---|---|---|
-| `base` | 2 | ✅ exit 0 |
-| `team` | 1 | ✅ exit 0 |
-| `team-collision` | 2 | ❌ exit 1（`conflicting_attribute_definition`）|
-
-順帶一提，`--display-policy-coverage` 在這裡很有用：跑乾淨的 `team` 時，`collision.rego` 顯示 full coverage，`layering.rego` 則會被逐行列出來——因為那條規則沒有被觸發過。這正是 Day10 說的「policy 層的探針」：coverage 報告不只告訴你檔案有沒有被執行，還告訴你哪幾行從來沒跑到。
-
-## 回到 AIOps：分層對 agent 意味著什麼
-
-Day15 會讓 agent 透過 MCP 直接查 registry。分層在那個場景下有一個很具體的影響：**agent 查到的定義，是哪一層的？**
-
-第二個陷阱在這裡會變得特別難處理。如果 `payment.id` 同時有 `string` 跟 `int` 兩份定義存在於 resolved schema 裡，agent 查詢時拿到的是什麼？它會看到兩筆、還是隨機一筆？它有沒有辦法知道「其中一筆是孤兒，永遠不會出現在真實資料裡」？
-
-答案是它沒辦法——因為那份矛盾在 registry 裡是合法的、沒有任何標記說哪一份才算數。Day10 講過 LLM 犯錯的方式很隱蔽：它不會說「這裡有兩個矛盾的定義，我不確定」，它會選一個然後往下推理。而這次它甚至沒做錯什麼——資料本身就是矛盾的。
-
-這也是為什麼今天那條 `conflicting_attribute_definition` 規則的價值不只是「保持整潔」：**它保證的是「這份 registry 對任何一個名字只有一個答案」**，而這正是把 registry 當成 agent 的知識來源時，最基本的前提。一份自相矛盾的知識庫，比一份不完整的知識庫危險得多——不完整會讓 agent 查不到，矛盾會讓它查到錯的還很有信心。
+**一條可以講給別人聽的因果鏈。** 治理 → 資料可信 → agent 的判斷有依據。這句話在十三天前是一個口號，現在每一段都有具體的實作跟具體的失敗案例可以指：欄位名沒有權威來源，agent 就會猜（Day10 那個 `not found` 之後自己命名）；值域沒宣告，agent 就查不到資料然後回報「系統正常」（Day11 那個 `AUTHORIZED`）；registry 改版沒有交代，下游的意圖會編出一條永遠不觸發的 alert（Day11）。
 
 ## 今天沒做的事
 
-沒有測那個 10 層依賴深度上限。文件有提到這個限制，但實務上會先撞到的是今天第三、四個陷阱——依賴不遞移、加上共同祖先重複載入，這兩件事讓「疊很多層」在三層就開始不舒服了，10 層對大部分團隊來說不是會碰到的邊界。
+沒有真的在 GitHub 上跑過那份 CI 範本。裡面的 `WEAVER_SHA256` 是一個佔位字，`git worktree add /tmp/baseline origin/main` 那一段也只在本機驗證過語法。Day7 就欠了一張「真的被擋下來的 PR 截圖」，今天還是沒補上——這件事需要一個公開 repo 跟一個真的會被擋的 PR，我打算等 Series 2 開始之前一次補完。
 
-沒有用 git URL 當 `registry_path`。weaver 支援從 git repo 或 GitHub release 載入依賴，那才是跨 repo、跨團隊分發的正式做法——今天全部用本機相對路徑，是為了讓範例可以直接跑、也才能把第一個陷阱（路徑基準點）講清楚。真正的發布跟版本控制留到 Day14。
+沒有把 checklist 接上 Day3–4 那一層。十三項全部落在 registry 跟意圖上，完全沒有檢查「這個服務的 Operator 設定對不對」——例如有沒有正確的 `Instrumentation` annotation、collector 的 pipeline 有沒有把它的資料收進來。這一層要檢查得連上真實 cluster，而那會讓這支腳本從「純本機、幾秒跑完」變成「需要 kubeconfig」。**這個取捨是刻意的**：一份需要環境的 checklist，會變成一份沒有人在本機跑的 checklist。真正該做的是把它拆成兩支，而那需要先想清楚哪一支該進 CI。
 
-沒有處理「base 改版之後，依賴它的團隊怎麼辦」。今天所有 registry 都是 `development`、都沒有版本演進的概念，`schema_url` 裡那個 `0.1.0` 也還只是個裝飾。這正是明天的主題。
+沒有處理「服務下線」。整個階段都在講怎麼上線，但一個服務被砍掉之後，它的 registry 該留還是該刪、它宣告過的欄位有沒有別人在引用、它的意圖檔案該不該一起消失——這些問題今天完全沒碰。Day9 那條 `deprecated_usage.rego` 是這個方向的一半（誰還在用某個欄位），另一半（誰還在引用某個已經不存在的服務的欄位）要等 Day15 的拓撲對帳才有工具可以查。
 
-明天：重現一次真實的 breaking change——weaver 0.23.0 對一個完全合法的欄位直接 hard error 的踩坑，講清楚三層驗證模型跟 `weaver registry diff` 的變更分類，以及升級之前該怎麼測。今天這個分層架構會在那裡派上用場：base 改一個欄位，`diff` 能不能告訴你哪些團隊會被打到。
+明天開始第二階段：**AIOps 核心能力管線**。第一階段做的是「讓資料值得信任」，第二階段要做的是「讓資料能被推理」——先讀現況，把 `signals` 模組實際的資料流畫出來（`topology.py`／`context.py`／`compile.py` 各自在做什麼），對照 Day2 那張 AIOps 九宮格，誠實標出哪幾格已經有東西、哪幾格還是空的。這一段會比第一階段更多「概念 vs 實作現況」的落差，而那個落差本身就是內容。
