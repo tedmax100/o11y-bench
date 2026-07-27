@@ -54,11 +54,57 @@ sequenceDiagram
 
 ```yaml
 env:
-  WEAVER_VERSION: 0.24.1
+  WEAVER_VERSION: 0.25.0
   WEAVER_SHA256: <從 release 的 .sha256 抄過來>
 ```
 
 **釘死版本，不要用 latest。** weaver 還在 0.x，內建驗證規則會隨版本變嚴——Day9 會重現一次 `0.23.0` 對一個完全合法的欄位直接 hard error 的踩坑，以及一個更難看的方向：舊版對多層依賴直接 panic、exit 134。用浮動版本等於讓 CI 隨時可能因為上游發新版而在一個跟這次 PR 完全無關的地方變紅。**升級 weaver 應該是一個獨立的、有人看著的 PR。**
+
+而既然這麼主張，就得示範一次那個 PR 該長什麼樣。這系列大部分內容是在 `0.24.1` 上寫的，`0.25.0` 出來之後我沒有直接改版號，是先把兩個版本並排跑過一輪：範例 repo 裡的 29 份 registry，加上 demo 用的另外 3 份，每一份都跑 `registry check`，四種 flag 組合（預設、`--v2`、`--future`、`--v2 --future`）各跑一次。
+
+```
+$ for m in $(find . -name manifest.yaml | sort); do
+    weaver-0.24.1 registry check -r $(dirname $m) > w24.txt 2>&1; a=$?
+    weaver-0.25.0 registry check -r $(dirname $m) > w25.txt 2>&1; b=$?
+    diff w24.txt w25.txt > /dev/null || echo "OUTPUT DIFF: $m"
+    [ "$a" != "$b" ] && echo "EXIT DIFF: $m ($a vs $b)"
+  done
+```
+
+結果是**離開碼逐份相同、輸出文字逐份相同**（唯一的差異是 `Total execution time` 那一行的毫秒數），連 `registry generate go` 跟 `python` 的產物都 byte-identical。release notes 上列的兩條 breaking change，一條都沒碰到我們。
+
+看到這裡我本來要把版號改掉收工。然後跑了一次 Day12 那組回歸測試：
+
+```
+$ ./testability/regress.sh
+  ✗ MCP 對分層 registry 答得出東西（total_attribute_count > 0）  exit=1（預期 0）
+  ✗ 生成物產得出來（含繼承的定義）                              exit=2（預期 0）
+  ✗ 把 retry.count 定義出來之後才乾淨                           exit=2（預期 0）
+  ✗ 補完的服務要放行                                            exit=1（預期 0）
+
+✗ 4 條不符合預期（共 21 條）
+```
+
+四條紅的，全部同一個原因：
+
+```
+$ weaver registry stats -r day13/team --include-unreferenced true
+error: unexpected argument 'true' found
+```
+
+`0.25.0` 把所有布林旗標改成 clap 的標準形式——裸的 `--include-unreferenced` 代表 `true`，要顯式給值得寫成 `--include-unreferenced=true`，**空格分隔的 `--include-unreferenced true` 現在會把 `true` 當成多餘的位置參數而報錯**。這兩個旗標在這個 repo 裡出現了 48 次：文章的指令、各天的 `README`、`regress.sh`、`mcp_probe.py`、`compile_intent.py`、`verify_onboarding.py`、兩份 `.mcp.json`、三份 CI workflow，全部是空格形式，全部要改。
+
+改法本身很機械（`--flag true` → `--flag=true`），但有一處不是換字串就好：`verify_onboarding.py` 裡有一段在檢查 `.mcp.json` 的參數陣列**裡面有沒有 `"--include-unreferenced"` 跟 `"true"` 這兩個元素**，而新寫法把它們併成一個 token 了。這種「檢查別人設定對不對」的程式碼，會跟著被檢查的那個格式一起腐化——**checklist 自己也是需要被維護的資產**，這正是 Day12 的主題。
+
+改完之後值得補一個確認：同一份東西在 `0.24.1` 上也是 21/21。`=` 形式是兩個版本都吃的，所以這次改動不需要跟版本升級綁在同一個 PR，可以先改寫法、確認兩版都綠，再單獨升版號。**能拆成兩步的升級就不要合成一步**——出事的時候你會知道是哪一步。
+
+**而這條在 release notes 的 breaking change 清單裡沒有。** 它藏在每個布林旗標的 help 文字裡（`A bare --include-unreferenced means true; use the = form...`），讀起來像一則新增功能的說明，不像一則會讓你 CI 變紅的通知。
+
+所以這一段的結論要比我原本想寫的更收斂一點：**`registry check` 的行為沒變，但「跑得起來」跟「行為沒變」是兩件事，而我差一點只驗了後者。** 32 份 registry 逐份對照給了我一個很漂亮的綠燈，那個綠燈的涵蓋範圍卻不包含「指令本身還解析得過」——真正抓到的是 Day12 那組回歸測試，因為它跑的是**真實的呼叫方式**，不是我為了對照而現寫的迴圈。
+
+這也是為什麼「升級 weaver 是一個獨立的、有人看著的 PR」這句話後面還要再加一句：**那個 PR 要跑的是既有的自動化，不是為了這次升級新寫的驗證。** 為驗證而寫的腳本只會驗到你想得到的東西，而升級會咬你的地方，定義上就是你沒想到的那些。
+
+從平台角度，這件事的分工很清楚。**產品團隊不該需要自己讀 weaver 的 changelog**——他們該看到的是一個附著上面那份對照結果、而且已經把三十幾處呼叫改好的 PR。如果平台團隊只是發一封「我們升到 0.25.0 了，請自行確認」，那三十幾處就會變成三十幾個團隊各自撞一次同一面牆，然後各自來問同一個問題。**一次升級的成本，是由誰吸收的，決定了這套治理能撐到幾個團隊。**
 
 **用 musl 而不是 gnu。** `weaver-x86_64-unknown-linux-gnu` 需要 GLIBC 2.38/2.39，在稍舊的環境（我的機器是 2.35）直接跑不起來。
 
@@ -94,7 +140,7 @@ $ weaver registry check ... --diagnostic-format gh_workflow_command 2>&1 >/dev/n
 9
 ```
 
-九行 `::error::` **全部走 stderr**，而 runner 只解析 stdout 上的 workflow command。失效非常隱蔽：job 還是紅的、log 裡看得到違規、一切「看起來都對」，但 **PR 頁面上不會有任何 annotation——而那是作者唯一會看的地方**。加上 `--diagnostic-stdout true` 就對了。而這件事沒有寫在 `--diagnostic-format` 的說明裡：那個選項的說明只寫「送到 stdout 而不是 stderr」，不會告訴你不加它整個 annotation 機制就是壞的。
+九行 `::error::` **全部走 stderr**，而 runner 只解析 stdout 上的 workflow command。失效非常隱蔽：job 還是紅的、log 裡看得到違規、一切「看起來都對」，但 **PR 頁面上不會有任何 annotation——而那是作者唯一會看的地方**。加上 `--diagnostic-stdout=true` 就對了。而這件事沒有寫在 `--diagnostic-format` 的說明裡：那個選項的說明只寫「送到 stdout 而不是 stderr」，不會告訴你不加它整個 annotation 機制就是壞的。
 
 **二、annotation 落不到程式碼的行上。**
 
@@ -159,6 +205,30 @@ Day6 找了半天沒找到的那套 `information`／`improvement`／`violation`�
 **內建的規則跟 Day6 手寫的 Rego 重疊，但守在不同時間點。** `missing_namespace`／`invalid_format` 不用寫就有——這不代表 Day6 白做：那三條跑在**PR 階段的定義上**（別把壞名字寫進 registry），這裡跑在**runtime 的真實資料上**（程式碼實際送了壞名字）。**同一條規則守在兩個時間點，攔到的是不同的東西**，而這正是今天整篇的主題。
 
 **`not_stable` 對「完全正確」的資料也會叫。** 一字不差照 registry 送的 `biz.user.id` 也拿到一條 improvement，因為整份 registry 都還是 `development`。它的意思不是「你送錯了」，而是「你正在依賴一個還沒承諾穩定的定義」——**本質上是一份技術債的即時提醒**，會一直叫到 Day9 開始把定義標成 `stable` 為止。
+
+### 那條界線在哪裡，是可以選的
+
+上面那句「有 violation 才 exit 1」在 `0.24.1` 上是寫死的。`0.25.0` 把它變成一個 flag：
+
+```
+--fail-on <FAIL_ON>
+    Findings at this level or higher cause a non-zero exit code.
+    Levels (highest→lowest): violation, improvement, information.
+    Use `none` to never fail. [default: violation]
+```
+
+預設值就是舊行為，所以升級不會改變任何既有 CI 的結果。但這四個等級對應的是四種很不一樣的治理姿態，拿 Day12 會用到的那兩份固定樣本跑一輪就看得出來：
+
+| 樣本 | `--fail-on none` | `violation`（預設） | `improvement` | `information` |
+|---|---|---|---|---|
+| `clean.json` | exit 0 | exit 0 | **exit 1** | exit 1 |
+| `drift.json` | **exit 0** | exit 1 | exit 1 | exit 1 |
+
+先看最下面那一列的第一格。`drift.json` 是一份明顯違規的樣本，但 `--fail-on none` 讓它 exit 0——**這不是把檢查關掉，是把「擋」跟「看」拆開**。報告照樣完整產出、照樣貼到 PR 上，只是不擋合併。這正是一個新機制上線時該有的第一個階段：**先讓所有人看到自己的數字，再談要不要擋**。如果第一天就用預設值上線，收到的第一個回應會是「你們平台團隊擋住我出貨」，而不是「原來我們有 12 個 violation」。
+
+從三層驗證模型（Day9）的角度看，這一條補上了缺的那一塊。`registry check` 的 hard error 是強制、`--future` 是平台團隊替所有人做的一個時程決定、Rego policy 是可以按團隊分級的——而 live-check 在 `0.24.1` 上只有「全有全無」一種姿態。現在它自己就是一條完整的光譜：`none` 觀察期、`violation` 預設的 paved road、`improvement` 給願意收緊的團隊自己選。**paved road 的重點從來不是只有一條路，是預設那條最好走、要走別條得自己說明理由**，而 `--fail-on` 讓「走別條」變成 workflow 裡一行看得見、review 得到的設定，不是某個團隊私下把這個步驟註解掉。
+
+（`0.25.0` 還有兩個配套的東西我今天沒用上：`finding_level_overrides` 可以把某一條 finding 的等級整個改掉，`sample_names` 可以讓 filter 只套用在指定的樣本上、支援 glob。這兩個合起來才是「同一份 advice policy、不同團隊不同嚴重度」的完整形狀，但要用得有道理，得先有數字證明哪一級真的會影響 agent 的判斷——這件事留在 Series 2。）
 
 ### 一個很少被問的數字：registry coverage
 

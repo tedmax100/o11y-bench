@@ -646,7 +646,7 @@ $ echo $?
             -p day14/policies \
             --future \
             --diagnostic-format gh_workflow_command \
-            --diagnostic-stdout true
+            --diagnostic-stdout=true
 
       - name: 把 diff 貼到 PR
         if: always()

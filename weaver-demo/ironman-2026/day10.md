@@ -123,7 +123,7 @@ $ python3 day15/mcp_probe.py day14/base-v2
 }
 ```
 
-`--include-unreferenced true` 那個參數為什麼是必要的，是今天第四個坑，先記著。
+`--include-unreferenced=true` 那個參數為什麼是必要的，是今天第四個坑，先記著。
 
 ### 發現：search 回來的東西比預期多
 
@@ -405,7 +405,7 @@ $ weaver registry check -r day15/team-retry
 ✔ No `after_resolution` policy violation
 
 $ python3 day15/run_and_extract.py after --samples \
-    | weaver registry live-check -r day15/team-retry --input-source stdin --include-unreferenced true
+    | weaver registry live-check -r day15/team-retry --input-source stdin --include-unreferenced=true
 
 Span charge `internal`
     payment.transaction_id = pay-1001
@@ -586,7 +586,7 @@ search {"query":"checkout"} -> { "count": 1, "results": [ { "attributes": [
 
 ```
 $ python3 day15/mcp_probe.py day13/team '[{"name":"get_attribute","arguments":{"key":"payment.outcome"}}]' \
-    --include-unreferenced true
+    --include-unreferenced=true
 
 {
   "key": "payment.outcome",
@@ -608,7 +608,7 @@ $ python3 day15/mcp_probe.py day13/team '[{"name":"get_attribute","arguments":{"
 
 技術上這是一行指令的事，但「誰跑、跑哪一份、怎麼更新」這三個問題決定了它是一個平台能力還是一個個人技巧。
 
-**誰維護。** 這個 server 沒有中央部署的必要（走 stdio，跟著開發者的 agent 一起啟動），但**它的設定必須是平台團隊發佈的**。理由就是上面第四個坑：漏掉 `--include-unreferenced true`，agent 得到的答案是「這個欄位不存在」；而這個參數該不該加，取決於這份 registry 有沒有分層——這是產品團隊不該需要知道的事。所以交付物是一份帶進 repo 的 `.mcp.json`（跟 Day7 那份 workflow 一樣，屬於平台團隊維護、產品團隊只是取用的東西），不是一段貼在 wiki 裡的指令。
+**誰維護。** 這個 server 沒有中央部署的必要（走 stdio，跟著開發者的 agent 一起啟動），但**它的設定必須是平台團隊發佈的**。理由就是上面第四個坑：漏掉 `--include-unreferenced=true`，agent 得到的答案是「這個欄位不存在」；而這個參數該不該加，取決於這份 registry 有沒有分層——這是產品團隊不該需要知道的事。所以交付物是一份帶進 repo 的 `.mcp.json`（跟 Day7 那份 workflow 一樣，屬於平台團隊維護、產品團隊只是取用的東西），不是一段貼在 wiki 裡的指令。
 
 **產品團隊要付多少成本。** 這是今天這個機制最漂亮的地方：接上它要做的事是零——`.mcp.json` 已經在 repo 裡，agent 啟動時自己會發現它。沒有新概念要學、沒有新指令要記，甚至不需要知道 registry 存在。對照 Day7 那道 gate（被擋了才知道有規則），這是同一份治理資產的兩種投遞方式，而**成本差在「使用者需不需要先知道它存在」**。這正是 paved road 的判準：不是規則變寬鬆了，是使用者不必為了合規多做動作。
 

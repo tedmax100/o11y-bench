@@ -7,7 +7,7 @@ tags: [OpenTelemetry, Weaver, eval, 鐵人賽]
 
 前面十天做出了一堆東西：四條 Rego policy、一道 CI gate、一份分層 registry、一個 MCP server、一組 template、一支意圖編譯器。這些全部是**程式碼**，而它們共同的問題是：**沒有任何東西在測它們。**
 
-這件事在治理上比在一般開發上更危險，理由是這系列反覆撞到的那個家族的問題。回想一下清單：`-r .` 讀到 0 個 group 還給綠燈（Day5）、policy 只比對名字前綴（Day5）、`--diagnostic-stdout` 不加就沒有 annotation（Day7）、`--advice-policies` 是覆蓋不是疊加（Day7）、`diff` 對型別改變完全靜音（Day9）、`browse_namespace` 不標 deprecated（Day10）、我自己的 checklist 漏掉 `shippingStatus`（Day13 會講）。
+這件事在治理上比在一般開發上更危險，理由是這系列反覆撞到的那個家族的問題。回想一下清單：`-r .` 讀到 0 個 group 還給綠燈（Day5）、policy 只比對名字前綴（Day5）、`--diagnostic-stdout` 不加就沒有 annotation（Day7）、`--advice-policies` 是覆蓋不是疊加（Day7）、`diff` 對型別改變完全靜音（Day9）、`browse_namespace` 不標 deprecated（Day10）、我自己的 checklist 漏掉 `shippingStatus`（Day13 會講）。今天結尾還會再加一個，而那一個是我自己寫的斷言裡的。
 
 **這七件事的共同點是：壞掉的時候，症狀是「一切看起來很順利」。** 一份壞掉的 policy 不會報錯，它會給你綠燈。所以「跑一次看看有沒有過」這種驗證方式，對治理資產是無效的——**你要驗證的不是它會不會通過，是它還會不會擋。**
 
@@ -46,14 +46,14 @@ Day10 那個 MCP server 是走 **stdio 上的 JSON-RPC**，所以完全不需要
 
 這件事的價值不在方便，在**歸因**：如果你只能透過對話測 MCP，那「agent 講錯」跟「registry 教錯」永遠分不開。Day10 那四個坑全部是靠這支腳本挖出來的——`search` 是關鍵字 AND 不是語意搜尋、`browse_namespace` 不標 deprecated、`not found` 回 `isError: false`、分層 registry 預設是空的——**一次 LLM 呼叫都沒有用到**。
 
-而其中最後一個坑特別能說明問題：分層 registry 沒帶 `--include-unreferenced true` 時，`browse_namespace` 回報 0 個 attribute、`get_attribute` 回報「不存在」。如果只用對話測，你看到的現象是「agent 說找不到那個欄位」——**這個現象跟「agent 幻覺」長得一模一樣**，而真相是工具真的回答了「不存在」。
+而其中最後一個坑特別能說明問題：分層 registry 沒帶 `--include-unreferenced=true` 時，`browse_namespace` 回報 0 個 attribute、`get_attribute` 回報「不存在」。如果只用對話測，你看到的現象是「agent 說找不到那個欄位」——**這個現象跟「agent 幻覺」長得一模一樣**，而真相是工具真的回答了「不存在」。
 
 所以這條斷言長這樣，而它是整組測試裡我最想留的一條：
 
 ```bash
 run_case 0 "MCP 對分層 registry 答得出東西（total_attribute_count > 0）" \
   "$PY day15/mcp_probe.py day13/team '[{\"name\":\"browse_namespace\",\"arguments\":{}}]' \
-     --include-unreferenced true | grep -qE 'total_attribute_count[^0-9]+[1-9]'"
+     --include-unreferenced=true | grep -qE 'total_attribute_count[^0-9]+[1-9]'"
 ```
 
 ### 做法二：樣本要從真實輸出抽，不能手打
@@ -149,6 +149,40 @@ $ ./testability/regress.sh
 **21 條裡有 12 條的預期離開碼是 1。** 這個比例是刻意的，也是今天最重要的一個設計決定：**這組測試主要在測「它還會不會擋」，不是「它會不會通過」。** 一組全部預期 exit 0 的測試，在治理資產上幾乎沒有價值——因為所有「安靜失效」的壞法都會讓它繼續全綠。
 
 跑完不到十秒，不需要 cluster、不需要 API key、不需要網路。**這件事本身就是一個設計約束**：一份需要環境才能跑的測試，會變成一份沒有人在本機跑的測試。
+
+### 第 22 條：這組測試自己也有一格假綠燈
+
+寫完上面 21 條之後，我拿 Day7 那個新的 `--fail-on`（weaver `0.25.0`）回頭掃了一次自己的 fixture，結果在最不該有問題的地方翻到一個。
+
+`clean.json` 是我用來當「乾淨對照組」的樣本——上面那組斷言裡「預期 exit 0」的那幾條，有一條就是靠它。它一直是綠的。但把門檻往下調一級：
+
+```
+$ weaver registry live-check -r day06/weaver/registry \
+    --input-source day12/samples/clean.json --fail-on improvement
+```
+
+exit 1。原因是它從來就不乾淨：
+
+```
+Span span.app.order.create `server`
+    biz.user.id = u-5
+        - [improvement] Attribute 'biz.user.id' is not stable; stability = development.
+    app.outcome = created
+        - [improvement] Attribute 'app.outcome' is not stable; stability = development.
+
+Advisories given
+  - total: 2
+  - advice level:
+    - improvement: 2
+  - advice type:
+    - not_stable: 2
+```
+
+這兩條 finding 從第一天就在那裡，`0.24.1` 只是不用它們決定離開碼，所以我的斷言看不到。**我以為我在斷言「這份樣本完全合規」，實際上斷言的是「這份樣本沒有 violation」**——兩句話在 `0.24.1` 上的觀測結果一模一樣，而我從頭到尾只看得到離開碼。
+
+這一格完全符合開頭那張清單的形狀：壞掉的時候症狀是一切看起來很順利。而它多帶出一層——**前面那七個坑是工具安靜，這一個是我自己的斷言解析度不夠**。離開碼是一個布林值，我卻拿它去斷言一件有四個等級的事情。所以做法四（先量一個基準）要再往前推一步：**光斷言離開碼不夠，要連「這一輪出了幾條 finding、分別是哪一級」一起釘住**，也就是把 `--format json` 的 advice 統計數字納進斷言，而不是只看 `$?`。
+
+順帶一提，這也是為什麼那兩條 `not_stable` 值得留著而不是修掉。它們是 Day7 講過的「技術債的即時提醒」，會一直叫到 Day9 開始把定義標成 `stable` 為止——**一個會在對的時間自己消失的告警，比一個被我調成綠燈的告警有用。**
 
 ## 平台工程：治理資產的擁有者，要能證明它還有效
 

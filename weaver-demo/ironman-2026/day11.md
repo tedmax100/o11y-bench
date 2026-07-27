@@ -17,7 +17,7 @@ Day10 讓 agent 讀懂了「這個欄位是什麼」。今天要處理它還讀�
 
 今天要做的就是把那三段補回來，而且**寫成 pipeline 跟 agent 可以直接消費的形式**，不是寫成 wiki 上一段給人看的說明。文章分兩半：前半是意圖怎麼寫、怎麼驗證；後半用 `weaver registry generate` 收口——因為意圖要能被驗證，前提是它引用的欄位名跟值域來自同一份 registry，而 template engine 正是讓 registry 直接變成程式碼的機制。
 
-程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`day16/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/day16)：三份意圖 YAML（兩份正確、兩份故意寫壞）、一支把意圖編譯成 PromQL 與 alert rule 的腳本、一組 Jinja template 跟它生出來的程式碼。registry 疊在 Day9 的 `base-v2` 之上，環境是 weaver `0.24.1`。
+程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`day16/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/day16)：三份意圖 YAML（兩份正確、兩份故意寫壞）、一支把意圖編譯成 PromQL 與 alert rule 的腳本、一組 Jinja template 跟它生出來的程式碼。registry 疊在 Day9 的 `base-v2` 之上，環境是 weaver `0.24.1`（後半有一段是 `0.25.0` 的新行為，會標明）。
 
 ## 對照組：規則、門檻、意圖
 
@@ -269,14 +269,69 @@ templates:
 
 ```
 $ weaver registry generate -r day16/registry --templates day16/templates \
-    python day16/generated --include-unreferenced true
+    python day16/generated --include-unreferenced=true
 ✔ Generated file "day16/generated/semconv_enums.py"
 ✔ Generated file "day16/generated/registry.json"
 ✔ Generated file "day16/generated/semconv_attrs.py"
 ✔ Artifacts generated successfully
 ```
 
-（`--include-unreferenced true` 又出現了。Day8 是 `stats` 的數字、Day10 是 MCP 查不到欄位，今天是**生成物會少掉繼承來的定義**——這個預設值到目前為止在三個不同的子命令上各咬了一次。）
+（`--include-unreferenced true` 又出現了。Day8 是 `stats` 的數字、Day10 是 MCP 查不到欄位，今天是**生成物會少掉繼承來的定義**——這個預設值到目前為止在三個不同的子命令上各咬了一次。另外注意寫法：weaver `0.25.0` 起這個空格分隔的形式**會直接報錯**，要寫成 `--include-unreferenced=true` 或裸的 `--include-unreferenced`，理由在 Day7 那段升級記錄裡。）
+
+### `when`：讓一筆 template 在條件不成立時整個不跑
+
+上面三筆 template 有一個不對稱的地方，跑一次就看得出來。拿同一組 template 去產 Day13 那份還沒治理好的 `shipping-v0`（它沒有任何 metric、也沒有 enum）：
+
+```
+$ weaver registry generate -r day17/services/shipping-v0/registry \
+    --templates day16/templates python /tmp/gen --include-unreferenced=true
+✔ Generated file "/tmp/gen/semconv_attrs.py"
+✔ Generated file "/tmp/gen/registry.json"
+```
+
+`semconv_enums.py` 沒產出來，因為第二筆的 filter 結果是空陣列。但 `registry.json` 產出來了——它的 filter 是 `.`，**永遠不可能是空的**。結果是一個沒有任何 metric 的 registry，也會生出一份要餵給意圖編譯器的事實來源檔，而那支編譯器只認得 metric。這種檔案不會報錯，它會安安靜靜地存在，然後在下游變成一個「編譯器說找不到 metric」的困惑。
+
+`0.25.0` 的 `when` 就是補這個洞的。它是一筆 template entry 的開關：
+
+```yaml
+  # 3. 整份 resolved registry 的 JSON：給 intent compiler 當事實來源
+  - template: registry.json.j2
+    filter: .
+    application_mode: single
+    file_name: "registry.json"
+    when: '[.groups[] | select(.type == "metric")] | length > 0'
+```
+
+同一組 template，兩份 registry 各跑一次：
+
+```
+$ weaver registry generate -r day16/registry ...        # 2 個 metric、2 個 enum
+✔ semconv_attrs.py
+✔ semconv_enums.py
+✔ registry.json
+
+$ weaver registry generate -r day17/.../shipping-v0/... # 0 個 metric、0 個 enum
+✔ semconv_attrs.py
+```
+
+**`when` 跟 `filter` 的差別是它求值的位置。** `filter` 跑在每一筆 entry 自己的資料上，決定「餵什麼進 template」；`when` 求值的對象是**整份 resolved registry 的根節點**，決定「這筆 entry 要不要跑」。實測確認了這一點：`when: '.type == "attribute_group"'` 恆為 false（根節點沒有 `type` 這個欄位），`when: '.groups | length > 0'` 恆為 true。語法是 JQ 跟 `filter` 一樣——寫成 JSONPath 的 `$.type` 會拿到 `Filter '...' failed: expected identifier`。
+
+### 但它有一個很典型的假綠燈
+
+把上面那份加了 `when` 的設定拿回去餵給 `0.24.1`：
+
+```
+$ weaver-0.24.1 registry generate -r day17/.../shipping-v0/... ...
+✔ Generated file "/tmp/gen/semconv_attrs.py"
+✔ Generated file "/tmp/gen/registry.json"     ← when 被無視
+✔ Artifacts generated successfully
+```
+
+**沒有警告、沒有 `unknown field`、exit 0。** 舊版不認得 `when`，於是把它當成不存在，那筆 entry 照跑。同一份 template 設定、同一份 registry，兩個版本產出不同的檔案集合，而且兩邊都宣稱成功。
+
+這一格值得停下來，因為它比前面那些坑多一個維度。Day5 的 `-r .`、Day9 的 `diff` 靜音，那些是**同一個版本裡**的安靜失效；這一個是**跨版本**的：CI 上釘的是 `0.25.0`、某個工程師本機還是 `0.24.1`，兩邊跑同一條指令會得到不同的生成物，而沒有任何一邊會說話。**「產出物不一致」這件事本身不會有人發現，要等到下游有人拿著一份不該存在的 `registry.json` 來問問題。**
+
+從平台角度，這條的結論很直接：**template 設定跟 weaver 版本是同一個工件的兩半，不能只釘一半。** Day7 那個 `WEAVER_VERSION` 釘在 CI 上是必要但不充分的——它擋住了 CI 上的漂移，擋不住本機的。真正的解法是讓本機跟 CI 用同一個來源取得 weaver（`.tool-versions`、devcontainer、或一支 wrapper script），而這件事的成本該由平台團隊吸收，不是寫在 onboarding 文件裡叫每個人自己裝對版本。
 
 生出來的常數檔：
 
@@ -325,7 +380,62 @@ class PaymentOutcome(StrEnum):
     PENDING_REVIEW = "pending_review"    # 轉人工審核
 ```
 
-實際跑一次：
+### 這份 enum 的 registry 端，`0.25.0` 讓它短了一半
+
+生出上面那個 `PaymentOutcome` 的定義，在 registry 裡長這樣：
+
+```yaml
+- id: payment.outcome
+  type:
+    members:
+      - id: authorized
+        value: authorized      # ← 跟上一行一模一樣
+        brief: "授權成功"
+        stability: development
+      - id: declined
+        value: declined        # ← 一模一樣
+        brief: "被拒絕"
+        stability: development
+```
+
+每個 member 都要把同一個字串寫兩次。weaver `0.25.0` 讓 `value` 在沒寫的時候預設等於 `id`，所以那三行可以直接刪掉。實測刪掉之後 `registry resolve` 的輸出（除了路徑那幾行）跟原本 **byte-identical**，`value` 被自動補回來：
+
+```
+$ weaver registry resolve -r day14/base-v2 --format yaml | grep -A3 "id: authorized"
+      - id: authorized
+        value: authorized
+        brief: 授權成功
+        stability: development
+```
+
+生成物當然也一個字都沒變——上面那份 `PaymentOutcome` 是同一份。**這是純粹的樣板消除，語意零改變。**
+
+值得多看一眼的是這個改動在舊版上的樣子。同一份刪掉 `value` 的 registry 餵給 `0.24.1`：
+
+```
+(Variant 9):
+- Value {"members":[{"brief":"ok","id":"success"}, ...]} is not of the
+  required type: 'string'.
+- Value {"members":[...]} does not match the required constant:
+  "template[boolean[]]".
+(Variant 3):
+- Missing required property: "value".
+- Missing required property: "value".
+```
+
+exit 1，而真正的原因躲在一大片 JSON schema variant 的最後兩行。`0.25.0` 上同一份東西是 exit 0，唯一的輸出是一句指名道姓的提醒：
+
+```
+⚠ Invalid attribute definition detected while resolving 'payment-events.yaml'
+│ (group_id='registry.demo', attribute_id='demo.outcome').
+│ Missing stability field on enum member authorized.
+```
+
+**這兩段輸出的差距，就是這系列一直在講的那條平台分水嶺。** 一道 gate 擋下來之後，產品團隊能不能自己修好，決定了這套治理能不能規模化——前面那段 variant 爆炸的訊息，實際結果是對方跑來問平台團隊「這是什麼意思」，而平台團隊的維護成本就隨團隊數線性成長。後面那句不用問。**同一個工具、同一個錯誤、差一個版本，一個要人陪、一個不用。**
+
+回到 AIOps 那條線：Day5 講過 `members` 是 agent 唯一能事先知道「這個 label 只會有這幾種值」的來源。而寫 `members` 的成本每降一次，「乾脆寫成 `type: string` 算了」的誘因就少一分——**降低正確做法的成本，跟提高錯誤做法的成本，是同一件事的兩端，而前者不需要任何人去盯。**
+
+### 實際跑一次
 
 ```
 $ cd day16/generated && python3 -c "

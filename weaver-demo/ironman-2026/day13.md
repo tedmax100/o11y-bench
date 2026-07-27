@@ -124,11 +124,11 @@ $ echo $?
 0
 ```
 
-`6 groups` 跟 `total_attribute_count=8` 這兩個數字比 v0 大，是因為 v1 有 `dependencies` 指向平台團隊那份 base，繼承的東西被算進來了（都帶了 `--include-unreferenced true`）。順帶一提，**這個旗標到今天為止已經在四個地方各咬過一次**：Day8 的 `stats` 數字、Day10 的 MCP 查不到欄位、Day11 的生成物少東西、今天 checklist 裡的兩項。一個預設值能製造四種不同的困惑，這件事本身就值得寫進範本的註解裡。
+`6 groups` 跟 `total_attribute_count=8` 這兩個數字比 v0 大，是因為 v1 有 `dependencies` 指向平台團隊那份 base，繼承的東西被算進來了（都帶了 `--include-unreferenced=true`）。順帶一提，**這個旗標到今天為止已經在四個地方各咬過一次**：Day8 的 `stats` 數字、Day10 的 MCP 查不到欄位、Day11 的生成物少東西、今天 checklist 裡的兩項。一個預設值能製造四種不同的困惑，這件事本身就值得寫進範本的註解裡。
 
 ### 幾項值得單獨說的檢查
 
-**「MCP 真的答得出來」跟「有 `.mcp.json`」是兩項，不是一項。** 這是 Day10 第四個坑教出來的：設定檔存在、格式正確、路徑也對，但如果漏了 `--include-unreferenced true`，agent 問任何一個繼承來的欄位都會得到「不存在」。所以 checklist 不能只檢查設定，得真的把 server 叫起來問一個問題，看 `total_attribute_count` 是不是 0。**「設定對」跟「答得出來」之間有一整個坑的距離。**
+**「MCP 真的答得出來」跟「有 `.mcp.json`」是兩項，不是一項。** 這是 Day10 第四個坑教出來的：設定檔存在、格式正確、路徑也對，但如果漏了 `--include-unreferenced=true`，agent 問任何一個繼承來的欄位都會得到「不存在」。所以 checklist 不能只檢查設定，得真的把 server 叫起來問一個問題，看 `total_attribute_count` 是不是 0。**「設定對」跟「答得出來」之間有一整個坑的距離。**
 
 **「意圖的 `why` 有填」是一項獨立的檢查，而且它檢查的是佔位字有沒有被清掉：**
 
@@ -186,7 +186,7 @@ day17/starter/
   registry/manifest.yaml        schema_url 帶版本、dependencies 路徑相對於 repo 根目錄
   registry/model/telemetry.yaml attribute_group 屬性池 + signal 只用 ref + enum 展開 members
   intent/steady-state.yaml      why / first_check 用「寫清楚：」當佔位字，逼你動它
-  .mcp.json                     帶 --include-unreferenced true
+  .mcp.json                     帶 --include-unreferenced=true
   ci/semconv-gate.yml           版本釘死 + sha256 + diagnostic-stdout + 假綠燈探針 + failure() 補印
 ```
 

@@ -75,6 +75,16 @@ $ weaver registry stats -r day13/base
 
 ## 分層：`dependencies` 怎麼寫
 
+在寫之前先把一個容易混淆的東西擺正。Day5 追過官方 registry 那條 `extends` 鏈（`attributes.http.common` → `attributes.http.server` → `metric_attributes.http.server` → 真正的 metric，宣告 0 個屬性、解析出 10 個），那也是一種「繼承」。**但 `extends` 跟今天要講的 `dependencies` 是兩件事，而它們的失敗模式差很多：**
+
+| | `extends`（Day5） | `dependencies`（今天） |
+|---|---|---|
+| 繼承的範圍 | **同一份 registry 內部**的 group 之間 | **跨 registry**，一份依賴另一份 |
+| 誰擁有被繼承的東西 | 同一批人 | **通常是別的團隊** |
+| 指錯的下場 | 直接報錯（找不到那個 group） | **安靜地少東西**——今天四個坑有三個是這個形狀 |
+
+差別的根源是：`extends` 的目標一定在同一份檔案集合裡，weaver 解析不到就是解析不到；而 `dependencies` 要去別的地方載入，「載入成功但內容不是你以為的那份」是一個完全合法的狀態。**同一個「繼承」的直覺，換到跨團隊的邊界上就不能再用了**，這是今天整篇的前提。
+
 現在加第二層。結帳團隊要定義自己的 `checkout.completed` 事件，但裡面的支付欄位應該沿用平台團隊那份，不該自己再造一次：
 
 ```yaml
@@ -115,13 +125,13 @@ $ weaver registry check -r day13/team
 $ weaver registry stats -r day13/team
   - 1 groups
 
-$ weaver registry stats -r day13/team --include-unreferenced true
+$ weaver registry stats -r day13/team --include-unreferenced=true
   - 3 groups
     - 1 AttributeGroups
     - 2 Events
 ```
 
-**預設只算團隊自己宣告的那一個。** base 的兩個 group 有被載入、`ref` 也解得到，但它們不算是這份 registry 的內容——除非加上 `--include-unreferenced true`，才會把依賴裡的東西也一起算進來。
+**預設只算團隊自己宣告的那一個。** base 的兩個 group 有被載入、`ref` 也解得到，但它們不算是這份 registry 的內容——除非加上 `--include-unreferenced=true`，才會把依賴裡的東西也一起算進來。
 
 這個差別對 Day7 那個 CI 探針有直接影響：如果你的 gate 檢查「group 數 > 0」，在分層架構下要先想清楚你期待的是哪一個數字，不然這個探針會在某次重構之後失去意義。
 
@@ -137,7 +147,7 @@ flowchart TB
     T -.->|"ref: payment.id<br/>ref: payment.outcome"| B
 
     S1["registry stats -r team<br/>→ 1 group（只算自己宣告的）"]
-    S2["registry stats -r team --include-unreferenced true<br/>→ 3 groups（連依賴一起算）"]
+    S2["registry stats -r team --include-unreferenced=true<br/>→ 3 groups（連依賴一起算）"]
     T --> S1
     T --> S2
 ```
@@ -282,10 +292,10 @@ $ weaver registry check -r day13/squad
 
 ### 四、但把所有層都列出來，會撞到重複載入
 
-修好第三個問題之後，跑一次 `--include-unreferenced true`：
+修好第三個問題之後，跑一次 `--include-unreferenced=true`：
 
 ```
-$ weaver registry stats -r day13/squad --include-unreferenced true
+$ weaver registry stats -r day13/squad --include-unreferenced=true
 
   × The attribute id `payment.outcome` is declared multiple times in the
   │ following groups: ["registry.payment", "registry.payment"]
@@ -298,7 +308,7 @@ $ weaver registry stats -r day13/squad --include-unreferenced true
 
 所以第三跟第四個陷阱合起來是一個兩難：
 
-| 做法 | 一般 `check` | `--include-unreferenced true` |
+| 做法 | 一般 `check` | `--include-unreferenced=true` |
 |---|---|---|
 | 只列直接依賴（division） | ❌ 隔層的 `ref` 解不到 | — |
 | 兩層都列（division + base） | ✅ 通過 | ❌ 重複載入，硬錯誤 |
