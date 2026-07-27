@@ -92,273 +92,7 @@ schema_url: https://tedmax100.github.io/o11y-bench/demo-services/schemas/0.1.0
 | 放在 `schema/` 子目錄（自己取的名字） | ✅ 讀到 |
 | 放在 `model/sub/deep/` 三層深 | ✅ 讀到 |
 
-跟著慣例用 `model/` 的好處只有一個：別人一眼看得懂。除此之外你怎麼擺都行。
-
-### 那個「慣例」到底是什麼
-
-既然沒有強制力，就值得知道慣例本身長什麼樣——因為 weaver 的預設值就是它。看 `-r` 的 help：
-
-```
--r, --registry <REGISTRY>
-    [default: `https://github.com/open-telemetry/semantic-conventions.git[model]`]
-```
-
-**你不給 `-r`，weaver 就去抓官方的 [semantic-conventions](https://github.com/open-telemetry/semantic-conventions) repo，而且指定的子目錄是 `[model]`。** 官方那份長這樣：
-
-```
-semantic-conventions/
-└── model/                    ← registry 的根，manifest 在這裡面
-    ├── manifest.yaml
-    ├── version.properties
-    ├── http/                 ← 先照 namespace 拆
-    │   ├── registry.yaml     ← 屬性定義池（attribute_group）
-    │   ├── spans.yaml        ← 再照訊號種類拆
-    │   ├── metrics.yaml
-    │   ├── events.yaml
-    │   ├── common.yaml
-    │   └── deprecated/
-    ├── db/
-    ├── k8s/
-    ├── jvm/
-    └── ...（70 幾個 namespace）
-```
-
-有兩件事跟我們這份不一樣，都值得注意。
-
-**一、官方的 `model/` 是 registry 的根，`manifest.yaml` 在它「裡面」。** 我們這份的根是 `registry/`，`model/` 是它底下的子目錄。所以「`model/`」這個名字在兩邊指的不是同一層——**它標記的是「模型檔住在這裡」，不是固定的第幾層。** 這也是為什麼前面要強調 `-r` 認的是「有 `manifest.yaml` 的那一層」而不是「叫 `model` 的那一層」，記後者會在讀官方 repo 時整個對不上。
-
-**二、官方是兩層拆法：先 namespace，再訊號種類。** 我們這份只有一層（直接照訊號拆），因為 34 個 group 全部屬於同一個 `demo-services` 領域，再切 namespace 只會多出一堆只有一兩個檔案的目錄。**官方有 70 幾個 namespace、幾千個 attribute，不先切就沒法看了。** 這個差異不是誰對誰錯，是規模不同——但它預告了 Day8：當你的 registry 開始要分層、要跨團隊，你就會需要官方那種拆法。
-
-還有一個細節解釋了前面那個命名慣例的來源：**每個 namespace 底下那份 `registry.yaml`，放的就是該 namespace 的屬性定義池**（`attribute_group`），其他 `spans.yaml`／`metrics.yaml` 用 `ref` 指過來。我們這份把它叫 `common.yaml`，但 group id 仍然沿用 `registry.app`／`registry.biz` 這個前綴——**那個 `registry.` 前綴就是從官方這個檔名慣例來的**，意思是「這裡是定義處，不是訊號」。
-
-### 把官方 registry 當教材：它是唯一一份「被幾百個團隊用過」的範例
-
-既然預設值就是它，那就跑跑看。**不帶 `-r`，weaver 會自己去 clone：**
-
-```
-$ weaver registry stats
-Computing stats for registry `https://github.com/open-telemetry/semantic-conventions.git[model]`
-ℹ Found registry manifest: .../model/manifest.yaml
-Registry
-  - 982 groups
-    - 216 AttributeGroups
-    - 64 Entitys
-    - 32 Events
-    - 557 Metrics
-    - ...
-```
-
-982 個 group，對照我們那份 34 個。**這件事本身就值得做一次**，因為它讓「registry 長大之後會變成什麼樣」從想像變成可以直接翻閱的東西。而底下那段 `Shared Catalog` 跟我們那份放在一起看，差異全部是**成熟度的差異**：
-
-| | demo-services（34 groups） | 官方（982 groups） |
-|---|---|---|
-| `stable` | **0** | 394 |
-| `development` | 55（100%） | 1132 |
-| `release_candidate` | 0 | 192 |
-| `opt_in` | **0** | 127 |
-| `template[string]` | 0 | 61（＋13 個 `template[string[]]`） |
-| deprecated attributes | 0 | **276（16%）** |
-
-最後一列是最有訊息量的。**一份活著的 registry，會有六分之一的欄位處於「已經不建議用、但還不能刪」的狀態。** 這不是官方沒整理好，這是治理的常態——刪掉一個欄位會打死下游，所以它只能被標記、被冷處理、等它自己死。Day9 整篇就在講這件事，而這個 16% 是它最好的證據。
-
-下面挑四個官方的欄位，每一個都是我們前面講過的概念的成熟版本。
-
-**一、`http.request.method`——enum 該怎麼留退路。** 它有 11 個 member，前 10 個是 RFC 定義的方法，最後一個是：
-
-```yaml
-            - id: other
-              value: "_OTHER"
-              brief: 'Any HTTP method that the instrumentation has no prior knowledge of.'
-              stability: stable
-```
-
-配的 `note` 寫得很硬：「如果 instrumentation 不認得這個方法，它 **MUST** 把 `http.request.method` 設成 `_OTHER`」，而且要提供一個環境變數讓人覆寫已知清單。
-
-**這是 enum 設計裡最重要的一個模式：有界的值域，加上一個明確的「其他」出口。** 沒有這個出口，enum 只有兩種下場——要嘛 instrumentation 硬送一個沒定義過的值（Day7 那個 `undefined_enum_variant`），要嘛它為了合規而丟掉資訊。有了 `_OTHER`，值域仍然是有界的（metric label 的成本可控），而「有東西掉出去了」這件事本身變成可觀測的。
-
-對 agent 更直接：`sum by (http_request_method)` 的結果最多 11 條，**而且 `_OTHER` 那一條變大就是一個訊號**。這比一個無界的 string label 有用得多。
-
-順帶注意每個 member 各有自己的 `stability`——`query` 是 `development`，其他是 `stable`。**穩定性是 member 級的，不是欄位級的**，因為新增一個 enum member 是一次獨立的相容性決定。
-
-**二、`http.request.header`——`template[string]` 的真實用途。** 它的型別是 `template[string[]]`：
-
-```yaml
-      - id: http.request.header
-        type: template[string[]]
-        brief: >
-          HTTP request headers, `<key>` being the normalized HTTP Header name (lowercase),
-          the value being the header values.
-```
-
-意思是它不是一個欄位，是**一整族欄位**：`http.request.header.content-type`、`http.request.header.x-forwarded-for`…… 前綴固定、後綴由 runtime 決定。這種東西天生高基數，所以官方的 `note` 第一句就是「Instrumentations SHOULD require an explicit configuration of which headers are to be captured」，理由寫的是資安（全抓會外洩敏感資訊）而不是成本。
-
-**三、`server.address` 在 metric 上的 `opt_in`——官方版的 cardinality 警告。** 這一段跟這篇後半那條 policy 是同一件事，但官方是用 `requirement_level` 加註解表達的：
-
-```yaml
-  - id: metric_attributes.http.server
-    type: attribute_group
-    extends: attributes.http.server
-    attributes:
-      - ref: server.address
-        requirement_level: opt_in
-        note: |
-          > [!WARNING]
-          > Since this attribute is based on HTTP headers, opting in to it may allow an attacker
-          > to trigger cardinality limits, degrading the usefulness of the metric.
-```
-
-三件事值得看。第一，`opt_in` 這一級終於有了具體場景——**它的意思是「預設不要，你要的話自己承擔後果」**，正好是這篇後面那個「白名單 + 署名理由」的官方版本。第二，那個警告講的是**攻擊者可以主動觸發 cardinality 爆炸**，這是我們那條 policy 沒想到的威脅模型：高基數不只是成本問題，是攻擊面。第三，同一個 `server.address` 在 span 上是正常的 `recommended`，只有在 metric 上被降級成 `opt_in`——**又一次印證「必填程度屬於使用處，不屬於定義處」。**
-
-但這段 YAML 有兩個地方，值得比上面三點花更多篇幅：那個 `extends`，還有「一個 `attribute_group` 底下寫 `attributes:` 到底在表達什麼」。
-
-### `attribute_group` 有兩種用法，`id:` 跟 `ref:` 是分界線
-
-前面說 `attribute_group` 是「屬性池」，那是它的第一種用法。上面這個 `metric_attributes.http.server` 是第二種，而兩者的差別就寫在 `attributes:` 底下那一個字：
-
-```yaml
-attributes:
-  - id: server.address     # 「定義」：這個欄位是什麼、什麼型別、值域多大
-  - ref: server.address    # 「決定」：在這個情境下，我對這個欄位承諾什麼
-```
-
-`registry.http` 底下全部是 `- id:`——它是**定義池**，欄位的身分證住在這裡。而 `metric_attributes.http.server` 底下全部是 `- ref:`，**它一個新欄位都沒定義**，它打包的是一組「用哪些欄位、各自什麼 `requirement_level`」的決定。
-
-**所以第二種 `attribute_group` 不是「一包屬性」，是「一包可以被重複使用的決定」。** 它自己不是訊號，也不是定義，是夾在中間的組合層。想不通這件事的時候，會覺得 `attribute_group` 這個名字取得很奇怪——一個「屬性群組」為什麼可以不含任何屬性定義？因為它群組的是**使用方式**，不是屬性本身。
-
-### `extends`：把 `attributes.http.server` 整條鏈追出來
-
-官方那個 HTTP server metric，實際上是一條四層的鏈。從最上面開始：
-
-```yaml
-# ① 所有 HTTP 都適用的（model/http/common.yaml）
-  - id: attributes.http.common
-    type: attribute_group
-    attributes:
-      - ref: http.request.method
-        requirement_level: required
-      - ref: http.response.status_code
-        requirement_level:
-          conditionally_required: If and only if one was received/sent.
-      - ref: error.type
-        requirement_level:
-          conditionally_required: If request has ended with an error.
-```
-
-```yaml
-# ② server 端專屬的，繼承 ① 再加四個
-  - id: attributes.http.server
-    type: attribute_group
-    extends: attributes.http.common
-    attributes:
-      - ref: http.route
-        requirement_level:
-          conditionally_required: If and only if it's available
-      - ref: server.address
-        brief: Name of the local HTTP server that received the request.
-      - ref: server.port
-        requirement_level:
-          conditionally_required: If available and `server.address` is set.
-      - ref: url.scheme
-        requirement_level: required
-```
-
-```yaml
-# ③ 「因為這是 metric」而要改的部分，繼承 ② 只覆寫兩個
-  - id: metric_attributes.http.server
-    type: attribute_group
-    extends: attributes.http.server
-    attributes:
-      - ref: server.address
-        requirement_level: opt_in          # ← 從 ② 的預設降級
-        note: |
-          > [!WARNING]
-          > ...may allow an attacker to trigger cardinality limits...
-      - ref: server.port
-        requirement_level: opt_in          # ← 同上
-```
-
-```yaml
-# ④ 真正的 metric，繼承 ③，自己一個 attributes: 都沒有
-  - id: metric.http.server.request.duration
-    type: metric
-    metric_name: http.server.request.duration
-    instrument: histogram
-    unit: "s"
-    stability: stable
-    extends: metric_attributes.http.server
-```
-
-**第四層那個 group 的宣告裡沒有任何 `attributes:`。** 那它最後有幾個 label？把整份官方 registry `resolve` 出來看：
-
-```
-$ weaver registry resolve -r <官方 model/> --format json
-   → group: metric.http.server.request.duration | attrs: 10
-
-   error.type                   conditionally_required: If request has ended with an error
-   http.request.method          required
-   http.response.status_code    conditionally_required: If and only if one was received/sent
-   http.route                   conditionally_required: If and only if it's available
-   network.protocol.name        conditionally_required: ...
-   network.protocol.version     recommended
-   server.address               opt_in          ← 被 ③ 覆寫的結果
-   server.port                  opt_in          ← 同上
-   url.scheme                   required
-   user_agent.synthetic.type    opt_in
-```
-
-**宣告 0 個，解析出 10 個。**
-
-這裡最重要的一件事是：**`extends` 不只能「加」，還能「改」。** `server.address` 在第 ② 層沒有指定 `requirement_level`（預設 `recommended`），到第 ③ 層被明確降成 `opt_in`。子層重新 `ref` 同一個欄位，就是在覆寫父層對它的決定。
-
-而這整條鏈存在的理由，用另一個查詢就看得出來——同一個欄位，在 span 上完全沒被降級：
-
-```
-metric.http.server.active_requests     server.address = opt_in
-span.http.server                       server.address = recommended
-```
-
-**`server.address` 這個欄位本身從頭到尾沒變，變的是「它當 metric label 的時候成本不一樣」。** 與其在二十幾個 HTTP server metric 上各寫一次 `opt_in` 加同一段 cardinality 警告，不如把這個決定收成第 ③ 層，讓所有 metric `extends` 它。**那一層的存在理由，就是「這個決定會被重複很多次」。**
-
-### `ref` 跟 `extends` 的分工
-
-| | `ref` | `extends` |
-|---|---|---|
-| 作用層級 | attribute | group |
-| 意思 | 我要用**這一個**欄位 | 我要用**那個 group 的整組決定** |
-| 能不能覆寫 | 能（`requirement_level`、`brief`、`note`） | 能（在子 group 重新 `ref` 同一個欄位） |
-| 我們那份 34 groups | ✅ 到處都是 | ❌ 一次都沒用 |
-
-我們用不到 `extends`，不是因為簡陋，是因為**沒有「一組會被十幾個 group 共用的決定」**——每個 event、每個 span 的欄位組合都不一樣，硬抽一層出來只會多一次跳轉。官方 982 個 group 則相反，不用 `extends` 會重複到沒人維護得動。
-
-**判準很簡單：當你發現自己在第三個 group 裡貼上同一組 `ref` ＋ 同一段 `requirement_level` 理由時，那組決定就該被抽成一層。** 在那之前抽，只是在製造一層沒有內容的間接。
-
-這條線在 Day8 會再走一次，但問題會變成另一個：`extends` 是**同一份 registry 內部**的繼承，而 Day8 要處理的是**跨 registry** 的繼承（`dependencies`），兩者的失敗模式完全不同——`extends` 指錯會直接報錯，跨 registry 的依賴指錯會安靜地少東西。
-
-**四、`deprecated/` 目錄——被淘汰的欄位不會消失，會搬家。** 官方每個 namespace 底下都有一個 `deprecated/`，裡面長這樣：
-
-```yaml
-      - id: http.method
-        type: string
-        brief: 'Deprecated, use `http.request.method` instead.'
-        stability: development
-        deprecated:
-          reason: renamed
-          renamed_to: http.request.method
-```
-
-**注意 `deprecated` 是結構化的**（`reason` ＋ `renamed_to`），不是一句寫在 `brief` 裡的散文。這個差別決定了它能不能被自動消費：`reason: renamed` ＋ `renamed_to` 讓工具可以自動產遷移表、讓 Day10 的 MCP server 在 agent 查到舊欄位時直接告訴它新名字、也讓 Day9 那條「下游還在用 deprecated 欄位」的 policy 寫得出來。
-
-**如果這件事只寫在 `brief` 裡，上面三件事一件都做不到。** 這就是這系列反覆的那條線在 deprecation 這個維度上的形狀——同樣的資訊，寫成句子只有人看得懂，寫成欄位才能被自動化。
-
-### 該從官方抄什麼、不該抄什麼
-
-看完之後很容易走向一個結論：「那我照官方的結構做就好了」。**不要。** 官方那份的形狀是被它的處境決定的——982 個 group、幾百個下游 instrumentation、改一個欄位要跑 OTEP 流程。你的 registry 第一天只有十幾個 group，硬套會得到一堆只有一個檔案的目錄跟一份沒人想維護的規範。
-
-該抄的是**機制**，不是**規模**：`_OTHER` 這種 enum 出口、`opt_in` 加上寫明理由的註解、結構化的 `deprecated`——這三個在你有十個 group 的時候就該用，因為它們解決的問題跟規模無關。
-
-不該抄的是**分層深度**。namespace 目錄、`extends` 繼承鏈、`deprecated/` 獨立目錄，這些是規模到了才需要付的維護成本。**過早分層跟過晚分層一樣糟**，差別只在前者比較不容易被發現——它看起來很專業。
-
-而這正好是平台團隊最常搞砸的地方：**照著一份「最佳實踐」設計介面，而不是照著使用者現在的處境設計。** 產品團隊接上治理要付的成本，是用「他們要學幾個新概念」算的，不是用「這個結構有多完整」算的。
+跟著慣例用 `model/` 的好處只有一個：別人一眼看得懂。除此之外你怎麼擺都行。（那個慣例本身長什麼樣、為什麼是 `model/` 這個名字，留到後面〈拿官方 registry 當對照組〉一起看。）
 
 好處是「新增一個檔案」不必改 manifest。**代價是你放進去的任何東西它都會讀，而它對兩種誤放的反應完全不同。**
 
@@ -639,6 +373,282 @@ Shared Catalog (after resolution and deduplication):
 ```
 
 大括號那種是 UCUM 的「無因次計數單位」寫法——`{order}` 的意思是「這個數字的單位是『筆訂單』」，而不是某個物理單位。**它不影響任何計算，純粹是給讀的人（跟 agent）的語意。** 一個 counter 如果 unit 是空的，agent 只知道「這是個會變大的數字」；寫了 `{order}` 它才知道這是在數訂單。這是這系列反覆的那條線在單位這個維度上的形狀：**能寫下來的語意，就不要留在腦子裡。**
+
+## 拿官方 registry 當對照組
+
+到這裡，自己這份 34 個 group 的 registry 已經看完、跑過、也拿到了一組基準數字。接下來很自然會想問兩件事：**前面那個 `model/` 慣例到底是誰的慣例？以及一份長大之後的 registry 會是什麼樣子？**
+
+這兩個問題有同一個答案，而且不用去找——**`-r` 不給值的時候，weaver 預設抓的就是官方那份。** 它是唯一一份被幾百個團隊實際用過、而且每一個設計決定都留有痕跡的 registry，拿來當對照組比任何教學範例都好。
+
+這一整節都是「讀別人的 code」，沒有要你改任何東西。讀完會多出三個關鍵字（`extends`、`opt_in`、結構化的 `deprecated`），它們會在後半那條 policy 跟 Day8、Day9 各回來一次。
+
+### `model/` 是誰的慣例：官方 registry 的形狀
+
+先解掉前面留的那個問號。weaver 的 `-r` help 已經把答案寫在預設值裡：
+
+```
+-r, --registry <REGISTRY>
+    [default: `https://github.com/open-telemetry/semantic-conventions.git[model]`]
+```
+
+**你不給 `-r`，weaver 就去抓官方的 [semantic-conventions](https://github.com/open-telemetry/semantic-conventions) repo，而且指定的子目錄是 `[model]`。** 官方那份長這樣：
+
+```
+semantic-conventions/
+└── model/                    ← registry 的根，manifest 在這裡面
+    ├── manifest.yaml
+    ├── version.properties
+    ├── http/                 ← 先照 namespace 拆
+    │   ├── registry.yaml     ← 屬性定義池（attribute_group）
+    │   ├── spans.yaml        ← 再照訊號種類拆
+    │   ├── metrics.yaml
+    │   ├── events.yaml
+    │   ├── common.yaml
+    │   └── deprecated/
+    ├── db/
+    ├── k8s/
+    ├── jvm/
+    └── ...（70 幾個 namespace）
+```
+
+有兩件事跟我們這份不一樣，都值得注意。
+
+**一、官方的 `model/` 是 registry 的根，`manifest.yaml` 在它「裡面」。** 我們這份的根是 `registry/`，`model/` 是它底下的子目錄。所以「`model/`」這個名字在兩邊指的不是同一層——**它標記的是「模型檔住在這裡」，不是固定的第幾層。** 這也是為什麼前面要強調 `-r` 認的是「有 `manifest.yaml` 的那一層」而不是「叫 `model` 的那一層」，記後者會在讀官方 repo 時整個對不上。
+
+**二、官方是兩層拆法：先 namespace，再訊號種類。** 我們這份只有一層（直接照訊號拆），因為 34 個 group 全部屬於同一個 `demo-services` 領域，再切 namespace 只會多出一堆只有一兩個檔案的目錄。**官方有 70 幾個 namespace、幾千個 attribute，不先切就沒法看了。** 這個差異不是誰對誰錯，是規模不同——但它預告了 Day8：當你的 registry 開始要分層、要跨團隊，你就會需要官方那種拆法。
+
+還有一個細節解釋了前面那個命名慣例的來源：**每個 namespace 底下那份 `registry.yaml`，放的就是該 namespace 的屬性定義池**（`attribute_group`），其他 `spans.yaml`／`metrics.yaml` 用 `ref` 指過來。我們這份把它叫 `common.yaml`，但 group id 仍然沿用 `registry.app`／`registry.biz` 這個前綴——**那個 `registry.` 前綴就是從官方這個檔名慣例來的**，意思是「這裡是定義處，不是訊號」。
+
+### 982 個 group：跟自己那份放在一起看
+
+形狀看完了，跑一次。**不帶 `-r`，weaver 會自己去 clone：**
+
+```
+$ weaver registry stats
+Computing stats for registry `https://github.com/open-telemetry/semantic-conventions.git[model]`
+ℹ Found registry manifest: .../model/manifest.yaml
+Registry
+  - 982 groups
+    - 216 AttributeGroups
+    - 64 Entitys
+    - 32 Events
+    - 557 Metrics
+    - ...
+```
+
+982 個 group，對照我們那份 34 個。**這件事本身就值得做一次**，因為它讓「registry 長大之後會變成什麼樣」從想像變成可以直接翻閱的東西。而底下那段 `Shared Catalog` 跟我們那份放在一起看，差異全部是**成熟度的差異**：
+
+| | demo-services（34 groups） | 官方（982 groups） |
+|---|---|---|
+| `stable` | **0** | 394 |
+| `development` | 55（100%） | 1132 |
+| `release_candidate` | 0 | 192 |
+| `opt_in` | **0** | 127 |
+| `template[string]` | 0 | 61（＋13 個 `template[string[]]`） |
+| deprecated attributes | 0 | **276（16%）** |
+
+最後一列是最有訊息量的。**一份活著的 registry，會有六分之一的欄位處於「已經不建議用、但還不能刪」的狀態。** 這不是官方沒整理好，這是治理的常態——刪掉一個欄位會打死下游，所以它只能被標記、被冷處理、等它自己死。Day9 整篇就在講這件事，而這個 16% 是它最好的證據。
+
+下面挑四個官方的欄位，每一個都是我們前面講過的概念的成熟版本。
+
+**一、`http.request.method`——enum 該怎麼留退路。** 它有 11 個 member，前 10 個是 RFC 定義的方法，最後一個是：
+
+```yaml
+            - id: other
+              value: "_OTHER"
+              brief: 'Any HTTP method that the instrumentation has no prior knowledge of.'
+              stability: stable
+```
+
+配的 `note` 寫得很硬：「如果 instrumentation 不認得這個方法，它 **MUST** 把 `http.request.method` 設成 `_OTHER`」，而且要提供一個環境變數讓人覆寫已知清單。
+
+**這是 enum 設計裡最重要的一個模式：有界的值域，加上一個明確的「其他」出口。** 沒有這個出口，enum 只有兩種下場——要嘛 instrumentation 硬送一個沒定義過的值（Day7 那個 `undefined_enum_variant`），要嘛它為了合規而丟掉資訊。有了 `_OTHER`，值域仍然是有界的（metric label 的成本可控），而「有東西掉出去了」這件事本身變成可觀測的。
+
+對 agent 更直接：`sum by (http_request_method)` 的結果最多 11 條，**而且 `_OTHER` 那一條變大就是一個訊號**。這比一個無界的 string label 有用得多。
+
+順帶注意每個 member 各有自己的 `stability`——`query` 是 `development`，其他是 `stable`。**穩定性是 member 級的，不是欄位級的**，因為新增一個 enum member 是一次獨立的相容性決定。
+
+**二、`http.request.header`——`template[string]` 的真實用途。** 它的型別是 `template[string[]]`：
+
+```yaml
+      - id: http.request.header
+        type: template[string[]]
+        brief: >
+          HTTP request headers, `<key>` being the normalized HTTP Header name (lowercase),
+          the value being the header values.
+```
+
+意思是它不是一個欄位，是**一整族欄位**：`http.request.header.content-type`、`http.request.header.x-forwarded-for`…… 前綴固定、後綴由 runtime 決定。這種東西天生高基數，所以官方的 `note` 第一句就是「Instrumentations SHOULD require an explicit configuration of which headers are to be captured」，理由寫的是資安（全抓會外洩敏感資訊）而不是成本。
+
+**三、`server.address` 在 metric 上的 `opt_in`——官方版的 cardinality 警告。** 這一段跟這篇後半那條 policy 是同一件事，但官方是用 `requirement_level` 加註解表達的：
+
+```yaml
+  - id: metric_attributes.http.server
+    type: attribute_group
+    extends: attributes.http.server
+    attributes:
+      - ref: server.address
+        requirement_level: opt_in
+        note: |
+          > [!WARNING]
+          > Since this attribute is based on HTTP headers, opting in to it may allow an attacker
+          > to trigger cardinality limits, degrading the usefulness of the metric.
+```
+
+三件事值得看。第一，`opt_in` 這一級終於有了具體場景——**它的意思是「預設不要，你要的話自己承擔後果」**，正好是這篇後面那個「白名單 + 署名理由」的官方版本。第二，那個警告講的是**攻擊者可以主動觸發 cardinality 爆炸**，這是我們那條 policy 沒想到的威脅模型：高基數不只是成本問題，是攻擊面。第三，同一個 `server.address` 在 span 上是正常的 `recommended`，只有在 metric 上被降級成 `opt_in`——**又一次印證「必填程度屬於使用處，不屬於定義處」。**
+
+但這段 YAML 有兩個地方，值得比上面三點花更多篇幅：那個 `extends`，還有「一個 `attribute_group` 底下寫 `attributes:` 到底在表達什麼」。
+
+### `attribute_group` 有兩種用法，`id:` 跟 `ref:` 是分界線
+
+前面說 `attribute_group` 是「屬性池」，那是它的第一種用法。上面這個 `metric_attributes.http.server` 是第二種，而兩者的差別就寫在 `attributes:` 底下那一個字：
+
+```yaml
+attributes:
+  - id: server.address     # 「定義」：這個欄位是什麼、什麼型別、值域多大
+  - ref: server.address    # 「決定」：在這個情境下，我對這個欄位承諾什麼
+```
+
+`registry.http` 底下全部是 `- id:`——它是**定義池**，欄位的身分證住在這裡。而 `metric_attributes.http.server` 底下全部是 `- ref:`，**它一個新欄位都沒定義**，它打包的是一組「用哪些欄位、各自什麼 `requirement_level`」的決定。
+
+**所以第二種 `attribute_group` 不是「一包屬性」，是「一包可以被重複使用的決定」。** 它自己不是訊號，也不是定義，是夾在中間的組合層。想不通這件事的時候，會覺得 `attribute_group` 這個名字取得很奇怪——一個「屬性群組」為什麼可以不含任何屬性定義？因為它群組的是**使用方式**，不是屬性本身。
+
+### `extends`：把 `attributes.http.server` 整條鏈追出來
+
+官方那個 HTTP server metric，實際上是一條四層的鏈。從最上面開始：
+
+```yaml
+# ① 所有 HTTP 都適用的（model/http/common.yaml）
+  - id: attributes.http.common
+    type: attribute_group
+    attributes:
+      - ref: http.request.method
+        requirement_level: required
+      - ref: http.response.status_code
+        requirement_level:
+          conditionally_required: If and only if one was received/sent.
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If request has ended with an error.
+```
+
+```yaml
+# ② server 端專屬的，繼承 ① 再加四個
+  - id: attributes.http.server
+    type: attribute_group
+    extends: attributes.http.common
+    attributes:
+      - ref: http.route
+        requirement_level:
+          conditionally_required: If and only if it's available
+      - ref: server.address
+        brief: Name of the local HTTP server that received the request.
+      - ref: server.port
+        requirement_level:
+          conditionally_required: If available and `server.address` is set.
+      - ref: url.scheme
+        requirement_level: required
+```
+
+```yaml
+# ③ 「因為這是 metric」而要改的部分，繼承 ② 只覆寫兩個
+  - id: metric_attributes.http.server
+    type: attribute_group
+    extends: attributes.http.server
+    attributes:
+      - ref: server.address
+        requirement_level: opt_in          # ← 從 ② 的預設降級
+        note: |
+          > [!WARNING]
+          > ...may allow an attacker to trigger cardinality limits...
+      - ref: server.port
+        requirement_level: opt_in          # ← 同上
+```
+
+```yaml
+# ④ 真正的 metric，繼承 ③，自己一個 attributes: 都沒有
+  - id: metric.http.server.request.duration
+    type: metric
+    metric_name: http.server.request.duration
+    instrument: histogram
+    unit: "s"
+    stability: stable
+    extends: metric_attributes.http.server
+```
+
+**第四層那個 group 的宣告裡沒有任何 `attributes:`。** 那它最後有幾個 label？把整份官方 registry `resolve` 出來看：
+
+```
+$ weaver registry resolve -r <官方 model/> --format json
+   → group: metric.http.server.request.duration | attrs: 10
+
+   error.type                   conditionally_required: If request has ended with an error
+   http.request.method          required
+   http.response.status_code    conditionally_required: If and only if one was received/sent
+   http.route                   conditionally_required: If and only if it's available
+   network.protocol.name        conditionally_required: ...
+   network.protocol.version     recommended
+   server.address               opt_in          ← 被 ③ 覆寫的結果
+   server.port                  opt_in          ← 同上
+   url.scheme                   required
+   user_agent.synthetic.type    opt_in
+```
+
+**宣告 0 個，解析出 10 個。**
+
+這裡最重要的一件事是：**`extends` 不只能「加」，還能「改」。** `server.address` 在第 ② 層沒有指定 `requirement_level`（預設 `recommended`），到第 ③ 層被明確降成 `opt_in`。子層重新 `ref` 同一個欄位，就是在覆寫父層對它的決定。
+
+而這整條鏈存在的理由，用另一個查詢就看得出來——同一個欄位，在 span 上完全沒被降級：
+
+```
+metric.http.server.active_requests     server.address = opt_in
+span.http.server                       server.address = recommended
+```
+
+**`server.address` 這個欄位本身從頭到尾沒變，變的是「它當 metric label 的時候成本不一樣」。** 與其在二十幾個 HTTP server metric 上各寫一次 `opt_in` 加同一段 cardinality 警告，不如把這個決定收成第 ③ 層，讓所有 metric `extends` 它。**那一層的存在理由，就是「這個決定會被重複很多次」。**
+
+### `ref` 跟 `extends` 的分工
+
+| | `ref` | `extends` |
+|---|---|---|
+| 作用層級 | attribute | group |
+| 意思 | 我要用**這一個**欄位 | 我要用**那個 group 的整組決定** |
+| 能不能覆寫 | 能（`requirement_level`、`brief`、`note`） | 能（在子 group 重新 `ref` 同一個欄位） |
+| 我們那份 34 groups | ✅ 到處都是 | ❌ 一次都沒用 |
+
+我們用不到 `extends`，不是因為簡陋，是因為**沒有「一組會被十幾個 group 共用的決定」**——每個 event、每個 span 的欄位組合都不一樣，硬抽一層出來只會多一次跳轉。官方 982 個 group 則相反，不用 `extends` 會重複到沒人維護得動。
+
+**判準很簡單：當你發現自己在第三個 group 裡貼上同一組 `ref` ＋ 同一段 `requirement_level` 理由時，那組決定就該被抽成一層。** 在那之前抽，只是在製造一層沒有內容的間接。
+
+這條線在 Day8 會再走一次，但問題會變成另一個：`extends` 是**同一份 registry 內部**的繼承，而 Day8 要處理的是**跨 registry** 的繼承（`dependencies`），兩者的失敗模式完全不同——`extends` 指錯會直接報錯，跨 registry 的依賴指錯會安靜地少東西。
+
+**四、`deprecated/` 目錄——被淘汰的欄位不會消失，會搬家。** 官方每個 namespace 底下都有一個 `deprecated/`，裡面長這樣：
+
+```yaml
+      - id: http.method
+        type: string
+        brief: 'Deprecated, use `http.request.method` instead.'
+        stability: development
+        deprecated:
+          reason: renamed
+          renamed_to: http.request.method
+```
+
+**注意 `deprecated` 是結構化的**（`reason` ＋ `renamed_to`），不是一句寫在 `brief` 裡的散文。這個差別決定了它能不能被自動消費：`reason: renamed` ＋ `renamed_to` 讓工具可以自動產遷移表、讓 Day10 的 MCP server 在 agent 查到舊欄位時直接告訴它新名字、也讓 Day9 那條「下游還在用 deprecated 欄位」的 policy 寫得出來。
+
+**如果這件事只寫在 `brief` 裡，上面三件事一件都做不到。** 這就是這系列反覆的那條線在 deprecation 這個維度上的形狀——同樣的資訊，寫成句子只有人看得懂，寫成欄位才能被自動化。
+
+### 該從官方抄什麼、不該抄什麼
+
+看完之後很容易走向一個結論：「那我照官方的結構做就好了」。**不要。** 官方那份的形狀是被它的處境決定的——982 個 group、幾百個下游 instrumentation、改一個欄位要跑 OTEP 流程。你的 registry 第一天只有十幾個 group，硬套會得到一堆只有一個檔案的目錄跟一份沒人想維護的規範。
+
+該抄的是**機制**，不是**規模**：`_OTHER` 這種 enum 出口、`opt_in` 加上寫明理由的註解、結構化的 `deprecated`——這三個在你有十個 group 的時候就該用，因為它們解決的問題跟規模無關。
+
+不該抄的是**分層深度**。namespace 目錄、`extends` 繼承鏈、`deprecated/` 獨立目錄，這些是規模到了才需要付的維護成本。**過早分層跟過晚分層一樣糟**，差別只在前者比較不容易被發現——它看起來很專業。
+
+而這正好是平台團隊最常搞砸的地方：**照著一份「最佳實踐」設計介面，而不是照著使用者現在的處境設計。** 產品團隊接上治理要付的成本，是用「他們要學幾個新概念」算的，不是用「這個結構有多完整」算的。
+
+
 
 ## 三個示範：管線上三個不同的位置各踩一次
 
