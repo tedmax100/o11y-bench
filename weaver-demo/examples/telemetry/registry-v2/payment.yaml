@@ -1,0 +1,135 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/open-telemetry/weaver/v0.25.0/schemas/semconv.schema.v2.json
+file_format: definition/2
+
+attributes:
+  - key: payment.order_id
+    type: string
+    stability: stable
+    brief: "唯一的訂單識別碼"
+    examples: ["ord-20240601-001", "ord-20240601-002"]
+
+  - key: payment.provider
+    type: string
+    stability: stable
+    brief: "支付服務提供商"
+    examples: ["stripe", "paypal", "bank_transfer"]
+
+  - key: payment.currency
+    type: string
+    stability: stable
+    brief: "貨幣代碼（ISO 4217）"
+    examples: ["USD", "EUR", "TWD"]
+
+  - key: payment.status
+    type: string
+    stability: stable
+    brief: "支付結果狀態"
+    examples: ["success", "failed", "pending"]
+
+  - key: error.type
+    type: string
+    stability: stable
+    brief: "失敗時的錯誤類型"
+    examples: ["insufficient_funds", "card_declined", "network_error"]
+
+  - key: payment.audit.action
+    type:
+      members:
+        - id: authorize
+          value: "authorize"
+          stability: development
+          brief: "授權"
+        - id: capture
+          value: "capture"
+          stability: development
+          brief: "請款"
+        - id: refund
+          value: "refund"
+          stability: development
+          brief: "退款"
+    stability: development
+    brief: "稽核的支付動作"
+
+  - key: payment.audit.amount
+    type: double
+    stability: development
+    brief: "本次動作的金額"
+    examples: [100.0, 49.99]
+
+attribute_groups:
+  # v1 沒有的東西：internal group 不會出現在 resolved registry / 文件裡
+  - id: payment.attributes.common
+    visibility: internal
+    attributes:
+      - ref: payment.provider
+        requirement_level: required
+      - ref: deployment.environment
+        requirement_level: required
+
+metrics:
+  - name: payment.amount
+    instrument: histogram
+    unit: "{TWD}"
+    stability: stable
+    requirement_level: recommended
+    brief: "每筆支付的金額分佈"
+    attributes:
+      - ref_group: payment.attributes.common
+
+  - name: payment.errors
+    instrument: counter
+    unit: "{errors}"
+    stability: stable
+    requirement_level: recommended
+    brief: "支付失敗次數計數器"
+    attributes:
+      - ref: payment.provider
+        requirement_level: required
+
+  - name: payment.duration
+    instrument: histogram
+    unit: "ms"
+    stability: stable
+    requirement_level: recommended
+    brief: "支付處理耗時（毫秒）"
+    attributes:
+      - ref_group: payment.attributes.common
+
+spans:
+  - type: payment.process
+    name:
+      note: "使用 `payment {payment.provider}` 作為 span 名稱。"
+    kind: server
+    stability: stable
+    requirement_level: recommended
+    brief: "處理訂單支付流程的 Span"
+    entity_associations:
+      - all_of: [service]
+      - one_of: [k8s.pod, k8s.node]
+    attributes:
+      # 注意：common.resource 已含 deployment.environment，
+      # 不能再疊 payment.attributes.common（同屬性重複宣告 → check 會擋）
+      - ref_group: common.resource
+      - ref: payment.provider
+        requirement_level: required
+      - ref: payment.order_id
+        requirement_level: required
+      - ref: payment.currency
+        requirement_level: required
+      - ref: payment.status
+        requirement_level: required
+      - ref: error.type
+        requirement_level:
+          conditionally_required: "僅在支付失敗時填入"
+
+events:
+  - name: payment.audit
+    stability: development
+    requirement_level: recommended
+    brief: "支付狀態變更的稽核 log event"
+    attributes:
+      - ref_group: payment.attributes.common
+      - ref: payment.audit.action
+        requirement_level: required
+      - ref: payment.audit.amount
+        requirement_level: recommended
