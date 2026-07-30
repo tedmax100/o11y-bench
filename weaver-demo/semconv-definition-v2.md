@@ -25,7 +25,214 @@
 | **`--v2` 旗標** | weaver **resolve 之後輸出**的 resolved schema 形狀（policy / template 看到的東西） | 已是上游標準，policy 和 template package 全部要求它 |
 | **Telemetry Schema File Format 2.0** | OTel **spec 層**的 schema 檔（`schema_url` 指向的那個，目前 1.1.0） | 規劃中，spec issue #4427 |
 
-三者互相獨立。**輸入檔還是 v1 語法，一樣可以（而且應該）加 `--v2` 輸出**——這是最多人搞錯的一點。這篇只講第一項，`definition/2`。
+三者互相獨立。**輸入檔還是 v1 語法，一樣可以（而且應該）加 `--v2` 輸出**——這是最多人搞錯的一點。這篇主要講第一項 `definition/2`，但既然 `--v2` 是混淆的最大來源，下一節先把它實跑一次看清楚，之後就不再提它。
+
+---
+
+## Part 0 — 先把 `--v2` 旗標跑一次，之後就不會再搞混
+
+光看表格上那句「resolve 之後輸出的形狀」很難有感覺。直接拿一份**純 v1 語法**的 registry，同一份輸入跑兩次，差別一秒就看懂了：
+
+```bash
+weaver registry resolve -r telemetry/registry --format yaml       -o resolved-v1.yaml   # 640 行
+weaver registry resolve -r telemetry/registry --format yaml --v2  -o resolved-v2.yaml   # 1167 行
+```
+
+> 輸入是 `examples/telemetry/registry`，7 個檔案，**全部 v1 語法、沒有一行 `file_format: definition/2`**。這正是重點：`--v2` 完全不管你的輸入怎麼寫。
+
+### 骨架差在哪
+
+不加 `--v2`，你拿到一個扁平 list，14 筆全混在一起，靠 `type` 分辨：
+
+```text
+registry_url
+groups[]                      ← 14 筆
+  type: attribute_group  ×1
+  type: entity           ×3
+  type: event            ×1
+  type: metric           ×6
+  type: span             ×3
+```
+
+加了 `--v2`，按 signal 種類分櫃，而且多出一整層 `refinements`：
+
+```text
+schema_url
+registry
+  attributes[]        19   ← 屬性在 resolved 層有了獨立身分
+  attribute_groups[]   0
+  metrics[]            6
+  spans[]              3
+  events[]             1
+  entities[]           3
+refinements
+  metrics[] 6 / spans[] 3 / events[] 1 / entities[] 3
+```
+
+注意 `registry.attributes[]` 那 19 筆——**輸入是 v1 語法，屬性照樣被抽成獨立清單**。Part 1 講的「痛點一：屬性沒有獨立身分」是 *authoring 層*的問題；resolved 層早就解決了。這兩層要分開看。
+
+### 同一個 metric 的長相
+
+不加 `--v2`：
+
+```yaml
+groups:
+- id: metric.payment.duration     # ← 有 id
+  type: metric                    # ← 工具要靠這個分派
+  metric_name: payment.duration   # ← 欄位叫 metric_name
+  instrument: histogram
+  unit: ms
+  attributes:
+  - name: deployment.environment  # ← 欄位叫 name
+    type: string
+    requirement_level: required
+  lineage:                        # ← 獨立的 lineage 區塊
+    provenance:
+      schema_url: https://example.com/schemas/1.0.0
+      path: telemetry/registry/payment-metrics.yaml
+    attributes:
+      deployment.environment:
+        source_group: common.resource
+        inherited_fields: [brief, examples, note, requirement_level, stability]
+```
+
+加了 `--v2`：
+
+```yaml
+registry:
+  metrics:
+  - name: payment.duration        # ← 沒有 id 了，欄位叫 name
+    instrument: histogram
+    unit: ms
+    attributes:
+    - key: deployment.environment # ← 欄位叫 key
+      type: string
+      requirement_level: required
+      provenance:                 # ← 每個屬性自己帶來源，沒有集中的 lineage
+        path: telemetry/registry/common.yaml
+    provenance:
+      path: telemetry/registry/payment-metrics.yaml
+```
+
+`refinements.metrics[]` 底下同一筆內容一模一樣，只多一個 `id: payment.duration`——registry 是目錄、refinements 是「可點名的操作版本」，現在兩者相同是因為這份 registry 還沒用到 specialization。
+
+### 為什麼這件事非知道不可
+
+因為 policy 和 template 是**照 resolved 形狀寫的**。同一個問題「拿到所有 metric」：
+
+| | 寫法 |
+| --- | --- |
+| 不加 `--v2` | `input.groups[_]` 再 filter `.type == "metric"`，名字讀 `.metric_name`，屬性讀 `.name` |
+| 加 `--v2` | `input.registry.metrics[_]`，名字讀 `.name`，屬性讀 `.key` |
+
+**沒有一個欄位是共通的。**而失敗的方式不一樣：
+
+- **Template** 會直接爆。上游 `weaver-packages` 的模板是照 v2 寫的，少加 `--v2` 會噴 `Filter 'semconv_grouped_metrics(...)' failed: cannot use null as iterable`——它去找 `registry.metrics`，你給的是 `groups`。
+- **Policy** 會**安靜地全部 pass**。規則掃 `input.groups[_]`，加了 `--v2` 之後那個 key 根本不存在，迴圈跑零次，CI 綠燈，治理實際上已經停擺。這是最陰險的一種壞法。
+- **`registry package`** 不給你選，不加就直接報 `Packaging is only supported for v2 registries`。
+
+所以結論不是「可以加」，是「現在就加，然後檢查你的 policy 有沒有跟著改」。
+
+> ⚠️ `resolve` 和 `package` 的 v2 輸出**不完全一樣**。`registry package --v2` 產出的 `resolved.yaml` 會做屬性去重——有一份 `attribute_catalog`，signal 裡只放 `base: <index>` 指標；而 `resolve --v2`（實測 0.25.0）欄位叫 `registry.attributes`，且屬性在 signal 裡是**展開**的。寫下游工具時要確認你吃的是哪一個。
+
+---
+
+## Part 0.5 — 那 `definition/2` 本身又長什麼樣
+
+`--v2` 是 weaver **吐出來**的東西，你不用寫。`definition/2` 相反——它是**你手寫**的，而且只需要在檔案第一行加一句宣告：
+
+```yaml
+file_format: definition/2
+```
+
+有這一行，weaver 就換一套 parser。以下用同一個 `payment.process` span，看兩套語法怎麼寫同一件事（完整檔案在 `examples/telemetry/registry/payment-spans.yaml` 與 `examples/telemetry/registry-v2/payment.yaml`）。
+
+**v1——只有一個容器 `groups:`，什麼都塞進去，靠 `type:` 分辨：**
+
+```yaml
+groups:
+  - id: span.payment.process     # ← 要自己取 group id
+    type: span                   # ← 工具靠這個分派
+    span_kind: server            # ← 欄位叫 span_kind
+    attributes:
+      - id: payment.provider     # ← 屬性「定義」在這個 span 裡面
+        type: string
+        brief: "支付服務提供商"
+        requirement_level: required   # ← 定義和用法混在一起
+```
+
+`payment.provider` 的家在 `span.payment.process` 底下，純粹是歷史偶然——它剛好第一次出現在這裡。要在 metric 用它，只能 `ref:` 過去再 override。
+
+**v2——頂層依 signal 種類分櫃，`attributes:` 獨立：**
+
+```yaml
+file_format: definition/2        # ← 這一行就是開關
+
+attributes:                      # ← 純定義區，不准帶 requirement_level
+  - key: payment.provider        # ← 欄位叫 key，不是 id
+    type: string
+    brief: "支付服務提供商"
+
+attribute_groups:
+  - id: payment.attributes.common
+    visibility: internal         # ← v1 沒有：不會進 resolved registry
+    attributes:
+      - ref: payment.provider
+        requirement_level: required
+
+metrics:
+  - name: payment.duration
+    instrument: histogram
+    attributes:
+      - ref_group: payment.attributes.common   # ← 可疊多個、可跟 ref 混排
+
+spans:
+  - type: payment.process        # ← 不用取 id，weaver 自動合成 span.payment.process
+    kind: server                 # ← span_kind → kind
+    attributes:
+      - ref_group: common.resource
+      - ref: payment.provider
+        requirement_level: required            # ← 用法寫在這裡
+```
+
+三個關鍵的新東西，各自對應 Part 1 的一個痛點：
+
+| 新東西 | 解決什麼 |
+| --- | --- |
+| `attributes:` 頂層獨立 | 屬性有自己的家；**定義**（type/brief/examples）和**用法**（requirement_level）徹底分開 |
+| `ref_group:` | 寫在 `attributes:` 列表裡，可疊多個、可跟 `ref:` 混排 → 不用再造中間轉接頭 group |
+| `visibility: internal` | 共用 group 只留在 authoring 層，不洩漏成 registry 的公開內容 |
+
+v1 只有單一 `extends:` 繼承，所以「想共用」就一定要造 group，而造出來的 group 又一定會洩漏進 resolved schema——官方 `model/hardware/` 因此堆了 15 個不代表任何東西的轉接頭。Part 1 痛點三會把這筆帳算給你看。
+
+### 「Alpha，weaver 會警告」具體是什麼樣
+
+拿 `examples/telemetry/registry-v2/` 實跑：
+
+```bash
+weaver registry check -r registry-v2 --v2
+```
+
+```text
+⚠ File format `definition/2` is not yet stable: registry-v2/payment.yaml
+⚠ File format `definition/2` is not yet stable: registry-v2/cart.yaml
+⚠ File format `definition/2` is not yet stable: registry-v2/common.yaml
+```
+
+**每個 v2 檔案一個警告**，但 exit code 是 0，CI 會過。加上 `--future` 就翻臉：
+
+```bash
+weaver registry check -r registry-v2 --v2 --future
+```
+
+```text
+× File format `definition/2` is not yet stable: registry-v2/common.yaml
+× File format `definition/2` is not yet stable: registry-v2/payment.yaml
+```
+
+`×` 代表 CI 直接紅。這就是「別現在搬生產 registry」最具體的理由——不只是語法會變，而是你一旦想用 `--future` 提早抓**其他**未來規則，就會先被 v2 本身擋住。這個三層驗證模型 Part 3 會完整拆。
+
+接下來 Part 1 講**為什麼**要這樣改，Part 2 逐條列**改了哪些**。
 
 ---
 
@@ -1225,7 +1432,7 @@ Semantic Convention Tooling SIG 規劃的 2.0 要做三件事：
 
 ## 給現在的你的三行結論
 
-1. **輸入繼續用 v1，輸出一定加 `--v2`。**這兩件事無關，別搞混。
+1. **輸入繼續用 v1，輸出一定加 `--v2`。**這兩件事無關，別搞混（Part 0 有實跑對照）。加的同時去檢查你的 policy——它不會報錯，只會安靜地不再擋任何東西。
 2. **現在做一次遷移演練，別上生產。**v2 的 `visibility`、屬性定義/使用分離、`ref_group` 衝突檢查會逼你把 registry 的結構問題攤開——這些發現在 v1 也修得動。
 3. **`# yaml-language-server:` 那行今天就加。**這是唯一一個零成本、立即有回報的動作。
 
