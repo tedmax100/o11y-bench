@@ -1,6 +1,6 @@
 # 官方 Demo 3.0 把 Weaver 搬進了生產：拆解 opentelemetry-demo 的 telemetry-schema
 
-> 驗證環境：weaver 0.25.0、opentelemetry-demo `3684411`（2026-07-29）、demo 3.0.0（2026-07-24 發布）
+> 驗證環境：weaver 0.25.1（本機）、opentelemetry-demo `3684411`（2026-07-29）、demo 3.0.0（2026-07-24 發布）
 > 本文所有指令都在本機實跑過，輸出直接貼在文中。
 
 2026 年 7 月 24 日，opentelemetry-demo 發了 3.0.0，官方部落格的標題直接叫 [_We Broke the Demo_](https://opentelemetry.io/blog/2026/we-broke-the-demo/)。

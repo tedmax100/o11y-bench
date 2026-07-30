@@ -1,6 +1,6 @@
 # semconv `definition/2`：為什麼要有 v2、它改了什麼、我現在該不該搬
 
-> 驗證環境：weaver 0.25.0、semantic-conventions `96da7e1`（2026-07-29）
+> 驗證環境：weaver 0.25.1、semantic-conventions `c6cda02`（2026-07-30）
 > 本文所有 YAML 都實際跑過 `weaver registry check --v2`，結果附在文中。
 
 如果你照著「從零開始」那篇把官方 semantic-conventions clone 下來跑過 `check`，一定會看到滿螢幕這行：
@@ -845,7 +845,11 @@ grep -rl "file_format: definition/2" model/ | cut -d/ -f2 | sort | uniq -c | sor
 
 `hardware` 和 `messaging` 正好是重複最嚴重、最需要 `*_refinements` 的兩個 domain（Part 1 已經拆過 hardware）。他們是挑痛點最大的先做，不是逐檔掃過去。
 
-**而且 v1 / v2 檔案可以在同一個 registry 裡共存。**`model/hardware/` 18 個檔案裡有 16 個是 v2，剩下兩個還是 v1：
+### v1 / v2 可以在同一個 registry 裡共存，而且引用是雙向的
+
+這一節是整篇最實用的部分，因為它決定了你的遷移能不能分批做。
+
+`model/hardware/` 18 個檔案裡有 16 個是 v2，剩下兩個還是 v1：
 
 ```bash
 for f in model/hardware/*.yaml; do
@@ -856,7 +860,78 @@ done
 # v2 …其餘 16 個
 ```
 
-`registry.yaml`（屬性定義）留在 v1，metric 定義先搬 v2，兩邊 `ref:` 互通、`check` 一次過。**這代表遷移可以逐檔進行，不用一次搬完整個 registry**——對你自己的 registry 是好消息。
+整包 250 個檔案混著 v1 和 v2，`check` 一次過：
+
+```bash
+weaver registry check -r model --v2
+# exit 0（只有 24 個 "not yet stable" 警告）
+```
+
+**能這樣混的原因是 `file_format` 是「每個檔案自己的 parser 宣告」，不是 registry 層級的設定。**weaver 的流程是「逐檔用各自的語法 parse → 全部攤平成同一個內部模型 → 才開始解 `ref:` / `extends:` / `ref_group:`」。到解引用那一步，某個定義原本寫在 v1 還是 v2 檔案裡，這個資訊已經不存在了。
+
+#### 方向一：v2 檔 `ref:` v1 檔定義的屬性
+
+`hw.fan.speed` 定義在 v2 的 `fan-metrics.yaml`，但它 `ref:` 的四個屬性全部定義在 v1 的 `registry.yaml`：
+
+```bash
+grep -n "hw.sensor_location" model/hardware/registry.yaml
+# 213:      - id: hw.sensor_location        ← v1 語法的 id:
+```
+
+resolve 出來，`type` / `examples` 全部從 v1 檔案帶過來，一個欄位都沒掉：
+
+```text
+--- resolved hw.fan.speed（定義在 v2 檔）---
+  hw.id               type=string  req=required     examples=['win32battery_battery_testsysa33_1']
+  hw.name             type=string  req=recommended  examples=['eth0']
+  hw.parent           type=string  req=recommended  examples=['dellStorage_perc_0']
+  hw.sensor_location  type=string  req=recommended  examples=['cpu0', 'ps1', 'INLET', …]
+```
+
+#### 方向二：v1 檔 `extends:` v2 檔定義的 group——而且穿過 `internal` 邊界
+
+反方向也通，這個比較意外。`model/hardware/common.yaml` 是 **v2**，它定義的 group 標了 `internal`：
+
+```yaml
+# yaml-language-server: $schema=…/weaver/v0.25.1/schemas/semconv.schema.v2.json
+file_format: definition/2
+attribute_groups:
+  - id: hardware.attributes.common
+    visibility: internal          # ← internal
+    attributes:
+      - ref: hw.id
+        requirement_level: required
+      # …
+```
+
+而 `model/hardware/host-metrics.yaml` 是 **v1**，它用 v1 的 `extends:` 去指這個 v2 group：
+
+```yaml
+groups:
+  - id: metric.hw.host.power
+    type: metric
+    extends: hardware.attributes.common      # ← v1 語法指向 v2 檔的 internal group
+```
+
+resolve 出來完全正常，而那個 group 依然不進 resolved registry：
+
+```text
+--- hw.host.power（定義在 v1 檔）---
+  hw.id      req=required
+  hw.name    req=recommended
+  hw.parent  req=recommended
+
+resolved attribute_groups 總數: 0
+裡面有 hardware.attributes.common 嗎: False
+```
+
+**兩件事同時成立**：v1 的 `extends:` 吃得下 v2 定義的 group，而 `visibility: internal` 仍然生效。所以 `internal` 的邊界是**「registry 的對外輸出」，不是「registry 內檔案之間」**——同一個 registry 裡誰都能引用它，跨 registry 才擋。這一點官方文件沒有寫，是 resolve 出來才確認的。
+
+#### 對你的遷移的意義
+
+**粒度是「檔案」，而且不用照拓樸順序搬。**你不必先把被依賴的定義檔搬到 v2 才能搬使用端——上游正是反過來做的：`registry.yaml`（27 個屬性定義、被所有人依賴）到今天還是 v1，上面 16 個使用端全搬了 v2。
+
+理由也很合理：`registry.yaml` 只有屬性定義，搬到 v2 的唯一改動是 `id:` → `key:` 加拿掉 `requirement_level`，**收益接近零**；使用端搬過去能換到 `metric_refinements` 和 `visibility`，收益很大。**挑收益大的先搬就好，被依賴的那層可以永遠留在 v1。**
 
 ### weaver 的態度：三層驗證的中間層
 
@@ -876,14 +951,26 @@ weaver registry check -r model --v2 --future
 
 ### 沒有自動遷移工具
 
-`weaver registry --help` 裡沒有 `migrate` 之類的指令（0.25.0 的 subcommand 是 check / generate / resolve / search / stats / update-markdown / json-schema / diff / emit / live-check / mcp / infer / package）。**遷移是純手工的。**這也是官方只搬了 24 個檔案的現實原因之一。
+`weaver registry --help` 裡沒有 `migrate` 之類的指令（0.25.1 的 subcommand 是 check / generate / resolve / search / stats / update-markdown / json-schema / diff / emit / live-check / mcp / infer / package）。**遷移是純手工的。**這也是官方只搬了 24 個檔案的現實原因之一。
+
+> 順帶一個 0.25.1 實測到的變化：`resolve` 和 `search` 在 `--help` 裡都標了 **DEPRECATED**。`resolve` 建議改用 `generate` 或 `package`，`search` 則直接寫「not compatible with V2 schema」。本文為了看 resolved 結果還是用 `resolve`（它現在仍可用），但如果你要寫進 CI，用 `package` 比較保險。
 
 ### 結論
 
 - **不要**現在把生產 registry 搬到 `definition/2`。格式會變，而且你的 CI 一加 `--future` 就紅。
 - **要**繼續用 v1 語法輸入 + `--v2` 輸出。這是上游 policy 和 template package 的前提。
 - **值得**現在做一次遷移演練，因為 v2 會逼你把 registry 的結構問題暴露出來（下面就有一個真實例子）。
-- **一定要**加上第一行的 `# yaml-language-server:` schema 註解，v1 v2 都適用，IDE 補全和即時驗證差很多。
+- **一定要**加上第一行的 `# yaml-language-server:` schema 註解，v1 v2 都適用，IDE 補全和即時驗證差很多。連上游都還沒做滿——24 個 v2 檔案裡只有 16 個有這行（hardware 全加了、messaging 7 個和 faas 1 個都沒加）：
+
+  ```bash
+  for f in $(grep -rl "file_format: definition/2" model/); do
+    grep -q "yaml-language-server" $f || echo "缺: $f"
+  done
+  # 缺: model/faas/spans.yaml
+  # 缺: model/messaging/{spans,kafka,rabbitmq,rocketmq,aws,gcp,azure}.yaml
+  ```
+
+  對照 Part 4「遷移踩到的五個坑」——其中兩個（`visibility` 必填、span 要 `type:`）的錯誤訊息都是難讀的 `oneOf` 報錯，加了這行 IDE 會直接在該行標紅。messaging 那 7 個檔案就是在沒有這層保護的情況下手工搬的。
 
 ---
 
@@ -913,7 +1000,7 @@ weaver registry check -r model --v2 --future
 `common.yaml`（屬性 + entity + 公開屬性組）：
 
 ```yaml
-# yaml-language-server: $schema=https://raw.githubusercontent.com/open-telemetry/weaver/v0.25.0/schemas/semconv.schema.v2.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/open-telemetry/weaver/v0.25.1/schemas/semconv.schema.v2.json
 file_format: definition/2
 
 attributes:
@@ -976,7 +1063,7 @@ attribute_groups:
 `payment.yaml`（三種訊號 + 一個 internal group）：
 
 ```yaml
-# yaml-language-server: $schema=https://raw.githubusercontent.com/open-telemetry/weaver/v0.25.0/schemas/semconv.schema.v2.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/open-telemetry/weaver/v0.25.1/schemas/semconv.schema.v2.json
 file_format: definition/2
 
 attributes:
