@@ -356,7 +356,7 @@ flowchart LR
 
 最下面那個框才是重點。這隻 agent 從頭到尾**沒有任何一個環節，會去問「你這個數字是從哪一次查詢的哪一行算出來的」**。模型講了什麼，就直接變成回答。
 
-這也是為什麼今天的評分器要有 `grounded` 那條檢查——它至少能對 trace id 做到這件事（引用的 id 必須在工具輸出裡出現過）。數字比 trace id 難驗證得多，那是 Day21 判官守門跟 Day28 決策路徑可回放要處理的東西。
+這也是為什麼今天的評分器要有 `grounded` 那條檢查——它至少能對 trace id 做到這件事（引用的 id 必須在工具輸出裡出現過）。數字比 trace id 難驗證得多：Day21 會用 LLM-as-a-judge 來處理這種沒辦法寫成正規表示式的判斷，但同時也會證明**判官自己也要被機械檢查擋一道**（不能用「再問一次 LLM 你覺得對嗎」來驗證判官）；Day28 則是讓 agent 的每一步決策變成可回放的 span，這樣「這個數字從哪來」才有地方可查。
 
 ```mermaid
 flowchart LR
@@ -485,7 +485,7 @@ error="failed to create cni conf monitor for default: failed to create fsnotify 
 | 今天看到的 | 哪一天回來處理 |
 |---|---|
 | 一個不存在的 label 讓四次查詢全空 | **Day7** discover-before-query：把探索變成走不掉的路徑 |
-| 空結果 → 編一個數字 | **Day21** 判官守門、**Day28** 決策路徑可回放 |
+| 空結果 → 編一個數字 | **Day21** LLM-as-a-judge 與判官自己的守門機制、**Day28** 決策路徑可回放 |
 | 預算用完就開始編 | **Day6** 截斷策略；防護留到 **Day26** |
 | 大小寫、label vs metadata 沒人講清楚 | **Day8-9** schema 是團隊共識，不是觀察結果 |
 | 「有時候會 discover，有時候不會」 | **Day7** 把它變成保證，**Day20** 寫成回歸 fixture |
