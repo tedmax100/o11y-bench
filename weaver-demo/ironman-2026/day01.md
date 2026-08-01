@@ -64,28 +64,48 @@ Severity is on the `level` field, with values `INFO`, `WARN` and `ERROR`.
 ./ironman-2026/day01/scripts/up.sh
 ```
 
+整組東西攤開來是四個角色，分在兩邊——**被調查的系統**在 cluster 裡，**調查的人跟打分的人**在 host 上：
+
 ```mermaid
 flowchart TB
-    subgraph host["host"]
-        AG["baseline agent<br/>(3 tools, budget 4)"]
-        BENCH["bench runner<br/>9 tasks + grader"]
+    subgraph host["host（你的機器）"]
+        RB["bench/run_bench.py<br/>讀 tasks.yaml、逐題執行、印分數表"]
+        GR["bench/grade.py<br/>現算真值 + 四種檢查"]
+        AG["agent/baseline_agent.py<br/>ReAct 迴圈、3 個工具、budget 4"]
+        PR["agent/prompt.md<br/>寫死的 schema 知識<br/>（故意是錯的）"]
+        RP["report.json<br/>每一句查詢 + 每一條檢查"]
     end
-    subgraph k3d["k3d cluster: aiops-day01"]
-        subgraph pod["pod o11y-stack"]
+
+    subgraph cluster["k3d cluster: aiops-day01（ns o11y）"]
+        subgraph pod["pod o11y-stack（單一容器）"]
+            GEN["telemetry generator<br/>開機時生成 24h 歷史"]
             PROM["Prometheus :9090"]
             LOKI["Loki :3100"]
             TEMPO["Tempo :3200"]
-            GEN["telemetry generator<br/>(開機時生成 24h 歷史)"]
         end
+        SVC["Service (NodePort)<br/>30090 / 30100 / 30200"]
     end
-    BENCH --> AG
-    AG -->|NodePort| PROM
-    AG -->|NodePort| LOKI
-    AG -->|NodePort| TEMPO
+
+    RB -->|"1 resolve_truth"| GR
+    GR -->|"2 真值查詢"| SVC
+    RB -->|"3 investigate(題目)"| AG
+    PR -.->|"system prompt"| AG
+    AG -->|"4 查詢"| SVC
+    AG -->|"5 RunTrace<br/>(答案 + 讀過的工具輸出)"| RB
+    RB -->|"6 grade"| GR
+    GR --> RP
+
+    SVC --- PROM
+    SVC --- LOKI
+    SVC --- TEMPO
     GEN -.-> PROM
     GEN -.-> LOKI
     GEN -.-> TEMPO
 ```
+
+這條 host / cluster 的分界線是刻意畫的。**agent 走的是任何人從外面都連得到的原生 HTTP API，它完全不知道自己在跟 Kubernetes 講話**——沒有 in-cluster 的捷徑、沒有我偷偷餵給它的 service account、沒有一份只有它拿得到的 schema 檔。今天量到的分數因此不會被「我幫 agent 開了後門」污染，而它也沒有藉口說它看到的是別的世界：**評分器打的是同一組端點、同一份資料。**
+
+至於 stack 為什麼是一個 pod 而不是四個——它是**被觀察的對象**，不是這系列要教的東西。拆成四個 Deployment 只會多四份設定，而 agent 下的每一句查詢一個字都不會變。Collector 的部署形態怎麼影響資料完整性，是 Day10 的題目，那天才值得拆開。
 
 九個問題，三種訊號各三題，都是真實排查會問的東西：「過去六小時哪個後端的 5xx 佔比最高」、「retry 噪音跟真的失敗哪個比較大聲」、「給我一條失敗的 `POST /api/orders` trace」。
 
@@ -118,6 +138,39 @@ flowchart TB
 `grounded` 這條特別說一下：它把 agent 回答裡出現的每一個 16 進位 trace id 撈出來，去比對它這一輪讀過的所有工具輸出。**只要有一個對不上，就是編的。** 這是唯一能自動抓出「聽起來很專業但整段是虛構」的檢查。
 
 真值也不寫死。每一題的真值是**評分當下拿一句正規查詢去打同一套 stack 現算出來的**——遙測每次開 cluster 都重新生成，寫死的期望值幾分鐘後就是錯的，而一個會給錯答案的評分器比沒有評分器更糟。這句話今天稍晚會用我自己的血來證明。
+
+把這兩件事跟前面那張元件圖疊起來，一題從頭到尾是這樣走的：
+
+```mermaid
+sequenceDiagram
+    participant R as run_bench
+    participant G as grade
+    participant S as o11y stack
+    participant A as baseline agent
+    participant M as LLM
+
+    R->>G: resolve_truth(task)
+    G->>S: truth.query（instant query）
+    S-->>G: 2.97 / "payment-service"
+    Note over G: 真值現算，不寫死
+
+    R->>A: investigate(題目)
+    loop 最多 4 次
+        A->>M: messages + tool schemas
+        M-->>A: tool_call(promql=...)
+        A->>S: GET /api/v1/query
+        S-->>A: {"status":"success","result":[]}
+        Note over A: 空結果也是 success，<br/>沒有任何訊號說「你問錯了」
+    end
+    A->>M: 預算用完，不給工具，逼它結論
+    M-->>A: 最終回答
+    A-->>R: RunTrace(答案 + 讀過的工具輸出)
+
+    R->>G: grade(答案, 工具紀錄, 真值)
+    G-->>R: 1.0 / 0.5 / 0.0 + 逐條檢查
+```
+
+這張圖有兩個位置，等一下每一種失敗都會回來踩：迴圈裡那句 `"status":"success"` 配一個空陣列——**系統從頭到尾沒有任何訊號告訴 agent「你問錯了」**；以及最後回傳的 `RunTrace` 同時帶著「它說了什麼」跟「它看過什麼」——沒有後者，`grounded` 這條檢查根本寫不出來。
 
 判分只有三檔：全過 1.0，只有「形狀對」的檢查過（有查、有講對服務，但數字或 grounding 錯）0.5，其他 0。**那個 0.5 就是今天最想給讀者看的東西：一份讀起來很專業、但數字是錯的報告。**
 
