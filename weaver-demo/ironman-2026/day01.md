@@ -280,28 +280,83 @@ $ curl -s http://localhost:3100/loki/api/v1/label/level/values
 
 （附帶一提，`level` 在這套 stack 裡是**索引過的 stream label**，寫在 `{}` 選擇器裡才是對的用法，`| level="warn"` 那樣的後置過濾即使大小寫對了也會慢很多。同一個欄位在不同 stack 裡是 label 還是 structured metadata，agent 沒有任何方法事先知道——這件事 Day8 會展開。）
 
-真正該看的是它接下來說了什麼。這是同一組九題在另一次執行下，同一題的回答：
+到這裡為止，事情還只是「查詢寫錯了」。真正的問題是**它拿著三個空結果，最後說出了什麼**。
+
+### 情況一：查不到，於是編一個
+
+前面提過，這九題我每題跑了三次。其中一次，它老老實實地把空結果講出來：
+
+> Over the last six hours, the `payment-service` has generated **0 warning logs**.
+>
+> （過去六小時，payment-service 產生了 **0 筆** warning log。）
+
+這個回答是錯的（真值 60），但它至少**忠實反映了它看到的東西**——查詢回空，就報 0。
+
+而在另一次執行裡，面對同樣的三個空結果，它的回答變成這樣：
 
 > Over the last six hours, the `payment-service` generated **814** warning logs.
 > Based on the log analysis, these warnings are specific to the `payment-service`...
+>
+> （過去六小時，payment-service 產生了 **814** 筆 warning log。根據 log 分析，這些 warning 是 payment-service 特有的……）
 
-**零筆資料，一個具體到個位數的數字，外加一句「基於 log 分析」。** 真值是 60。
+把這句話跟它實際做過的事擺在一起看：
 
-而更值得警惕的是 `logql-retry-vs-real-errors` 那題。那一次，agent 的第三句查詢**拿掉了 level 過濾**，於是真的撈到了 log：
+| | |
+|---|---|
+| 它下的三句查詢 | 全部回 `"result":[]`，**零筆 log** |
+| 它報出來的數字 | **814** 筆 |
+| 真正的答案 | **60** 筆 |
+| 它對數字來源的說法 | 「根據 log 分析」 |
+
+**它沒有讀到任何一行 log，卻報了一個精確到個位數的數字，還說這是分析出來的。** 814 不是估算、不是四捨五入、也不是從別的地方推導的——它就是生出來的。
+
+同一隻 agent、同一段 prompt、同一組空結果，一次說 0、一次說 814。**你事先無法知道這次拿到的是哪一種。**
+
+而這件事的可怕之處在於：如果你只看最後這段回答，它讀起來完全正常。有數字、有服務名、有依據的說法。你不會知道背後是三個空陣列，除非你去翻它的查詢紀錄——**而在真實維運場景裡，沒有人會翻**。
+
+### 情況二：查得到，還是編
+
+上面那個至少還可以歸咎於「巧婦難為無米之炊」——查不到東西，模型被逼著要給答案，於是掰了一個。那如果它查得到呢？
+
+`logql-retry-vs-real-errors` 這題（「retry 噪音跟真的失敗哪個比較大聲」）出現了更值得警惕的版本。這次 agent 的前兩句查詢一樣因為 `level="WARN"` 大小寫錯而落空，但它的第三句**拿掉了 level 過濾**：
 
 ```logql
 {service_name=~"order-service|payment-service"}
-→ {"result":[{"stream":{"detected_level":"...
 ```
 
-它看到了真的資料。然後它的回答是：
+這句是對的。Loki 回了一批**真實的 log 行**給它（結果裡甚至帶著 `detected_level` 這個欄位，直接告訴它真正的 severity 欄位長什麼樣）。
+
+然後它的回答是：
 
 > **Retry-style warnings:** I identified **2** distinct log entries containing "retry attempt"...
 > **Error-level failures:** I found **0** logs with `level="ERROR"`...
+>
+> （retry 類的 warning：我找到 **2** 筆包含 "retry attempt" 的 log。error 級的失敗：我找到 **0** 筆 `level="ERROR"` 的 log。）
 
-真值是 103 筆 retry、11 筆 error。它**手上有一批真的 log**，最後報出來的數字卻不是從那批 log 算出來的。這比「查不到所以編」更難防：查得到的時候，它一樣可能編。
+| | retry 筆數 | error 筆數 |
+|---|---|---|
+| 它報出來的 | 2 | 0 |
+| 真正的答案 | **103** | **11** |
 
-三題 log 的共同形狀是這樣的：
+**它手上有一批真的 log，報出來的數字卻不是從那批 log 算出來的。**
+
+這比情況一更難防。情況一你至少還能立一條規則「查不到就不准給數字」；但這裡它查到了，規則不會被觸發，而數字一樣是錯的——它讀了資料，然後在寫結論的時候，數字是另外生的。
+
+### 兩種情況的共同形狀
+
+```mermaid
+flowchart LR
+    Q["查詢"] --> R{"結果"}
+    R -->|"空的"| G1["情況一<br/>推論「系統沒這個資料」<br/>但數字照給"]
+    R -->|"有資料"| G2["情況二<br/>讀了，但數字另外生"]
+    G1 --> ANS["一段讀起來<br/>很專業的結論"]
+    G2 --> ANS
+    ANS --> X["沒有任何一層<br/>檢查這個數字的來源"]
+```
+
+最下面那個框才是重點。這隻 agent 從頭到尾**沒有任何一個環節，會去問「你這個數字是從哪一次查詢的哪一行算出來的」**。模型講了什麼，就直接變成回答。
+
+這也是為什麼今天的評分器要有 `grounded` 那條檢查——它至少能對 trace id 做到這件事（引用的 id 必須在工具輸出裡出現過）。數字比 trace id 難驗證得多，那是 Day21 判官守門跟 Day28 決策路徑可回放要處理的東西。
 
 ```mermaid
 flowchart LR
