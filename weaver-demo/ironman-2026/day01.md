@@ -44,7 +44,11 @@ Every signal carries `service_name`, `git_version`, `git_repo` and
 Severity is on the `level` field, with values `INFO`, `WARN` and `ERROR`.
 ```
 
-這段話**在我原本那套 demo-services 上完全正確**。它是我一年前為了讓 agent 少走冤枉路，親手整理進 prompt 的——當時的效果很好，agent 不用先探索就能直接下對查詢，省了好幾輪 tool call。
+這段話不是隨便寫的，**它在我當初開發這隻 agent 的那套環境上，每一個字都正確**。
+
+那套環境是我自己維護的一組示範服務——五個服務、一套 Prometheus / Loki / Tempo，跑在我的筆電上。我一年前坐下來，把那套環境的 label 慣例、severity 值域、選擇器該用哪個欄位，一條一條整理成上面這段話塞進 prompt。效果好得不得了：agent 不用先探索就能直接下對查詢，一個問題省下好幾輪 tool call，回答又快又準。
+
+**當時我覺得這是一次成功的 prompt engineering。** 現在回頭看，這段話是今天九題裡至少五題失敗的直接原因。
 
 **二，它每題只有 4 次 tool call 的硬預算。** 用完會走進一個叫 `force_answer` 的節點：不給它任何工具，只給一句「你的預算用完了，用你已經收集到的資料回答」。
 
@@ -52,7 +56,7 @@ Severity is on the `level` field, with values `INFO`, `WARN` and `ERROR`.
 
 ## 換一套系統，同一隻 agent
 
-今天要把它丟進去的，不是它熟悉的那套 demo-services，而是另一套獨立的可觀測性 stack：一樣有 `webapp` / `api-gateway` / `order-service` / `user-service` / `payment-service` 五個服務，一樣有 Prometheus、Loki、Tempo，一樣有真實的錯誤流量。
+今天要把它丟進去的，不是它從小長大的那套環境，而是另一套獨立的可觀測性 stack。兩邊乍看幾乎一樣：一樣有 `webapp` / `api-gateway` / `order-service` / `user-service` / `payment-service` 五個服務，一樣是 Prometheus / Loki / Tempo，一樣有真實的錯誤流量，連服務名稱都對得上。
 
 **唯一的差別是：它是別人建的。**
 
