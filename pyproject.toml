@@ -17,6 +17,9 @@ dependencies = [
     "pyyaml>=6.0",
 ]
 
+[project.optional-dependencies]
+agento11y = ["agento11y>=0.12.0"]
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",
@@ -84,6 +87,8 @@ files = [
     "reporting/run_report.py",
     "reporting/summary.py",
     "o11y_bench/cli.py",
+    "o11y_bench/agento11y_publish.py",
+    "o11y_bench/agento11y_suite.py",
     "o11y_bench/config.py",
     "o11y_bench/harbor.py",
     "o11y_bench/resume.py",
@@ -94,6 +99,7 @@ files = [
 
 [[tool.mypy.overrides]]
 module = [
+    "agento11y",
     "promql_parser",
     "harbor.*",
 ]

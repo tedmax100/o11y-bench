@@ -1,7 +1,8 @@
 # /// script
 # dependencies = [
 #   "litellm==1.83.10",
-#   "mcp>=1.9.0",
+#   # Match mcp version with harbor to avoid API breakage
+#   "mcp<2.0.0",
 # ]
 # ///
 """o11y-bench agent runner — executes inside the Harbor container.

@@ -21,6 +21,7 @@ from reporting.report_paths import (
     run_report_output_path,
 )
 
+from .agento11y_publish import Agento11yLivePublisher, Agento11yPublishResult
 from .config import (
     PROVIDERS,
     ROOT,
@@ -55,6 +56,7 @@ class JobResult:
     missing_trials: int = 0
     harbor_exit_code: int | None = None
     report_path: Path | None = None
+    agento11y_result: Agento11yPublishResult | None = None
 
 
 def _print_job_summary(result: JobResult) -> None:
@@ -74,8 +76,46 @@ def _print_job_summary(result: JobResult) -> None:
 
     if result.report_path:
         message = f"{message} | report: {result.report_path}"
+    if result.agento11y_result:
+        message = f"{message} | Agent Observability: {result.agento11y_result.url}"
 
     print(f"{result.job_name}: {message}")
+
+
+def _make_agento11y_publisher(spec: JobSpec, job_dir: Path) -> Agento11yLivePublisher:
+    agent_name = os.getenv("AGENTO11Y_AGENT_NAME", "").strip()
+    if not agent_name:
+        agent_name = spec.agent or spec.agent_import_path.split(":", 1)[0].rsplit(".", 1)[-1]
+    agent_version = os.getenv("AGENTO11Y_AGENT_VERSION", "").strip() or "unknown"
+    return Agento11yLivePublisher(
+        job_dir,
+        spec.tasks_dir,
+        model=spec.model,
+        agent_name=agent_name,
+        agent_version=agent_version,
+        planned_trial_count=len(_selected_task_names(spec)) * spec.n_attempts,
+    )
+
+
+def _run_harbor_with_agento11y(
+    command: list[str],
+    *,
+    publisher: Agento11yLivePublisher | None,
+) -> tuple[int, Agento11yPublishResult | None]:
+    if publisher is None:
+        return run_harbor(command, forward_signals=False), None
+
+    publisher.start()
+    exit_code = 1
+    error = ""
+    try:
+        exit_code = run_harbor(command, forward_signals=False)
+    except BaseException as exc:
+        error = str(exc)
+        raise
+    finally:
+        result = publisher.finish(succeeded=exit_code == 0 and not error, error=error)
+    return exit_code, result
 
 
 def _selected_task_names(spec: JobSpec) -> list[str]:
@@ -490,10 +530,19 @@ def execute_regrade(target_dir: Path, *, tasks_dir: Path, quiet: bool = False) -
         suite_report.write_report(target_dir, tasks_dir=tasks_dir, quiet=quiet)
 
 
-def execute_job(spec: JobSpec, *, dry_run: bool = False, quiet: bool = False) -> JobResult:
+def execute_job(
+    spec: JobSpec,
+    *,
+    dry_run: bool = False,
+    quiet: bool = False,
+    agento11y_publish: bool = False,
+) -> JobResult:
     """Single-pass: plan, repair, run harbor, finalize."""
     task_checksums = compute_task_checksums(spec.tasks_dir)
     job_dir = spec.jobs_dir / spec.job_name
+    publisher = (
+        _make_agento11y_publisher(spec, job_dir) if agento11y_publish and not dry_run else None
+    )
     scenario_time_iso = resolve_scenario_time()
     os.environ["O11Y_SCENARIO_TIME_ISO"] = scenario_time_iso
     task_names = _selected_task_names(spec)
@@ -513,7 +562,9 @@ def execute_job(spec: JobSpec, *, dry_run: bool = False, quiet: bool = False) ->
             if quiet:
                 _print_job_summary(result)
             return result
-        fresh_harbor_exit_code = run_harbor(build_command(spec, quiet=quiet), forward_signals=False)
+        fresh_harbor_exit_code, fresh_publish_result = _run_harbor_with_agento11y(
+            build_command(spec, quiet=quiet), publisher=publisher
+        )
         report_path = finalize_job_dir(job_dir, spec.tasks_dir, task_checksums)
         result = JobResult(
             "fresh",
@@ -522,6 +573,7 @@ def execute_job(spec: JobSpec, *, dry_run: bool = False, quiet: bool = False) ->
             missing_trials=missing,
             harbor_exit_code=fresh_harbor_exit_code,
             report_path=report_path,
+            agento11y_result=fresh_publish_result,
         )
         if quiet:
             _print_job_summary(result)
@@ -554,7 +606,8 @@ def execute_job(spec: JobSpec, *, dry_run: bool = False, quiet: bool = False) ->
         return result
 
     if not needs_repair and not needs_harbor:
-        result = JobResult("up_to_date", spec.job_name)
+        existing_publish_result = publisher.publish_existing() if publisher is not None else None
+        result = JobResult("up_to_date", spec.job_name, agento11y_result=existing_publish_result)
         if quiet:
             _print_job_summary(result)
         return result
@@ -566,15 +619,18 @@ def execute_job(spec: JobSpec, *, dry_run: bool = False, quiet: bool = False) ->
                 print(f"  {note}")
 
     rerun_harbor_exit_code: int | None = None
+    publish_result: Agento11yPublishResult | None = None
     if needs_harbor:
-        rerun_harbor_exit_code = run_harbor(
+        rerun_harbor_exit_code, publish_result = _run_harbor_with_agento11y(
             build_resume_command(
                 str(job_dir / "config.json"),
                 quiet=quiet,
                 harbor_args=spec.harbor_args,
             ),
-            forward_signals=False,
+            publisher=publisher,
         )
+    elif publisher is not None:
+        publish_result = publisher.publish_existing()
 
     report_path = finalize_job_dir(job_dir, spec.tasks_dir, task_checksums)
     if report_path and not quiet:
@@ -589,6 +645,7 @@ def execute_job(spec: JobSpec, *, dry_run: bool = False, quiet: bool = False) ->
         missing_trials=missing,
         harbor_exit_code=rerun_harbor_exit_code,
         report_path=report_path,
+        agento11y_result=publish_result,
     )
     if quiet:
         _print_job_summary(result)
@@ -606,7 +663,12 @@ def _run_provider_queue(provider: str, suite_dir: Path, opts: SuiteOpts) -> list
         spec = build_suite_job_spec(suite_dir, provider, model, reasoning_effort, opts)
         if not opts.quiet:
             print(f"[{provider}] {model} ({reasoning_effort})")
-        result = execute_job(spec, dry_run=opts.dry_run, quiet=opts.quiet)
+        result = execute_job(
+            spec,
+            dry_run=opts.dry_run,
+            quiet=opts.quiet,
+            agento11y_publish=opts.agento11y_publish,
+        )
         results.append(result)
         if result.harbor_exit_code and result.harbor_exit_code != 0:
             print(f"[{provider}] Harbor failed (exit {result.harbor_exit_code})", file=sys.stderr)

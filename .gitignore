@@ -9,6 +9,8 @@ build/
 .venv/
 venv/
 .env
+.env.*
+!.env.sample
 .ruff_cache/
 .pytest_cache/
 .mypy_cache/

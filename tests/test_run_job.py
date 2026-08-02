@@ -53,6 +53,30 @@ def test_build_command_maps_task_filters_to_harbor_include_task_name() -> None:
     assert "dashboard-create-service-overview" in command
 
 
+def test_agento11y_publisher_receives_exact_planned_trial_count(monkeypatch, tmp_path) -> None:
+    captured: dict[str, object] = {}
+
+    class FakePublisher:
+        def __init__(self, job_dir, tasks_dir, **kwargs):
+            captured.update(job_dir=job_dir, tasks_dir=tasks_dir, **kwargs)
+
+    monkeypatch.setattr(run, "Agento11yLivePublisher", FakePublisher)
+    spec = config.JobSpec(
+        jobs_dir=tmp_path / "jobs",
+        job_name="test-job",
+        tasks_dir=tmp_path / "tasks",
+        model="anthropic/claude-sonnet-4-6",
+        reasoning_effort="off",
+        n_attempts=3,
+        n_concurrent=1,
+        task_names=("task-a", "task-b"),
+    )
+
+    run._make_agento11y_publisher(spec, spec.jobs_dir / spec.job_name)
+
+    assert captured["planned_trial_count"] == 6
+
+
 def test_build_resume_command_uses_saved_job_config() -> None:
     command = harbor.build_resume_command("/tmp/job/config.json")
 
@@ -407,6 +431,32 @@ def test_main_passes_unknown_job_args_through_to_harbor(monkeypatch) -> None:
 
     assert len(execute_calls) == 1
     assert execute_calls[0].harbor_args == ("--ak", "temperature=0")
+
+
+def test_main_enables_agento11y_publishing_only_with_explicit_flag(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "o11y_bench",
+            "job",
+            "--model",
+            "openai/gpt-5.4-nano",
+            "--dry-run",
+            "--agento11y-publish",
+        ],
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_execute_job(spec: config.JobSpec, **kwargs):
+        calls.append(kwargs)
+        return run.JobResult(status="dry_run", job_name=spec.job_name)
+
+    monkeypatch.setattr(cli, "execute_job", fake_execute_job)
+
+    cli.main()
+
+    assert calls == [{"dry_run": True, "quiet": False, "agento11y_publish": True}]
 
 
 def test_main_rejects_unknown_args_before_job_subcommand(monkeypatch) -> None:

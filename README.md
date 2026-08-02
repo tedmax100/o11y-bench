@@ -12,6 +12,7 @@
 - [Running A Single Job](#running-a-single-job)
 - [Running With Different Agents](#running-with-different-agents)
 - [Running Your Own Models](#running-your-own-models)
+- [Publishing Results To Agent Observability](#publishing-results-to-agent-observability)
 - [Submitting Results To The Leaderboard](#submitting-results-to-the-leaderboard)
 
 ---
@@ -331,6 +332,86 @@ The suite uses the default repo agent.
 If you want to benchmark a custom agent across the same matrix, run `bench:job` variants yourself
 or extend suite orchestration in code.
 
+## Publishing Results To Agent Observability
+
+Publishing is optional. Harbor remains the experiment runner and ATIF remains the native trajectory
+format. The integration sends experiment and trial lifecycle events, candidate generations,
+token usage and cost, verifier scores, and links to Harbor trajectory and grading artifacts.
+Each scored trial is sent as soon as Harbor finishes it rather than waiting for the full job.
+
+Install the published `agento11y` package through the optional project extra:
+
+```bash
+mise run agento11y:setup
+```
+
+### Configure Agent Observability
+
+Copy `.env.sample` to `.env` and fill in the `AGENTO11Y_*` values. Mise loads `.env` automatically.
+Do not commit that file.
+
+The integration uses two credential planes:
+
+| Variable | Purpose | Where to find it |
+|---|---|---|
+| `AGENTO11Y_ENDPOINT` | Experiment, trial, generation, and score ingest URL | Grafana Cloud **Agent Observability > Configuration > Connection** |
+| `AGENTO11Y_AUTH_TENANT_ID` | Grafana Cloud stack/tenant ID used for ingest basic auth | Agent Observability connection details |
+| `AGENTO11Y_AUTH_TOKEN` | Access policy token with `sigil:write` for ingest | Agent Observability connection details |
+| `AGENTO11Y_CONTROL_ENDPOINT` | Grafana app URL used to publish and retrieve test suites | `https://<stack>.grafana.net/a/grafana-agento11y-app` |
+| `AGENTO11Y_SERVICE_ACCOUNT_TOKEN` | Grafana service-account token used by test-suite APIs | Grafana **Administration > Users and access > Service accounts** |
+| `AGENTO11Y_INGEST_ACTOR` | Tenant or owner label attached to published experiments | Choose a stable identifier for the publishing team or user |
+
+`AGENTO11Y_SUITE_ID` selects the remote test-suite name and defaults to `o11y-bench`.
+`AGENTO11Y_AGENT_NAME`, `AGENTO11Y_AGENT_VERSION`, `AGENTO11Y_EXPERIMENT_NAME`,
+`AGENTO11Y_EXPERIMENT_DESCRIPTION`, and `AGENTO11Y_EXPERIMENT_TAGS` customize run labels.
+See [.env.sample](.env.sample) for the complete configuration.
+
+### Publish The Dataset
+
+The YAML files under `tasks-spec/` remain the only source of truth for the dataset. Publish them to
+Agent Observability before sending benchmark results:
+
+```bash
+mise run agento11y:sync-suite
+```
+
+The task validates every YAML spec, converts it to an Agent Observability test case, synchronizes the
+configured `AGENTO11Y_SUITE_ID`, removes remote cases no longer present in YAML, and publishes the
+new suite version. It prints progress and a direct test-suite link. Running it again with unchanged
+YAML is idempotent.
+
+Choose a different remote suite name without changing the source dataset:
+
+```bash
+AGENTO11Y_SUITE_ID=o11y-bench-my-team mise run agento11y:sync-suite
+```
+
+### Publish Benchmark Results
+
+Run a job through the Agent Observability mise task:
+
+```bash
+mise run agento11y:job -- \
+  --model anthropic/claude-haiku-4-5-20251001 \
+  --task-name promql-error-rate \
+  --n-attempts 3
+```
+
+This task installs the published SDK extra for the command and supplies the explicit
+`--agento11y-publish` opt-in flag. The equivalent direct command is:
+
+```bash
+uv run --extra agento11y python -m o11y_bench job \
+  --model anthropic/claude-haiku-4-5-20251001 \
+  --task-name promql-error-rate \
+  --n-attempts 3 \
+  --agento11y-publish
+```
+
+Use `mise run agento11y:suite -- <options>` to publish the standard multi-model suite. Publishing
+state is retained in each job directory, so resume and retry operations preserve stable experiment,
+trial, and attempt identities instead of duplicating completed results.
+
 ## Reports And Artifacts
 
 Single-job report:
@@ -413,6 +494,8 @@ the full submission structure, validation rules, and example layout.
 mise run setup:sync
 mise run setup:preflight
 mise run setup:smoke
+mise run agento11y:setup
+mise run agento11y:sync-suite
 mise run lint
 mise run format
 mise run typecheck
