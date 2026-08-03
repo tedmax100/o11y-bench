@@ -72,8 +72,77 @@
 - **抽象名詞第一次出現時，用反引號標起來。** 不只程式碼識別字——`組織脈絡`、`缺語意`、`上下文內容`、`無歧義` 都要。這是我用來標記「這個詞等一下還會再用」的視覺記號。
 - **抽象詞要立刻給一句大白話翻譯，可以用俗語或歌詞。** 「這是**語意**，格式檢查完全抓不到︰廣義點白話點講`無歧義`（你說的黑不是黑，你說的白是什麼白）。」——沒有這句，讀者記不住那個詞。
 - **情緒用口語標記，不要只用括號註記。** 「（包括我 QQ）」比「（包括去年的我）」更接近我的語氣。
-- **引用書或文章一定附連結**，並且指稱要完整（「ARE 這本書裡」，不要只寫「ARE 裡」——ARE 這個縮寫還有別的同名東西）。
+- **引用書或文章一定附連結**，並且指稱要完整（「ARE 這本書裡」，不要只寫「ARE 裡」，ARE 這個縮寫還有別的同名東西）。連結的完整規則見下面「引用與連結」。
 - **句子寧可鬆一點也不要為了精簡而變硬。** 我會把「沒有一件是把模型換大就會消失的」改成「沒有一件事情，是把模型換大換更強就會消失的」。念起來像在講話比字數少重要。
+
+## 引用與連結
+
+OTel 這個領域的好處是幾乎每件事都查得到官方出處，不管是 spec、repo 裡的 YAML，還是 OTel blog。所以這系列的標準是：**除了自己實測的東西，其他事實宣稱都要能點到來源。**
+
+### 什麼要給連結
+
+版本狀態、預設行為、規格條文、數字、上游進度，只要不是自己跑出來的，就附連結。自己實測的不用連結，但要標環境（「驗證環境：weaver 0.25.1、semantic-conventions `c6cda02`」），這條跟前面「所有輸出都要是真跑出來的」是同一件事的兩面。
+
+來源的優先順序：官方 repo 的原始碼最高，其次是官方 spec 文件，再來是 OTel blog，最後才是二手文章。講 semconv 的行為時，直接連到那個 YAML 或 JSON Schema，比連一篇轉述的部落格有力得多。
+
+### 連結要 pin 版本
+
+引官方 YAML 或程式碼時用 tag 或 commit，不要用 `main`。文章裡的行號和數字是寫的當下數出來的，`main` 三個月後就對不上，讀者點進去會發現你在講一個不存在的東西。
+
+- 用 `.../blob/v1.37.0/model/hardware/fan-metrics.yaml`
+- 不要用 `.../blob/main/model/hardware/fan-metrics.yaml`
+
+例外是你要講的正是「現在的 main 長怎樣」，那就寫明是哪一天看的。
+
+### 不要猜路徑
+
+聽起來很合理的路徑不代表存在。已經確認 404 的：
+
+- `open-telemetry/weaver/blob/main/docs/semconv-syntax.md`
+- `open-telemetry/semantic-conventions/blob/main/model/syntax.md`
+
+貼之前開一次，跟前面「貼路徑之前先 `ls` 確認一次」是同一個習慣，只是對象換成網址。
+
+### 常用來源（2026-08-03 實際開過）
+
+| 用途 | 連結 |
+| --- | --- |
+| semconv 規格總覽（含目前版本號） | https://opentelemetry.io/docs/specs/semconv/ |
+| semconv repo | https://github.com/open-telemetry/semantic-conventions |
+| semconv YAML 模型目錄 | https://github.com/open-telemetry/semantic-conventions/tree/main/model |
+| semconv 人類可讀文件 | https://github.com/open-telemetry/semantic-conventions/blob/main/docs/general/README.md |
+| semconv Releases（查版本與日期） | https://github.com/open-telemetry/semantic-conventions/releases |
+| semconv CHANGELOG | https://github.com/open-telemetry/semantic-conventions/blob/main/CHANGELOG.md |
+| Weaver repo | https://github.com/open-telemetry/weaver |
+| Weaver registry 語法 | https://github.com/open-telemetry/weaver/blob/main/docs/registry.md |
+| Weaver 驗證與 policy | https://github.com/open-telemetry/weaver/blob/main/docs/validate.md |
+| Weaver codegen | https://github.com/open-telemetry/weaver/blob/main/docs/codegen.md |
+| Weaver registry diff | https://github.com/open-telemetry/weaver/blob/main/docs/schema-changes.md |
+| `definition/2` 的權威定義 | https://github.com/open-telemetry/weaver/blob/main/schemas/semconv.schema.v2.json |
+| Weaver 官方介紹文（Observability by Design） | https://opentelemetry.io/blog/2025/otel-weaver/ |
+| Telemetry Schema 2.0 追蹤 issue | https://github.com/open-telemetry/opentelemetry-specification/issues/4427 |
+| OTel spec repo | https://github.com/open-telemetry/opentelemetry-specification |
+| OTel 官方 blog | https://opentelemetry.io/blog/ |
+| codegen 非規範指引 | https://opentelemetry.io/docs/specs/semconv/non-normative/code-generation/ |
+
+### 說清楚數字是哪來的
+
+這個比連結本身更有用。寫出一個數字時，順手交代它的來源等級，讀者才知道要多信它：
+
+> （這份清單是從 `semconv.schema.v2.json` 的 `properties` 直接讀出來的，不是猜的。）
+
+一篇至少用一次。尤其是文章的核心數字，例如「24 / 250 個檔案」「上游有 100 個屬性沒填 `role`」這種，讀者第一個反應就是「你怎麼知道的」，先把 `grep` 或 resolve 的指令貼出來會省掉很多懷疑。
+
+### 連結要融進句子
+
+行內連結，不要在文末堆一份參考資料清單。寫成「官方那篇 [Observability by Design](網址) 把『把遙測當成 public API』這個立場講得很清楚」，而不是「參考：[1] Observability by Design」。圖片同理，下一行補「圖片參考自 [來源](網址)」。
+
+### 交稿前掃一次
+
+```bash
+# 找出提到版本號、百分比、數量但整段沒有連結的地方
+grep -nE "[0-9]+\s*(個|%|次|行)" dayNN.md | grep -v "http"
+```
 
 ## 小結怎麼寫（Day4 定稿的範例）
 
