@@ -1,536 +1,389 @@
 ---
-title: "【Day11】機器可讀的意圖，與從 schema 生出型別安全的常數"
+title: "【Day11】機器可讀的意圖：讓 registry 說得出「為什麼」"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
 tags: [OpenTelemetry, Weaver, AIOps, 鐵人賽]
 ---
-# Day11：機器可讀的「意圖」，與從 schema 生出型別安全的常數
 
-Day10 讓 agent 讀懂了「這個欄位是什麼」。今天要處理它還讀不到的兩件事：**這個系統現在應該處於什麼狀態**，以及**這次變更打算改變什麼**。
+# Day11：機器可讀的意圖，讓 registry 說得出「為什麼」
 
-先講為什麼這是兩件事，而不是一件事的兩種說法。
+昨天把 registry 開成 MCP server 交給 agent，它現在查得到「`app.outcome` 有哪三種值」。但它查不到一件更重要的事：**這三種值裡，哪一種代表這個服務正常。**
 
-試著把時間拉回一次很典型的 on-call。凌晨兩點，一條 alert 響了：`payment service CPU > 80% for 5m`。你被叫起來，看了一眼 dashboard，CPU 確實是 85%，然後你花二十分鐘做的事情是**重建這條 alert 當初想保護的東西**——85% 是問題嗎？如果同時 latency 沒變、成功率沒變、佇列沒有積，那 85% 可能只是有人跑了一個批次作業。這條 alert 記錄了一個門檻，但它沒有記錄**為什麼是 80%**、**它在保護誰**、以及**不處理會怎樣**。
+這件事目前寫在哪裡？寫在一個 Grafana dashboard 的 panel 標題裡、寫在某條 alert rule 的 `expr` 裡、寫在值班手冊的第三段，還有寫在幾個資深工程師的腦子裡。這些地方沒有一個是 agent 讀得到的，也沒有一個會在有人改壞的時候發出聲音。
 
-那些資訊當初是存在的。設定這條 alert 的人心裡有一個完整的因果鏈：CPU 高 → 處理變慢 → 付款超時 → 使用者付不了錢。但寫進系統的只有鏈條最上游那個技術指標，中間那三段都留在他腦子裡，而他兩年前就離職了。
+程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day11/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day11)：
 
-**這就是「意圖」這個概念要解決的問題：規則被保存了下來，意圖沒有。** 而在 AIOps 的語境下這件事會變得更嚴重，因為一個 agent 拿到的東西比人更少——人至少能問隔壁同事、能猜、能從歷史工單裡拼湊；agent 只有你餵給它的東西。你給它一條 `CPU > 80%`，它能做的推理就只有「CPU 高於 80%」這件事本身。
-
-今天要做的就是把那三段補回來，而且**寫成 pipeline 跟 agent 可以直接消費的形式**，不是寫成 wiki 上一段給人看的說明。文章分兩半：前半是意圖怎麼寫、怎麼驗證；後半用 `weaver registry generate` 收口——因為意圖要能被驗證，前提是它引用的欄位名跟值域來自同一份 registry，而 template engine 正是讓 registry 直接變成程式碼的機制。
-
-程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`day16/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/day16)：三份意圖 YAML（兩份正確、兩份故意寫壞）、一支把意圖編譯成 PromQL 與 alert rule 的腳本、一組 Jinja template 跟它生出來的程式碼。registry 疊在 Day9 的 `base-v2` 之上，環境是 weaver `0.24.1`（後半有一段是 `0.25.0` 的新行為，會標明）。
-
-## 對照組：規則、門檻、意圖
-
-先把三個很容易混在一起的東西分開。同一件事的三種寫法：
-
-```yaml
-# ① 規則（rule）——只有條件跟動作
-- alert: HighCPU
-  expr: rate(process_cpu_seconds_total[5m]) > 0.8
-  for: 5m
+```
+ironman-2026/day11/
+├── registry/          ← 兩個 metric，attribute 上掛了 annotations
+├── intent/            ← 三份意圖，其中一份是故意寫壞的
+├── compile_intent.py  ← 拿 registry 驗證意圖，再編譯成 alert rule
+├── templates/python/  ← codegen 的樣板
+└── generated/         ← 生成物，而且要 commit 進版控
 ```
 
-```yaml
-# ② 門檻加上一點註解——好一些，但註解是給人看的
-- alert: HighCPU
-  expr: rate(process_cpu_seconds_total[5m]) > 0.8
-  for: 5m
-  annotations:
-    summary: "CPU 偏高，可能影響付款"      # 「可能」是什麼意思？影響到什麼程度算要處理？
-```
+指令一律假設從 repo 根目錄跑。驗證環境是 weaver 0.25.1。
 
-```yaml
-# ③ 意圖（intent）——先寫「什麼算正常」，門檻是它的產物
-- id: payment-success-rate
-  statement: "結帳付款的成功率不得低於 99.5%"
-  why: >-
-    低於這條線代表有一批使用者付不了錢而且會直接離站，是營收損失而不是效能問題。
-    99.5% 是從去年的 decline 分佈推回來的：正常的 declined 幾乎都是額度不足與風控攔截。
-  signal:
-    metric: payment.attempts
-    dimension: payment.outcome
-    good_values: [authorized, pending_review]
-  objective:
-    ratio_min: 0.995
-    window: 5m
-  on_violation:
-    severity: page
-    first_check: "看 declined 是不是集中在單一 payment.method 或單一金流商"
-```
+## 三層：規則、門檻加註解、意圖
 
-三者的差別不在資訊量，在**方向**。①②是從系統的內部狀態出發（CPU 是一個原因），③是從使用者的體驗出發（付不了錢是一個結果）。這個方向差異決定了它能不能被自動消費：
+先把「意圖」這個詞講清楚，不然它會聽起來很虛。拿同一件事的三種寫法對照：
 
-| | 規則 | 門檻＋註解 | 意圖 |
-|---|---|---|---|
-| 條件可執行 | ✅ | ✅ | ✅（編譯出來） |
-| 為什麼是這個數字 | ❌ | 散文 | 結構化欄位 |
-| 違反時第一步查什麼 | ❌ | ❌ | `first_check` |
-| agent 能不能判斷嚴重度 | 只能看門檻 | 要讀散文 | `severity` ＋ `why` |
-| **欄位名能不能被驗證** | ❌ | ❌ | ✅（指向 registry） |
+| 層次 | 寫出來長這樣 | 機器讀得到什麼 |
+| --- | --- | --- |
+| 規則 | `rate(orders_attempts_total{app_outcome="declined"}[5m]) > 0.005` | 一個門檻，跟一個沒有人記得為什麼是這個數字的 0.005 |
+| 門檻加註解 | 同上，`annotations: summary: "被拒率過高"` | 多一句給人看的描述 |
+| 意圖 | 「結帳成功率不得低於 99.5%，因為下單失敗直接等於營收損失」＋它指向 registry 裡哪個 metric、哪個 dimension、哪些值算成功 | 目標、理由、以及**這條規則跟 schema 的哪個部分綁在一起** |
 
-最後一列才是今天真正的重點，也是這系列前十五天的東西在這裡收成的地方。**一份意圖如果引用了不存在的 metric、不存在的維度、或不在 enum 值域裡的值，它就不是機器可讀的意圖，只是一段長得很像 YAML 的散文。** 而要能檢查這件事，你需要一份可信的 registry——Day1 到 Day9 做的正是這個。
+第三層跟前兩層的差別不是寫得比較詳細，是**它可以被驗證**。前兩層的 `expr` 裡那串 `app_outcome="declined"` 是一段字串，沒有任何東西保證 `declined` 這個值真的存在；第三層是一份指向 registry 的宣告，而 registry 知道 `app.outcome` 只有哪三個值。
 
-## 兩種意圖：穩定狀態與變更
-
-意圖有兩種，時間尺度完全不同。
-
-```mermaid
-flowchart TB
-    subgraph S["穩定狀態意圖（長期有效）"]
-      S1["什麼叫正常<br/>成功率 ≥ 99.5%<br/>p99 ≤ 2s"]
-    end
-    subgraph C["變更意圖（一次部署有效）"]
-      C1["這次打算改變什麼<br/>p99 應該下降"]
-      C2["這次打算<br/><b>不</b>改變什麼<br/>被拒率不該動"]
-    end
-
-    S1 -->|"編譯"| A["alert rule<br/>（持續監控）"]
-    C1 -->|"編譯"| V["部署後的驗證查詢<br/>（比對前後）"]
-    C2 -->|"編譯"| V
-    V -->|"超出容忍"| R["回滾"]
-    S1 -.->|"被打破也是回滾條件"| R
-```
-
-穩定狀態意圖就是上面那份，它會被編譯成 alert rule，長期生效。變更意圖是一次性的，長這樣：
-
-```yaml
-apiVersion: intent.o11y/v1
-kind: ChangeIntent
-metadata:
-  service: payment
-  registry: day16/registry
-  change_id: PAY-4471
-spec:
-  summary: "把金流商的 HTTP timeout 從 3s 降到 1s，逾時改為重試一次"
-  rationale: >-
-    金流商的 p99 是 600ms，3 秒的 timeout 實際上只是讓失敗變慢。
-    縮短之後失敗會更快被看見，重試一次能吃掉偶發的網路抖動。
-  expected:
-    - id: latency-drops
-      statement: "p99 應該下降"
-      signal: { metric: payment.duration, dimension: payment.outcome }
-      direction: down
-      window: 30m
-  unchanged:
-    - id: decline-rate-flat
-      statement: "被拒率不應該改變——如果變了，代表重試把不該重試的請求重試了"
-      signal: { metric: payment.attempts, dimension: payment.outcome, values: [declined] }
-      tolerance_ratio: 0.10
-      window: 30m
-  rollback_if:
-    - "decline-rate-flat 超出容忍範圍"
-    - "payment-success-rate 這條穩定狀態意圖被打破"
-```
-
-**`unchanged` 那一段是整份文件裡最有價值的東西**，而它也是實務上最少被寫下來的。`expected` 大家都會寫（不然為什麼要改），但「這次改動**不該**動到什麼」通常只存在於改的人的直覺裡。
-
-而對 agent 來說，這一段是它唯一能判斷「一個指標的變化是預期的還是意外的」的依據。想想線上出事那一刻的處境：p99 下降了、被拒率上升了。沒有變更意圖，agent 看到的是兩個同時發生的變化，它得自己猜哪個是好事；有了變更意圖，這兩個變化一個落在 `expected`、一個落在 `unchanged` 的容忍範圍之外，判斷立刻變成查表。**這就是 Day2 講的「缺語意」在變更這個維度上的具體形狀。**
-
-## 編譯：意圖要能長出可執行的東西，否則它只是文件
-
-「機器可讀」這件事很容易嘴巴上說，所以今天要有一個實際的消費者。`day16/compile_intent.py` 做兩件事：**拿 registry 驗證意圖**，然後**把它編譯成 PromQL 與 alert rule**。
+寫成圖是這樣：
 
 ```mermaid
 flowchart LR
-    R["registry<br/>day16/registry"] -->|"weaver registry generate<br/>（filter: .）"| J["generated/registry.json<br/>resolved schema"]
-    I["intent YAML"] --> CC["compile_intent.py"]
-    J --> CC
-    CC -->|"欄位名／值域對不上"| X["✗ exit 1"]
-    CC -->|"全部對得上"| P["alert rule ＋ PromQL"]
+    I["意圖<br/>結帳成功率 ≥ 99.5%<br/>why / first_check"] --> C["compile_intent.py"]
+    R["registry<br/>orders.attempts<br/>app.outcome 的值域"] --> C
+    C -->|"對不上"| E["✗ exit 1<br/>指出是哪個欄位錯"]
+    C -->|"對得上"| A["Prometheus alert rule<br/>expr ＋ why ＋ first_check"]
+    A --> H["值班的人 / agent<br/>看到告警就看到為什麼"]
 ```
 
-先看成功的路徑：
+## registry 這一端：`annotations`
 
-```
-$ python3 day16/compile_intent.py day16/intent/steady-state.yaml
-# SteadyStateIntent ← day16/intent/steady-state.yaml
-# registry: day16/registry（2 metrics、1 enums）
-
-# payment-success-rate: 結帳付款的成功率不得低於 99.5%
-- alert: payment-success-rate
-  expr: |
-    (sum(rate(payment_attempts_total{payment_outcome=~"authorized|pending_review"}[5m]))
-      / sum(rate(payment_attempts_total[5m]))) < 0.995
-  for: 5m
-  labels:
-    severity: page
-  annotations:
-    intent: "結帳付款的成功率不得低於 99.5%"
-    why: "低於這條線代表有一批使用者付不了錢而且會直接離站，是營收損失而不是效能問題。 99.5% 是從去年的 decline 分佈推回來的：正常的 declined 幾乎都是額度不足與風控攔截。"
-    first_check: "看 declined 是不是集中在單一 payment.method 或單一金流商"
-
-# payment-latency: 付款請求的 p99 不得超過 2 秒
-- alert: payment-latency
-  expr: |
-    (histogram_quantile(0.99, sum by (le) (rate(payment_duration_bucket[5m])))) > 2
-  for: 5m
-  labels:
-    severity: ticket
-  annotations:
-    intent: "付款請求的 p99 不得超過 2 秒"
-    why: "超過 2 秒之後結帳頁的放棄率會開始上升；這條線是產品端給的，不是從系統容量推的。"
-    first_check: "先確認是所有 outcome 都變慢，還是只有 declined 變慢"
-
-# ✔ 2 條意圖全部對得上 registry
-```
-
-注意產出物的形狀：**`why` 跟 `first_check` 被搬進了 alert 的 annotations。** 這是「意圖機器可讀」最直接的兌現——那個凌晨兩點被叫起來的人（或那個要做 RCA 的 agent）拿到的不再只是一個門檻，而是連著理由跟第一步該查什麼。這兩段文字從來不是新資訊，只是它們原本存在別人的腦子裡，現在存在一個會跟著 alert 一起送到現場的欄位裡。
-
-`payment_outcome=~"authorized|pending_review"` 這一段也值得看一眼：它是從意圖裡的 `good_values` 展開的，而那三個值的合法性是拿 enum members 檢查過的。**「成功」的定義沒有被寫在查詢裡，是從 registry 推出來的**——所以哪天 `pending_review` 這個狀態被拿掉，這條意圖會編譯失敗，而不是安靜地繼續算一個錯的比率。
-
-變更意圖編出來的是驗證查詢，不是 alert：
-
-```
-$ python3 day16/compile_intent.py day16/intent/change.yaml
-# ChangeIntent ← day16/intent/change.yaml
-
-# expected[latency-drops]: p99 應該下降
-# 期望方向：down（跟部署前的同一條查詢比）
-histogram_quantile(0.99, sum by (le) (rate(payment_duration_bucket[30m])))
-
-# unchanged[decline-rate-flat]: 被拒率不應該改變——如果變了，代表重試把不該重試的請求重試了
-# 容忍變化：±10%（超過就回滾）
-sum(rate(payment_attempts_total{payment_outcome=~"declined"}[30m]))
-  / sum(rate(payment_attempts_total[30m]))
-
-# ✔ 2 條意圖全部對得上 registry
-```
-
-一次部署要跑哪幾條查詢、每一條的判準是什麼、超過就回滾——這些原本寫在 runbook 裡（或根本沒寫），現在是從變更意圖直接算出來的。**部署流程不需要知道 payment 這個服務的任何事，它只需要知道怎麼跑這份意圖。**
-
-### 兩個故意寫壞的意圖
-
-編譯器最重要的功能不是編譯，是**拒絕**。兩份故意寫壞的意圖，各對應一種真的會發生的錯誤：
+weaver 的 group 跟 attribute 都吃一個 `annotations` 欄位，內容是自由的 key-value，它不參與任何驗證，但**會被完整帶進 resolved schema**。這就是掛意圖用的地方：
 
 ```yaml
+      - id: app.outcome
+        stability: development
+        brief: "這次業務操作的結果"
+        annotations:
+          intent:
+            role: outcome_dimension
+            good_values: [authorized]
+        type:
+          members:
+            - id: authorized
+              value: authorized
+              brief: "成功"
+              stability: development
+            - id: declined
+              value: declined
+              brief: "被業務規則拒絕"
+              stability: development
+            - id: gateway_error
+              value: gateway_error
+              brief: "下游回錯"
+              stability: development
+```
+
+跑 `weaver registry resolve --format json` 撈出來確認它真的還在：
+
+```console
+metric.orders.attempts | annotations: {"intent": {"owner": "orders-team", "slo": "checkout-success"}}
+   attr app.outcome {"intent": {"role": "outcome_dimension", "good_values": ["authorized"]}}
+```
+
+**這是 registry 第一次記錄「這個欄位在業務上扮演什麼角色」**，而不只是它叫什麼、是什麼型別。`role: outcome_dimension` 這種東西 weaver 完全不認得，它只負責原封不動地送過去，認得它的是下一段那支腳本。
+
+## 意圖這一端：兩種形狀
+
+穩定狀態意圖，講的是「這個服務正常的定義」：
+
+```yaml
+apiVersion: intent.o11y/v1
+kind: SteadyStateIntent
+metadata:
+  service: orders
+  owner: orders-team
+  registry: ironman-2026/day11/registry
+spec:
+  objectives:
+    - id: checkout-success-rate
+      statement: "結帳的成功率不得低於 99.5%"
+      why: >-
+        下單失敗直接等於營收損失，而且使用者不會重試第二次。
+        這條是這個服務唯一一條會叫醒人的規則。
+      first_check: >-
+        先看 app.outcome 的分佈：declined 變多是業務規則的問題（例如風控改了門檻），
+        gateway_error 變多是下游的問題，兩者的處理方式完全不同。
       signal:
-        metric: payment.attempts
-        dimension: payment.status        # ← registry 裡沒有這個維度
-        good_values: [AUTHORIZED]        # ← 大小寫不符
+        metric: orders.attempts
+        dimension: app.outcome
+        good_values: [authorized]
+      threshold:
+        ratio_min: 0.995
+        window: 30m
 ```
 
+`why` 跟 `first_check` 這兩個欄位是我覺得整份格式裡最有價值的東西，而它們的內容一個字都不是新的，全部是本來就存在、只是散落在別的地方的知識。差別在於現在它們跟那條規則綁在一起，會跟著告警一起送到值班的人面前。
+
+變更意圖是另一種形狀，講的是「這次部署打算改變什麼」：
+
+```yaml
+kind: ChangeIntent
+spec:
+  summary: "把下游支付的 timeout 從 3s 降到 1s，逾時改為重試一次"
+  expected:
+    - id: latency-drops
+      statement: "p99 應該下降"
+      direction: down
+  unchanged:
+    - id: declined-flat
+      statement: "被拒的比例不應該改變。如果變了，代表重試把不該重試的請求重試了"
+      signal:
+        metric: orders.attempts
+        dimension: app.outcome
+        values: [declined]
+      tolerance_ratio: 0.10
 ```
-$ python3 day16/compile_intent.py day16/intent/steady-state-broken.yaml
-✗ 意圖與 registry 不一致：objectives[payment-success-rate]:
-  'payment.attempts' 沒有 'payment.status' 這個維度（有的是：payment.method, payment.outcome）
+
+**`unchanged` 那段才是重點，而它是實務上最少人寫的一段。** 大家都會寫「這次改動要讓 p99 下降」，很少人會寫「這次改動不應該動到被拒率」。但對一個要判斷「這個指標的變化是預期的還是意外的」的 agent 來說，後者才是它唯一的依據。沒有這段，部署後所有的變化看起來都一樣可疑，或者一樣不可疑。
+
+> 這個格式是我自己編的，不是任何標準。重點不在欄位怎麼取名，在於「正常的定義」跟「這次改動的預期」這兩件事，值得從人的腦袋裡搬到一個檔案裡。
+
+## 編譯：意圖要能長出可執行的東西
+
+一份不會被執行的宣告，三個月後就會跟現實脫節。所以 `compile_intent.py` 做兩件事：先拿 registry 當型別檢查器驗一遍，再編譯成 Prometheus 的 rule。
+
+驗證那段是這樣：
+
+```python
+members = enum_values(dimension)
+for value in signal.get("good_values", []):
+    if value not in members:
+        errors.append(
+            f"{where}: `{dimension_name}` 沒有 `{value}` 這個值。"
+            f"合法的是：{', '.join(members)}"
+        )
+```
+
+跑正常那份：
+
+```console
+$ python3 ironman-2026/day11/compile_intent.py ironman-2026/day11/intent/steady-state.yaml
+# steady-state.yaml: SteadyStateIntent，2 條，registry = ironman-2026/day11/registry
+✔ 每一個 metric、dimension、值都在 registry 裡對得上
+
+groups:
+- name: orders
+  rules:
+  - alert: checkout-success-rate
+    expr: sum(rate(orders_attempts_total{app_outcome=~"authorized"}[30m])) / sum(rate(orders_attempts_total[30m]))
+      < 0.995
+    for: 30m
+    labels:
+      severity: page
+      owner: orders-team
+    annotations:
+      summary: 結帳的成功率不得低於 99.5%
+      why: 下單失敗直接等於營收損失，而且使用者不會重試第二次。 這條是這個服務唯一一條會叫醒人的規則。
+      first_check: 先看 app.outcome 的分佈：declined 變多是業務規則的問題（例如風控改了門檻）， gateway_error 變多是下游的問題，兩者的處理方式完全不同。
+```
+
+那個 `owner: orders-team` 不是我在意圖裡寫的，是從 registry 那個 metric 的 `annotations.intent.owner` 撈出來的。**誰擁有這個 metric 是 schema 的事實，不該在每一份意圖裡重寫一次。**
+
+第二條 objective 編出來的是 histogram 版本：
+
+```
+expr: histogram_quantile(0.99, sum by (le) (rate(orders_duration_bucket[30m]))) > 2
+```
+
+那個 `owner` 欄位在這條變成 `unknown`，因為我只在 `orders.attempts` 上掛了 annotation，沒有在 `orders.duration` 上掛。這種缺漏會直接顯示在產物上，比藏在腦子裡好。
+
+## 兩個故意寫壞的意圖
+
+這才是這支腳本真正的價值。我另外寫了一份 `steady-state-broken.yaml`，裡面兩個錯誤各對應 Day1 那隻 agent 犯過的一種：
+
+```console
+$ python3 ironman-2026/day11/compile_intent.py ironman-2026/day11/intent/steady-state-broken.yaml
+# steady-state-broken.yaml: SteadyStateIntent，2 條
+
+✗ 驗證失敗，2 個問題：
+
+  - objective `checkout-success-rate`: `app.outcome` 沒有 `AUTHORIZED` 這個值。
+    合法的是：authorized, declined, gateway_error
+  - objective `checkout-error-budget`: registry 裡沒有 metric `orders.errors`。
+    有的是：orders.attempts, orders.duration
+
 $ echo $?
 1
-
-$ python3 day16/compile_intent.py day16/intent/steady-state-broken2.yaml
-✗ 意圖與 registry 不一致：objectives[payment-success-rate]:
-  'payment.outcome' 沒有 'AUTHORIZED' 這個值（enum members：authorized, declined, pending_review）
-$ echo $?
-1
 ```
 
-這兩個錯誤不是我編出來湊範例的，它們是**我自己的 agent 實際犯過的兩種錯**。`payment.status` 是那種 LLM 覺得「這個欄位應該叫這個名字」而生成出來的合理猜測（Day10 第三個坑那個 `not found` 之後自己命名的行為）；`AUTHORIZED` 大寫則是我在真實 RCA 任務上踩過的坑——agent 用 `level="ERROR"` 去撈 Loki，而資料裡全都是 `INFO`，於是它得到零筆結果，然後往「系統正常」的方向推理下去。
+第一個錯是大小寫。這就是 Day1 那隻 agent 把 `warn` 猜成 `WARN`、讓 60 筆 log 變成 0 筆的同一個錯誤，只是這次犯錯的是人，而且是在 PR 階段被抓到，不是在凌晨三點。
 
-**這兩種錯的共通點是：如果沒有人檢查，它們都會產生一個語法完全正確、跑得起來、而且永遠回傳零筆的查詢。** 一條永遠不會觸發的 alert 跟一條不存在的 alert，在 dashboard 上長得一模一樣。今天這個編譯器把它們變成 exit 1，而它能做到這件事的唯一原因是**意圖裡的欄位名有一個權威來源可以對**。
+第二個錯更值得看：`orders.errors` 跟 `app.error_type` 這兩個名字聽起來都很合理，合理到 code review 的時候不會有人停下來問「我們真的有這個 metric 嗎」。**這正是 LLM 產生幻覺欄位時的長相，它們從來不會編一個離譜的名字。**
 
-這也是為什麼意圖檔案裡要有 `registry:` 那一行 metadata。它不是裝飾，是宣告「這份意圖的欄位名以哪一份 registry 為準」——而按照 Day9 的教訓，那份 registry 還會演進，所以這條線之後要接的是版本（`schema_url`），不只是路徑。
+兩條錯誤訊息都做到同一件事：不只說哪裡錯，還說合法的有哪些。這是 Day7 那條判準的具體實踐，被擋下來的人不用來問你就能自己修好。
 
 ## 後半：讓 registry 直接變成程式碼
 
-意圖能被驗證，靠的是 `day16/generated/registry.json`——那份 resolved schema 是 `weaver registry generate` 產出來的。既然 template engine 已經在手上，就順便把它最實用的用途做完：**把 registry 生成程式碼，讓服務端也不用手打字串。**
+意圖那半解決的是「規則指向的東西存不存在」。但服務程式碼裡還是到處在手打字串：
 
-一組 template 的設定長這樣（`day16/templates/python/weaver.yaml`）：
+```python
+span.set_attribute("app.outcome", "AUTHORIZED")   # 又是那個大小寫
+```
+
+weaver 的 codegen 可以把 registry 編成程式碼。樣板是 Jinja，資料來源是 resolved schema，中間用 JQ 表達式挑要哪些東西：
 
 ```yaml
-whitespace_control:
-  trim_blocks: true
-  lstrip_blocks: true
-
 templates:
-  # 1. 欄位名稱常數
-  - template: semconv_attrs.py.j2
-    filter: >
-      .groups | map(select(.type == "attribute_group"))
-      | map(.attributes[]) | unique_by(.name) | sort_by(.name)
-    application_mode: single
-    file_name: "semconv_attrs.py"
-
-  # 2. enum 值域：只有 type 是物件（有 members）的才算
   - template: semconv_enums.py.j2
     filter: >
-      .groups | map(select(.type == "attribute_group"))
-      | map(.attributes[]) | map(select(.type | type == "object"))
-      | unique_by(.name) | sort_by(.name)
+      .groups
+      | map(select(.type == "attribute_group"))
+      | map(.attributes[])
+      | map(select(.type | type == "object"))   # type 是物件的才是 enum
+      | unique_by(.name)
+      | sort_by(.name)
     application_mode: single
     file_name: "semconv_enums.py"
-
-  # 3. 整份 resolved registry 的 JSON：給 intent compiler 當事實來源
-  - template: registry.json.j2
-    filter: .
-    application_mode: single
-    file_name: "registry.json"
 ```
 
-`filter` 是 JQ，`application_mode: single` 表示整個 filter 的結果一次餵給 template（對照 `each`：每個元素跑一次、產生多個檔案）。第三筆那個 `filter: .` 加上一行 `{{ ctx | tojson(2) }}` 就把整份 resolved schema 倒出來——**這是我今天覺得最好用的一招**：不需要學 template 語法，就能拿到一份給任何語言消費的 JSON。
+跑一次：
 
-```
-$ weaver registry generate -r day16/registry --templates day16/templates \
-    python day16/generated --include-unreferenced=true
-✔ Generated file "day16/generated/semconv_enums.py"
-✔ Generated file "day16/generated/registry.json"
-✔ Generated file "day16/generated/semconv_attrs.py"
-✔ Artifacts generated successfully
+```console
+$ weaver registry generate -r ironman-2026/day11/registry \
+    --templates ironman-2026/day11/templates python ironman-2026/day11/generated
+✔ Generated file "ironman-2026/day11/generated/semconv_enums.py"
+✔ Generated file "ironman-2026/day11/generated/semconv_attrs.py"
 ```
 
-（`--include-unreferenced true` 又出現了。Day8 是 `stats` 的數字、Day10 是 MCP 查不到欄位，今天是**生成物會少掉繼承來的定義**——這個預設值到目前為止在三個不同的子命令上各咬了一次。另外注意寫法：weaver `0.25.0` 起這個空格分隔的形式**會直接報錯**，要寫成 `--include-unreferenced=true` 或裸的 `--include-unreferenced`，理由在 Day7 那段升級記錄裡。）
-
-### `when`：讓一筆 template 在條件不成立時整個不跑
-
-上面三筆 template 有一個不對稱的地方，跑一次就看得出來。拿同一組 template 去產 Day13 那份還沒治理好的 `shipping-v0`（它沒有任何 metric、也沒有 enum）：
-
-```
-$ weaver registry generate -r day17/services/shipping-v0/registry \
-    --templates day16/templates python /tmp/gen --include-unreferenced=true
-✔ Generated file "/tmp/gen/semconv_attrs.py"
-✔ Generated file "/tmp/gen/registry.json"
-```
-
-`semconv_enums.py` 沒產出來，因為第二筆的 filter 結果是空陣列。但 `registry.json` 產出來了——它的 filter 是 `.`，**永遠不可能是空的**。結果是一個沒有任何 metric 的 registry，也會生出一份要餵給意圖編譯器的事實來源檔，而那支編譯器只認得 metric。這種檔案不會報錯，它會安安靜靜地存在，然後在下游變成一個「編譯器說找不到 metric」的困惑。
-
-`0.25.0` 的 `when` 就是補這個洞的。它是一筆 template entry 的開關：
-
-```yaml
-  # 3. 整份 resolved registry 的 JSON：給 intent compiler 當事實來源
-  - template: registry.json.j2
-    filter: .
-    application_mode: single
-    file_name: "registry.json"
-    when: '[.groups[] | select(.type == "metric")] | length > 0'
-```
-
-同一組 template，兩份 registry 各跑一次：
-
-```
-$ weaver registry generate -r day16/registry ...        # 2 個 metric、2 個 enum
-✔ semconv_attrs.py
-✔ semconv_enums.py
-✔ registry.json
-
-$ weaver registry generate -r day17/.../shipping-v0/... # 0 個 metric、0 個 enum
-✔ semconv_attrs.py
-```
-
-**`when` 跟 `filter` 的差別是它求值的位置。** `filter` 跑在每一筆 entry 自己的資料上，決定「餵什麼進 template」；`when` 求值的對象是**整份 resolved registry 的根節點**，決定「這筆 entry 要不要跑」。實測確認了這一點：`when: '.type == "attribute_group"'` 恆為 false（根節點沒有 `type` 這個欄位），`when: '.groups | length > 0'` 恆為 true。語法是 JQ 跟 `filter` 一樣——寫成 JSONPath 的 `$.type` 會拿到 `Filter '...' failed: expected identifier`。
-
-### 但它有一個很典型的假綠燈
-
-把上面那份加了 `when` 的設定拿回去餵給 `0.24.1`：
-
-```
-$ weaver-0.24.1 registry generate -r day17/.../shipping-v0/... ...
-✔ Generated file "/tmp/gen/semconv_attrs.py"
-✔ Generated file "/tmp/gen/registry.json"     ← when 被無視
-✔ Artifacts generated successfully
-```
-
-**沒有警告、沒有 `unknown field`、exit 0。** 舊版不認得 `when`，於是把它當成不存在，那筆 entry 照跑。同一份 template 設定、同一份 registry，兩個版本產出不同的檔案集合，而且兩邊都宣稱成功。
-
-這一格值得停下來，因為它比前面那些坑多一個維度。Day5 的 `-r .`、Day9 的 `diff` 靜音，那些是**同一個版本裡**的安靜失效；這一個是**跨版本**的：CI 上釘的是 `0.25.0`、某個工程師本機還是 `0.24.1`，兩邊跑同一條指令會得到不同的生成物，而沒有任何一邊會說話。**「產出物不一致」這件事本身不會有人發現，要等到下游有人拿著一份不該存在的 `registry.json` 來問問題。**
-
-從平台角度，這條的結論很直接：**template 設定跟 weaver 版本是同一個工件的兩半，不能只釘一半。** Day7 那個 `WEAVER_VERSION` 釘在 CI 上是必要但不充分的——它擋住了 CI 上的漂移，擋不住本機的。真正的解法是讓本機跟 CI 用同一個來源取得 weaver（`.tool-versions`、devcontainer、或一支 wrapper script），而這件事的成本該由平台團隊吸收，不是寫在 onboarding 文件裡叫每個人自己裝對版本。
-
-生出來的常數檔：
+生出來的東西長這樣：
 
 ```python
 # Code generated by Weaver. DO NOT EDIT.
-"""registry 裡的 attribute 名稱常數。程式碼不再手打字串。"""
+"""enum attribute 的合法值域。手打字串的機會到這裡為止。"""
 
-# 處理這筆交易的金流商代號 —— DEPRECATED（obsoleted）
-PAYMENT_GATEWAY: str = "payment.gateway"
-# 支付交易識別碼 —— DEPRECATED（renamed → payment.transaction_id）
-PAYMENT_ID: str = "payment.id"
-# 支付方式
-PAYMENT_METHOD: str = "payment.method"
-# 支付的終態結果
-PAYMENT_OUTCOME: str = "payment.outcome"
-# 支付交易識別碼（改名後的正式欄位）
-PAYMENT_TRANSACTION_ID: str = "payment.transaction_id"
-
-ALL_ATTRIBUTES: frozenset[str] = frozenset({ ... })
-
-ATTRIBUTE_TYPES: dict[str, str] = {
-    "payment.gateway": "string",
-    "payment.id": "string",
-    "payment.method": "string",
-    "payment.outcome": "enum[authorized|declined|pending_review]",
-    "payment.transaction_id": "string",
-}
-
-DEPRECATED_ATTRIBUTES: dict[str, str] = {
-    "payment.gateway": "obsoleted",
-    "payment.id": "renamed → payment.transaction_id",
-}
-```
-
-還有 enum 檔，這個是今天後半的重點：
-
-```python
 from enum import StrEnum
 
 
-class PaymentOutcome(StrEnum):
-    """支付的終態結果"""
+class AppOutcome(StrEnum):
+    """這次業務操作的結果"""
 
-    AUTHORIZED = "authorized"    # 授權成功
-    DECLINED = "declined"    # 被拒絕
-    PENDING_REVIEW = "pending_review"    # 轉人工審核
+    AUTHORIZED = "authorized"    # 成功
+    DECLINED = "declined"    # 被業務規則拒絕
+    GATEWAY_ERROR = "gateway_error"    # 下游回錯
 ```
 
-### 這份 enum 的 registry 端，`0.25.0` 讓它短了一半
+於是那個大小寫的錯誤，現在會在建構的當下就爆掉：
 
-生出上面那個 `PaymentOutcome` 的定義，在 registry 裡長這樣：
+```console
+>>> AppOutcome("authorized")
+<AppOutcome.AUTHORIZED: 'authorized'>
 
-```yaml
-- id: payment.outcome
-  type:
-    members:
-      - id: authorized
-        value: authorized      # ← 跟上一行一模一樣
-        brief: "授權成功"
-        stability: development
-      - id: declined
-        value: declined        # ← 一模一樣
-        brief: "被拒絕"
-        stability: development
+>>> AppOutcome("AUTHORIZED")
+ValueError: 'AUTHORIZED' is not a valid AppOutcome
 ```
 
-每個 member 都要把同一個字串寫兩次。weaver `0.25.0` 讓 `value` 在沒寫的時候預設等於 `id`，所以那三行可以直接刪掉。實測刪掉之後 `registry resolve` 的輸出（除了路徑那幾行）跟原本 **byte-identical**，`value` 被自動補回來：
+**錯誤從「可以被檢查」變成「說不出來」。** 前面幾天做的事都是「寫錯了會被抓到」，這一步是「根本寫不出錯的東西」，這兩者在工程上差很多：前者需要有人記得跑檢查，後者不需要。
 
-```
-$ weaver registry resolve -r day14/base-v2 --format yaml | grep -A3 "id: authorized"
-      - id: authorized
-        value: authorized
-        brief: 授權成功
-        stability: development
-```
+## 意外收穫：生成物的 diff 補上了 Day9 那三個洞
 
-生成物當然也一個字都沒變——上面那份 `PaymentOutcome` 是同一份。**這是純粹的樣板消除，語意零改變。**
+Day9 量過一件很不舒服的事：`registry diff` 對型別改變、enum member 移除、`brief` 改寫這三種變更完全靜音，而那三種正好是最會痛的。
 
-值得多看一眼的是這個改動在舊版上的樣子。同一份刪掉 `value` 的 registry 餵給 `0.24.1`：
+今天做完 codegen 之後，我拿 Day9 那兩份 registry 各生成一次，然後 diff 生成物：
 
-```
-(Variant 9):
-- Value {"members":[{"brief":"ok","id":"success"}, ...]} is not of the
-  required type: 'string'.
-- Value {"members":[...]} does not match the required constant:
-  "template[boolean[]]".
-(Variant 3):
-- Missing required property: "value".
-- Missing required property: "value".
+```console
+$ weaver registry generate -r ironman-2026/day09/base-v1 --templates ... python /tmp/g1
+$ weaver registry generate -r ironman-2026/day09/base-v2 --templates ... python /tmp/g2
+$ diff -u /tmp/g1/semconv_attrs.py /tmp/g2/semconv_attrs.py
 ```
 
-exit 1，而真正的原因躲在一大片 JSON schema variant 的最後兩行。`0.25.0` 上同一份東西是 exit 0，唯一的輸出是一句指名道姓的提醒：
+```diff
+-# 使用者識別碼
++# 使用者的 email，登入用
+ BIZ_USER_ID: str = "biz.user.id"
 
-```
-⚠ Invalid attribute definition detected while resolving 'payment-events.yaml'
-│ (group_id='registry.demo', attribute_id='demo.outcome').
-│ Missing stability field on enum member authorized.
-```
+ ATTRIBUTE_TYPES: dict[str, str] = {
+-    "app.outcome": "enum[authorized|declined|gateway_error]",
++    "app.outcome": "enum[authorized|declined]",
+-    "biz.order.id": "string",
++    "biz.order.id": "int",
+ }
 
-**這兩段輸出的差距，就是這系列一直在講的那條平台分水嶺。** 一道 gate 擋下來之後，產品團隊能不能自己修好，決定了這套治理能不能規模化——前面那段 variant 爆炸的訊息，實際結果是對方跑來問平台團隊「這是什麼意思」，而平台團隊的維護成本就隨團隊數線性成長。後面那句不用問。**同一個工具、同一個錯誤、差一個版本，一個要人陪、一個不用。**
-
-回到 AIOps 那條線：Day5 講過 `members` 是 agent 唯一能事先知道「這個 label 只會有這幾種值」的來源。而寫 `members` 的成本每降一次，「乾脆寫成 `type: string` 算了」的誘因就少一分——**降低正確做法的成本，跟提高錯誤做法的成本，是同一件事的兩端，而前者不需要任何人去盯。**
-
-### 實際跑一次
-
-```
-$ cd day16/generated && python3 -c "
-from semconv_enums import PaymentOutcome
-from semconv_attrs import PAYMENT_OUTCOME, DEPRECATED_ATTRIBUTES, ALL_ATTRIBUTES
-print('constant:', PAYMENT_OUTCOME)
-print('legal:', [m.value for m in PaymentOutcome])
-print('ok:', PaymentOutcome('declined'))
-try:
-    PaymentOutcome('DECLINED')
-except ValueError as e:
-    print('raises:', e)
-print('payment.status in registry?', 'payment.status' in ALL_ATTRIBUTES)"
-
-constant: payment.outcome
-legal: ['authorized', 'declined', 'pending_review']
-ok: declined
-raises: 'DECLINED' is not a valid PaymentOutcome
-payment.status in registry? False
+ DEPRECATED_ATTRIBUTES: dict[str, str] = {
++    "biz.cart.id": "renamed → biz.basket.id",
+ }
 ```
 
-**`PaymentOutcome('DECLINED')` 直接 raise。** 這一行是今天兩半合起來的地方：Day10 那份 before 程式碼裡的 `outcome.upper()`，如果值域是從這個 enum 來的，那個 bug 在寫的當下就不可能發生——它不是被檢查出來，是**被結構排除掉**。同一個道理，`payment.status` 這種 agent 猜出來的欄位名，只要程式碼用的是常數而不是字串，它連 import 都過不了。
-
-這是「規則變成結構」跟「規則靠檢查」的差別，也是 Day9 那個三層驗證模型往前再走一步：**第一層是工具說不行、第三層是你的 policy 說不行，而生成物讓某些錯誤變成「說不出來」。**
-
-### 生成物的 diff，把 Day9 的靜音區補起來
-
-還有一個副作用，我做完才發現它其實是今天最實用的東西。
-
-Day9 花了一整篇證明 `weaver registry diff` 對三種最危險的變更是靜音的：型別改變、`brief` 改動、enum member 被拿掉。三份 registry 跑出來的 diff 報告都是空白。
-
-但如果 registry 被生成成程式碼，那些變更就會出現在**生成物的 diff** 裡。拿 Day9 那幾份 registry 各生成一次，然後 diff：
-
-```
-$ diff gen-base-v1/semconv_attrs.py gen-base-v3/semconv_attrs.py
-9c9
-< # 支付的終態結果
----
-> # 支付的終態結果（authorized/declined/pending_review）
-11c11
-< # 這筆交易重試了幾次
----
-> # 這筆交易重試了幾次（含首次嘗試）
-27c27
-<     "payment.retry_count": "int",
----
->     "payment.retry_count": "string",
+```diff
+ class AppOutcome(StrEnum):
+     AUTHORIZED = "authorized"    # 成功
+     DECLINED = "declined"    # 被業務規則拒絕
+-    GATEWAY_ERROR = "gateway_error"    # 下游回錯
 ```
 
+```mermaid
+flowchart TB
+    CH["v1 → v2 的變更"] --> D1{"registry diff<br/>看得到嗎？"}
+    D1 -->|"新增、更名"| OK["✅ 報告裡有"]
+    D1 -->|"型別、值域、語意"| SIL["❌ 靜音"]
+    SIL --> P["comparison_after_resolution policy<br/>要有人記得帶 --baseline-registry"]
+    SIL --> G["生成物的 diff<br/>本來就長在 PR 頁面上"]
+    G --> V["review 的人看得懂的形式<br/>enum 少一行、型別從 string 變 int"]
 ```
-$ diff gen-base-v1/semconv_enums.py gen-v4/semconv_enums.py
-11d10
-<     DECLINED = "declined"    # 被拒絕
+
+**三種靜音的變更，在生成物的 diff 上全部現形。** 型別、值域、語意，只要它們有出現在生成物裡，`git diff` 就會把它們攤在 PR 上，而且是用 review 的人看得懂的形式。
+
+這件事直接推出一個實務結論：**生成物要 commit 進版控。** 一般的直覺是「這東西反正每次都能重生，不要進 git」，但在這個場景裡，把它放進 git 才是重點，因為 diff 才是那個會說話的東西。生成物在這裡不只是產物，是一份**變更的顯影劑**。
+
+而它同時補上了另一個洞：Day9 那條 `comparison_after_resolution` policy 需要有人記得帶 `--baseline-registry` 去跑，生成物的 diff 不需要任何人記得任何事，它就長在 PR 頁面上。
+
+> 這裡有個小陷阱：diff 會不會顯示，完全取決於你的樣板有沒有把那個欄位印出來。`ATTRIBUTE_TYPES` 那個字典是我刻意加的，如果樣板只印名字常數，型別改變一樣是靜音的。**顯影劑只顯影它照得到的東西。**
+
+## 誰來寫這份意圖
+
+從平台工程的角度看，這一天的東西比前幾天更敏感，因為它要求產品團隊寫東西，而不只是照規範命名。
+
+**誰維護？** 意圖一定是產品團隊的，不能是平台團隊。「結帳成功率低於 99.5% 要叫醒人」這種判斷只有懂那個業務的人能下，平台團隊來寫就會變成一堆抄來抄去的 99.9%。平台團隊提供的是格式、編譯器，跟那條「你寫的東西必須指得到 registry 裡真的存在的欄位」的檢查。
+
+**成本落在誰身上？** 我算過這份 `steady-state.yaml`，一條 objective 大概八行，其中有實質內容的是 `statement`、`why`、`first_check` 三段散文，而那三段本來就寫在值班手冊裡。要學的新概念是「意圖要指向 registry 裡的欄位」這一件事。
+
+**擋下來的時候修得動嗎？** 前面那兩條錯誤訊息都附了合法值清單，這是我刻意花力氣做的部分。一條只說「validation failed」的訊息，會把每一次驗證失敗都變成一張給平台團隊的工單。
+
+**這條規則是強制、預設、還是建議？** 我的做法是：意圖檔案本身不強制每個服務都要有，但**一旦有了，它就必須編得過**。這是一條 paved road，走上來之後路很好走，但不走也不會被擋在門外。硬性要求每個服務都寫意圖，只會收到一堆為了通過檢查而複製貼上的 YAML。
+
+## 回到 AIOps：意圖是 agent 的判準
+
+最後接回主軸。今天做的兩件事，對 agent 的意義完全不同。
+
+codegen 那半跟 agent 沒什麼關係，它服務的是寫程式的人。但它間接影響 agent：**資料源頭的品質提高了，agent 讀到的東西才會一致。**
+
+意圖那半才是給 agent 的。Day1 那隻 agent 拿到「過去六小時的錯誤率是 2.98%」這個數字之後，它沒有任何依據判斷這個數字算不算異常。它可以講出這個數字、可以講出趨勢，但「這樣算不算壞掉」這個問題，它答不出來，因為那個判準從來沒有被寫在任何它讀得到的地方。
+
+意圖就是那個判準。有了它，agent 的推理鏈可以變成：查到成功率 99.2% → 讀到意圖說門檻是 99.5% → **這是一次違反，不是一個數字** → 讀到 `first_check` 說要先看 `app.outcome` 的分佈 → 下一步該查什麼不用它自己猜。
+
+```mermaid
+sequenceDiagram
+    participant A as agent
+    participant P as Prometheus
+    participant I as 意圖（編進 alert annotations）
+
+    P->>A: checkout-success-rate 觸發
+    A->>I: 讀 summary / why / first_check
+    I-->>A: 門檻 99.5%，先看 app.outcome 的分佈
+    A->>P: sum by (app_outcome) (rate(orders_attempts_total[30m]))
+    P-->>A: declined 78%，gateway_error 3%
+    A-->>A: 對照 why：declined 變多是業務規則的問題
+    Note over A: 「這是一次違反」而不是「這是一個數字」
 ```
 
-`int` → `string`、`brief` 的改動、`DECLINED` 這個 member 消失——**Day9 那三個 `diff` 一句話都不說的變更，全部出現在這裡。**
+放到值班的場景差別更明顯。凌晨三點，agent 說「訂單服務的成功率是 99.2%」，你得自己想這個數字正不正常；agent 說「訂單服務違反了 checkout-success-rate 這條意圖（門檻 99.5%），依照 first_check 我先看了 `app.outcome` 的分佈，declined 佔了 78%，看起來是業務規則的問題不是下游故障」，你可以直接開始處理。**兩句話背後的資料完全一樣，差別只在有沒有那份寫下來的判準。**
 
-原因很簡單：`diff` 比對的是「有哪些東西」，而生成物是「這些東西長什麼樣」的一份逐字投影。只要投影裡包含了那個屬性（我在 template 裡多加了 `ATTRIBUTE_TYPES` 那一段，就是為了讓型別進到投影裡），git 就會幫你 diff 它。
-
-所以這裡有一條很值得帶回團隊的實務結論：**把生成物 commit 進版控。** 不是因為它不能被重新生成，而是因為 commit 之後，registry 的任何實質變更都會變成一個 reviewer 看得見的 diff——包括工具自己的 `diff` 指令看不見的那些。Day9 那條 `comparison_after_resolution` policy 是「主動去抓」，這個是「被動也會露出來」，兩者互補：policy 能擋，生成物的 diff 能讓人**理解**。而且它連 `payment.retry_count` 這種欄位消失都會直接變成下游的 import 錯誤——一個沒有人能忽略的失敗。
-
-## 平台工程：意圖該由誰寫
-
-今天的東西比前幾天更容易做成一個沒有人用的框架，所以幾個所有權問題要先答清楚。
-
-**誰寫意圖。** 一定是產品團隊，不能是平台團隊。理由在那份意圖檔案本身：`why` 那一段（99.5% 是從去年的 decline 分佈推回來的）、`first_check` 那一段（先看 declined 有沒有集中在單一金流商）——這些是領域知識，平台團隊寫不出來，寫出來也一定是錯的。平台團隊該提供的是**格式、編譯器、跟一份範本**，然後閉嘴。這跟 Day9 那條線一致：影響只在自己團隊內的，交給團隊。
-
-**產品團隊要付多少成本。** 這一項今天答得比 Day10 差。Day10 那個 MCP 是零成本（`.mcp.json` 放進 repo 就結束），今天要團隊坐下來寫一份 YAML，而且要寫出 `why`——那是真正花時間的部分，也是最容易被寫成廢話的部分（「因為這很重要」）。所以務實的做法是**別要求一次寫完**：從已經存在的 alert 開始，一條一條反推它的意圖，寫不出 `why` 的那些，本身就是一個發現（那條 alert 可能該刪掉）。**把「補意圖」當成一次盤點，不是一次新的文件工程。**
-
-**強制、預設、還是建議。** 意圖不該是 merge gate，至少一開始不該。可以擋的是**格式**——編譯不過就不准 merge（就是上面那兩個 exit 1），這個判斷是確定性的、訊息也講得清楚該改什麼。至於「每個服務都必須有意圖檔案」，那是 Day13 那份新服務 checklist 的一欄，用 checklist 推，不要用 gate 擋。**擋一個「你還沒想清楚什麼算正常」的 PR，只會讓人隨便填一個數字進去。**
-
-**演進的責任。** 意圖引用 registry 的欄位名，所以 registry 一改版，意圖可能就失效了——而這次失效是**好的**那種：編譯器會 exit 1，明確指出哪一條意圖指向了不存在的東西。這正好補上 Day9 結尾那個缺口的一角：當時的問題是「base 改版之後，誰還在用舊欄位」沒有機制回答；`deprecated_usage.rego` 抓的是下游 registry，今天這個編譯器抓的是**下游的意圖**。兩者加起來，registry 的消費端就有兩條可以自動掃的路徑了。
-
-## 回到 AIOps：意圖是 agent 的判準，不是它的輸入
-
-最後把今天放回整條線。Day2 講 AIOps 九宮格的時候提過一個概念：agent 要能判斷，前提是它有一個「應該是什麼樣」的參照。今天做的就是那個參照，而它跟前面幾天的東西合起來，剛好構成 agent 做一次判斷需要的三種資料：
-
-| 資料 | 回答什麼問題 | 哪一天做的 |
-|---|---|---|
-| registry | 這個欄位是什麼、值域有哪些 | Day8–10 |
-| 拓撲 | 誰呼叫誰、影響會傳到哪 | Day14–15 |
-| **意圖** | **這樣算不算不正常、該不該叫人** | **今天** |
-
-三者缺一個，agent 的輸出就會退化成一種很好認的形狀：缺 registry 它會猜欄位名；缺拓撲它會把上游的症狀當成根因；**缺意圖它會描述現象但不敢下結論**——你會拿到一段「CPU 是 85%，latency 是 1.2 秒，成功率是 99.2%」的複述，而不是「這件事要叫人」。
-
-而今天這個編譯器還帶了一個我原本沒預期的性質：它讓意圖變成**可以被 eval 的東西**。既然一份意圖能編譯出「這個情境該不該告警」的確定性判準，那它就能當成 Day24 那個 eval harness 的 ground truth——不需要人工標註「這次算不算 incident」，意圖已經寫清楚了。這條線今天不展開，但它是後面 Series 2 講校準（calibration）時的起點。
+而這也是為什麼 `first_check` 那個欄位值得寫。它是資深工程師腦子裡「遇到這種狀況先看哪裡」的那份直覺，而那份直覺目前是這個系統裡最貴、也最沒有被記錄下來的東西。
 
 ## 今天沒做的事
 
-沒有把編譯出來的 alert rule 真的餵給 Prometheus。輸出的 YAML 是照 alerting rule 的格式產的，但沒有實際 `promtool check rules` 過、也沒有在跑著的 Prometheus 上驗證過它會不會觸發。這一步不難但需要真實的 metric 資料（那個 `payment_attempts_total` 目前在任何地方都不存在），所以留到 Series 2 把 demo stack 接上來的時候一起做。
+沒有把編譯出來的 alert rule 真的部署到 Prometheus 上。今天輸出到 stdout 就停了，接下來那一段（進 GitOps、跟現有的手寫 rule 併存、怎麼處理衝突）沒有做。
 
-沒有處理 histogram 的 bucket 邊界。`payment-latency` 那條意圖編出了 `histogram_quantile(0.99, ...)`，但這個查詢正不正確取決於 bucket 邊界有沒有涵蓋 2 秒這個門檻——我自己在這個 stack 上踩過一次很痛的坑：`*_duration_seconds` 記的是秒，卻用了預設的毫秒 bucket，於是 `histogram_quantile` 回傳一個恆定的假值，看起來完全正常。**一份意圖可以完全對得上 registry，編譯出來的查詢卻回傳一個假數字**——這是「schema 對了不等於資料對了」的又一個版本，而它會在 Series 2 講資料可信度時變成主題。
+沒有做「意圖跟現實對帳」。編譯器只驗證意圖指向的東西存不存在，不驗證那個 metric 現在有沒有資料。一條指向合法欄位、但那個 metric 三個月沒人送資料的意圖，今天完全驗得過。
 
-沒有做意圖檔案自己的 schema 驗證。`compile_intent.py` 檢查的是「欄位名對不對得上 registry」，但它假設 YAML 的結構是對的——少一個 `objective` 區塊就會直接 KeyError，錯誤訊息是 python 的堆疊而不是一句人看得懂的話。真要當成一個平台交付物，這裡需要一份 JSON Schema（或者，更符合這系列的精神：用 Rego 寫，跟 registry 的 policy 用同一套工具）。這件事沒做是因為它會讓文章的重點從「意圖是什麼」變成「YAML 驗證怎麼寫」，但它是把今天的東西推上生產前必補的一格。
+`ChangeIntent` 的 `expected` 那段只驗證了欄位，沒有編譯成查詢。「p99 應該下降」要編成什麼，需要一個部署前的基準值，那是另一個題目。
 
-沒有用 `weaver registry package`。它是官方用來發佈 resolved registry 的正式做法，但它要求 `--v2`（不加就直接告訴你 `Packaging is only supported for v2 registries`），而 v2 schema 會同時改變 template 跟 policy 看到的資料形狀——Day9 就把 `--v2` 列成沒做的事了，今天用 `filter: .` 自己倒一份 JSON 繞過去。這個繞法的代價是那份 JSON 是 v1 形狀、沒有版本資訊在裡面，也就是說 `compile_intent.py` 現在無法判斷自己讀的是哪一版 registry——Day10 那個 `provenance.source` 的問題，換一個地方又出現了一次。
+生成物只做了 Python。同一份 registry 要生 Go、TypeScript，樣板得各寫一份，而「多語言之間的生成結果一不一致」本身又是一個要處理的問題。
 
-明天：**可測試性**。到今天為止做出來的東西——四條 policy、一道 CI gate、一個 MCP server、一組 template、一支意圖編譯器——全部是程式碼，而沒有任何東西在測它們。而治理資產壞掉的方式不是報錯，是放行：所以要驗證的不是「它會不會通過」，是「它還會不會擋」。明天把前面散落的四個做法（不接 LLM 驗證 MCP、從真實 span 抽樣本、每條規則都要有一個本來就該紅的 fixture、先量一個基準）收斂成一支跑得動的回歸測試，也讓「agent 表現不好」這句話第一次能被歸因。
+## 小結
+
+今天寫的兩支東西看起來沒什麼關係，一個把散文編成告警，一個把 schema 編成程式碼。但它們做的其實是同一件事：**把只存在於人腦裡的東西，搬到一個機器讀得到、而且會在改壞的時候出聲的地方。**
+
+意外的收穫是那份生成物的 diff。我本來只是想讓程式碼別再手打字串，結果它順手補上了 Day9 那三個 `registry diff` 看不見的變更，而且補得比 policy 更自然，因為 review 的人本來就會看 diff，不需要有人記得多跑一個指令。
+
+明天要處理一個到現在為止一直被我閃過的問題：這一路做出來的東西，怎麼證明它們還在正常運作。
