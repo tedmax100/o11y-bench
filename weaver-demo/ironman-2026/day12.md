@@ -1,217 +1,203 @@
 ---
-title: "【Day12】可測試性：不用 LLM，也能驗證治理資產還有效"
+title: "【Day12】可測試性：不用 LLM，也能驗證治理資產還在擋人"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
-tags: [OpenTelemetry, Weaver, eval, 鐵人賽]
+tags: [OpenTelemetry, Weaver, CI, 鐵人賽]
 ---
-# Day12：可測試性——不用 LLM，也能驗證治理資產還有效
 
-前面十天做出了一堆東西：四條 Rego policy、一道 CI gate、一份分層 registry、一個 MCP server、一組 template、一支意圖編譯器。這些全部是**程式碼**，而它們共同的問題是：**沒有任何東西在測它們。**
+# Day12：不用 LLM，也能驗證治理資產還在擋人
 
-這件事在治理上比在一般開發上更危險，理由是這系列反覆撞到的那個家族的問題。回想一下清單：`-r .` 讀到 0 個 group 還給綠燈（Day5）、policy 只比對名字前綴（Day5）、`--diagnostic-stdout` 不加就沒有 annotation（Day7）、`--advice-policies` 是覆蓋不是疊加（Day7）、`diff` 對型別改變完全靜音（Day9）、`browse_namespace` 不標 deprecated（Day10）、我自己的 checklist 漏掉 `shippingStatus`（Day13 會講）。今天結尾還會再加一個，而那一個是我自己寫的斷言裡的。
+這十一天做出了一堆會擋人的東西：三條命名規則、一道 CI gate、live-check、分層的衝突檢查、breaking change 的比對規則、意圖編譯器。每一個都在寫出來的當天證明過自己有效。
 
-**這七件事的共同點是：壞掉的時候，症狀是「一切看起來很順利」。** 一份壞掉的 policy 不會報錯，它會給你綠燈。所以「跑一次看看有沒有過」這種驗證方式，對治理資產是無效的——**你要驗證的不是它會不會通過，是它還會不會擋。**
+但沒有任何一個東西，會在它**停止有效**的時候告訴我。
 
-而接上 agent 之後這件事又多一層。今天要處理的第二個問題是：**當 agent 表現不好的時候，你怎麼知道是 agent 的問題，還是你餵給它的東西本來就是錯的？**
+這不是假設。Day6 那個 package 打錯名字的坑就是這個形狀：`.rego` 檔還在、CI 還在跑、輸出還是綠燈，只是那條規則從來沒有被執行過。今天要做的事，就是讓這種情況不可能安靜地發生。
 
-程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`testability/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/testability)（一支 `regress.sh`，21 條斷言，跑完不到十秒、一次 LLM 呼叫都沒有）。
+程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day12/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day12)，主角是一支 [`regress.sh`](https://github.com/tedmax100/OTel_AIOps_Agent/blob/main/ironman-2026/day12/regress.sh)。指令一律假設從 repo 根目錄跑。
 
-## 四個做法，一個原則
+## 先把這十一天壞掉的方式列出來
 
-今天的內容不是新工具，是把前面十天散落的四個做法收斂成方法論。它們共用一個原則：**確定性的部分要先被測到滿，才有辦法歸因非確定性的部分。**
+寫測試之前得先知道要防什麼。我把前面每一天真的踩到的坑攤開來排，結果它們的形狀高度一致：
+
+| 哪一天 | 出了什麼事 | 當下看到的畫面 |
+| --- | --- | --- |
+| Day5 | `-r .` 路徑寫錯，讀到 0 個 group | `✔ No policy violation`，離開碼 0 |
+| Day5 | cardinality 規則只比對 `biz.` 前綴 | 綠燈，換個名字就繞過去了 |
+| Day6 | policy 的 package 名字打錯 | 綠燈，連 coverage 報告都空的 |
+| Day7 | 診斷預設走 stderr | CI 是紅的，但 PR 上一條 annotation 都沒有 |
+| Day7 | resolver 錯誤配 GitHub 格式 | 一個空的 `::group::`，紅得莫名其妙 |
+| Day7 | live-check 不管 `required` 有沒有送 | 綠燈 |
+| Day8 | 重複定義變成沒人引用的孤兒 | 綠燈 |
+| Day8 | `before_resolution` 的違規 | 摘要行印綠色勾勾，離開碼 1 |
+| Day9 | `diff` 對型別／值域／語意改變 | 什麼都不印，離開碼 0 |
+| Day10 | 分層 registry 查不到 base 的屬性 | 一句 `not found`，`isError` 是 false |
+
+十條裡有七條的症狀是**綠燈**。這就導出今天整篇的那句話：
+
+**你要驗證的不是「它會不會通過」，是「它還會不會擋」。**
+
+一般的測試直覺是「跑一遍，沒壞就好」。但這一整排東西壞掉的時候，跑一遍正好就是沒壞的樣子。所以斷言要反過來寫：拿一份**本來就該被擋下來**的東西餵給它，如果它放行了，那才是失敗。
+
+## 四個做法
+
+### 一、每條規則都要有一個「本來就該紅」的靶子
+
+這是最重要的一條。Day6 的漂移 registry、Day9 的 `base-v1` 對 `base-v2`、Day11 那份 `steady-state-broken.yaml`，這些檔案我當初都是為了寫文章才留著的，現在它們的正式身分是 fixture。
+
+```bash
+expect_exit 1 "day06 命名漂移擋得住" \
+  weaver registry check -r ironman-2026/day06/registry -p ironman-2026/day07/policies
+
+expect_exit 1 "day11 意圖裡的大小寫錯誤擋得住" \
+  python3 ironman-2026/day11/compile_intent.py ironman-2026/day11/intent/steady-state-broken.yaml
+```
+
+> 我現在接任何新的檢查機制，第一件事都是先讓它失敗一次給我看。這個習慣是被 `-r .` 那次教會的，那次我對著一個綠燈滿意了大概二十分鐘。
+
+### 二、先量一個基準
+
+Day5 那個探針的正式版本。每份 registry 在被檢查之前，先確認它真的被讀進來了：
+
+```bash
+expect_groups ironman-2026/day08/team-orders   "day08 team-orders（含分層）"
+```
+
+底層就是 `weaver registry stats` 撈出 group 數，小於 1 就直接判失敗。這條斷言便宜到幾乎沒有成本，但它擋掉的是「整套檢查其實什麼都沒在檢查」這種最難發現的狀況。
+
+### 三、不接 LLM 也要能驗證
+
+Day10 那支 `mcp_probe.py` 在這裡變成一條斷言。MCP server 是 stdio 上的 JSON-RPC，打它不需要模型：
+
+```bash
+expect_output "not found in registry" "MCP 對分層 registry 查不到 base 的屬性" \
+  python3 ironman-2026/day12/mcp_layered_probe.py
+```
+
+這條的意義在**歸因**。哪天 agent 給了一個爛答案，我可以先跑這支腳本：如果它綠的，那 registry 這一側是好的，問題在 agent；如果它紅的，那不用去調 prompt，先去修 YAML。**把「要靠 LLM 才能觀察」的東西變成「不用 LLM 就能斷言」的東西，是這個系列到目前為止投報率最高的一個習慣。**
+
+### 四、連「已知的缺口」也寫成斷言
+
+這條是這次才想清楚的。`registry diff` 對三種變更靜音、live-check 對被移除的 enum 值只給 `information`、MCP 在分層下查不到 base 的屬性，這些今天都是既定行為。我把它們也寫進腳本，斷言的內容是「它現在就是不會擋」：
+
+```bash
+echo "== 已知的缺口：這些現在就是不會擋，寫下來才不會誤以為有人在守"
+expect_exit 0 "registry diff 對型別／值域／語意改變靜音" \
+  weaver registry diff -r ironman-2026/day09/base-v2 --baseline-registry ironman-2026/day09/base-v1
+```
+
+這樣做有兩個好處。一是這份清單變成一個看得到的東西，不會有人半年後接手時以為那裡有防護。二是**上游哪天修好了，這幾條會變紅**，而那個紅燈的意思是好消息：可以把自己補的那層拆掉了。
+
+一個會因為「事情變好了」而失敗的測試聽起來很怪，但它記錄的是一個當下的事實，而事實會變。與其讓它默默過期，不如讓它出聲。
+
+## 跑起來長什麼樣
+
+```console
+$ bash ironman-2026/day12/regress.sh
+
+== 探針：這些檢查真的讀得到東西
+  ✓ day06 drift registry                     2 groups
+  ✓ day08 team-orders（含分層）              3 groups
+  ...
+
+== 該紅的還會紅嗎（這一段才是重點）
+  ✓ day06 命名漂移擋得住                     exit=1
+  ✓ day08 同名兩份定義擋得住                 exit=1
+  ✓ day08 孤兒在 include-unreferenced 下現形  exit=1
+  ✓ day09 三種靜音變更被 policy 抓到          exit=1
+  ✓ day09 --future 把警告變成錯誤             exit=1
+  ✓ day11 意圖裡的大小寫錯誤擋得住            exit=1
+  ✓ day07 live-check 抓得到型別對不上         exit=1
+  ✓ day07 live-check 抓得到還在送的舊欄位     exit=1
+
+== 訊息本身也要能讓人自己修好
+  ✓ day06 講得出是哪一條規則        找到「duplicate_concept」
+  ✓ day08 講得出跟誰衝突            找到「registry.acme.biz」
+  ✓ day11 講得出合法值有哪些        找到「合法的是：authorized, declined, g」
+  ✓ day07 產得出 GitHub annotation       找到「::error file=」
+
+...
+
+────────────────────────────────────────────────────────────
+29 條斷言：29 通過，0 失敗
+其中預期離開碼非 0 的有 8 條，預期 0 的有 10 條
+```
+
+29 條斷言，跑一次 36 秒，零次 LLM 呼叫。那 36 秒裡有大半是分層的那幾份 registry 要去解析官方 semconv，純本地的那些是毫秒級的。
+
+那段「訊息本身也要能讓人自己修好」是我後來才加的。Day7 講過，一道 gate 說不清楚，維護成本會隨團隊數線性成長。既然這件事這麼重要，那它就該被測試，而不是靠我每次改 policy 的時候記得順手看一眼輸出。**「錯誤訊息夠不夠好」是一個可以被斷言的東西，只要你願意把那個關鍵字寫進測試裡。**
+
+## 這支腳本自己會不會壞
+
+一條永遠不會失敗的斷言等於沒有斷言。所以最後我做了一次自我驗證，把 Day6 那個坑原樣重現：
+
+```console
+$ sed -i 's/^package after_resolution/package mypolicy/' ironman-2026/day07/policies/naming.rego
+$ bash ironman-2026/day12/regress.sh
+
+  ✗ day06 命名漂移擋得住                  exit=0（預期 1）
+  ✗ day06 講得出是哪一條規則              沒找到「duplicate_concept」
+  ✗ day07 產得出 GitHub annotation             沒找到「::error file=」
+
+29 條斷言：26 通過，3 失敗
+```
+
+registry 一個字都沒改，policy 檔也還在原地，只是 package 名字錯了，於是那條規則靜悄悄地不執行。**三條斷言同時倒下，而在沒有這支腳本的世界裡，這件事的表現形式是「CI 全綠」。**
+
+改回來就恢復 29/29。
+
+```mermaid
+flowchart LR
+    B["policy 的 package 打錯一個字"] --> W["weaver：綠燈，離開碼 0"]
+    W --> C["CI：全綠"]
+    C --> M["人：以為命名規則還在守"]
+    B --> R["regress.sh：3 條斷言變紅"]
+    R --> F["人：知道那條規則死了"]
+```
+
+## 這支腳本該由誰維護
+
+從平台工程的角度，今天做的東西有個容易被忽略的性質：**它是平台團隊自己的測試，不是給產品團隊的 gate。**
+
+產品團隊不需要知道它存在。它保護的是平台團隊自己的資產，回答的是「我提供的這些檢查，今天還有效嗎」。這跟前面幾天做的東西方向相反，前面都是平台團隊對其他人設的門，這一天是平台團隊對自己設的門。
+
+**這也是治理能不能規模化的一個隱形前提。** 一個團隊如果沒辦法證明自己的檢查還有效，那它遲早會不敢改那些檢查，因為每次改動都是在賭。不敢改的規則會慢慢跟現實脫節，然後某一天有人發現它擋掉了不該擋的東西，於是整套被繞過。
+
+從成本上看，這支腳本一百五十六行 bash，維護成本是「每加一條新規則，順手加一條該紅的斷言」。而它換到的是**改治理資產這件事變得沒有那麼可怕**。
+
+## 回到 AIOps：這是 eval 的前身
+
+最後接回主軸，這一天跟 agent 的關係比看起來近。
+
+Day1 那份 bench 做的事，本質上跟今天這支腳本一模一樣：**準備一組已知答案的輸入，跑一遍，斷言結果符合預期。** 差別只在 Day1 的受測物是一隻 LLM agent，所以斷言必須寫成容差跟形狀（`tol: 0.15`、`contains`、`grounded`），而今天的受測物是一堆確定性的工具，所以斷言可以寫成離開碼跟字串比對。
+
+兩者放在一起，才拼得出「agent 表現不好」這句話的完整拆解：
 
 ```mermaid
 flowchart TB
-    subgraph D["確定性的部分（今天全部測掉）"]
-      D1["registry／policy 會不會擋"]
-      D2["MCP 回答什麼"]
-      D3["意圖編不編得過"]
-      D4["真實 span 合不合規"]
-    end
-    subgraph N["非確定性的部分（Series 2 的 eval）"]
-      N1["agent 會不會照工具描述查"]
-      N2["agent 拿到 Finding 之後會不會真的改"]
-      N3["同一個任務跑十次的分佈"]
-    end
-    D --> Q{"agent 答錯了"}
-    N --> Q
-    Q -->|"確定性全綠"| A1["問題在 agent／prompt"]
-    Q -->|"有一條紅"| A2["問題在治理資產<br/>agent 只是誠實地反映了它"]
+    Q["agent 給了一個爛答案"] --> A{"regress.sh 綠的嗎？"}
+    A -->|"紅的"| G["治理資產壞了<br/>去修 YAML / policy"]
+    A -->|"綠的"| B{"MCP 探針答得對嗎？"}
+    B -->|"答錯"| S["registry 教錯了<br/>去補 schema"]
+    B -->|"答對"| C["才輪到 agent 自己<br/>prompt、工具、模型"]
 ```
 
-右邊那個分岔就是今天真正的產出。**沒有左邊那組斷言，「agent 表現不好」這句話沒有辦法被歸因**——你會花一整天調 prompt，而真正的原因是 registry 裡有兩個矛盾的定義。
+沒有前兩層，第三層的每一次調整都是在猜。而我在 Day1 花了很多時間調 prompt，現在回頭看，那時候真正該做的是先確認那套 stack 送出來的資料跟我 prompt 裡寫的是不是同一件事。
 
-### 做法一：不接 LLM，也要能驗證 agent 拿到什麼
-
-Day10 那個 MCP server 是走 **stdio 上的 JSON-RPC**，所以完全不需要 LLM 就能驅動它：`day15/mcp_probe.py` 就是一支六十行的 python，spawn 一個 `weaver registry mcp`、送 `initialize`、送 `tools/list`、再送你指定的 `tools/call`，把回應原封不動印出來。
-
-這件事的價值不在方便，在**歸因**：如果你只能透過對話測 MCP，那「agent 講錯」跟「registry 教錯」永遠分不開。Day10 那四個坑全部是靠這支腳本挖出來的——`search` 是關鍵字 AND 不是語意搜尋、`browse_namespace` 不標 deprecated、`not found` 回 `isError: false`、分層 registry 預設是空的——**一次 LLM 呼叫都沒有用到**。
-
-而其中最後一個坑特別能說明問題：分層 registry 沒帶 `--include-unreferenced=true` 時，`browse_namespace` 回報 0 個 attribute、`get_attribute` 回報「不存在」。如果只用對話測，你看到的現象是「agent 說找不到那個欄位」——**這個現象跟「agent 幻覺」長得一模一樣**，而真相是工具真的回答了「不存在」。
-
-所以這條斷言長這樣，而它是整組測試裡我最想留的一條：
-
-```bash
-run_case 0 "MCP 對分層 registry 答得出東西（total_attribute_count > 0）" \
-  "$PY day15/mcp_probe.py day13/team '[{\"name\":\"browse_namespace\",\"arguments\":{}}]' \
-     --include-unreferenced=true | grep -qE 'total_attribute_count[^0-9]+[1-9]'"
-```
-
-### 做法二：樣本要從真實輸出抽，不能手打
-
-這一條是我自己被抓到的，所以印象最深。
-
-Day10 要示範「agent 照 Finding 修好 instrumentation」的閉環，我寫了 before／after 兩份程式碼，然後**手打**了一份 live-check 樣本清單去驗證。after 那份的結果很漂亮：只剩 `not_stable`，violation 歸零。
-
-後來把它改成從真實送出的 span 抽樣本——`run_and_extract.py` 設一個 `InMemorySpanExporter`、真的呼叫 `charge()`、把 exporter 收到的 span 轉成樣本，**這支腳本不知道 handler 裡寫了哪些欄位名**。結果：
-
-```
-$ python3 day15/run_and_extract.py after --samples \
-    | weaver registry live-check -r day14/base-v2 --input-source stdin
-    ...
-    Span event payment.retried
-        retry.count = 2
-            - [violation] Attribute 'retry.count' does not exist in the registry.
-$ echo $?
-1
-```
-
-**還是 exit 1，而原因是一個我自己剛加進去的欄位。** 我手打的那份清單裡沒有 `retry.count`，因為我打的是**我腦子裡那份改動**，不是程式碼真的送出的東西——那行 `add_event` 把一個欄位從 attribute 搬到 span event 上、名字也順手改了，而我在驗證的時候完全忘了它的存在。
-
-一般化之後這條教訓很硬：**手打的樣本永遠只涵蓋你記得的那部分，而你會忘記的正是你剛剛動過的地方。** 而「把欄位搬到別的地方」在 registry 眼裡不是搬移，是新增——所以每一個「重構一下遙測結構」的 PR 都是這個坑的候選人。
-
-### 做法三：每一條規則都要有一個「本來就該紅」的 fixture
-
-一條從來沒有紅過的規則，等於一條沒有被測試過的規則。所以前面每一天都留了一份故意壞掉的東西，而它們現在全部是測試資料：
-
-| fixture | 故意壞在哪 | 該擋住的是 |
-|---|---|---|
-| `day17/services/shipping-v0` | camelCase、缺 stability、inline 定義、沒有意圖 | 命名／分層 policy、checklist |
-| `day14/breaking` | 一個規格有、weaver 不收的欄位 | 第一層 hard error |
-| `day14/future` | 缺 stability／examples、字串式 deprecated | 第二層 `--future` |
-| `day14/base-v3` | 型別 `int` → `string` | 第三層（`diff` 對此靜音） |
-| `day14/base-v4` | enum 少一個 member | 第三層（`diff` 也靜音） |
-| `day14/team-on-v2` | 下游還在 ref 被改名的欄位 | `deprecated_usage.rego` |
-| `day16/intent/steady-state-broken.yaml` | 指到不存在的維度 | 意圖編譯器 |
-| `day16/intent/steady-state-broken2.yaml` | enum 值大小寫不符 | 意圖編譯器 |
-
-最後兩個特別值得說，因為它們不是我編的壞例子，是**我自己的 agent 實際犯過的兩種錯**：`payment.status` 是那種「這個欄位應該叫這個名字」的合理猜測，`AUTHORIZED` 大寫則是真實 RCA 任務上的坑——agent 用 `level="ERROR"` 去撈 Loki，資料裡全是 `INFO`，於是它得到零筆結果然後往「系統正常」推理下去。
-
-**把 agent 犯過的錯變成 fixture，是這整套方法裡投資報酬率最高的一件事**，因為它讓同一個坑第二次出現時是紅燈，而不是一次新的除錯。
-
-### 做法四：先量一個基準，數字掉下來才有東西可比
-
-`stats` 的 group 數、live-check 的 advice 條數與 coverage、MCP 的 `total_attribute_count`——這些數字單獨看都沒什麼意義，但它們是唯一能發現「安靜失效」的方式。Day7 那道 CI 探針（`groups > 0`）就是最小版本。
-
-原則：**任何自動化檢查都該有一個「我確實檢查了 N 個東西」的斷言**，而不是只看它有沒有報錯。
-
-## 把四個做法變成一支腳本
-
-`testability/regress.sh` 是表格驅動的：每一行是「預期離開碼 + 說明 + 指令」。跑一次：
-
-```
-$ ./testability/regress.sh
-治理資產回歸測試（無 LLM）
-
-── 規範本身：定義層的規則還擋得住嗎（Day5-6）
-  ✔ 命名 policy 抓到 camelCase／缺 namespace                 exit=1
-  ✔ 命名 policy 對乾淨的 registry 放行                       exit=0
-  ✔ 分層 policy 抓到 signal group 裡 inline 定義的 attribute  exit=1
-
-── 三層驗證模型：每一層都還在它該在的位置（Day9）
-  ✔ 第一層 hard error：metric_requirement_level 進不去        exit=1
-  ✔ 第二層預設不擋（三個 ⚠、exit 0）                          exit=0
-  ✔ 第二層加 --future 就擋                                    exit=1
-  ✔ 第三層：attribute 直接消失（v1→v2）                       exit=1
-  ✔ 第三層：型別 int→string（diff 靜音的那一格）              exit=1
-  ✔ 第三層：enum member 被拿掉（diff 也靜音）                 exit=1
-  ✔ 下游還在用 deprecated 欄位                                exit=1
-
-── 消費端：agent 查得到、意圖編得過（Day10-11）
-  ✔ MCP 對分層 registry 答得出東西（total_attribute_count > 0） exit=0
-  ✔ 生成物產得出來（含繼承的定義）                            exit=0
-  ✔ 穩定狀態意圖編得過                                        exit=0
-  ✔ 變更意圖編得過                                            exit=0
-  ✔ 意圖指到不存在的維度 → 擋                                 exit=1
-  ✔ 意圖用了 enum 裡沒有的值（大小寫）→ 擋                    exit=1
-
-── 真實遙測：程式碼實際送出的東西（Day10）
-  ✔ before 的四個欄位有 violation                             exit=1
-  ✔ after 仍有 violation：retry.count 是新增，不是搬移         exit=1
-  ✔ 把 retry.count 定義出來之後才乾淨                          exit=0
-
-── checklist 自己（Day13）
-  ✔ 照抄一半的服務要被擋                                      exit=1
-  ✔ 補完的服務要放行                                          exit=0
-
-✔ 21/21 全部符合預期
-```
-
-**21 條裡有 12 條的預期離開碼是 1。** 這個比例是刻意的，也是今天最重要的一個設計決定：**這組測試主要在測「它還會不會擋」，不是「它會不會通過」。** 一組全部預期 exit 0 的測試，在治理資產上幾乎沒有價值——因為所有「安靜失效」的壞法都會讓它繼續全綠。
-
-跑完不到十秒，不需要 cluster、不需要 API key、不需要網路。**這件事本身就是一個設計約束**：一份需要環境才能跑的測試，會變成一份沒有人在本機跑的測試。
-
-### 第 22 條：這組測試自己也有一格假綠燈
-
-寫完上面 21 條之後，我拿 Day7 那個新的 `--fail-on`（weaver `0.25.0`）回頭掃了一次自己的 fixture，結果在最不該有問題的地方翻到一個。
-
-`clean.json` 是我用來當「乾淨對照組」的樣本——上面那組斷言裡「預期 exit 0」的那幾條，有一條就是靠它。它一直是綠的。但把門檻往下調一級：
-
-```
-$ weaver registry live-check -r day06/weaver/registry \
-    --input-source day12/samples/clean.json --fail-on improvement
-```
-
-exit 1。原因是它從來就不乾淨：
-
-```
-Span span.app.order.create `server`
-    biz.user.id = u-5
-        - [improvement] Attribute 'biz.user.id' is not stable; stability = development.
-    app.outcome = created
-        - [improvement] Attribute 'app.outcome' is not stable; stability = development.
-
-Advisories given
-  - total: 2
-  - advice level:
-    - improvement: 2
-  - advice type:
-    - not_stable: 2
-```
-
-這兩條 finding 從第一天就在那裡，`0.24.1` 只是不用它們決定離開碼，所以我的斷言看不到。**我以為我在斷言「這份樣本完全合規」，實際上斷言的是「這份樣本沒有 violation」**——兩句話在 `0.24.1` 上的觀測結果一模一樣，而我從頭到尾只看得到離開碼。
-
-這一格完全符合開頭那張清單的形狀：壞掉的時候症狀是一切看起來很順利。而它多帶出一層——**前面那七個坑是工具安靜，這一個是我自己的斷言解析度不夠**。離開碼是一個布林值，我卻拿它去斷言一件有四個等級的事情。所以做法四（先量一個基準）要再往前推一步：**光斷言離開碼不夠，要連「這一輪出了幾條 finding、分別是哪一級」一起釘住**，也就是把 `--format json` 的 advice 統計數字納進斷言，而不是只看 `$?`。
-
-順帶一提，這也是為什麼那兩條 `not_stable` 值得留著而不是修掉。它們是 Day7 講過的「技術債的即時提醒」，會一直叫到 Day9 開始把定義標成 `stable` 為止——**一個會在對的時間自己消失的告警，比一個被我調成綠燈的告警有用。**
-
-## 平台工程：治理資產的擁有者，要能證明它還有效
-
-**誰維護這組測試。** 跟 policy 同一批人——它們是同一份資產的兩面。這也帶出一個實際的工作習慣：**新增一條規則的時候，順手在對應的 fixture 裡種一個違規**。Day13 那個 `shipping-v0` 就是這樣長出來的，而它已經抓到過一次真的（我的 enum 檢查漏掉 `shippingStatus`）。
-
-**為什麼這件事對平台團隊比對產品團隊重要。** 產品團隊的程式碼壞掉，他們自己會知道（服務掛了、測試紅了）。**平台團隊的 policy 壞掉，沒有人會知道**——所有人的 CI 都變綠，大家會覺得治理做得很好。一道靜靜失效的 gate 比沒有 gate 更糟，因為它讓所有人以為有人在看。
-
-**這組測試也是一份可以拿出去講的東西。** 當有人問「你們的治理有沒有在運作」，答案不該是「我們有 CI」，而是「這 21 條斷言每天在跑，其中 12 條是在確認規則還擋得住」。**前者描述你裝了什麼，後者描述它現在還有效。**
-
-**沒有做成 gate。** 這組測試自己不該進 merge gate 擋別人的 PR——它該在治理資產自己的 repo 裡跑（改 policy、改範本、升級 weaver 的時候）。這跟 Day9 那個「平台團隊要先讓自己被同一套規則擋住」是同一件事。
-
-## 回到 AIOps：這是 eval harness 的前身
-
-今天這 21 條斷言全部是確定性的：同樣的輸入永遠同樣的離開碼。而 agent 不是這樣——同一個問題問十次，可能有八次照著工具描述查、兩次把整句自然語言丟進 `search` 然後得到零筆。**所以 agent 的品質不能用「跑一次看看」來驗證，只能用分佈來描述。**
-
-那正是後面 eval harness 要做的事，而今天這組測試是它的前提。三個具體的銜接點：
-
-**一、fixture 可以直接升級成 eval case。** 那份「意圖指到不存在的維度」的 YAML，現在測的是編譯器會不會擋；同一份東西可以拿去問 agent「這份意圖對不對」，測的就變成 agent 會不會發現。**輸入完全一樣，被測的對象換了。**
-
-**二、意圖檔案是現成的 ground truth。** Day11 那份意圖已經把「什麼情況該告警、嚴重度多少」寫成機器可讀的判準了。這代表 eval 不需要人工標註「這次算不算 incident」——**意圖已經回答了**。這條線會在 Series 2 講校準的時候變成主題。
-
-**三、確定性的斷言是歸因的前提。** 前面那張圖的右半邊：agent 答錯的時候，先看這 21 條。全綠，問題在 agent；有一條紅，agent 只是誠實地反映了你餵給它的東西是錯的。**我自己在 RCA 任務上拿到 2/9 分的那一次，事後回頭看，有一部分根本不是 agent 的問題**——它查不到資料是因為它照著一份跟真實資料不一致的 schema 在查（Day7 那個「空結果跟沒有問題長得一模一樣」）。如果當時有這組斷言，那一天會少浪費很多時間。
+這條分流也解釋了為什麼這個系列要把治理放在 agent 前面。**不是因為治理比較重要，是因為治理是唯一一層可以被確定性地驗證的東西**，而所有不確定的東西都應該站在確定的東西上面。
 
 ## 今天沒做的事
 
-沒有跑任何 LLM，也沒有量任何分佈。今天證明的是「工具會給出正確答案」，完全沒有證明「agent 真的會去用它、而且照著用」。Day10 那條「一次只查一兩個關鍵字」的指令，實際上有多少比例的對話會照做？這需要跑很多次、看分佈，而那是 eval harness 的工作。**在有那份數字之前，所有結論的正確說法都是「這讓對的事情變得可能」，不是「這樣就不會出錯了」。**
+沒有把 `regress.sh` 接進 CI。它現在是我手動跑的，而一個要靠人記得跑的回歸測試，跟今天整篇在講的問題是同一個。接進去不難，難的是決定它該多久跑一次，以及「已知的缺口」那幾條變紅的時候該通知誰。
 
-沒有把這支腳本接進 CI。它現在是手動跑的。要進 CI 得先決定一件事：weaver 版本要不要釘死在腳本裡（釘死的話，升級 weaver 就必須改這支腳本；不釘死，某天上游改行為會讓它整組變紅）——而這正是 Day9 那個「跨版本矩陣」該負責的事，兩者要一起設計。
+斷言的粒度還很粗。目前大部分只驗離開碼，只有四條驗到訊息內容。理想上每一條 policy 都該驗「它抓到的是不是我以為的那一條」，而不只是「有東西被抓到」。
 
-沒有測 template 生成物的內容，只測了「產得出來」。Day11 講過生成物的 diff 能補上 `diff` 的靜音區，那件事該有一條斷言（例如「`ATTRIBUTE_TYPES` 裡 `payment.retry_count` 必須是 `int`」），但那需要先決定生成物要不要 commit 進版控——我認為要，理由 Day11 說過，只是這組測試還沒跟上這個決定。
+沒有處理效能。36 秒裡大部分花在解析官方 semconv 上，雖然有快取，但每次都要重新跑一遍解析。真的進 CI 的話這個數字要再看。
 
-明天：第一階段的最後一天，把這十二天的結論壓成一份新服務上線 checklist——會自己跑的那種，十三項檢查、每一項都真的執行一次工具。而今天這組斷言會在那裡多一個用途：**checklist 自己也是需要被測試的程式碼。**
+也沒有測 Day7 那道 workflow 本身。CI gate 的 YAML 現在只有被人眼看過，沒有任何東西驗證它改壞了會怎樣。要測它得起一個 act 之類的本地 runner，那是另一個題目。
+
+## 小結
+
+今天沒有做出任何新的治理能力，只是把前面十一天的東西各戳了一下，確認它們還醒著。
+
+比較有價值的是那份「壞掉的方式」清單。十條裡有七條的症狀是綠燈，這個比例高到我自己整理的時候都愣了一下。**一個系統如果它的失敗模式大多是靜默的，那麼「沒有壞消息」就完全不是好消息**，而這正是整個可觀測性領域一直在講的那件事，只是這次發生在治理工具自己身上。
+
+明天做這個階段的收尾：把這十二天的東西整理成一份新服務上線時真的照著跑的 checklist，並且回答一個到現在都還沒正面回答的問題，就是這一整套東西到底替 agent 換到了什麼。
