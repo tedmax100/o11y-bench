@@ -149,7 +149,7 @@ targetallocators.opentelemetry.io
 apiVersion: opentelemetry.io/v1beta1
 kind: OpenTelemetryCollector
 metadata:
-  name: otel                      # ← 這個名字很關鍵，見下
+  name: otel                      # ← 名字取成這樣是有原因的，見下
   namespace: demo
 spec:
   mode: deployment
@@ -306,7 +306,7 @@ spec:
 
 **調和迴圈能保證你送的東西一直送得出去，但保證不了那些東西彼此還在講同一種語言。** Day1 那個 `job` vs `service_name` 正好落在第二半，所以今天做完，那個問題一個字都沒被解決，它是 Weaver 那幾天的主題。
 
-還有一個洞得誠實講：Operator 自己也會重演同一個病。調和迴圈保證的是「CR 寫什麼版本，跑起來就是什麼版本」，它不會替你決定那個版本號該是多少。十幾個團隊各自維護各自的 `OpenTelemetryCollector` CR，「版本號一不一致」就又變成一個沒人管的問題，從「SDK 沒人管」變成「Collector 沒人管」而已。
+還有一個洞：Operator 自己也會重演同一個病。調和迴圈保證的是「CR 寫什麼版本，跑起來就是什麼版本」，它不會替你決定那個版本號該是多少。十幾個團隊各自維護各自的 `OpenTelemetryCollector` CR，「版本號一不一致」就又變成一個沒人管的問題，從「SDK 沒人管」變成「Collector 沒人管」而已。
 
 **今天做的是把施力點做出來，不是把力施下去。**
 

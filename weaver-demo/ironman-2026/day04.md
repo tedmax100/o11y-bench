@@ -231,7 +231,7 @@ webapp          POST /api/{path:path}
 
 服務數、span 數、`http.route` 完全一樣。span name 還是 FastAPI 的 route template，而不是「checkout」這種業務語意。
 
-### 誠實講：換到了什麼、沒換到什麼
+### 換到了什麼、沒換到什麼
 
 這是今天最容易被誤會的地方。**annotation 注入換掉的是「誰負責遞送 instrumentation」，不是「自動抓到多少東西」。**
 

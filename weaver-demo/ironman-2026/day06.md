@@ -252,7 +252,7 @@ deny contains f if {
 最後這個是今天測出來最陰的一件事。把 package 從 `after_resolution` 改成 `mypolicy`，其他一字不改：
 
 ```
-$ weaver registry check -r registry -p policies
+$ weaver registry check -r ironman-2026/day06/registry -p ironman-2026/day06/policies
 ✔ No `after_resolution` policy violation
 
 $ echo $?
@@ -264,12 +264,12 @@ $ echo $?
 更麻煩的是連 `--display-policy-coverage` 都什麼都不印：
 
 ```
-$ weaver registry check -r registry -p policies --display-policy-coverage
+$ weaver registry check -r ironman-2026/day06/registry -p ironman-2026/day06/policies --display-policy-coverage
 （coverage 區段完全空白）
 
 # 對照：package 正確時
 COVERAGE REPORT:
-policies/naming.rego has full coverage
+ironman-2026/day06/policies/naming.rego has full coverage
 ```
 
 反過來說，這就是驗證方式。**coverage 報告裡有沒有列出你那個 `.rego` 檔，就是「這份 policy 到底有沒有被執行」的探針**，地位等同昨天用 `registry stats` 的 group 數量當 registry 的探針。
@@ -314,10 +314,10 @@ groups:
 先跑一次不帶 policy 的 check，確認基準：
 
 ```
-$ weaver registry check -r registry
+$ weaver registry check -r ironman-2026/day06/registry
 ✔ No `after_resolution` policy violation
 
-$ weaver registry stats -r registry
+$ weaver registry stats -r ironman-2026/day06/registry
   - 2 groups
 ```
 
@@ -352,7 +352,7 @@ camel_case_attribute(group_id, attr_id) := violation if {
 `input.groups[_]` 那個底線是 Rego 的核心語法，它不是「取第 0 個」，是「對所有 group 都試一次」。兩層 `[_]` 疊起來，就是「對每一個 group 的每一個 attribute 都試一次」，任何一組讓後面條件成立的，就產出一個 violation。這也是 Rego 讀起來跟一般程式語言最不一樣的地方，沒有 for 迴圈，迭代是宣告出來的。
 
 ```
-$ weaver registry check -r registry -p policies
+$ weaver registry check -r ironman-2026/day06/registry -p ironman-2026/day06/policies
 ✔ All `after_resolution` policies checked (2 violations found)
 
   - Message : id=camel_case_attribute, category=naming, group=registry.order,   attr=userId
@@ -413,7 +413,7 @@ deny contains missing_namespace(group.id, attr.name) if {
 三條規則一起跑，這份 registry 總共噴出 9 個違規：
 
 ```
-$ weaver registry check -r registry -p policies
+$ weaver registry check -r ironman-2026/day06/registry -p ironman-2026/day06/policies
 ✔ All `after_resolution` policies checked (9 violations found)
 
   - id=missing_namespace,     group=registry.order,     attr=status
@@ -551,9 +551,9 @@ $ weaver registry live-check --help
 昨天那個 `-r .` 假綠燈的教訓是「檢查通過不代表檢查有在做事」。policy 這一層有對應的探針：
 
 ```
-$ weaver registry check -r registry -p policies --display-policy-coverage
+$ weaver registry check -r ironman-2026/day06/registry -p ironman-2026/day06/policies --display-policy-coverage
 COVERAGE REPORT:
-policies/naming.rego has full coverage
+ironman-2026/day06/policies/naming.rego has full coverage
 ```
 
 一條規則如果從來沒有被觸發過（例如條件寫錯，永遠不成立），這裡會看得出來。寫完一條新規則之後，最好的驗證方式還是先故意寫一份會違規的 registry，確認它真的噴出來，再把規則放進 CI。不然你接進 CI 的可能是一條永遠沉默的規則，那跟昨天那條「規則寫得比問題窄」是同一類問題的另一個版本。
