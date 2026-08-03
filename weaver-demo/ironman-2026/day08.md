@@ -1,420 +1,378 @@
 ---
-title: "【Day8】自訂 semconv 與多 registry 分層"
+title: "【Day8】分層與所有權：哪一層統一，哪一層放手"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
 tags: [OpenTelemetry, Weaver, 鐵人賽]
 ---
-# Day8：自訂 semconv 與多 registry 分層
 
-前面六天都在同一份 registry 上打轉——那份 registry 是 Day3 就準備好的，我只是拿它來跑各種指令。今天要做兩件之前刻意跳過的事：**從零寫一份自己的 semantic convention**，然後**把它疊成多層**。
+# Day8：分層與所有權，哪一層統一哪一層放手
 
-第二件事才是重點。Day1 那段診斷說得很清楚：問題不是「有人沒跟上版本」，而是每個部門的 OTel 都是各自安裝、各自維護的。但反過來，如果為了統一而要求全公司共用一份 registry、任何一個團隊要加一個欄位都得去改那份中央檔案，那份 registry 會在三個月內變成一個沒有人敢動、也沒有人跟得上的東西。
+昨天 live-check 對著 `service.name` 說「這個屬性不存在於 registry」。那不是資料的問題，是我那份 registry 沒有宣告任何 dependency，所以在它眼裡，OTel（OpenTelemetry）官方定義了幾百個的標準屬性全部都是陌生人。一份會把 `service.name` 判成違規的 gate，上線第一天就會被淹沒在假警報裡，然後大家學會忽略它。
 
-**治理的難處從來不是「要不要統一」，而是「哪一層統一、哪一層放手」。** 今天要看的就是 Weaver 用什麼機制表達這件事，以及——照這系列的慣例——它在哪些地方會安靜地讓你以為你做到了。
+今天要把那件事解掉。但真正的題目比「補一行 dependency」大得多：**一份 registry 要給幾十個團隊用，它到底該由誰維護？**
 
-程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`day13/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/day13)（五份 registry ＋ 兩條 policy），這裡直接講重點跟真實輸出。
-
-## 先從零寫一份 base registry
-
-分層之前，先有一層。這是一份完全從空白開始的支付領域 registry，只有一個 `manifest.yaml` 加一個 model 檔：
-
-```yaml
-# base/manifest.yaml
-name: payments-base
-description: 支付領域的共用 semantic convention（平台團隊維護）
-schema_url: https://example.com/schemas/payments-base/0.1.0
-```
-
-```yaml
-# base/model/payment-events.yaml
-groups:
-  - id: registry.payment
-    type: attribute_group          # ← 屬性池，不是 signal
-    stability: development
-    brief: "支付領域的共用屬性"
-    attributes:
-      - id: payment.id
-        type: string
-        stability: development
-        brief: "支付交易識別碼"
-        examples: ["pay-1001"]
-      - id: payment.outcome
-        type:
-          members:                 # ← Day5 講的 enum，值域寫進 schema
-            - id: authorized
-              value: authorized
-              brief: "授權成功"
-              stability: development
-            - id: declined
-              value: declined
-              brief: "被拒絕"
-              stability: development
-        stability: development
-        brief: "支付的終態結果"
-
-  - id: event.payment.authorized
-    type: event
-    name: payment.authorized
-    stability: development
-    brief: "支付授權成功"
-    attributes:
-      - ref: payment.id            # ← 只 ref，不重複定義
-        requirement_level: required
-      - ref: payment.outcome
-        requirement_level: required
-```
+程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day08/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day08)：
 
 ```
-$ weaver registry check -r day13/base
-✔ No `after_resolution` policy violation
-
-$ weaver registry stats -r day13/base
-  - 2 groups
+ironman-2026/day08/
+├── base/                  ← 平台團隊擁有
+├── team-orders/           ← 訂單團隊擁有
+├── policies/              ← 正式那條規則
+└── policies-prefix-ban/   ← 我第一次寫錯的那條
 ```
 
-這份的結構就是 Day5 那份大 registry 的縮小版，也是寫任何 registry 都該有的骨架：**`attribute_group` 當屬性池，signal group 只用 `ref` 去引用**。屬性定義一次、被多個 signal 共用，改一次全部生效。今天後面會看到，這個「只 ref、不 inline」的習慣在分層之後從「比較整潔」升級成「必要」。
+指令一律假設從 repo 根目錄跑。驗證環境是 weaver 0.25.1、semantic-conventions [v1.43.0](https://github.com/open-telemetry/semantic-conventions/releases/tag/v1.43.0)。
 
-## 分層：`dependencies` 怎麼寫
+## 兩種都會壞掉的極端
 
-在寫之前先把一個容易混淆的東西擺正。Day5 追過官方 registry 那條 `extends` 鏈（`attributes.http.common` → `attributes.http.server` → `metric_attributes.http.server` → 真正的 metric，宣告 0 個屬性、解析出 10 個），那也是一種「繼承」。**但 `extends` 跟今天要講的 `dependencies` 是兩件事，而它們的失敗模式差很多：**
+先講為什麼需要分層，因為兩個極端我都待過。
 
-| | `extends`（Day5） | `dependencies`（今天） |
-|---|---|---|
-| 繼承的範圍 | **同一份 registry 內部**的 group 之間 | **跨 registry**，一份依賴另一份 |
-| 誰擁有被繼承的東西 | 同一批人 | **通常是別的團隊** |
-| 指錯的下場 | 直接報錯（找不到那個 group） | **安靜地少東西**——今天四個坑有三個是這個形狀 |
+一種是**全公司一份 registry**，誰要加欄位都去改那個中央檔案。前三個月很好，第四個月開始，那份檔案變成一個沒有人敢動的東西：你要加一個只有自己團隊在用的 `biz.order.channel`，得先搞懂另外十二個團隊的命名慣例，還要等一個不熟悉你領域的人來 review。**這個設計把成本推給了使用者，而且推得很不平均**，愈邊緣的團隊付愈多。
 
-差別的根源是：`extends` 的目標一定在同一份檔案集合裡，weaver 解析不到就是解析不到；而 `dependencies` 要去別的地方載入，「載入成功但內容不是你以為的那份」是一個完全合法的狀態。**同一個「繼承」的直覺，換到跨團隊的邊界上就不能再用了**，這是今天整篇的前提。
+另一種是**每個團隊各自一份**，互不相干。這個一開始更快，但它就是 Day1 那個現場：`userId` 跟 `user_id` 並存，不是因為誰不願意統一，而是根本沒有一個東西在盯著。
 
-現在加第二層。結帳團隊要定義自己的 `checkout.completed` 事件，但裡面的支付欄位應該沿用平台團隊那份，不該自己再造一次：
-
-```yaml
-# team/manifest.yaml
-name: checkout-team
-description: 結帳團隊在 payments-base 之上的擴充
-schema_url: https://example.com/schemas/checkout-team/0.1.0
-dependencies:
-  - name: payments-base
-    registry_path: day13/base
-```
-
-```yaml
-# team/model/checkout.yaml
-groups:
-  - id: event.checkout.completed
-    type: event
-    name: checkout.completed
-    stability: development
-    brief: "結帳完成（團隊自訂事件，重用 base 的支付屬性）"
-    attributes:
-      - ref: payment.id            # ← 這兩個都是 base 定義的
-        requirement_level: required
-      - ref: payment.outcome
-        requirement_level: required
-```
-
-```
-$ weaver registry check -r day13/team
-ℹ Found registry manifest: day13/team/manifest.yaml
-ℹ No registry manifest found: ... （第一次會踩坑，見下）
-✔ No `after_resolution` policy violation
-```
-
-跑得起來之後，有一件事值得先看：這份 team registry「有幾個 group」？
-
-```
-$ weaver registry stats -r day13/team
-  - 1 groups
-
-$ weaver registry stats -r day13/team --include-unreferenced=true
-  - 3 groups
-    - 1 AttributeGroups
-    - 2 Events
-```
-
-**預設只算團隊自己宣告的那一個。** base 的兩個 group 有被載入、`ref` 也解得到，但它們不算是這份 registry 的內容——除非加上 `--include-unreferenced=true`，才會把依賴裡的東西也一起算進來。
-
-這個差別對 Day7 那個 CI 探針有直接影響：如果你的 gate 檢查「group 數 > 0」，在分層架構下要先想清楚你期待的是哪一個數字，不然這個探針會在某次重構之後失去意義。
+分層要回答的是中間那條線畫在哪。而畫線這件事本身就是治理最核心的決定：
 
 ```mermaid
 flowchart TB
-    subgraph L1["第一層：平台團隊"]
-      B["payments-base<br/>registry.payment（屬性池）<br/>event.payment.authorized"]
-    end
-    subgraph L2["第二層：產品團隊"]
-      T["checkout-team<br/>event.checkout.completed"]
-    end
-    T -->|"dependencies:<br/>registry_path"| B
-    T -.->|"ref: payment.id<br/>ref: payment.outcome"| B
+    SEMCONV["官方 semantic conventions<br/>v1.43.0（上游擁有）"]
+    BASE["base registry<br/>平台團隊擁有<br/>biz.user.id / biz.order.id / app.outcome"]
+    T1["team-orders<br/>訂單團隊擁有<br/>biz.order.channel"]
+    T2["team-payments<br/>支付團隊擁有"]
 
-    S1["registry stats -r team<br/>→ 1 group（只算自己宣告的）"]
-    S2["registry stats -r team --include-unreferenced=true<br/>→ 3 groups（連依賴一起算）"]
-    T --> S1
-    T --> S2
+    SEMCONV --> BASE
+    BASE --> T1
+    BASE --> T2
+
+    N1["改一次要跟上游談<br/>週期以季計"] -.-> SEMCONV
+    N2["改一次影響所有團隊<br/>需要平台團隊同意"] -.-> BASE
+    N3["改一次只影響自己<br/>PR 自己就 merge"] -.-> T1
 ```
 
-## 四個實測出來的陷阱
+判準其實只有一句話：**一個定義如果需要跨團隊對齊才有意義，它就該在下面那層；如果只有自己在用，就該在自己那層。** `biz.user.id` 是前者，因為 agent 要跨服務串一個使用者的行為；`biz.order.channel` 是後者，只有訂單團隊在分 web 跟 mobile。
 
-分層這件事，Weaver 提供的機制很簡潔，但每一個環節都有一個「你以為它會這樣、它其實不是」的地方。四個都是實際撞到的。
+> 這條線我畫錯過。第一版把整個 `biz.*` 收進 base，理由聽起來很正當（業務識別碼要統一）。結果三週內收到四個「我可以加一個 `biz.xxx` 嗎」的 PR，全部要我 review，全部都是只有那個團隊在用的東西。**我不是在治理，我是在當一個人肉的 merge queue。**
 
-### 一、`registry_path` 是相對於「你在哪裡跑」，不是相對於 manifest
+## 兩層各自長什麼樣
 
-最直覺的寫法是 `registry_path: ../base`——manifest 在 `team/` 底下，base 在隔壁，相對路徑當然是 `../base`。實測：
-
-| `registry_path` | 在哪裡跑 | `-r` 給什麼 | 結果 |
-|---|---|---|---|
-| `../base` | repo 根目錄 | `day13/team` | ❌ 找不到 |
-| `day13/base` | repo 根目錄 | `day13/team` | ✅ 通過 |
-| `base` | `day13/` | `team` | ✅ 通過 |
-| `../base` | `day13/` | `team` | ❌ 找不到 |
-
-**基準點是當下的工作目錄，不是 manifest 檔案的位置。** 也就是說 `manifest.yaml` 這份檔案**不是自足的**——同一份檔案，`cd` 到不同地方跑會得到不同結果。
-
-這件事的實務影響比看起來大：你在本機 `cd day13 && weaver registry check -r team` 跑得好好的，CI 從 repo 根目錄跑就爆掉；或者更糟，反過來——CI 好好的，同事在自己的目錄結構下永遠跑不動。
-
-錯誤訊息本身還算清楚（會告訴你它去哪裡找了）：
-
-```
-ℹ Found registry manifest: day13/team/manifest.yaml
-ℹ No registry manifest found: ../base/manifest.yaml
-
-  × The following error occurred during the processing of semantic convention
-  │ file: IO error for operation on ../base: No such file or directory
-```
-
-所以慣例只能是：**路徑一律寫成相對於 repo 根目錄，並且在 README／CI 裡明講「所有 weaver 指令都從 repo 根目錄跑」**。這也跟 Day5 那個 `-r .` 的坑疊在一起——`-r` 不能用 `.`，`registry_path` 又綁 cwd，兩個限制合起來，「固定從 repo 根目錄跑」幾乎是唯一不會出事的用法。
-
-### 二、重複定義不是覆寫，是製造一個沒有人用的孤兒
-
-這是今天最危險的一個。
-
-一個很自然的需求：團隊覺得 base 的 `payment.id` 定成 `string` 不合用，想在自己這層改成 `int`。直覺做法就是在自己的 registry 裡重新定義一次同名的 attribute：
+平台團隊那層，重點在 `dependencies`：
 
 ```yaml
-# team-collision/model/checkout.yaml
-  - id: registry.checkout_override
-    type: attribute_group
-    stability: development
-    brief: "團隊重新定義了一個 base 已經有的 attribute，型別還不一樣"
-    attributes:
-      - id: payment.id
-        type: int                  # ← 想覆寫成整數
-        stability: development
-        brief: "團隊版：把它改成整數"
-        examples: [1001]
+# ironman-2026/day08/base/manifest.yaml
+name: acme-base
+schema_url: https://example.com/schemas/acme-base/0.1.0
+dependencies:
+  - schema_url: https://opentelemetry.io/schemas/1.43.0
+    registry_path: https://github.com/open-telemetry/semantic-conventions@v1.43.0[model]
 ```
 
+`registry_path` 是「檔案在哪」，`schema_url` 是「這是誰的哪一版」。官方文件把這個區分寫得很清楚：`schema_url` 不需要真的下載得到，它是身分識別，provenance 跟版本衝突都靠它來判斷。這裡順手做了昨天講過的那件事，**把版本釘在 `@v1.43.0`**，不要用 `main`，理由跟釘 weaver 版本一模一樣。
+
+產品團隊那層，就是再往上疊一次：
+
+```yaml
+# ironman-2026/day08/team-orders/manifest.yaml
+name: team-orders
+schema_url: https://example.com/schemas/team-orders/0.1.0
+dependencies:
+  - schema_url: https://example.com/schemas/acme-base/0.1.0
+    registry_path: ironman-2026/day08/base
 ```
-$ weaver registry check -r day13/team-collision
+
+團隊的 model 檔裡，來自 base 的東西用 `ref` 引用，自己的東西才用 `id` 定義：
+
+```yaml
+  - id: span.orders.create
+    type: span
+    span_kind: server
+    stability: development
+    brief: "建立訂單"
+    attributes:
+      - ref: biz.user.id        # base 的
+        requirement_level: required
+      - ref: biz.order.id       # base 的
+        requirement_level: required
+      - ref: app.outcome        # base 的
+        requirement_level: required
+      - ref: biz.order.channel  # 自己的
+```
+
+`ref` 的時候可以就地改 `requirement_level`，這是分層裡很重要的一個彈性：**base 決定這個欄位叫什麼、代表什麼，團隊決定在自己這個 span 上它必不必填。** 語意統一，嚴格度放手。
+
+兩層都是綠的：
+
+```console
+$ weaver registry check -r ironman-2026/day08/base
+✔ No `after_resolution` policy violation
+
+$ weaver registry check -r ironman-2026/day08/team-orders
+ℹ Found registry manifest: ironman-2026/day08/team-orders/manifest.yaml
+ℹ Found registry manifest: ironman-2026/day08/base/manifest.yaml
+ℹ Found registry manifest: /home/nathan/.weaver/vdir_cache/repoq1zqSQ/model/manifest.yaml
+✔ No `after_resolution` policy violation
+
+Total execution time: 2.201078414s
+```
+
+那三行 `Found registry manifest` 就是分層在跑的證據，一層一層往下讀。第三行那個 `vdir_cache` 是 weaver 把官方 semconv clone 下來的快取，第一次會慢一點。
+
+## 四個安靜的坑
+
+### 一、`registry_path` 是相對於你在哪裡跑，不是相對於 manifest
+
+上面那份 team manifest 裡寫的是 `ironman-2026/day08/base`，一個從 repo 根目錄看過去的路徑。換一個工作目錄再跑同一份 registry：
+
+```console
+$ cd ironman-2026/day08
+$ weaver registry check -r team-orders
+  × The following error occurred during the processing of semantic convention
+  │ file: IO error for operation on ironman-2026/day08/base: No such file or
+  │ directory (os error 2)
+```
+
+**那個路徑是相對於 `cwd` 解析的，不是相對於 manifest 檔案自己的位置。** 這件事的後果比看起來大：manifest 進了版控，但它能不能用，取決於執行的人站在哪個目錄。CI 上跑得好好的，同事在自己的子目錄跑就壞掉，而錯誤訊息只說「找不到檔案」，不會說「你可能站錯地方了」。
+
+這個坑至少是會噴錯的，比後面三個仁慈。實務上的解法是在 README 裡寫死「所有指令從 repo 根目錄跑」，然後在 CI 裡永遠 `cd` 到根目錄。
+
+### 二、依賴不會遞移
+
+base 已經宣告了官方 semconv 的 dependency。那 team-orders 是不是就能直接用 `service.name` 了？我在 span 裡加了一行 `- ref: service.name`：
+
+```console
+$ weaver registry check -r ironman-2026/day08/team-orders
+  × The following attribute reference is not resolved for the group
+  │ 'span.orders.create'.
+  │ Attribute reference: service.name
+```
+
+**不行。dependency 只往下看一層。** 你依賴 base，就只拿得到 base 自己定義的東西，拿不到 base 依賴的東西。
+
+要用就得自己也列一次：
+
+```yaml
+dependencies:
+  - schema_url: https://example.com/schemas/acme-base/0.1.0
+    registry_path: ironman-2026/day08/base
+  - schema_url: https://opentelemetry.io/schemas/1.43.0
+    registry_path: https://github.com/open-telemetry/semantic-conventions@v1.43.0[model]
+```
+
+這樣在 0.25.1 上是可以跑的，`check` 綠燈。但要付兩個代價。近的一個是時間：官方那份 semconv 被載入兩次，執行時間從 2.2 秒變成 4.8 秒，一份不到 40 行的 team registry 花四秒鐘檢查完。
+
+遠的一個更麻煩：**版本號現在被寫在兩個地方了。** 哪天平台團隊把 base 升到 semconv v1.44.0，team-orders 那份 manifest 不會自動跟上，也不會有人提醒你。你的 team registry 會拿著 v1.43.0 的定義去 ref 一個 base 認為是 v1.44.0 的世界，而兩邊都是綠燈。
+
+> 這就是那個老問題換一個地方出現：**一份設定要在兩個地方保持一致，而沒有任何機制檢查它們一不一致。** 前面幾天在 Collector 的版本號上撞過同一件事。
+
+### 三、重複定義不是覆寫，是製造一個沒人用的孤兒
+
+這是四個裡最惡劣的。訂單團隊覺得 base 那個 `biz.user.id` 定義得不夠精確，於是在自己的 registry 裡「補」了一份：
+
+```yaml
+  - id: registry.orders.local
+    type: attribute_group
+    stability: development
+    brief: "團隊自己重新定義的屬性"
+    attributes:
+      - id: biz.user.id
+        type: string
+        stability: development
+        brief: "使用者識別碼（訂單團隊版本：這裡其實放的是 email）"
+        examples: ["nathan@example.com"]
+```
+
+跑 check：
+
+```console
+$ weaver registry check -r ironman-2026/day08/team-orders
 ✔ No `after_resolution` policy violation
 
 $ echo $?
 0
 ```
 
-**綠燈。** 沒有「重複定義」的警告，沒有「覆寫」的提示，什麼都沒有。
+綠燈。那到底哪一份生效了？把 resolve 出來的結果撈出來看：
 
-但它到底覆寫了嗎？寫一條 debug 用的 Rego，把 resolved schema 裡所有叫 `payment.id` 的定義印出來：
+```console
+$ weaver registry resolve -r ironman-2026/day08/team-orders --format json | ...
 
-```
-group=event.checkout.completed      type=string  brief=支付交易識別碼
-group=event.payment.authorized      type=string  brief=支付交易識別碼
-group=registry.checkout_override    type=int     brief=團隊版：把它改成整數
-group=registry.payment              type=string  brief=支付交易識別碼
+registry.orders.local | biz.user.id | 使用者識別碼（訂單團隊版本：這裡其實放的是 email）
+span.orders.create    | biz.user.id | 使用者識別碼
 ```
 
-真相是：**兩份定義並存，而所有 `ref: payment.id` 都解到 base 那份 `string`。** 團隊那份 `int` 定義存在於 resolved schema 裡，但沒有任何東西引用它——它是一個孤兒。
+**兩份定義同時存在，而 span 上引用到的是 base 那份。** 團隊自己寫的那份沒有被任何東西引用，它是一個孤兒，靜靜地躺在 resolved schema 裡。
 
-後果分三層。**團隊以為改成功了**，實際上每一個 signal 上的 `payment.id` 還是 `string`。**下游拿到的是矛盾的資料**——`registry generate` 產出的程式碼、`registry mcp` 餵給 LLM 的定義、`live-check` 拿去比對的規範，看到的是同一個名字的兩種型別。而**沒有任何一個階段會報錯**。
+整件事的形狀畫出來是這樣：
 
-正確的做法是什麼？Weaver 沒有提供「覆寫」這個動作，因為那本來就不該被允許——`payment.id` 的語意是平台團隊定的，某個團隊單方面把它改成 int，這件事在治理上就是錯的。真正該走的路是回頭跟平台團隊談：要嘛改 base 的定義（所有人一起改），要嘛在自己的 namespace 下定義一個新的欄位（`checkout.payment_ref`）。**分層機制的價值不是讓你能覆寫，是讓你不需要覆寫。**
+```mermaid
+flowchart LR
+    B["base<br/>registry.acme.biz<br/>biz.user.id = 使用者識別碼"]
+    L["team-orders<br/>registry.orders.local<br/>biz.user.id = 其實放的是 email"]
+    S["span.orders.create<br/>- ref: biz.user.id"]
 
-### 三、依賴不會遞移
-
-三層是很現實的結構：平台 → 事業群 → 小隊。試著把它疊起來：
-
-```yaml
-# division/manifest.yaml —— 事業群疊在 base 上
-dependencies:
-  - name: payments-base
-    registry_path: day13/base
-
-# squad/manifest.yaml —— 小隊疊在事業群上
-dependencies:
-  - name: commerce-division
-    registry_path: day13/division
+    B -->|"ref 解析到這一份"| S
+    L -->|"沒有任何人引用"| O["孤兒<br/>留在 resolved schema 裡"]
+    S --> R["跑起來送出去的資料<br/>照 base 的語意"]
+    O --> A["agent 讀 registry<br/>看到兩個互斥的答案"]
 ```
 
-小隊的事件同時用到兩層的東西：
+這比「覆寫失敗」糟糕的地方在於，寫的人得到的訊號是綠燈。他以為自己成功地把定義改精確了，實際上送出去的資料仍然照著 base 的語意，而 registry 裡多了一份說「這裡放的是 email」的定義。**一份自相矛盾的規範，比一份不完整的規範危險得多。**
 
-```yaml
-  - id: event.checkout.completed
-    type: event
-    attributes:
-      - ref: payment.id          # 來自第一層 base
-      - ref: commerce.channel    # 來自第二層 division
-```
+有一個方式能讓它現形，但要用一個已經被標為 deprecated 的 flag：
 
-```
-$ weaver registry check -r day13/squad
-ℹ Found registry manifest: day13/squad/manifest.yaml
-ℹ Found registry manifest: day13/division/manifest.yaml
-ℹ Found registry manifest: day13/base/manifest.yaml      ← 三份都載入了
+```console
+$ weaver registry check -r ironman-2026/day08/team-orders --include-unreferenced
+  ⚠ The flag `include_unreferenced` is deprecated. Please prefer manually
+  │ adding the required imports to your schema files in the future.
 
-  × The following attribute reference is not resolved for the group
-  │ 'event.checkout.completed'.
-  │ Attribute reference: payment.id
+  × The attribute id `biz.user.id` is declared multiple times in the following
+  │ groups:
+  │ ["registry.acme.biz", "registry.orders.local"]
 
 $ echo $?
 1
 ```
 
-注意那三行：**weaver 確實把三份 manifest 都讀進來了**，但 `ref: payment.id` 還是解不到。把那一行 `ref` 拿掉、只留 `commerce.channel`（直接依賴的那一層），立刻就通過。
+訊息非常好，兩個 group 都指出來了。問題是這個 flag 正在被淘汰，而它建議的替代方案（在 schema 檔裡手動寫 `imports`）**對 attribute 不成立**：
 
-也就是說：**`ref` 只看得到直接依賴，看不到依賴的依賴。** manifest 鏈會被走完，但可見範圍只有一層。
-
-解法是把用到的每一層都列成直接依賴：
-
-```yaml
-# squad/manifest.yaml
-dependencies:
-  - name: commerce-division
-    registry_path: day13/division
-  - name: payments-base          # ← 隔一層的也要自己列
-    registry_path: day13/base
+```console
+$ # 在 model 檔裡加 imports: attributes: [biz.*]
+$ weaver registry check -r ironman-2026/day08/team-orders
+  × The following YAML snippet does not match any of the allowed schemas.
+  │ - Object contains unexpected properties: attributes.
 ```
 
-```
-$ weaver registry check -r day13/squad
+`imports` 只吃 `metrics`、`events`、`entities` 三種，attribute 沒有這條路，只能靠 `ref`。所以這個檢查目前是走在一條要被拆掉的橋上，而橋的另一頭還沒蓋。這也是為什麼後面那條 policy 得自己寫。
+
+### 四、摘要那行綠字，不代表沒有違規
+
+這個是我寫 policy 的時候撞到的。只放一條 `before_resolution` 規則去跑：
+
+```console
+$ weaver registry check -r ironman-2026/day08/team-orders -p ironman-2026/day08/policies-prefix-ban
 ✔ No `after_resolution` policy violation
+
+Violation: semconv_attribute
+  - Message   : id=redefines_platform_attribute, category=layering, group=registry.orders, attr=biz.order.channel
+  - Level     : violation
+Violation: semconv_attribute
+  - Message   : id=redefines_platform_attribute, category=layering, group=registry.orders.local, attr=biz.user.id
+  - Level     : violation
+
+$ echo $?
+1
 ```
 
-這個限制值得放在心上：它代表**依賴關係不能只描述「我疊在誰上面」，還得把所有實際用到的層都列出來**。層數一多，每個小隊的 manifest 都會長出一份完整的祖先清單，而這份清單沒有列全時的症狀是 resolver 錯誤——好在這個錯誤是硬的、擋得住的，不像前一個陷阱那樣安靜。
+**那句 `✔ No after_resolution policy violation` 只講 `after_resolution` 那一個階段**，`before_resolution` 的違規不會被算進去，但它們照樣印在下面、照樣讓離開碼變成 1。第一次看到的時候我以為是自己 policy 寫錯了，因為畫面上最顯眼的是一個綠色勾勾。
 
-### 四、但把所有層都列出來，會撞到重複載入
+這個坑本身不嚴重（訊息都在，離開碼也對），但它跟昨天那三個 CI 陷阱是同一個家族：**摘要跟細節講的不是同一件事，而人只看摘要。**
 
-修好第三個問題之後，跑一次 `--include-unreferenced=true`：
+## 那條 policy 我第一次寫錯了
 
-```
-$ weaver registry stats -r day13/squad --include-unreferenced=true
-
-  × The attribute id `payment.outcome` is declared multiple times in the
-  │ following groups: ["registry.payment", "registry.payment"]
-
-  × The attribute id `payment.id` is declared multiple times in the following
-  │ groups: ["registry.payment", "registry.payment"]
-```
-
-`["registry.payment", "registry.payment"]`——同一個 group 出現兩次。因為 base 被載入了兩次：一次是 squad 直接列的，一次是透過 division 傳進來的。
-
-所以第三跟第四個陷阱合起來是一個兩難：
-
-| 做法 | 一般 `check` | `--include-unreferenced=true` |
-|---|---|---|
-| 只列直接依賴（division） | ❌ 隔層的 `ref` 解不到 | — |
-| 兩層都列（division + base） | ✅ 通過 | ❌ 重複載入，硬錯誤 |
-
-實務上這代表：**分層架構下要謹慎使用 `--include-unreferenced`**，而它正是前面用來看「依賴裡有什麼」的那個旗標。兩層以內沒事（`team` 那份就好好的），三層以上而且有共同祖先時就會撞到。
-
-這也解釋了為什麼真實世界的 semconv 分層通常很淺——不是因為大家不想分細，是因為工具鏈在深層依賴上還很脆。
-
-## 用 policy 把前兩個坑補起來
-
-第三、四個陷阱會硬報錯，擋得住。第一、二個是安靜的，得自己寫規則。
-
-### `before_resolution` 終於有場景了
-
-Day6 講兩個 package 的差別時說過，`before_resolution` 適合寫「不准 inline 定義、一律要用 ref」這類規則，但當時沒有場景可以掛。今天有了：**inline 定義正是第二個陷阱的成因**。
+回到孤兒那件事。既然 weaver 預設不管，就自己寫一條。我第一版的想法很直覺：`biz.*` 跟 `app.*` 是平台團隊的 namespace，團隊 registry 只能 `ref`，不能自己定義。
 
 ```rego
 package before_resolution
 
-import rego.v1
+platform_owned_prefixes := ["biz.", "app."]
 
-signal_group_types := {"event", "span", "metric"}
-
-deny contains inline_attribute_in_signal(group.id, attr.id) if {
+deny contains reserved_namespace(group.id, attr.id) if {
 	group := input.groups[_]
-	group.type in signal_group_types
 	attr := group.attributes[_]
-	attr.id            # inline 定義才有 id；ref 進來的只有 ref
+	attr.id                          # 只看定義（有 id:），不看引用（ref:）
+	some prefix in platform_owned_prefixes
+	startswith(attr.id, prefix)
 }
 ```
 
-`attr.id` 那一行是整條規則的支點，而且**只有 `before_resolution` 寫得出來**——Day6 實測過，`before_resolution` 看到的 attribute 保持手寫原樣（inline 的有 `id`，引用的只有 `ref`），而 `after_resolution` 的 `ref` 已經展開，鍵統一變成 `name`，根本分不出來誰是 inline 寫的。
+`before_resolution` 這個 package 到今天才第一次有真正的用武之地。它跑在解析之前，看到的是 YAML 原本的樣子，所以 `id:` 跟 `ref:` 還分得出來，這正是這條規則需要的視野。跑起來：
 
-照 Day6 的教訓，規則寫完要**故意讓它失敗一次**，確認它真的會動：
+```console
+$ weaver registry check -r ironman-2026/day08/team-orders -p ironman-2026/day08/policies-prefix-ban
 
+  - Message : id=redefines_platform_attribute, group=registry.orders,       attr=biz.order.channel
+  - Message : id=redefines_platform_attribute, group=registry.orders.local, attr=biz.user.id
 ```
-# 在 event group 裡故意 inline 定義一個 checkout.cart_size
-- Message : id=inline_attribute_in_signal_group, category=layering,
-            group=event.checkout.completed, attr=checkout.cart_size
-```
 
-### 撞名檢查：跨 registry 的版本
+第二條是對的，第一條是誤傷。`biz.order.channel` 是訂單團隊自己的新概念，base 裡根本沒有這個東西，但它被擋下來了，理由是「名字開頭是 `biz.`」。
 
-Day6 那條 `duplicate_concept` 抓的是「正規化之後撞名」（`userId` vs `user_id`）。分層之後需要另一種：**同一個名字，兩種型別**。
+這跟 Day5 那條只認 `biz.` 前綴的 cardinality 規則，是同一個錯誤的第二次上演：**規則問的是「這個名字歸誰管」，該問的是「這個定義跟別人衝不衝突」。**
+
+而它在平台工程上的代價比技術代價大得多。這條規則等於宣告「`biz.` 這個 namespace 整個歸平台團隊」，於是訂單團隊想加一個只有自己在用的欄位，就得先來找我談。我又變回那個人肉 merge queue 了。**一條寫得比問題寬的規則，會把治理變成審批。**
+
+改對的版本問的是衝突，不是名字。這條得跑在 `after_resolution`，因為它需要「解析完之後，全部的定義攤平在一起」的視野：
 
 ```rego
 package after_resolution
 
-import rego.v1
-
-type_name(t) := t if is_string(t)
-type_name(t) := "enum" if is_object(t)
-
-types_of(name) := {type_name(a.type) |
-	some g in input.groups
-	some a in g.attributes
-	a.name == name
+definitions[name] contains attr.brief if {
+	group := input.groups[_]
+	attr := group.attributes[_]
+	name := attr.name
 }
 
 deny contains conflicting_definition(name) if {
-	some g in input.groups
-	some a in g.attributes
-	name := a.name
-	count(types_of(name)) > 1
+	briefs := definitions[name]
+	count(briefs) > 1        # 同一個名字，兩份不一樣的 brief
 }
 ```
 
-`types_of` 是 Day6 講的 comprehension 用法：把散在各 group 的同名 attribute 攤平成一個型別集合，集合大小 > 1 就是衝突。`type_name` 那兩行則是 Day6 講的「同名規則寫兩次 = OR」，順便處理 enum 的 `type` 是物件、其他是字串這件事（Day5 那條值域規則的同一個支點）。
+用 `brief` 當比較的依據，是因為它就是那個「這個欄位代表什麼」的欄位。同名而 `brief` 不同，意思就是有兩個人對同一個名字有不同的理解，而這正是要抓的東西。
 
-```
-$ weaver registry check -r day13/team-collision -p day13/policies
+```console
+$ weaver registry check -r ironman-2026/day08/team-orders -p ironman-2026/day08/policies
 ✔ All `after_resolution` policies checked (1 violations found)
 
-  - Message : id=conflicting_attribute_definition, category=layering,
-              group=(cross-registry), attr=payment.id
-
-$ echo $?
-1
+  - Message : id=conflicting_definition, category=layering, group=(registry-wide), attr=biz.user.id
 ```
 
-原本安靜的綠燈，現在會擋。三份 registry 加上這兩條 policy 的最終行為：
+一條，正好是那個孤兒。`biz.order.channel` 通過了，因為沒有人跟它衝突。
 
-| registry | groups | check + policy |
-|---|---|---|
-| `base` | 2 | ✅ exit 0 |
-| `team` | 1 | ✅ exit 0 |
-| `team-collision` | 2 | ❌ exit 1（`conflicting_attribute_definition`）|
+```mermaid
+flowchart TD
+    A["團隊要定義一個新 attribute"] --> Q1{"名字開頭是<br/>biz. / app. ？"}
+    Q1 -->|"是"| V1["❌ 申請制<br/>擋下來，來找平台團隊談"]
+    Q1 -->|"否"| OK1["✅ 通過"]
 
-順帶一提，`--display-policy-coverage` 在這裡很有用：跑乾淨的 `team` 時，`collision.rego` 顯示 full coverage，`layering.rego` 則會被逐行列出來——因為那條規則沒有被觸發過。這正是 Day6 說的「policy 層的探針」：coverage 報告不只告訴你檔案有沒有被執行，還告訴你哪幾行從來沒跑到。
+    A2["團隊要定義一個新 attribute"] --> Q2{"解析後有沒有<br/>同名而不同 brief 的定義？"}
+    Q2 -->|"有"| V2["❌ 衝突制<br/>擋下來，指出跟誰衝突"]
+    Q2 -->|"沒有"| OK2["✅ 通過，不用問任何人"]
+```
 
-## 回到 AIOps：分層對 agent 意味著什麼
+兩條規則的差別，用 platform 的語言講是這樣：前者是**申請制**（這個 namespace 是我的，你要用先問我），後者是**衝突制**（你自己開，撞到別人的時候我才出面）。第二種的維護成本不會隨團隊數成長，因為平台團隊只在真的有衝突時才需要介入。
 
-Day10 會讓 agent 透過 MCP 直接查 registry。分層在那個場景下有一個很具體的影響：**agent 查到的定義，是哪一層的？**
+## 誰維護、誰使用、誰負責演進
 
-第二個陷阱在這裡會變得特別難處理。如果 `payment.id` 同時有 `string` 跟 `int` 兩份定義存在於 resolved schema 裡，agent 查詢時拿到的是什麼？它會看到兩筆、還是隨機一筆？它有沒有辦法知道「其中一筆是孤兒，永遠不會出現在真實資料裡」？
+分層把所有權寫成了機器可讀的形式，但有幾個問題是機制回答不了的，得先講好。
 
-答案是它沒辦法——因為那份矛盾在 registry 裡是合法的、沒有任何標記說哪一份才算數。Day6 講過 LLM 犯錯的方式很隱蔽：它不會說「這裡有兩個矛盾的定義，我不確定」，它會選一個然後往下推理。而這次它甚至沒做錯什麼——資料本身就是矛盾的。
+**base 改一個定義，誰負責通知？** 今天示範的 dependency 是靠 `schema_url` 裡的版本號釘住的，所以平台團隊改 base 的時候，團隊那邊不會有任何事情發生，直到有人手動把版本號往上調。這其實是好事，它讓升級變成一個有人看著的動作。但它也代表**平台團隊有義務主動通知**，因為沒有任何機制會替你通知。
 
-這也是為什麼今天那條 `conflicting_attribute_definition` 規則的價值不只是「保持整潔」：**它保證的是「這份 registry 對任何一個名字只有一個答案」**，而這正是把 registry 當成 agent 的知識來源時，最基本的前提。一份自相矛盾的知識庫，比一份不完整的知識庫危險得多——不完整會讓 agent 查不到，矛盾會讓它查到錯的還很有信心。
+**團隊要付多少成本才接得上？** 這個問題我用實際的行數回答：一份 `manifest.yaml` 五行，加上在自己的 model 檔裡把共用的欄位從 `id:` 改成 `ref:`。要學的新概念只有一個，就是 `ref` 跟 `id` 的差別。如果答案變成「先讀完 registry 規格」，那這個設計就失敗了。
+
+**擋下來的時候，對方修得動嗎？** `conflicting_definition` 那條訊息目前只有名字，沒有講「跟誰衝突」。今天那個 `--include-unreferenced` 的訊息反而好得多，它直接列出 `["registry.acme.biz", "registry.orders.local"]` 兩個 group。這是我這條 policy 該補的，把衝突的另一方也放進 Finding 裡。
+
+## 回到 AIOps：agent 讀到兩份定義會怎樣
+
+分層對 agent 的影響，全部集中在那個孤兒身上。
+
+registry 是 agent 唯一能事先知道「這個欄位代表什麼」的地方。當同一個 `biz.user.id` 在裡面躺著兩份定義，一份說是使用者識別碼、一份說其實放的是 email，agent 沒有任何辦法判斷該信哪一份。它不會說「這裡有矛盾」，它會挑一份用下去，而且挑的方式跟它當初猜 `WARN` 是大寫的方式一樣：看起來合理就好。
+
+放到值班的場景。凌晨三點，agent 要查「使用者 `u-5` 的訂單失敗了幾筆」。它讀到的定義如果是團隊那份，它會認為 `biz.user.id` 裡放的是 email，於是它可能先去找 email、找不到就換一個查法，或者更糟，它在回報裡寫「這個使用者的識別碼格式異常」。**這是一個完全由規範不一致造成的假故障，而系統本身好得很。**
+
+這也是為什麼 `conflicting_definition` 這條規則的價值不只是整潔。**它擋掉的是一份會讓 agent 得到兩個互斥答案的知識庫**，而那種錯誤在下游是無法被偵測的：agent 不會報錯，它只會很有信心地選一邊。
 
 ## 今天沒做的事
 
-沒有測那個 10 層依賴深度上限。文件有提到這個限制，但實務上會先撞到的是今天第三、四個陷阱——依賴不遞移、加上共同祖先重複載入，這兩件事讓「疊很多層」在三層就開始不舒服了，10 層對大部分團隊來說不是會碰到的邊界。
+沒有處理 base 升版之後的通知。今天只講到「版本號釘住了所以不會自動跟上」，但真正的問題是團隊怎麼知道該升、升了會壞掉什麼。這個題目本身值得一整天。
 
-沒有用 git URL 當 `registry_path`。weaver 支援從 git repo 或 GitHub release 載入依賴，那才是跨 repo、跨團隊分發的正式做法——今天全部用本機相對路徑，是為了讓範例可以直接跑、也才能把第一個陷阱（路徑基準點）講清楚。真正的發布跟版本控制留到 Day9。
+`conflicting_definition` 那條規則還很粗。它用 `brief` 當比較依據，所以兩份定義如果 `brief` 剛好一模一樣、但 `type` 或 `examples` 不同，它抓不到。要做完整得比對更多欄位。
 
-沒有處理「base 改版之後，依賴它的團隊怎麼辦」。今天所有 registry 都是 `development`、都沒有版本演進的概念，`schema_url` 裡那個 `0.1.0` 也還只是個裝飾。這正是明天的主題。
+也沒有真的建第二個團隊的 registry。`team-payments` 在圖上出現過，但沒有寫出來，所以「兩個團隊同時定義同一個新概念」這個更有趣的衝突情境，今天沒有實際跑過。
 
-明天：重現一次真實的 breaking change——weaver 0.23.0 對一個完全合法的欄位直接 hard error 的踩坑，講清楚三層驗證模型跟 `weaver registry diff` 的變更分類，以及升級之前該怎麼測。今天這個分層架構會在那裡派上用場：base 改一個欄位，`diff` 能不能告訴你哪些團隊會被打到。
+那個「依賴不遞移」的問題，我選了「兩邊都列」這個解法並記下它的代價，但沒有去找有沒有更好的做法。這條留給後面。
+
+## 小結
+
+今天寫的東西很少，兩份 manifest 加起來不到二十行，policy 也只有十幾行。但這是這系列第一次，registry 上面有了「誰擁有什麼」這個維度。
+
+比較意外的是那條寫錯的 policy。它在技術上完全能跑、也真的擋到了該擋的東西，唯一的問題是它順便擋掉了不該擋的，而那個「順便」的實際後果，是把平台團隊變成每個新欄位的審批關卡。**規則寫得太寬，代價不會出現在 CI 的離開碼上，會出現在三週後那四個等我 review 的 PR 上。**
+
+明天處理版本演進：base 改了一個定義，怎麼知道那是不是 breaking change，以及 weaver 的 `diff` 在哪些變更上會完全靜音。
