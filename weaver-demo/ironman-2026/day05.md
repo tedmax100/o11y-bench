@@ -861,7 +861,31 @@ $ weaver registry infer --otlp-grpc-port 14317 --registry-path /tmp/inferred
 | 需要事先有 registry | 要 | **不用** | 要 |
 | 典型用途 | CI merge gate | 導入治理的第一天 | 上線後的持續稽核 |
 
-對 Day1 那個服務跑一次，`userId` 跟 `user_id` **兩個名字一字不差地被學了進去**。這是漂移第一次以「資料」而不是「敘述」的形式出現。一份 infer 出來的草稿裡同時有兩個同義欄位，就是一份現成的待辦清單。
+把 Day1 那組服務跑起來、流量指向它，出來的草稿是 1852 行。在 `span.post__api_orders`（api-gateway 的 `POST /api/orders`）底下，`userId` 跟 `user_id` **兩個名字一字不差地被學了進去**，成為兩個完全獨立的 attribute：
+
+```yaml
+- id: userId
+  type: string
+  brief: ''
+  examples: u-5
+  requirement_level: recommended
+  ...
+- id: user_id
+  type: string
+  brief: ''
+  examples:
+  - u-4
+  - u-2
+  - u-7
+  - ''
+  - u-12
+  requirement_level: recommended
+  ...
+```
+
+這是漂移第一次以「資料」而不是「敘述」的形式出現。`infer` 沒有、也不可能有任何依據說它們是同一件事，它看到的是線路上兩個不同的字串 key，如實記下來。
+
+兩個地方值得多看一眼。`brief` 是空字串而不是缺欄位，**它明確地說「這裡什麼都沒有」**，這比省略更誠實。而 `user_id` 的 `examples` 裡混進了一個空字串，那不是 `infer` 的 bug，是真的有請求把這個欄位送成空值。一份現況盤點連這種東西都會照實端出來，這正是它的價值。
 
 ### 一個受控的往返實驗：語意不在線路上
 
@@ -881,7 +905,9 @@ $ weaver registry infer --otlp-grpc-port 14317 --registry-path /tmp/inferred
 
 前三列可以自動化：名字、型別、結構都在線路上，機器抓得到。後四列不行，而它們剛好是**對 agent 最有價值的四項**：`brief` 是語意、`requirement_level` 是承諾、`members` 是值域。**「觀察」永遠只能給你前三列；後四列必須有人坐下來決定。** 這就是「自動生成的草稿」跟「團隊審過的規範」之間的差距，也是為什麼 `infer` 是治理的**起點**而不是治理本身。
 
-反過來說，這也讓 `infer` 的正確用法很清楚：**它是一份「現況盤點」，用來讓那場對話有素材可以吵**，`userId` 跟 `user_id` 到底留哪一個、`status` 那兩種意思要拆成幾個欄位。沒有這份草稿，這場對話會停在「我覺得應該…」；有了它，對話從「這是我們現在真的在送的 41 個欄位」開始。
+反過來說，這也讓 `infer` 的正確用法很清楚：**它是一份「現況盤點」，用來讓那場對話有素材可以吵**，`userId` 跟 `user_id` 到底留哪一個、`status` 那兩種意思要拆成幾個欄位。沒有這份草稿，這場對話會停在「我覺得應該…」；有了它，起點變成那 1852 行裡每一個真的在送的欄位，誰都不能說「應該沒有人在用那個吧」。
+
+也因為這樣，那份草稿**不該直接 commit 成 registry**，我也沒有把它放進範例 repo。它的 `requirement_level` 全部是 `recommended`、`brief` 全部是空的，收下來等於宣告「這些欄位我們都沒有意見」。它是丟棄式的，該進的是一個 PR 的描述欄，讓人照著它一條一條決定。
 
 
 ## 小結
