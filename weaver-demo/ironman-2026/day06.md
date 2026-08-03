@@ -13,9 +13,9 @@ tags: [OpenTelemetry, Weaver, Rego, 鐵人賽]
 
 Rego 是這整套治理機制裡最陡的一段，所以中間會有一節專門講 weaver 實際用到的那一小塊：兩個 package 各自看得到什麼（我把 `input` 整包印出來對照過）、哪些關鍵字真的會用到、以及為什麼網路上大部分 Rego 範例貼進來會直接被拒絕。文件沒寫、但一定會踩到的行為，也一併記下來。
 
-程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`day10/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/day10)，一份刻意留著漂移的 registry 加一份 `naming.rego`。資料夾的日號沿用原本的編號，跟文章的日號對不上是正常的，理由在講 Operator 那天說明過。
+程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day06/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day06)，一份刻意留著漂移的 registry 加一份 [`naming.rego`](https://github.com/tedmax100/OTel_AIOps_Agent/blob/main/ironman-2026/day06/policies/naming.rego)。
 
-> 驗證環境：weaver 0.25.1。下面所有輸出都是實際跑出來貼上的，離開碼也是真的 `echo $?` 出來的。
+> 驗證環境：weaver 0.24.1。下面所有輸出都是實際跑出來貼上的，離開碼也是真的 `echo $?` 出來的。
 
 ## 命名漂移為什麼靠 code review 擋不住
 
@@ -280,7 +280,7 @@ policies/naming.rego has full coverage
 
 ## 三條規則，一條比一條難
 
-拿一份刻意保留漂移的最小 registry 當靶子（`day10/registry/`），裡面同時放了 `userId`、`user_id`、`status`、`biz.order.id` 四個 attribute：
+拿一份刻意保留漂移的最小 registry 當靶子（[`ironman-2026/day06/registry/model/drift.yaml`](https://github.com/tedmax100/OTel_AIOps_Agent/blob/main/ironman-2026/day06/registry/model/drift.yaml)），裡面同時放了 `userId`、`user_id`、`status`、`biz.order.id` 四個 attribute：
 
 ```yaml
 groups:
