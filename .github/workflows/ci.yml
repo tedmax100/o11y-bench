@@ -137,3 +137,16 @@ jobs:
       # ubuntu-latest ships Docker; the script runs the pinned otel/weaver image.
       - name: Validate demo-services semantic-convention registry
         run: bash demo-services/scripts/weaver.sh check --policy
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      # The registry checking itself is not enough: the agent's signal contracts
+      # name Prometheus metrics, and nothing until now verified those names are
+      # ones the registry declares. Regenerates schema_alignment.json and fails
+      # if it drifted from the committed copy.
+      - name: Check signal contracts against the registry
+        working-directory: aiops-agent/service
+        run: |
+          uv run python -m app.signals.weaver
+          git diff --exit-code app/signals/schema_alignment.json

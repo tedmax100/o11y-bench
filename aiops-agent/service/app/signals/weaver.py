@@ -16,6 +16,7 @@ RCA hot path. Fail-open: if the registry isn't readable, returns an empty set
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -56,19 +57,62 @@ def weaver_prom_metric_names(path: Path | None = None) -> set[str]:
     return names
 
 
-if __name__ == "__main__":  # pragma: no cover
+def alignment_report(path: Path | None = None) -> dict:
+    """Check every contract SLI against the registry and return a shippable
+    verdict.
+
+    The registry is a repo artifact, not something the agent image carries, so
+    this runs at dev/CI time and its result is written to `schema_alignment.json`
+    for `dq.py` to read. Crucially the "registry unreadable" case is reported as
+    `checked: 0` rather than as violations: an empty name set would otherwise
+    make *every* SLI look undeclared, turning a missing file into six findings.
+
+    Deterministic on purpose (no timestamp): the artifact is committed, so CI can
+    regenerate it and fail on a diff. Git already records when it last changed.
+    """
     from .contract import get_contracts, validate_against_weaver
 
-    weaver = weaver_prom_metric_names()
-    if not weaver:
-        print("weaver registry not found — skipping alignment check")
+    declared = weaver_prom_metric_names(path)
+    if not declared:
+        return {
+            "checked": 0,
+            "declared_metrics": 0,
+            "undeclared": [],
+            "note": "weaver registry not readable; schema alignment unproven",
+        }
+    contracts = get_contracts().contracts
+    undeclared = [w for c in contracts for w in validate_against_weaver(c, declared)]
+    return {
+        "checked": len(contracts),
+        "declared_metrics": len(declared),
+        "undeclared": undeclared,
+        "note": (
+            f"{len(contracts)} contracts checked against {len(declared)} registry metrics"
+            if not undeclared
+            else f"{len(undeclared)} SLI reference(s) not declared in the registry"
+        ),
+    }
+
+
+def alignment_path() -> Path:
+    return Path(__file__).parent / "schema_alignment.json"
+
+
+if __name__ == "__main__":  # pragma: no cover
+    report = alignment_report()
+    alignment_path().write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+    if not report["checked"]:
+        print(f"⚠ {report['note']}")
+        print(f"  wrote {alignment_path().name} recording that there is no evidence")
         raise SystemExit(0)
-    print(f"weaver registry declares {len(weaver)} Prom metrics: {sorted(weaver)}")
-    any_drift = False
-    for c in get_contracts().contracts:
-        warns = validate_against_weaver(c, weaver)
-        for w in warns:
-            any_drift = True
-            print(f"  ⚠ {w}")
-    if not any_drift:
+    print(
+        f"weaver registry declares {report['declared_metrics']} Prom metrics; "
+        f"checked {report['checked']} contracts"
+    )
+    for w in report["undeclared"]:
+        print(f"  ⚠ {w}")
+    if not report["undeclared"]:
         print("✓ all contract SLIs reference metrics declared in the Weaver registry")
+    print(f"  wrote {alignment_path().name}")
+    raise SystemExit(1 if report["undeclared"] else 0)
