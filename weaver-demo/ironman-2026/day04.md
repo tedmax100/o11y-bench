@@ -19,7 +19,7 @@ tags: [OpenTelemetry, Kubernetes, 鐵人賽]
 
 挑 `api-gateway` 一個服務來換。
 
-**Dockerfile** 拿掉 `opentelemetry-instrument` 這個包裝指令，變回最單純的 `uvicorn`：
+Dockerfile 拿掉 `opentelemetry-instrument` 這個包裝指令，變回最單純的 `uvicorn`：
 
 ```dockerfile
 # 這裡刻意不寫 opentelemetry-instrument，
@@ -27,7 +27,7 @@ tags: [OpenTelemetry, Kubernetes, 鐵人賽]
 CMD ["uvicorn", "api_gateway.main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
-**k8s manifest** 在 Pod template 加一個 annotation：
+k8s manifest 在 Pod template 加一個 annotation：
 
 ```yaml
 template:
@@ -126,7 +126,7 @@ FIELDS:
   java / python / nodejs / dotnet / go / apacheHttpd / nginx   <Object>
 ```
 
-分成兩層很清楚：上面那些是**跨語言共用的決定**，下面七個是**各語言各自的設定**。每個語言區塊裡長這樣：
+分成兩層很清楚：上面那些是跨語言共用的決定，下面七個是各語言各自的設定。每個語言區塊裡長這樣：
 
 ```console
 $ kubectl explain instrumentation.spec.python
@@ -180,7 +180,7 @@ spec:
 
 所以你把 sampler 從 `always_on` 改成 `traceidratio`、apply 上去、`kubectl get instrumentation` 顯示新值 —— 然後線上的採樣率一點變化都沒有。因為那些 Pod 是舊的，它們身上的環境變數是建立當下就寫死的。
 
-這跟 Collector 那種「改了 CR，controller 自動把現實拉過去」的直覺剛好相反。`OpenTelemetryCollector` 是持續調和的，`Instrumentation` 是**一次性蓋章**的。
+這跟 Collector 那種「改了 CR，controller 自動把現實拉過去」的直覺剛好相反。`OpenTelemetryCollector` 是持續調和的，`Instrumentation` 是一次性蓋章的。
 
 ```mermaid
 flowchart LR
@@ -201,7 +201,7 @@ flowchart LR
 
 **CR 給的是預設值，不是強制值。** 任何一個團隊只要自己在 manifest 裡寫死 `OTEL_SERVICE_NAME` 或 `OTEL_EXPORTER_OTLP_ENDPOINT`，webhook 就會讓路。今天 `api-gateway` 那兩個沒被蓋掉的環境變數，就是這條規則的實證。
 
-這是好事還是壞事，要看你想達成什麼。它讓「預設那條路最好走，但要走別條也走得掉」變成可能，團隊有特殊需求時不用來求平台開特例。代價是**平台團隊沒辦法從這份 CR 推斷全公司的實際狀態** —— 你以為大家都在用 10% 採樣，但某個團隊三個月前為了 debug 自己覆蓋掉了，而這件事不會有任何地方通知你。
+這是好事還是壞事，要看你想達成什麼。它讓「預設那條路最好走，但要走別條也走得掉」變成可能，團隊有特殊需求時不用來求平台開特例。代價是**平台團隊沒辦法從這份 CR 推斷全公司的實際狀態**。你以為大家都在用 10% 採樣，但某個團隊三個月前為了 debug 自己覆蓋掉了，而這件事不會有任何地方通知你。
 
 要知道實際狀態，只能反過來從遙測資料本身去對帳。這個問題後面談 registry 跟一致性檢查時還會回來。
 
@@ -209,7 +209,7 @@ flowchart LR
 
 切換前後，各對 `webapp → api-gateway → order-service → user/payment-service` 這條下單流程送一次真實請求，把 `trace_id` 從 log 撈出來直接查 Tempo。
 
-**Before**（Dockerfile 裡的 `opentelemetry-instrument`）：
+Before（Dockerfile 裡的 `opentelemetry-instrument`）：
 
 ```
 api-gateway     POST /api/orders   {http.route: /api/orders, user_id: u-1}
@@ -219,7 +219,7 @@ payment-service POST /charge
 webapp          POST /api/{path:path}
 ```
 
-**After**（annotation 注入，這次故意送 `userId` 而不是 `user_id`）：
+After（annotation 注入，這次故意送 `userId` 而不是 `user_id`）：
 
 ```
 api-gateway     POST /api/orders   {http.route: /api/orders, userId: u-4}
@@ -356,7 +356,7 @@ $ kubectl -n demo describe pod -l app=otel-collector
     Restart Count:  3
 ```
 
-我們能看到** `Reason: Error` 加 `Exit Code: 137`。**
+我們能看到 `Reason: Error` 加 `Exit Code: 137`。
 
 137 就是 128 + 9，也就是行程被 `SIGKILL` 砍掉。真正動手的是核心的 OOM killer，但這個叢集回報時把它歸類成一般的 `Error`。如果你的排查腳本是去 grep `OOMKilled` 這個字，這次它會什麼都抓不到。**判斷依據要看 exit code 137，不是那個字串。**
 
@@ -369,7 +369,7 @@ $ kubectl -n demo describe pod -l app=otel-collector
 壓垮後  1322  1022  0 traces
 ```
 
-不是斷崖式歸零，是**滑下去的**。從 1600 掉到 1322，再掉到 1022，最後歸零。
+不是斷崖式歸零，是滑下去的。從 1600 掉到 1322，再掉到 1022，最後歸零。
 
 原因是 collector 沒有一次就死透，它在 crashloop：起來、吃流量、被砍、再起來。每一輪活著的那幾秒還是能送出一些東西，所以曲線是斜的。這比直接歸零更難察覺，因為 dashboard 上看起來只是「有點少」，而不是「壞了」。
 
@@ -455,7 +455,7 @@ service:
 
 順序很重要，`memory_limiter` 要放在 pipeline 的第一個。放在 `batch` 後面就沒意義了，因為資料已經先被收下來堆在記憶體裡。
 
-然後**同樣的 64Mi、同樣的負載**再跑一次。這次 collector 沒死：
+然後同樣的 64Mi、同樣的負載再跑一次。這次 collector 沒死：
 
 ```console
 $ kubectl -n demo get pods -l app=otel-collector

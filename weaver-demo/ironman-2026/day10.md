@@ -168,7 +168,7 @@ flowchart TB
     F --> D["但這個 flag 已標為 deprecated"]
 ```
 
-原因是 Day8 講過的：dependency 提供的是可以被 `ref` 的定義池，沒有被引用到的部分不會進 resolved schema，而 MCP 讀的就是 resolved schema。所以「有沒有被某個 span 引用」決定了 agent 查不查得到。
+原因是前面做分層的時候講過的：dependency 提供的是可以被 `ref` 的定義池，沒有被引用到的部分不會進 resolved schema，而 MCP 讀的就是 resolved schema。所以「有沒有被某個 span 引用」決定了 agent 查不查得到。
 
 加上 `--include-unreferenced` 就會全部出現：
 
@@ -179,7 +179,7 @@ flowchart TB
    "provenance": {"source": "https://example.com/schemas/acme-base/0.2.0"}}
 ```
 
-940 個，因為官方 semconv 整份都進來了。而這正是 Day8 那個兩難的另一面：這個 flag 已經被標為 deprecated，官方建議改用 `imports`，但 `imports` 不吃 attribute。所以現在要讓 agent 查得到 base 的屬性，你只有兩條路：用一個正在被淘汰的 flag，或者確保每一個屬性都真的被某個 span 或 metric 引用到。
+940 個，因為官方 semconv 整份都進來了。而這正是分層那個兩難的另一面：這個 flag 已經被標為 deprecated，官方建議改用 `imports`，但 `imports` 不吃 attribute。所以現在要讓 agent 查得到 base 的屬性，你只有兩條路：用一個正在被淘汰的 flag，或者確保每一個屬性都真的被某個 span 或 metric 引用到。
 
 > 第二條路其實不算壞。「沒有任何訊號在用的定義，agent 也不需要知道」聽起來滿合理的。但它有個副作用：team registry 就此無法回答「這個公司有哪些共用欄位」這種問題，只能回答「我這一層用到了哪些」。
 
@@ -272,8 +272,8 @@ sequenceDiagram
 
 ## 小結
 
-今天寫的程式碼只有一支七十行的探針，但它把一件事變成了可重複的：**這個 server 到底會告訴 agent 什麼。**
+今天寫的程式碼只有一支七十行的探針，沒有做出任何新的治理能力。但它把「這個 server 到底會告訴 agent 什麼」變成一件可以重複跑、跑完就有答案的事，之後每次改 registry 我都會順手打一次。
 
-比較意外的是那個 `total_attribute_count: 1`。分層是 Day8 花一整天做對的事，結果它在 agent 這一側的預設行為，是讓大部分共用定義變成查不到。**治理做得愈仔細，愈需要回頭確認 agent 那一端看到的是不是同一份東西**，這兩件事之間沒有任何自動的保證。
+比較意外的是那個 `total_attribute_count: 1`。分層是前面花一整天做對的事，結果它在 agent 這一側的預設行為，是讓大部分共用定義變成查不到，而這兩件事之間沒有任何自動的保證。這也讓我對後面的東西多了一個習慣：做完一層治理，要記得換到 agent 那一側再看一次。
 
-明天把這條線繼續往前拉：讓 registry 不只描述欄位，還能帶著「這個欄位為什麼重要」的意圖，並且把那份意圖編譯成真的會跑的東西。
+明天把這條線繼續往前拉，讓 registry 不只描述欄位。

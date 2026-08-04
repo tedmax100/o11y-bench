@@ -18,14 +18,14 @@ tags: [OpenTelemetry, Weaver, AIOps, 鐵人賽]
 
 ```mermaid
 flowchart TB
-    E["環境層<br/>Operator 注入、Collector 調和<br/>（Day3-4）"] --> S["規範層<br/>registry、命名 policy、分層、breaking change<br/>（Day5-6、Day8-9）"]
-    S --> X["執行層<br/>CI gate、live-check、意圖編譯<br/>（Day7、Day11）"]
-    X --> C["消費層<br/>MCP、agent 讀得到的值域與意圖<br/>（Day10-11）"]
+    E["環境層<br/>Operator 注入、Collector 調和"] --> S["規範層<br/>registry、命名 policy<br/>分層、breaking change"]
+    S --> X["執行層<br/>CI gate、live-check、意圖編譯"]
+    X --> C["消費層<br/>MCP、agent 讀得到的值域與意圖"]
     C -.->|"消費端會反過來檢查規範品質"| S
-    T["可測試性<br/>regress.sh（Day12）"] -.->|"每一層都要能證明自己還活著"| S
+    T["可測試性<br/>regress.sh"] -.->|"每一層都要能證明自己還活著"| S
 ```
 
-那條虛線的回饋是這十二天我最沒預期到的收穫。Day10 把 registry 交給 agent 之後才發現，分層做得好好的 registry，在 agent 那一端預設看不到 base 的屬性。**消費端會反過來暴露規範層的問題**，而在沒有消費端之前，那些問題完全看不出來。
+圖裡「消費層」那一格用的是 MCP（Model Context Protocol），而那條回饋虛線是這十二天我最沒預期到的收穫。把 registry 交給 agent 之後才發現，分層做得好好的 registry，在 agent 那一端預設看不到 base 的屬性。**消費端會反過來暴露規範層的問題**，而在沒有消費端之前，那些問題完全看不出來。
 
 ## 十三項檢查，每一項都真的跑一次
 
@@ -57,7 +57,7 @@ $ python3 ironman-2026/day13/verify_onboarding.py ironman-2026/day13/shipping-v0
   ✓ 8. 狀態類欄位都把值域寫進 schema  enum：（沒有）
   ✗ 9. 每個 metric 都有語意單位
       問題：單位是空的或 1：shipping.dispatched
-      下一步：用 UCUM 的計數單位，例如 {shipment}，agent 才知道這個數字在數什麼
+      下一步：用 UCUM（Unified Code for Units of Measure）的計數單位，例如 {shipment}，agent 才知道這個數字在數什麼
   ✗ 10. 每個 metric 都標了 owner
       問題：沒有 annotations.intent.owner：shipping.dispatched
       下一步：在 metric group 上加 annotations.intent.owner，告警才知道要找誰
@@ -77,9 +77,9 @@ $ python3 ironman-2026/day13/verify_onboarding.py ironman-2026/day13/shipping-v0
 
 先看第 3 項：**`registry check` 是綠的。** 這個服務在 weaver 眼裡完全合法，YAML 結構正確、該有的欄位都有。但它有六項沒過，而那六項全部落在「合法，但對 agent 沒有用」這個區間。
 
-Day5 講過內建檢查的邊界：少了 `brief` 是硬錯誤，少了 `examples` 完全不吭聲。這份 checklist 補的就是那條邊界之外的東西。**工具管的是這份 YAML 合不合法，checklist 管的是這份 schema 好不好用。**
+前面講過內建檢查的邊界：少了 `brief` 是硬錯誤，少了 `examples` 完全不吭聲。這份 checklist 補的就是那條邊界之外的東西。**工具管的是這份 YAML 合不合法，checklist 管的是這份 schema 好不好用。**
 
-每一項失敗都有「下一步」，這是我花最多力氣的部分。Day7 講過那條判準：一道 gate 如果擋下來之後還要平台團隊親自去解釋，它的維護成本會隨團隊數線性成長。所以第 4 項不只說 `shippingStatus` 違規，還說改成 `shipping.status`；第 11 項不只說沒有意圖，還說去哪抄一份。
+每一項失敗都有「下一步」，這是我花最多力氣的部分。前面講過那條判準：一道 gate 如果擋下來之後還要平台團隊親自去解釋，它的維護成本會隨團隊數線性成長。所以第 4 項不只說 `shippingStatus` 違規，還說改成 `shipping.status`；第 11 項不只說沒有意圖，還說去哪抄一份。
 
 補完之後：
 
@@ -109,7 +109,7 @@ flowchart TB
 
 看清楚這個因果：**它因為同時違反了命名規則，反而躲過了值域檢查。** 一個服務如果命名寫對了，這個檢查會抓到它；命名寫錯的服務反而全身而退。這是我看過最諷刺的一種假綠燈，而它只有在跑一個「兩件事都做錯」的服務時才會現形。
 
-**第 6 項放過了 `biz.user.id`。** `shipping-v0` 裡有一個自己定義的 `biz.user.id`，brief 寫的是「收件人的識別碼」，而 base 裡那個是「使用者識別碼」。這正是 Day8 那條 `conflicting_definition` 規則要抓的東西，但它是綠的。
+**第 6 項放過了 `biz.user.id`。** `shipping-v0` 裡有一個自己定義的 `biz.user.id`，brief 寫的是「收件人的識別碼」，而 base 裡那個是「使用者識別碼」。這正是分層時那條 `conflicting_definition` 規則要抓的東西，但它是綠的。
 
 第一個原因很單純：v0 沒宣告 dependency，base 的定義根本不在視野裡。但我手動補上 dependency 之後，它**還是綠的**：
 
@@ -118,7 +118,7 @@ $ weaver registry check -r ironman-2026/day13/shipping-v0/registry -p ironman-20
 （沒有任何違規）
 ```
 
-因為那個屬性沒有被任何 span 或 metric `ref` 到，所以它不會進 resolved schema，而 policy 看的就是 resolved schema。這是 Day8 那個「未引用的定義不會進來」的行為，跟 Day10 那個「MCP 查不到 base 屬性」是同一件事，今天它第三次出現，這次的受害者是我自己的 checklist。
+因為那個屬性沒有被任何 span 或 metric `ref` 到，所以它不會進 resolved schema，而 policy 看的就是 resolved schema。這是「未引用的定義不會進來」那個行為，跟「MCP 查不到 base 屬性」是同一件事，今天它第三次出現，這次的受害者是我自己的 checklist。
 
 加上 `--include-unreferenced` 確實抓得到，但代價是這個：
 
@@ -159,9 +159,9 @@ $ weaver registry check -r ironman-2026/day13/shipping-v0/registry -p ironman-20
 | 沒有判準說 2.98% 算不算異常 | 意圖編成 alert rule，帶著 `why` 跟 `first_check` | 沒有測過 agent 讀了會不會用 |
 | 「有時候會 discover，有時候不會」 | 沒有解決 | 同上 |
 
-誠實地說，**第一階段沒有讓那隻 agent 變聰明，它做的是讓 agent 面對的世界變得可推斷。** 這兩件事的差別，正好是這個系列從 Day2 開始講的那句話：AIOps 要的不是更多資料，是可推斷的資料。
+誠實地說，**第一階段沒有讓那隻 agent 變聰明，它做的是讓 agent 面對的世界變得可推斷。** 這兩件事的差別，正好是這個系列一開始就在講的那句話：AIOps 要的不是更多資料，是可推斷的資料。
 
-而「可推斷」現在有了具體的清單：欄位名是唯一的（Day6）、值域寫下來了（Day5）、規範跟實際送出去的東西對得上（Day7）、誰擁有哪一層講清楚了（Day8）、改版有人比對（Day9）、agent 查得到（Day10）、什麼叫正常寫下來了（Day11）、而且這些東西壞掉的時候會有人知道（Day12）。
+而「可推斷」現在有了具體的清單：欄位名是唯一的、值域寫下來了、規範跟實際送出去的東西對得上、誰擁有哪一層講清楚了、改版有人比對、agent 查得到、什麼叫正常寫下來了，而且這些東西壞掉的時候會有人知道。
 
 至於這些到底讓分數變成幾分，我還沒量。那是接下來要做的事。
 
@@ -171,7 +171,7 @@ $ weaver registry check -r ironman-2026/day13/shipping-v0/registry -p ironman-20
 
 沒有把 checklist 自己加進昨天那支回歸腳本。`shipping-v0` 要跑出 exit 1、`shipping-v1` 要跑出 exit 0，這兩條斷言應該進去，不然哪天有人改壞了第 4 項的判斷邏輯，沒有任何東西會發現。
 
-上面那兩個洞也沒有修。第 8 項要改成「先確認命名合規，再檢查值域」，或者乾脆改成看 `examples` 裡有幾個相異值；第 6 項在 `--include-unreferenced` 的雜訊被解決之前，只能先誠實記著。修它們需要先想清楚規則該問什麼問題，而那正是 Day8 那條規則教過的事：**問「這個名字歸誰管」跟問「這個定義跟別人衝不衝突」，是兩條完全不同的規則。**
+上面那兩個洞也沒有修。第 8 項要改成「先確認命名合規，再檢查值域」，或者乾脆改成看 `examples` 裡有幾個相異值；第 6 項在 `--include-unreferenced` 的雜訊被解決之前，只能先誠實記著。修它們需要先想清楚規則該問什麼問題，而那正是分層那條規則教過的事：**問「這個名字歸誰管」跟問「這個定義跟別人衝不衝突」，是兩條完全不同的規則。**
 
 也沒有做多語言。`shipping-v1` 生的是 Python，一個 Go 的服務要接上這套，樣板得另外寫一份。
 
@@ -181,6 +181,6 @@ $ weaver registry check -r ironman-2026/day13/shipping-v0/registry -p ironman-20
 
 但那兩個洞讓我想了很久。我寫這份 checklist 的時候，是照著自己前面十二天踩過的坑一項一項排的，理論上不會有比這更貼近真實問題的清單了。結果它在第一次面對一個真的沒做好的服務時，就漏掉了兩件事，而且其中一件的漏法是「因為那個服務錯得更徹底，所以躲過了檢查」。
 
-**檢查機制只會在壞掉的東西上顯現自己的缺陷，而我們平常手上大多是好的東西。** 這件事對後面要做的 agent evaluation 大概是同一個道理：一組全部答對的題目，量不出任何東西。
+**檢查機制只會在壞掉的東西上顯現自己的缺陷，而我們平常手上大多是好的東西。** 這對後面要做的 agent evaluation 應該是同一個道理，一組全部答對的題目量不出任何東西，所以那組題目本身也得先想辦法弄壞一次看看。
 
-第一階段到這裡結束。接下來要回到 Day1 那隻 agent 身上，把這十三天做出來的東西真的接給它，然後重跑那九題。
+第一階段到這裡結束。這一段做的是讓資料值得相信，接下來換一個問題：讓資料能被推理。明天先去把現在手上已經有的東西讀清楚。
