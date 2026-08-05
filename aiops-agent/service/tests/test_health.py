@@ -70,10 +70,13 @@ async def test_query_none_is_unavailable(monkeypatch):
     assert h.verdict == "unavailable"
 
 
-async def test_neighbor_without_contract_is_skipped(monkeypatch):
-    # api-gateway declares no SLIs → nothing to judge it by.
+async def test_neighbor_without_contract_is_unjudgeable_not_dropped(monkeypatch):
+    # api-gateway declares no SLIs. Dropping it silently used to let the verdict
+    # line claim it was healthy, so it now comes back as an explicit verdict.
     monkeypatch.setattr(health, "_instant_scalar", _fake_scalar({}))
-    assert await health._evaluate("api-gateway", "upstream") is None
+    h = await health._evaluate("api-gateway", "upstream")
+    assert h is not None
+    assert h.verdict == "unjudgeable"
 
 
 # ---- blame propagation across the real demo topology -----------------------
@@ -154,7 +157,9 @@ async def test_downstream_unhealthy_no_attribution_falls_back(monkeypatch):
     )
     block = await evaluate_dependency_health(["api-gateway"])
     assert "downstream payment-service: error 12.0% — UNHEALTHY" in block
-    assert "HEALTHY SLIs themselves" in block
+    # api-gateway has no SLI of its own: the verdict must NOT claim it is healthy.
+    assert "HEALTHY SLIs themselves" not in block
+    assert "could NOT be judged from metrics" in block
     assert "CONFIRM they actually see failures attributed to that dependency" in block
 
 
@@ -176,11 +181,42 @@ async def test_self_and_downstream_both_unhealthy_is_cascade(monkeypatch):
     assert "order-service" in block and "payment-service" in block
 
 
-async def test_all_healthy(monkeypatch):
+async def test_all_healthy_says_only_what_it_could_judge(monkeypatch):
     monkeypatch.setattr(health, "_instant_scalar", _fake_scalar({}))  # all 0.0
     block = await evaluate_dependency_health(["order-service"])
-    assert "Neither the service(s)" in block
+    assert "No unhealthy SLI among the services this walk could judge" in block
+    # user-service is throughput-only, so the all-clear must be qualified.
+    assert "could NOT be judged (no error SLI)" in block
+    assert "user-service" in block
     assert "SYMPTOM" not in block and "ROOT CAUSE" not in block
+
+
+# ---- what the walk could not reach -----------------------------------------
+
+
+async def test_service_without_sli_is_stated_not_dropped(monkeypatch):
+    """webapp and its only dependency both lack an SLI. The walk used to return
+    nothing at all; it must now say that it could not judge either of them."""
+    monkeypatch.setattr(health, "_instant_scalar", _fake_scalar({}))
+    block = await evaluate_dependency_health(["webapp"])
+    assert block is not None
+    assert "this service webapp: no error SLI declared — CANNOT be judged" in block
+    assert "downstream api-gateway: no error SLI declared — CANNOT be judged" in block
+
+
+async def test_root_cause_verdict_does_not_clear_unjudgeable_deps(monkeypatch):
+    """order breaching, payment healthy, user-service throughput-only. Calling
+    order the root cause is fine; claiming its dependencies are healthy is not."""
+    monkeypatch.setattr(
+        health,
+        "_instant_scalar",
+        _fake_scalar({"orders_total": 0.3, "user_lookups_total": 4.7}),
+    )
+    block = await evaluate_dependency_health(["order-service"])
+    assert "LIKELY ROOT CAUSE" in block
+    assert "its downstream dependencies are healthy" not in block
+    assert "none of its judgeable downstream dependencies is unhealthy" in block
+    assert "a fault inherited from them is not ruled out" in block
 
 
 async def test_disabled_returns_none(monkeypatch):

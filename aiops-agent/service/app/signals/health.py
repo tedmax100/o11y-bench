@@ -39,7 +39,7 @@ class NeighborHealth(BaseModel):
     value: float | None
     unit: str
     objective: str = ""  # the SLI's declared target, e.g. "declined_rate < 1%"
-    verdict: str  # healthy | unhealthy | unknown | unavailable
+    verdict: str  # healthy | unhealthy | unknown | unavailable | unjudgeable
 
 
 class ImpactEdge(BaseModel):
@@ -97,7 +97,17 @@ async def _instant_scalar(expr: str, at: str = "now") -> float | None:
 async def _evaluate(svc: str, relation: str) -> NeighborHealth | None:
     sli = _health_sli(svc)
     if sli is None:
-        return None
+        # No SLI declared for this service — that is a gap in the contract, not
+        # a clean bill of health. Say so on its own line instead of dropping the
+        # service, so no downstream sentence can read the silence as "healthy".
+        return NeighborHealth(
+            service=svc,
+            relation=relation,
+            metric="none",
+            value=None,
+            unit="",
+            verdict="unjudgeable",
+        )
     try:
         value = await _instant_scalar(sli.promql)
     except Exception as e:
@@ -131,13 +141,18 @@ async def _evaluate(svc: str, relation: str) -> NeighborHealth | None:
 
 
 def _fmt(h: NeighborHealth) -> str:
+    label = "this service" if h.relation == "self" else h.relation
+    if h.verdict == "unjudgeable":
+        return (
+            f"- {label} {h.service}: no error SLI declared — CANNOT be judged from metrics "
+            "(a missing declaration, not a healthy verdict; judge it from its logs)"
+        )
     if h.value is None:
         val = "n/a"
     elif h.unit == "ratio":
         val = f"{h.value:.1%}"
     else:
         val = f"{h.value:.2g} {h.unit}".strip()
-    label = "this service" if h.relation == "self" else h.relation
     if h.verdict == "unhealthy":
         obj = f" (breaches objective {h.objective})" if h.objective else ""
         tail = f" — UNHEALTHY{obj}"
@@ -205,7 +220,9 @@ def _fmt_impact(im: ImpactEdge) -> str:
 async def evaluate_dependency_health(services: list[str]) -> str | None:
     """For the service(s) under investigation, evaluate each neighbour's health
     live and return a context block that tells the agent which way blame flows.
-    None when there's nothing to evaluate (no topology/contract neighbours)."""
+    None only when the service isn't in the topology at all — a service the walk
+    reaches but cannot judge still gets a block saying exactly that, because
+    silence here reads as "healthy" to whoever consumes it next."""
     if not (settings.signal_plane_enabled and settings.signal_dependency_health_enabled):
         return None
     topo = get_topology()
@@ -250,6 +267,28 @@ async def evaluate_dependency_health(services: list[str]) -> str | None:
     ]
     had_deps = any(h.relation == "downstream" for h in evaluated)
 
+    # Services the walk reached but could not judge (no error SLI declared, or the
+    # query came back empty). Every verdict below has to qualify itself with these
+    # — otherwise "no unhealthy SLI" gets read as "everything here is fine", which
+    # is a claim about services we never actually measured.
+    _blind = ("unjudgeable", "unavailable", "unknown")
+    blind_self = [h.service for h in evaluated if h.relation == "self" and h.verdict in _blind]
+    blind_deps = [
+        h.service for h in evaluated if h.relation == "downstream" and h.verdict in _blind
+    ]
+    blind_self_note = (
+        f" NOTE: {', '.join(blind_self)} has no error SLI of its own, so this verdict says "
+        "nothing about it — judge it from its logs before ruling it out."
+        if blind_self
+        else ""
+    )
+    blind_deps_note = (
+        f" NOTE: {len(blind_deps)} downstream dependency/dependencies ({', '.join(blind_deps)}) "
+        "could NOT be judged (no error SLI), so a fault inherited from them is not ruled out."
+        if blind_deps
+        else ""
+    )
+
     # s4.2: for each unhealthy downstream a primary declares an attribution edge
     # to, measure whether the primary's failures attributed to it actually ROSE
     # (vs baseline) — the difference between adjacent and materially impacted.
@@ -277,11 +316,12 @@ async def evaluate_dependency_health(services: list[str]) -> str | None:
             + (rise_note or " Determine whether the breach is caused by the unhealthy dependency.")
         )
     elif bad_self:
-        deps_note = (
-            "its downstream dependencies are healthy"
-            if had_deps
-            else "it has no downstream dependencies to inherit a fault from"
-        )
+        if not had_deps:
+            deps_note = "it has no downstream dependencies to inherit a fault from"
+        elif blind_deps:
+            deps_note = "none of its judgeable downstream dependencies is unhealthy"
+        else:
+            deps_note = "its downstream dependencies are healthy"
         verdict = (
             f"→ {', '.join(bad_self)} is itself breaching its error SLO and {deps_note} — "
             "it is the LIKELY ROOT CAUSE, not a symptom. Do NOT dismiss this as normal; "
@@ -313,26 +353,30 @@ async def evaluate_dependency_health(services: list[str]) -> str | None:
         # Downstream unhealthy, no attribution metric declared to measure impact.
         # Fall back to s4.1: self is healthy, so tell the agent to confirm before
         # claiming symptom rather than assert it from topology.
+        self_state = (
+            "the service(s) under investigation could NOT be judged from metrics"
+            if blind_self
+            else "the service(s) under investigation show HEALTHY SLIs themselves"
+        )
         verdict = (
             "→ A downstream dependency is unhealthy ("
             + ", ".join(bad_deps)
-            + "), but the service(s) under investigation show HEALTHY SLIs themselves. "
+            + f"), but {self_state}. "
             "An unhealthy downstream does NOT by itself mean they are impacted — before "
             "calling them a symptom, CONFIRM they actually see failures attributed to that "
             "dependency (e.g. their own upstream-error / cancelled-by-dependency count, "
             "not just their overall error SLI). Fix the unhealthy dependency regardless; "
-            "it is the primary problem to investigate."
+            "it is the primary problem to investigate." + blind_self_note
         )
     elif had_deps:
-        verdict = (
-            "→ Neither the service(s) under investigation nor their downstream "
-            "dependencies show an unhealthy SLI right now."
-        )
+        verdict = "→ No unhealthy SLI among the services this walk could judge." + blind_self_note
     else:
         verdict = (
             "→ No unhealthy SLI right now; the service(s) under investigation are a "
-            "leaf with no downstream dependencies."
+            "leaf with no downstream dependencies." + blind_self_note
         )
+
+    verdict += blind_deps_note
 
     primary_label = ", ".join(sorted(primaries))
     return (
