@@ -25,7 +25,7 @@ import logging
 from pydantic import BaseModel
 
 from ..config import settings
-from ..tools.query import _get_json, _parse_dt, _rfc3339
+from ..tools.query import _get_json, _parse_dt, _rfc3339, current_now
 from .contract import SLI, contract_for
 from .topology import get_topology
 
@@ -379,8 +379,14 @@ async def evaluate_dependency_health(services: list[str]) -> str | None:
     verdict += blind_deps_note
 
     primary_label = ", ".join(sorted(primaries))
+    # State the clock these readings were taken against. Inside an alert
+    # investigation `current_now()` is pinned to the alert's startsAt, so "just
+    # now" would be wrong by however old the alert is — and a reader (human or
+    # model) has no other way to tell which window these numbers came from.
+    read_at = current_now().strftime("%Y-%m-%dT%H:%M:%SZ")
     return (
         f"## Dependency health (live) — {primary_label}\n"
-        "Each service's SLI, read just now, to attribute root cause to the right "
-        "node:\n" + "\n".join(lines) + "\n" + verdict
+        f"Each service's SLI, read at {read_at} (the incident clock for this "
+        "investigation, not necessarily wall-clock now), to attribute root cause "
+        "to the right node:\n" + "\n".join(lines) + "\n" + verdict
     )

@@ -259,3 +259,19 @@ def test_fmt_throughput_liveness():
             verdict="unknown",
         )
     )
+
+
+async def test_block_states_the_clock_it_read_at(monkeypatch):
+    """Inside an alert investigation the clock is pinned to the alert's startsAt,
+    so the block must state that time rather than claim it read "just now"."""
+    from datetime import UTC, datetime
+
+    from app.tools.query import now_override
+
+    monkeypatch.setattr(health, "_instant_scalar", _fake_scalar({"declined": 0.41}))
+    pinned = datetime(2026, 8, 5, 15, 30, 0, tzinfo=UTC)
+    with now_override(pinned):
+        block = await evaluate_dependency_health(["payment-service"])
+    assert "read at 2026-08-05T15:30:00Z" in block
+    assert "not necessarily wall-clock now" in block
+    assert "just now" not in block
