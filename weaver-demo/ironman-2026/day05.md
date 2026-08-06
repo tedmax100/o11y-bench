@@ -180,16 +180,16 @@ schema_url: https://tedmax100.github.io/o11y-bench/demo-services/schemas/0.1.0
 
 好處是「新增一個檔案」不必改 manifest。**代價是你放進去的任何東西它都會讀，而它對兩種誤放的反應完全不同。**
 
-**第一種：丟進一份根本不是 registry 的 YAML。** 在 `model/` 裡放一份 k8s ConfigMap：
+第一種：丟進一份根本不是 registry 的 YAML。 在 `model/` 裡放一份 k8s ConfigMap：
 
 ```
 × Object contains unexpected properties: apiVersion, kind, metadata.
   These properties are not defined in the schema.
 ```
 
-硬錯誤、exit 1。**這種很好**，它把話講清楚了，你不可能誤會。
+硬錯誤、exit 1。這種很好，它把話講清楚了，你不可能誤會。
 
-**第二種：丟進一份格式正確、但不該在這裡的 YAML。** 想像你改 registry 之前手動備份了一份 `oops-backup.yaml`，裡面是合法的 group 定義：
+第二種：丟進一份格式正確、但不該在這裡的 YAML。 想像你改 registry 之前手動備份了一份 `oops-backup.yaml`，裡面是合法的 group 定義：
 
 ```
 $ weaver registry stats -r <registry>
@@ -274,17 +274,17 @@ flowchart TB
 
 這個問題我想多講一點，因為它是整份 registry 設計的地基。
 
-假設沒有 `attribute_group`。`biz.user.id` 要同時出現在一個 span 跟一個 event 上，你就得**把同一份定義寫兩次**，型別、`brief`、`stability`、enum members 全部複製一遍。然後兩份定義會開始各自漂移：有人改了 span 那份的 `brief`，event 那份沒改；有人在 span 那份加了一個 enum member，event 那份沒加。
+假設沒有 `attribute_group`。`biz.user.id` 要同時出現在一個 span 跟一個 event 上，你就得把同一份定義寫兩次，型別、`brief`、`stability`、enum members 全部複製一遍。然後兩份定義會開始各自漂移：有人改了 span 那份的 `brief`，event 那份沒改；有人在 span 那份加了一個 enum member，event 那份沒加。
 
 **於是你為了消滅命名漂移而建的 registry，自己內部長出了漂移。**
 
 `attribute_group` 就是那個屬性池：定義一次，其他 group 用 `ref` 指過來。慣例上這種 group 的 `id` 用 `registry.` 開頭（`registry.app`、`registry.biz`、`registry.gen_ai`），一眼看得出「這裡是定義處，不是訊號」。
 
-這也是為什麼等一下 `stats` 那個 `deduplicated attributes: 55 (53%)` 是**設計指標**而不只是統計：53% 代表超過一半的屬性是被共用的。這個數字低，代表大家各寫各的，那份 registry 遲早會自相矛盾。
+這也是為什麼等一下 `stats` 那個 `deduplicated attributes: 55 (53%)` 是設計指標而不只是統計：53% 代表超過一半的屬性是被共用的。這個數字低，代表大家各寫各的，那份 registry 遲早會自相矛盾。
 
 ### `ref` 展開之後是什麼
 
-`ref` 不是「指標」，是**編譯期的展開**。看一個引用方，`model/events.yaml` 裡的宣告只有三行：
+`ref` 不是「指標」，是編譯期的展開。看一個引用方，`model/events.yaml` 裡的宣告只有三行：
 
 ```yaml
   - id: event.payment.declined
@@ -321,17 +321,17 @@ attributes:
 
 **那一行 `- ref: app.fail_reason` 展開成了完整的定義，含 13 個 enum member。** 這件事有兩個後果值得記住。
 
-第一，**policy 跟 template 看到的是展開後的東西，不是你寫的東西**。後面寫 Rego 規則時你操作的是 `input.groups[_].attributes[_].name`。那個 `name` 只存在於展開後的結構裡，原始 YAML 裡的欄位叫 `ref`。這是初次寫 policy 最容易卡住的地方。
+第一，policy 跟 template 看到的是展開後的東西，不是你寫的東西。後面寫 Rego 規則時你操作的是 `input.groups[_].attributes[_].name`。那個 `name` 只存在於展開後的結構裡，原始 YAML 裡的欄位叫 `ref`。這是初次寫 policy 最容易卡住的地方。
 
-第二，**`resolve` 是你唯一能確認「我以為的」跟「weaver 認定的」是同一件事的工具**。當 `ref` 指錯、或分層 registry 的繼承沒生效時，`check` 可能還是綠的，但 `resolve` 的輸出會直接把真相攤開。**養成習慣：改完 registry 先 `resolve` 看一眼，再談 `check` 過不過。**
+第二，`resolve` 是你唯一能確認「我以為的」跟「weaver 認定的」是同一件事的工具。當 `ref` 指錯、或分層 registry 的繼承沒生效時，`check` 可能還是綠的，但 `resolve` 的輸出會直接把真相攤開。**養成習慣：改完 registry 先 `resolve` 看一眼，再談 `check` 過不過。**
 
 ### 三個欄位決定這份 schema 對 agent 有多少價值
 
 attribute 自己也有很多變化，但有三個欄位值得現在就記住，因為後面每一天都會回頭用到：
 
-**`enum` 的 `members` 把「合法值」也納入治理範圍。** 寫 `type: string` 加兩個 `examples`，意思是「這是個字串，長得像 `created`」，沒有任何東西擋得住有人送 `CREATED` 或 `success`。改寫成 `members` 之後，這幾個值變成 schema 的一部分。**這件事對 AIOps 的意義更直接：agent 要下 `sum by (app_outcome)` 這種查詢時，`members` 是它唯一能事先知道「這個 label 只會有這幾種值」的來源**，否則它只能猜，而猜錯的方式通常是憑空生一個看起來很合理的 `success` 出來。這條線會在後面幾天（agent 查 registry、生成 enum 常數、把這個坑寫成測試）各兌現一次。
+`enum` 的 `members` 把「合法值」也納入治理範圍。 寫 `type: string` 加兩個 `examples`，意思是「這是個字串，長得像 `created`」，沒有任何東西擋得住有人送 `CREATED` 或 `success`。改寫成 `members` 之後，這幾個值變成 schema 的一部分。**這件事對 AIOps 的意義更直接：agent 要下 `sum by (app_outcome)` 這種查詢時，`members` 是它唯一能事先知道「這個 label 只會有這幾種值」的來源**，否則它只能猜，而猜錯的方式通常是憑空生一個看起來很合理的 `success` 出來。這條線會在後面幾天（agent 查 registry、生成 enum 常數、把這個坑寫成測試）各兌現一次。
 
-**`requirement_level` 有四級，不是二選一**（`required`／`conditionally_required`／`recommended`／`opt_in`）。這是初次寫 registry 最容易草率帶過的欄位，但它決定了之後 live-check 拿真實流量對照時，缺了這個欄位到底算違規還是算正常。
+`requirement_level` 有四級，不是二選一（`required`／`conditionally_required`／`recommended`／`opt_in`）。這是初次寫 registry 最容易草率帶過的欄位，但它決定了之後 live-check 拿真實流量對照時，缺了這個欄位到底算違規還是算正常。
 
 而它還有一個位置上的設計，比四個等級本身更值得理解：**`requirement_level` 寫在引用處，不寫在定義處。**
 
@@ -350,11 +350,11 @@ attribute 自己也有很多變化，但有三個欄位值得現在就記住，�
           conditionally_required: when `app.outcome` is not `created`.
 ```
 
-在**建立訂單**這個 span 上，`biz.order.id` 不可能是 `required`，訂單建立失敗的時候，根本還沒有 order id 可以填。而 `app.fail_reason` 剛好相反，只有失敗時才該有。**這兩個 `conditionally_required` 是一組互斥的承諾，而且條件寫成了人看得懂的句子。**
+在**建立訂單**這個 span 上，`biz.order.id` 不可能是 `required`，訂單建立失敗的時候，根本還沒有 order id 可以填。而 `app.fail_reason` 剛好相反，只有失敗時才該有。這兩個 `conditionally_required` 是一組互斥的承諾，而且條件寫成了人看得懂的句子。
 
 同一個 `biz.order.id`，在 `event.payment.requested` 上就是硬性的 `required`（都要付款了不可能沒有訂單），在這個 span 上是 `conditionally_required`。如果 `requirement_level` 綁在定義處，你只能二選一：要嘛 `required`（成功的請求會被誤判違規），要嘛 `recommended`（等於放棄要求）。**定義處回答「這是什麼」，引用處回答「在這裡我承諾什麼」。**
 
-注意 `conditionally_required` 的 YAML 寫法。它是一個**帶值的 map**，不是一個字串：
+注意 `conditionally_required` 的 YAML 寫法。它是一個帶值的 map，不是一個字串：
 
 ```yaml
         requirement_level:                                    # ✅ 正確
@@ -363,7 +363,7 @@ attribute 自己也有很多變化，但有三個欄位值得現在就記住，�
         requirement_level: conditionally_required             # ❌ 少了條件
 ```
 
-這個條件字串不是註解，它會被帶進 resolved schema、進到生成的文件、也進得了後面那個 MCP server 的回答裡。**它是少數幾個「寫給人看的句子」會一路流到 agent 面前的欄位之一**。所以請把它當成規格寫，不要寫「有時候需要」。
+這個條件字串不是註解，它會被帶進 resolved schema、進到生成的文件、也進得了後面那個 MCP server 的回答裡。它是少數幾個「寫給人看的句子」會一路流到 agent 面前的欄位之一。所以請把它當成規格寫，不要寫「有時候需要」。
 
 **`template[string]` 是給「一整族 key」用的**（`app.order.tag.vip`、`app.order.tag.wholesale`…）。這種欄位天生高基數，等一下那條擋 metric label 的 policy 特別容易在這裡被觸發。
 
@@ -495,11 +495,11 @@ Shared Catalog (after resolution and deduplication):
         - {token}: 1
 ```
 
-大括號那種是 UCUM 的「無因次計數單位」寫法，`{order}` 的意思是「這個數字的單位是『筆訂單』」，而不是某個物理單位。**它不影響任何計算，純粹是給讀的人（跟 agent）的語意。** 一個 counter 如果 unit 是空的，agent 只知道「這是個會變大的數字」；寫了 `{order}` 它才知道這是在數訂單。這是這系列反覆的那條線在單位這個維度上的形狀：**能寫下來的語意，就不要留在腦子裡。**
+大括號那種是 UCUM 的「無因次計數單位」寫法，`{order}` 的意思是「這個數字的單位是『筆訂單』」，而不是某個物理單位。它不影響任何計算，純粹是給讀的人（跟 agent）的語意。 一個 counter 如果 unit 是空的，agent 只知道「這是個會變大的數字」；寫了 `{order}` 它才知道這是在數訂單。這是這系列反覆的那條線在單位這個維度上的形狀：**能寫下來的語意，就不要留在腦子裡。**
 
 ## 拿官方 registry 當對照組
 
-到這裡，自己這份 34 個 group 的 registry 已經看完、跑過、也拿到了一組基準數字。接下來很自然會想問兩件事：**前面那個 `model/` 慣例到底是誰的慣例？以及一份長大之後的 registry 會是什麼樣子？**
+到這裡，自己這份 34 個 group 的 registry 已經看完、跑過、也拿到了一組基準數字。接下來很自然會想問兩件事：前面那個 `model/` 慣例到底是誰的慣例？以及一份長大之後的 registry 會是什麼樣子？
 
 這兩個問題有同一個答案，而且不用去找，**`-r` 不給值的時候，weaver 預設抓的就是官方那份。** 它是唯一一份被幾百個團隊實際用過、而且每一個設計決定都留有痕跡的 registry，拿來當對照組比任何教學範例都好。
 
@@ -536,11 +536,11 @@ semantic-conventions/
 
 有兩件事跟我們這份不一樣。
 
-**一、官方的 `model/` 是 registry 的根，`manifest.yaml` 在它「裡面」。** 我們這份的根是 `registry/`，`model/` 是它底下的子目錄。所以「`model/`」這個名字在兩邊指的不是同一層，**它標記的是「模型檔住在這裡」，不是固定的第幾層。** 這也是為什麼前面要強調 `-r` 認的是「有 `manifest.yaml` 的那一層」而不是「叫 `model` 的那一層」，記後者會在讀官方 repo 時整個對不上。
+一、官方的 `model/` 是 registry 的根，`manifest.yaml` 在它「裡面」。 我們這份的根是 `registry/`，`model/` 是它底下的子目錄。所以「`model/`」這個名字在兩邊指的不是同一層，它標記的是「模型檔住在這裡」，不是固定的第幾層。 這也是為什麼前面要強調 `-r` 認的是「有 `manifest.yaml` 的那一層」而不是「叫 `model` 的那一層」，記後者會在讀官方 repo 時整個對不上。
 
-**二、官方是兩層拆法：先 namespace，再訊號種類。** 我們這份只有一層（直接照訊號拆），因為 34 個 group 全部屬於同一個 `demo-services` 領域，再切 namespace 只會多出一堆只有一兩個檔案的目錄。**官方有 70 幾個 namespace、幾千個 attribute，不先切就沒法看了。** 這個差異不是誰對誰錯，是規模不同。但它預告了之後的問題：當你的 registry 開始要分層、要跨團隊，你就會需要官方那種拆法。
+二、官方是兩層拆法：先 namespace，再訊號種類。 我們這份只有一層（直接照訊號拆），因為 34 個 group 全部屬於同一個 `demo-services` 領域，再切 namespace 只會多出一堆只有一兩個檔案的目錄。官方有 70 幾個 namespace、幾千個 attribute，不先切就沒法看了。 這個差異不是誰對誰錯，是規模不同。但它預告了之後的問題：當你的 registry 開始要分層、要跨團隊，你就會需要官方那種拆法。
 
-還有一個細節解釋了前面那個命名慣例的來源：**每個 namespace 底下那份 `registry.yaml`，放的就是該 namespace 的屬性定義池**（`attribute_group`），其他 `spans.yaml`／`metrics.yaml` 用 `ref` 指過來。我們這份把它叫 `common.yaml`，但 group id 仍然沿用 `registry.app`／`registry.biz` 這個前綴，**那個 `registry.` 前綴就是從官方這個檔名慣例來的**，意思是「這裡是定義處，不是訊號」。
+還有一個細節解釋了前面那個命名慣例的來源：**每個 namespace 底下那份 `registry.yaml`，放的就是該 namespace 的屬性定義池**（`attribute_group`），其他 `spans.yaml`／`metrics.yaml` 用 `ref` 指過來。我們這份把它叫 `common.yaml`，但 group id 仍然沿用 `registry.app`／`registry.biz` 這個前綴，那個 `registry.` 前綴就是從官方這個檔名慣例來的，意思是「這裡是定義處，不是訊號」。
 
 ### 快一千個 group：跟自己那份放在一起看
 
@@ -574,7 +574,7 @@ Registry
 
 下面挑四個官方的欄位，每一個都是我們前面講過的概念的成熟版本。
 
-**一、`http.request.method`，enum 該怎麼留退路。** 它有 11 個 member，前 10 個是 RFC 定義的方法，最後一個是：
+一、`http.request.method`，enum 該怎麼留退路。 它有 11 個 member，前 10 個是 RFC 定義的方法，最後一個是：
 
 ```yaml
             - id: other
@@ -591,7 +591,7 @@ Registry
 
 順帶注意每個 member 各有自己的 `stability`，`query` 是 `development`，其他是 `stable`。**穩定性是 member 級的，不是欄位級的**，因為新增一個 enum member 是一次獨立的相容性決定。
 
-**二、`http.request.header`，`template[string]` 的真實用途。** 它的型別是 `template[string[]]`：
+二、`http.request.header`，`template[string]` 的真實用途。 它的型別是 `template[string[]]`：
 
 ```yaml
       - id: http.request.header
@@ -603,7 +603,7 @@ Registry
 
 意思是它不是一個欄位，是**一整族欄位**：`http.request.header.content-type`、`http.request.header.x-forwarded-for`…… 前綴固定、後綴由 runtime 決定。這種東西天生高基數，所以官方的 `note` 第一句就是「Instrumentations SHOULD require an explicit configuration of which headers are to be captured」，理由寫的是資安（全抓會外洩敏感資訊）而不是成本。
 
-**三、`server.address` 在 metric 上的 `opt_in`，官方版的 cardinality 警告。** 這一段跟這篇後半那條 policy 是同一件事，但官方是用 `requirement_level` 加註解表達的：
+三、`server.address` 在 metric 上的 `opt_in`，官方版的 cardinality 警告。 這一段跟這篇後半那條 policy 是同一件事，但官方是用 `requirement_level` 加註解表達的：
 
 ```yaml
   - id: metric_attributes.http.server
@@ -618,7 +618,7 @@ Registry
           > to trigger cardinality limits, degrading the usefulness of the metric.
 ```
 
-三件事值得看。第一，`opt_in` 這一級終於有了具體場景，**它的意思是「預設不要，你要的話自己承擔後果」**，正好是這篇後面那個「白名單 + 署名理由」的官方版本。第二，那個警告講的是**攻擊者可以主動觸發 cardinality 爆炸**，這是我們那條 policy 沒想到的威脅模型：高基數不只是成本問題，是攻擊面。第三，同一個 `server.address` 在 span 上是正常的 `recommended`，只有在 metric 上被降級成 `opt_in`，**又一次印證「必填程度屬於使用處，不屬於定義處」。**
+三件事值得看。第一，`opt_in` 這一級終於有了具體場景，**它的意思是「預設不要，你要的話自己承擔後果」**，正好是這篇後面那個「白名單 + 署名理由」的官方版本。第二，那個警告講的是**攻擊者可以主動觸發 cardinality 爆炸**，這是我們那條 policy 沒想到的威脅模型：高基數不只是成本問題，是攻擊面。第三，同一個 `server.address` 在 span 上是正常的 `recommended`，只有在 metric 上被降級成 `opt_in`，又一次印證「必填程度屬於使用處，不屬於定義處」。
 
 但這段 YAML 有兩個地方，值得比上面三點花更多篇幅：那個 `extends`，還有「一個 `attribute_group` 底下寫 `attributes:` 到底在表達什麼」。
 
@@ -632,7 +632,7 @@ attributes:
   - ref: server.address    # 「決定」：在這個情境下，我對這個欄位承諾什麼
 ```
 
-`registry.http` 底下全部是 `- id:`。它是**定義池**，欄位的身分證住在這裡。而 `metric_attributes.http.server` 底下全部是 `- ref:`，**它一個新欄位都沒定義**，它打包的是一組「用哪些欄位、各自什麼 `requirement_level`」的決定。
+`registry.http` 底下全部是 `- id:`。它是**定義池**，欄位的身分證住在這裡。而 `metric_attributes.http.server` 底下全部是 `- ref:`，它一個新欄位都沒定義，它打包的是一組「用哪些欄位、各自什麼 `requirement_level`」的決定。
 
 **所以第二種 `attribute_group` 不是「一包屬性」，是「一包可以被重複使用的決定」。** 它自己不是訊號，也不是定義，是夾在中間的組合層。想不通這件事的時候，會覺得 `attribute_group` 這個名字取得很奇怪，一個「屬性群組」為什麼可以不含任何屬性定義？因為它群組的是**使用方式**，不是屬性本身。
 
@@ -728,7 +728,7 @@ metric.http.server.active_requests     server.address = opt_in
 span.http.server                       server.address = recommended
 ```
 
-**`server.address` 這個欄位本身從頭到尾沒變，變的是「它當 metric label 的時候成本不一樣」。** 與其在二十幾個 HTTP server metric 上各寫一次 `opt_in` 加同一段 cardinality 警告，不如把這個決定收成第 ③ 層，讓所有 metric `extends` 它。**那一層的存在理由，就是「這個決定會被重複很多次」。**
+**`server.address` 這個欄位本身從頭到尾沒變，變的是「它當 metric label 的時候成本不一樣」。** 與其在二十幾個 HTTP server metric 上各寫一次 `opt_in` 加同一段 cardinality 警告，不如把這個決定收成第 ③ 層，讓所有 metric `extends` 它。那一層的存在理由，就是「這個決定會被重複很多次」。
 
 ### `ref` 跟 `extends` 的分工
 
@@ -743,9 +743,9 @@ span.http.server                       server.address = recommended
 
 **判準很簡單：當你發現自己在第三個 group 裡貼上同一組 `ref` ＋ 同一段 `requirement_level` 理由時，那組決定就該被抽成一層。** 在那之前抽，只是在製造一層沒有內容的間接。
 
-這條線之後會再走一次，但問題會變成另一個：`extends` 是**同一份 registry 內部**的繼承，而之後要處理的是**跨 registry** 的繼承（`dependencies`），兩者的失敗模式完全不同，`extends` 指錯會直接報錯，跨 registry 的依賴指錯會安靜地少東西。
+這條線之後會再走一次，但問題會變成另一個：`extends` 是同一份 registry 內部的繼承，而之後要處理的是跨 registry 的繼承（`dependencies`），兩者的失敗模式完全不同，`extends` 指錯會直接報錯，跨 registry 的依賴指錯會安靜地少東西。
 
-**四、`deprecated/` 目錄，被淘汰的欄位不會消失，會搬家。** 官方每個 namespace 底下都有一個 `deprecated/`，裡面長這樣：
+四、`deprecated/` 目錄，被淘汰的欄位不會消失，會搬家。 官方每個 namespace 底下都有一個 `deprecated/`，裡面長這樣：
 
 ```yaml
       - id: http.method
@@ -759,15 +759,15 @@ span.http.server                       server.address = recommended
 
 **注意 `deprecated` 是結構化的**（`reason` ＋ `renamed_to`），不是一句寫在 `brief` 裡的散文。這個差別決定了它能不能被自動消費：`reason: renamed` ＋ `renamed_to` 讓工具可以自動產遷移表、讓 MCP server 在 agent 查到舊欄位時直接告訴它新名字、也讓後面講 breaking change 時那條「下游還在用 deprecated 欄位」的 policy 寫得出來。
 
-**如果這件事只寫在 `brief` 裡，上面三件事一件都做不到。** 這就是這系列反覆的那條線在 deprecation 這個維度上的形狀，同樣的資訊，寫成句子只有人看得懂，寫成欄位才能被自動化。
+如果這件事只寫在 `brief` 裡，上面三件事一件都做不到。 這就是這系列反覆的那條線在 deprecation 這個維度上的形狀，同樣的資訊，寫成句子只有人看得懂，寫成欄位才能被自動化。
 
 ### 該從官方抄什麼、不該抄什麼
 
 看完之後很容易走向一個結論：「那我照官方的結構做就好了」。**不要。** 官方那份的形狀是被它的處境決定的：快一千個 group、幾百個下游 instrumentation、改一個欄位要跑 OTEP 流程。你的 registry 第一天只有十幾個 group，硬套會得到一堆只有一個檔案的目錄跟一份沒人想維護的規範。
 
-該抄的是**機制**，不是**規模**：`_OTHER` 這種 enum 出口、`opt_in` 加上寫明理由的註解、結構化的 `deprecated`。這三個在你有十個 group 的時候就該用，因為它們解決的問題跟規模無關。
+該抄的是機制，而不是規模：`_OTHER` 這種 enum 出口、`opt_in` 加上寫明理由的註解、結構化的 `deprecated`。這三個在你有十個 group 的時候就該用，因為它們解決的問題跟規模無關。
 
-不該抄的是**分層深度**。namespace 目錄、`extends` 繼承鏈、`deprecated/` 獨立目錄，這些是規模到了才需要付的維護成本。**過早分層跟過晚分層一樣糟**，差別只在前者比較不容易被發現。它看起來很專業。
+不該抄的是分層深度。namespace 目錄、`extends` 繼承鏈、`deprecated/` 獨立目錄，這些是規模到了才需要付的維護成本。過早分層跟過晚分層一樣糟，差別只在前者比較不容易被發現。它看起來很專業。
 
 而這正好是平台團隊最常搞砸的地方：**照著一份「最佳實踐」設計介面，而不是照著使用者現在的處境設計。** 產品團隊接上治理要付的成本，是用「他們要學幾個新概念」算的，不是用「這個結構有多完整」算的。
 
@@ -777,11 +777,11 @@ span.http.server                       server.address = recommended
 
 拿一份丟棄式的複製亂改，看錯誤長什麼樣。
 
-**示範一：`ref` 指到不存在的屬性。** 在 metric group 裡塞一行 `- ref: app.nonexistent_attr`。這是 `weaver_resolver` 階段的錯誤，管線根本走不到 policy，輸出是純文字診斷、exit 1。
+示範一：`ref` 指到不存在的屬性。 在 metric group 裡塞一行 `- ref: app.nonexistent_attr`。這是 `weaver_resolver` 階段的錯誤，管線根本走不到 policy，輸出是純文字診斷、exit 1。
 
-**示範二：把高基數的業務識別碼拿去當 metric label。** 改成 `- ref: biz.order.id`，這正是自訂 `biz_policies.rego` 要擋的事，輸出是帶 `id`／`level`／`context` 結構的 Finding、exit 1。
+示範二：把高基數的業務識別碼拿去當 metric label。 改成 `- ref: biz.order.id`，這正是自訂 `biz_policies.rego` 要擋的事，輸出是帶 `id`／`level`／`context` 結構的 Finding、exit 1。
 
-**示範三：弄壞、但沒被抓到。** 這個最重要。翻開那條 policy（[`ironman-2026/day05/policies/biz_policies.rego`](https://github.com/tedmax100/OTel_AIOps_Agent/blob/main/ironman-2026/day05/policies/biz_policies.rego)，整份只有 32 行）的規則本體：
+示範三：弄壞、但沒被抓到。 這個最重要。翻開那條 policy（[`ironman-2026/day05/policies/biz_policies.rego`](https://github.com/tedmax100/OTel_AIOps_Agent/blob/main/ironman-2026/day05/policies/biz_policies.rego)，整份只有 32 行）的規則本體：
 
 ```rego
 deny contains high_cardinality_metric_label(group.id, attr.name) if {
@@ -792,7 +792,7 @@ deny contains high_cardinality_metric_label(group.id, attr.name) if {
 }
 ```
 
-**它擋的不是「高基數」，是「名字開頭是 `biz.`」。** 這兩件事在這份 registry 裡剛好重疊，因為團隊把所有業務識別碼都收進了 `biz.*`。只要有人繞過這個慣例就會安靜放行。實測，定義一個一樣高基數、但掛在 `app.*` 底下的追蹤碼 `app.order.tracking_id`，掛到同一個 metric 上：
+它擋的不是「高基數」，是「名字開頭是 `biz.`」。 這兩件事在這份 registry 裡剛好重疊，因為團隊把所有業務識別碼都收進了 `biz.*`。只要有人繞過這個慣例就會安靜放行。實測，定義一個一樣高基數、但掛在 `app.*` 底下的追蹤碼 `app.order.tracking_id`，掛到同一個 metric 上：
 
 ```
 $ weaver registry check -r /tmp/weaver-demo/registry -p /tmp/weaver-demo/policies
@@ -804,17 +804,17 @@ $ echo $?
 
 綠燈。這條 metric 現在每一筆訂單都會生出一條新的時間序列，而檢查完全沒有意見。因為它從頭到尾沒有在看基數，只是在看名字。這條規則我當初寫完還覺得挺不錯的 XD
 
-這是繼 `-r .` 之後第二次踩到同一類問題的不同版本：**檢查通過，不等於東西是對的。** 但兩者的性質不同，而這個區別值得記住：`-r .` 是**工具用法出錯**（讀不到檔案），可以靠 `stats` 探針發現；這次是**規則本身的能力邊界**（規則寫得比它宣稱要解決的問題窄），只能靠「知道自己這條規則實際在比對什麼」。**命名慣例跟 policy 是一組配套：policy 只認得慣例，慣例一旦破功，policy 就跟著失效。**
+這是繼 `-r .` 之後第二次踩到同一類問題的不同版本：**檢查通過，不等於東西是對的。** 但兩者的性質不同，而這個區別值得記住：`-r .` 是工具用法出錯（讀不到檔案），可以靠 `stats` 探針發現；這次是規則本身的能力邊界（規則寫得比它宣稱要解決的問題窄），只能靠「知道自己這條規則實際在比對什麼」。**命名慣例跟 policy 是一組配套：policy 只認得慣例，慣例一旦破功，policy 就跟著失效。**
 
 ### 把規則改對：從「檢查名字」到「檢查值域」
 
-原規則問錯了問題。它問「這個 attribute 叫什麼」，該問的是「**這個 attribute 的值有幾種可能**」，metric label 的成本完全由值域大小決定，跟名字無關。
+原規則問錯了問題。它問「這個 attribute 叫什麼」，該問的是「這個 attribute 的值有幾種可能」，metric label 的成本完全由值域大小決定，跟名字無關。
 
 registry 有辦法回答值域嘛？有，就是前面講的 `enum.members`。所以規則翻轉成一句話：
 
 > **metric label 只能是值域有界的型別，enum 或 boolean。其他一律視為無界，除非被明確列入白名單。**
 
-這是「預設拒絕」而不是「列舉壞東西」。原規則要窮舉所有危險的命名前綴（`biz.`、然後呢？`app.*.id`？`*.tracking_id`？）永遠列不完；新規則只要窮舉**例外**，而例外是有限的、每一條都該有人簽名。
+這是「預設拒絕」而不是「列舉壞東西」。原規則要窮舉所有危險的命名前綴（`biz.`、然後呢？`app.*.id`？`*.tracking_id`？）永遠列不完；新規則只要窮舉例外，而例外是有限的、每一條都該有人簽名。
 
 ```mermaid
 flowchart TD
@@ -841,7 +841,7 @@ flowchart TD
 
 加上白名單之後回到綠燈。但**這次的綠燈跟開頭那個綠燈，意義完全不同**。開頭那個是「沒有任何欄位的名字以 `biz.` 開頭」；現在這個是「每一個 metric label 的值域，要嘛寫在 schema 裡有界，要嘛有人明確簽名允許它無界」。同樣一行 `✔`，保證強度差很多。
 
-那個白名單集合本身也變成一份有用的文件，**它就是「這份 registry 目前承擔的所有 cardinality 風險」的完整清單**，一眼看得完，每一條都有署名的理由。這比散落在註解裡的 `# TODO: 這個可能會爆` 有用得多。
+那個白名單集合本身也變成一份有用的文件，它就是「這份 registry 目前承擔的所有 cardinality 風險」的完整清單，一眼看得完，每一條都有署名的理由。這比散落在註解裡的 `# TODO: 這個可能會爆` 有用得多。
 
 ## `infer`：治理不必從一張白紙開始
 
@@ -889,11 +889,11 @@ $ weaver registry infer --otlp-grpc-port 14317 --registry-path /tmp/inferred
 
 這是漂移第一次以「資料」而不是「敘述」的形式出現。`infer` 沒有、也不可能有任何依據說它們是同一件事，它看到的是線路上兩個不同的字串 key，如實記下來。
 
-兩個地方值得多看一眼。`brief` 是空字串而不是缺欄位，**它明確地說「這裡什麼都沒有」**，這比省略更誠實。而 `user_id` 的 `examples` 裡混進了一個空字串，那不是 `infer` 的 bug，是真的有請求把這個欄位送成空值。一份現況盤點連這種東西都會照實端出來，這正是它的價值。
+兩個地方值得多看一眼。`brief` 是空字串而不是缺欄位，它明確地說「這裡什麼都沒有」，這比省略更誠實。而 `user_id` 的 `examples` 裡混進了一個空字串，那不是 `infer` 的 bug，是真的有請求把這個欄位送成空值。一份現況盤點連這種東西都會照實端出來，這正是它的價值。
 
 ### 一個受控的往返實驗：語意不在線路上
 
-更有意思的是拿一份**已知的** registry 做往返：先 `weaver registry emit` 把它照定義發成 OTLP，讓 `infer` 收下來，再比對兩份 YAML 差在哪。
+更有意思的是拿一份已知的 registry 做往返：先 `weaver registry emit` 把它照定義發成 OTLP，讓 `infer` 收下來，再比對兩份 YAML 差在哪。
 
 | 資訊 | 往返之後 | 為什麼 |
 |---|---|---|
@@ -905,11 +905,11 @@ $ weaver registry infer --otlp-grpc-port 14317 --registry-path /tmp/inferred
 | `requirement_level` | ❌ 一律 `recommended` | 「必不必填」是承諾，不是觀察得到的事實 |
 | `enum` 的 `members` | ❌ 退化成 `string` | 只看到用過的值，看不到值域 |
 
-這張表是今天最該帶走的東西，因為它同時定義了**自動化能到哪裡**跟**治理的價值在哪裡**。
+這張表是今天最該帶走的東西，因為它同時定義了自動化能到哪裡跟治理的價值在哪裡。
 
-前三列可以自動化：名字、型別、結構都在線路上，機器抓得到。後四列不行，而它們剛好是**對 agent 最有價值的四項**：`brief` 是語意、`requirement_level` 是承諾、`members` 是值域。**「觀察」永遠只能給你前三列；後四列必須有人坐下來決定。** 這就是「自動生成的草稿」跟「團隊審過的規範」之間的差距，也是為什麼 `infer` 是治理的**起點**而不是治理本身。
+前三列可以自動化：名字、型別、結構都在線路上，機器抓得到。後四列不行，而它們剛好是對 agent 最有價值的四項：`brief` 是語意、`requirement_level` 是承諾、`members` 是值域。「觀察」永遠只能給你前三列；後四列必須有人坐下來決定。 這就是「自動生成的草稿」跟「團隊審過的規範」之間的差距，也是為什麼 `infer` 是治理的起點而不是治理本身。
 
-反過來說，這也讓 `infer` 的正確用法很清楚：**它是一份「現況盤點」，用來讓那場對話有素材可以吵**，`userId` 跟 `user_id` 到底留哪一個、`status` 那兩種意思要拆成幾個欄位。沒有這份草稿，這場對話會停在「我覺得應該…」；有了它，起點變成那 1852 行裡每一個真的在送的欄位，誰都不能說「應該沒有人在用那個吧」。
+反過來說，這也讓 `infer` 的正確用法很清楚：它是一份「現況盤點」，用來讓那場對話有素材可以吵，`userId` 跟 `user_id` 到底留哪一個、`status` 那兩種意思要拆成幾個欄位。沒有這份草稿，這場對話會停在「我覺得應該…」；有了它，起點變成那 1852 行裡每一個真的在送的欄位，誰都不能說「應該沒有人在用那個吧」。
 
 也因為這樣，那份草稿**不該直接 commit 成 registry**，我也沒有把它放進範例 repo。它的 `requirement_level` 全部是 `recommended`、`brief` 全部是空的，收下來等於宣告「這些欄位我們都沒有意見」。它是丟棄式的，該進的是一個 PR 的描述欄，讓人照著它一條一條決定。
 

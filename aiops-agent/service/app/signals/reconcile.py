@@ -47,7 +47,14 @@ class TopologyDrift(BaseModel):
     # observed; <1.0 = real edges we never declared (the dangerous direction).
     # None when no traffic was observed (can't judge).
     dq_score: float | None = None
+    # How many sampled traces each service appeared in. An edge A→B that we
+    # never observed only means something if A was *active* in the sample: a
+    # caller nobody exercised is silence, not evidence of a dead edge.
+    caller_samples: dict[str, int] = Field(default_factory=dict)
     computed_ts: float = 0.0
+
+    def evidence_for(self, caller: str) -> int:
+        return self.caller_samples.get(caller, 0)
 
 
 def _otlp_service(resource: dict) -> str | None:
@@ -80,8 +87,22 @@ def edges_from_trace(raw: dict) -> set[tuple[str, str]]:
     return edges
 
 
+def services_from_trace(raw: dict) -> set[str]:
+    """Every service that appears anywhere in one trace. Used to tell 'this
+    caller ran and never made the call' apart from 'this caller never ran'."""
+    seen: set[str] = set()
+    for batch in raw.get("batches", []):
+        service = _otlp_service(batch.get("resource", {}))
+        if service and any(ss.get("spans") for ss in batch.get("scopeSpans", [])):
+            seen.add(service)
+    return seen
+
+
 def diff_edges(
-    topo: Topology, observed: set[tuple[str, str]], traces_sampled: int
+    topo: Topology,
+    observed: set[tuple[str, str]],
+    traces_sampled: int,
+    caller_samples: dict[str, int] | None = None,
 ) -> TopologyDrift:
     """Pure diff of declared vs observed edges → drift + DQ score."""
     declared = {(e.caller, e.callee) for e in topo.edges}
@@ -96,6 +117,7 @@ def diff_edges(
         undeclared_edges=[Edge(caller=c, callee=k) for c, k in sorted(undeclared)],
         unobserved_edges=[Edge(caller=c, callee=k) for c, k in sorted(unobserved)],
         dq_score=round(dq, 3) if dq is not None else None,
+        caller_samples=dict(caller_samples or {}),
         computed_ts=time.time(),
     )
 
@@ -133,10 +155,12 @@ async def _search_trace_ids(lookback: str, limit: int) -> list[str]:
 
 async def observe_edges(
     lookback: str = "now-1h", max_traces: int = 50
-) -> tuple[set[tuple[str, str]], int]:
-    """Sample recent traces and union their observed edges."""
+) -> tuple[set[tuple[str, str]], int, dict[str, int]]:
+    """Sample recent traces; union their observed edges and count how many of
+    those traces each service took part in."""
     trace_ids = await _search_trace_ids(lookback, max_traces)
     observed: set[tuple[str, str]] = set()
+    caller_samples: dict[str, int] = {}
     sampled = 0
     for tid in trace_ids:
         try:
@@ -145,15 +169,17 @@ async def observe_edges(
             logger.warning("reconcile: fetch trace %s failed: %s", tid, e)
             continue
         observed |= edges_from_trace(raw)
+        for svc in services_from_trace(raw):
+            caller_samples[svc] = caller_samples.get(svc, 0) + 1
         sampled += 1
-    return observed, sampled
+    return observed, sampled, caller_samples
 
 
 async def reconcile(lookback: str = "now-1h", max_traces: int = 50) -> TopologyDrift:
     """Observe live edges, diff against the declared topology, cache + return."""
     topo = get_topology()
-    observed, sampled = await observe_edges(lookback, max_traces)
-    drift = diff_edges(topo, observed, sampled)
+    observed, sampled, caller_samples = await observe_edges(lookback, max_traces)
+    drift = diff_edges(topo, observed, sampled, caller_samples)
     set_last_drift(drift)
     logger.info(
         "reconcile: %d traces, dq=%s, %d undeclared, %d unobserved",

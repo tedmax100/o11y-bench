@@ -9,10 +9,17 @@ inferring it from the catalog prose.
 Pure and I/O-free (reads the cached static topology + the cached reconcile
 snapshot), so it can be called inline on both the headless and chat paths
 without adding a network round-trip. When a reconcile (s2) has run, declared
-edges not seen in recent traces are marked ⚠, observed-but-undeclared edges are
+edges not seen in recent traces are marked, observed-but-undeclared edges are
 surfaced, and a DQ score is shown — turning the static graph into one the agent
 knows is (or isn't) aligned to live telemetry. s3/s4 extend the same block with
 signal contracts (authoritative SLIs) and live dependency health.
+
+Every marker here is rationed. A ⚠ costs the reader attention, so it is only
+spent where the reconcile had real evidence (the caller was exercised and still
+never took the edge), each missing edge is stated once rather than on both
+endpoints, and the DQ line explains what its own score does not cover. A block
+full of warnings that are mostly sampling artefacts trains the reader — human or
+model — to skip all of them.
 """
 
 from __future__ import annotations
@@ -22,12 +29,26 @@ from .contract import SignalContract, contract_for
 from .reconcile import TopologyDrift, get_last_drift
 from .topology import get_topology, tier_label
 
+# A caller seen in fewer than this many sampled traces tells us nothing about
+# the edges it didn't take: absence of evidence, not evidence of absence.
+_MIN_CALLER_EVIDENCE = 5
+
 
 def _annotate(edge: tuple[str, str], drift: TopologyDrift | None) -> str:
-    """Mark a declared edge ⚠ if a reconcile saw no traffic on it."""
-    if drift and any((e.caller, e.callee) == edge for e in drift.unobserved_edges):
-        return " (⚠ declared, not seen in recent traces)"
-    return ""
+    """Mark a declared edge only when the reconcile had a real chance to see it.
+
+    Marking every unobserved edge floods the block with ⚠ that are mostly
+    sampling artefacts, and a warning that is usually wrong gets ignored — the
+    ones that matter go with it. So an edge is only called out when its caller
+    was actually exercised in the sample; otherwise the honest answer is that we
+    have no evidence either way, and that is said once, quietly.
+    """
+    if not drift or not any((e.caller, e.callee) == edge for e in drift.unobserved_edges):
+        return ""
+    seen = drift.evidence_for(edge[0])
+    if seen >= _MIN_CALLER_EVIDENCE:
+        return f" (⚠ not seen in {seen} sampled traces of {edge[0]})"
+    return " (not exercised in this sample)"
 
 
 def _service_block(svc: str, drift: TopologyDrift | None) -> str | None:
@@ -49,7 +70,10 @@ def _service_block(svc: str, drift: TopologyDrift | None) -> str | None:
 
     up = topo.upstream(svc)
     if up:
-        rendered = ", ".join(c + _annotate((c, svc), drift) for c in up)
+        # Deliberately unannotated: the same edge is already flagged on the
+        # caller's own downstream line, and saying it twice reads as two
+        # independent problems.
+        rendered = ", ".join(up)
         lines.append(f"- upstream (callers — degrade if this fails): {rendered}")
     else:
         lines.append("- upstream (callers): none (entry point)")
@@ -132,6 +156,14 @@ def _dq_note(drift: TopologyDrift | None) -> str:
         note += (
             " ⚠ the declared graph is out of date vs live traffic"
             " — trust the trace evidence over it where they disagree."
+        )
+    # The agreement score only grades observed→declared, so a graph can score
+    # 100% while declared edges sit unseen. Saying so here stops the header from
+    # contradicting the ⚠ markers a few lines below it.
+    elif drift.unobserved_edges:
+        note += (
+            f" That score only grades edges seen in traffic; {len(drift.unobserved_edges)}"
+            " declared edge(s) were not exercised in this sample and are marked below."
         )
     return note
 

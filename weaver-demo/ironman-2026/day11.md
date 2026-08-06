@@ -10,7 +10,7 @@ tags: [OpenTelemetry, Weaver, AIOps, 鐵人賽]
 > 哪一種值代表「這個服務是好的」
 > 目前只寫在 dashboard 標題跟幾個人的腦子裡
 
-昨天把 registry 開成 MCP server 交給 agent，它現在查得到「`app.outcome` 有哪三種值」。但它查不到一件更重要的事：**這三種值裡，哪一種代表這個服務正常。**
+昨天把 registry 開成一個 MCP（Model Context Protocol）server 交給 agent，它現在查得到「`app.outcome` 有哪三種值」。但它查不到一件更重要的事：**這三種值裡，哪一種代表這個服務正常。**
 
 這件事目前寫在哪裡？寫在一個 Grafana dashboard 的 panel 標題裡、寫在某條 alert rule 的 `expr` 裡、寫在值班手冊的第三段，還有寫在幾個資深工程師的腦子裡。這些地方沒有一個是 agent 讀得到的，也沒有一個會在有人改壞的時候發出聲音。
 
@@ -215,7 +215,7 @@ $ echo $?
 
 第二個錯更值得看：`orders.errors` 跟 `app.error_type` 這兩個名字聽起來都很合理，合理到 code review 的時候不會有人停下來問「我們真的有這個 metric 嗎」。**這正是 LLM 產生幻覺欄位時的長相，它們從來不會編一個離譜的名字。**
 
-兩條錯誤訊息都做到同一件事：不只說哪裡錯，還說合法的有哪些。這是 Day7 那條判準的具體實踐，被擋下來的人不用來問你就能自己修好。
+兩條錯誤訊息都做到同一件事：不只說哪裡錯，還說合法的有哪些。這是前面做 CI gate 時那條判準的具體實踐，被擋下來的人不用來問你就能自己修好。
 
 ## 後半：讓 registry 直接變成程式碼
 
@@ -279,11 +279,11 @@ ValueError: 'AUTHORIZED' is not a valid AppOutcome
 
 **錯誤從「可以被檢查」變成「說不出來」。** 前面幾天做的事都是「寫錯了會被抓到」，這一步是「根本寫不出錯的東西」，這兩者在工程上差很多：前者需要有人記得跑檢查，後者不需要。
 
-## 意外收穫：生成物的 diff 補上了 Day9 那三個洞
+## 意外收穫：生成物的 diff 補上了 `registry diff` 那三個洞
 
-Day9 量過一件很不舒服的事：`registry diff` 對型別改變、enum member 移除、`brief` 改寫這三種變更完全靜音，而那三種正好是最會痛的。
+前面講 breaking change 的時候量過一件很不舒服的事：`registry diff` 對型別改變、enum member 移除、`brief` 改寫這三種變更完全靜音，而那三種正好是最會痛的。
 
-今天做完 codegen 之後，我拿 Day9 那兩份 registry 各生成一次，然後 diff 生成物：
+今天做完 codegen 之後，我拿前面那兩份 `base-v1`／`base-v2` registry 各生成一次，然後 diff 生成物：
 
 ```console
 $ weaver registry generate -r ironman-2026/day09/base-v1 --templates ... python /tmp/g1
@@ -329,7 +329,7 @@ flowchart TB
 
 這件事直接推出一個實務結論：**生成物要 commit 進版控。** 一般的直覺是「這東西反正每次都能重生，不要進 git」，但在這個場景裡，把它放進 git 才是重點，因為 diff 才是那個會說話的東西。生成物在這裡不只是產物，是一份**變更的顯影劑**。
 
-而它同時補上了另一個洞：Day9 那條 `comparison_after_resolution` policy 需要有人記得帶 `--baseline-registry` 去跑，生成物的 diff 不需要任何人記得任何事，它就長在 PR 頁面上。
+而它同時補上了另一個洞：那條 `comparison_after_resolution` policy 需要有人記得帶 `--baseline-registry` 去跑，生成物的 diff 不需要任何人記得任何事，它就長在 PR 頁面上。
 
 > 這裡有個小陷阱：diff 會不會顯示，完全取決於你的樣板有沒有把那個欄位印出來。`ATTRIBUTE_TYPES` 那個字典是我刻意加的，如果樣板只印名字常數，型別改變一樣是靜音的。**顯影劑只顯影它照得到的東西。**
 
@@ -386,7 +386,7 @@ sequenceDiagram
 
 ## 小結
 
-總結來說，今天寫的兩支東西看起來沒什麼關係，一個把散文編成告警，一個把 schema 編成程式碼，但它們做的其實是同一件事：**把只存在於人腦裡的東西，搬到一個機器讀得到、而且會在改壞的時候出聲的地方。** 意外的收穫是那份生成物的 diff，我本來只是想讓程式碼別再手打字串，結果它順手補上了 Day9 那三個 `registry diff` 看不見的變更，而且補得比 policy 更自然，因為 review 的人本來就會看 diff，不需要有人記得多跑一個指令。
+總結來說，今天寫的兩支東西看起來沒什麼關係，一個把散文編成告警，一個把 schema 編成程式碼，但它們做的其實是同一件事：**把只存在於人腦裡的東西，搬到一個機器讀得到、而且會在改壞的時候出聲的地方。** 意外的收穫是那份生成物的 diff，我本來只是想讓程式碼別再手打字串，結果它順手補上了 `registry diff` 看不見的那三種變更，而且補得比 policy 更自然，因為 review 的人本來就會看 diff，不需要有人記得多跑一個指令。
 
 > 那兩份故意寫壞的意圖，是照著 agent 真的犯過的兩種錯改的。
 > 把自己的失敗紀錄拿來當測資，是我做這系列以來投報率最高的一件事 :)

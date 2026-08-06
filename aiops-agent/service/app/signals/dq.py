@@ -16,15 +16,54 @@ withheld (autonomy is earned).
 
 from __future__ import annotations
 
+import json
+import logging
 import time
 
 from ..config import settings
 from .reconcile import get_last_drift
+from .weaver import alignment_path
+
+logger = logging.getLogger("aiops_agent.signals.dq")
+
+
+def schema_alignment() -> dict | None:
+    """The committed schema-alignment artifact, or None when it was never
+    produced. Read from disk rather than recomputed: the Weaver registry is a
+    repo artifact and is not shipped in the agent image, so checking it here
+    would report "no registry" as "every SLI is undeclared"."""
+    try:
+        return json.loads(alignment_path().read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.info("no schema alignment artifact (%s): %s", alignment_path(), e)
+        return None
 
 
 def dq_verdict() -> dict:
     """{proven_good, score, note} for governance. proven-good requires a recent
-    reconcile with no observed-but-undeclared edges and agreement ≥ floor."""
+    reconcile with no observed-but-undeclared edges, agreement ≥ floor, and
+    contract SLIs that the schema registry actually declares."""
+    schema = schema_alignment()
+    if schema is None or not schema.get("checked"):
+        return {
+            "proven_good": False,
+            "score": None,
+            "note": (
+                "contract SLIs never checked against the schema registry; DQ unproven"
+                if schema is None
+                else f"{schema['note']}; DQ unproven"
+            ),
+        }
+    if schema.get("undeclared"):
+        return {
+            "proven_good": False,
+            "score": None,
+            "note": (
+                f"{len(schema['undeclared'])} contract SLI(s) reference metrics the schema"
+                f" registry does not declare; DQ degraded ({schema['undeclared'][0]})"
+            ),
+        }
+
     drift = get_last_drift()
     if drift is None or not drift.traces_sampled:
         return {
@@ -62,5 +101,6 @@ def dq_verdict() -> dict:
         "proven_good": True,
         "score": drift.dq_score,
         "note": f"topology aligned to live traffic (agreement {drift.dq_score}, "
-        f"{drift.traces_sampled} traces, reconciled {age}s ago)",
+        f"{drift.traces_sampled} traces, reconciled {age}s ago); "
+        f"SLIs match the schema registry ({schema['declared_metrics']} metrics)",
     }
