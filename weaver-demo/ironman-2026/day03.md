@@ -3,7 +3,11 @@ title: "【Day3】OTel Operator：把「持續維護」從人身上搬到迴圈�
 series: "2026 鐵人賽：賢者大叔的觀測結界"
 tags: [OpenTelemetry, Kubernetes, GitOps, 鐵人賽]
 ---
-# Day3：OTel Operator——把「持續維護」從人身上搬到迴圈裡
+# Day3：OTel Operator，把「持續維護」從人身上搬到迴圈裡
+
+> 一次性的 apply 是下指令
+> 宣告式的 CR 是一個不會停下來的承諾
+> 差別要等到某個東西被改壞的那天才看得出來
 
 昨天講到，語意是一份共同的約定。一個團隊自己怎麼命名永遠不算錯，但只要資料要被別人讀，命名一不一致就變成治理問題。
 
@@ -298,7 +302,7 @@ spec:
 
 而第二半更難防，有兩個來源。
 
-一個是上游。OTel 官方訂了一份公定名單，叫 `semantic convention`，白話講就是「這種東西大家統一叫這個名字」：HTTP 請求的方法叫什麼、服務名稱叫什麼、資料庫語句叫什麼。有這份名單，不同團隊、不同語言、不同廠商的工具才可能對得起來。
+一個是上游。OTel 官方訂了一份公定名單，叫 `semantic convention`，白話講就是「這種東西大家統一叫這個名字」：HTTP 請求的方法叫什麼、服務名稱叫什麼、資料庫語句叫什麼。有這份名單，你家的 Python 服務跟隔壁部門買的那套 APM，才有機會在講同一件事的時候用同一個欄位名。
 
 但它本身一直在演進。這幾年最有感的一次，是 HTTP 那組從實驗階段走向穩定的時候，`http.method` 被改名成 `http.request.method`、`net.peer.name` 變成 `server.address`。舊名字會先標成 deprecated 再移除，而這種公告只會出現在 changelog 裡，產品團隊不會去看。於是你的系統裡開始一半的服務送新名字、一半送舊名字，兩邊都「沒有壞」。
 
@@ -310,4 +314,9 @@ spec:
 
 **今天做的是把施力點做出來，不是把力施下去。**
 
-明天：把某一個服務的 annotation 換上去、同時從 Dockerfile 拿掉手動的 `opentelemetry-instrument`，實地對比 trace 差在哪；然後把 collector 壓到 `OOMKilled`，示範「注入了不代表送達」。
+## 小結
+
+總結來說，今天做的事其實跟 AIOps 沒有直接關係，一隻 agent 都沒出現。但把手寫的 Deployment 換成一份會被持續調和的 CR 之後，平台團隊終於有一個地方可以回答「現在到底有幾種 Collector 設定在跑」，而不是回一句「去問各個團隊」。而 `status.conditions` 那段是意外的收穫，它本來就在 etcd 裡躺著，是這系列第一個「本來就存在、只是沒有人端到 agent 面前」的訊號，之後畫拓撲的時候還會再挖它一次。
+
+> 明天把 annotation 真的換上去，順便示範一下「注入了不代表送達」。
+> 那個 `resource` processor 把 `service.name` 複製成 `service` 的帳，我沒忘，只是還不敢算 XD

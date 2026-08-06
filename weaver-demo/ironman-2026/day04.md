@@ -5,6 +5,11 @@ tags: [OpenTelemetry, Kubernetes, 鐵人賽]
 ---
 # Day4：注入了不代表送達
 
+> 注入成功了
+> 服務也全綠
+> 使用者也沒抱怨
+> 然後你的 trace 沒了
+
 昨天裝完 OpenTelemetry（以下簡稱 OTel）Operator，刻意留了一個空白：`Instrumentation` CR 宣告了，但沒接到任何一個 Pod 上，五個服務還是靠自己 Dockerfile 裡的 `opentelemetry-instrument` 在跑。
 
 今天我們來把這個空白填上，然後做一件更重要的事。
@@ -170,7 +175,7 @@ spec:
 
 釘住之後，升級版本這件事才變成一個可以被 review、被排程、被 rollback 的動作，而不是「升 Operator 的時候順便被換掉了」。
 
-> 這種「你以為你在管，其實是預設值在管」的狀況，我覺得比完全沒管更危險。因為它看起來是治理過的。
+> 這種「你以為你在管，其實是預設值在管」的狀況，我覺得比完全沒管更危險。因為它看起來是治理過的。而且你去 review 那份 CR 的時候，它還很乾淨、很好看 XD
 
 **`resource` 跟 `env` 是給全公司訂共同底線的地方。** 想讓每個 span 都帶 `deployment.environment`、想讓所有服務用同一組 propagator，寫在這裡一次，不用去拜託每個團隊在自己的 manifest 補。
 
@@ -356,7 +361,7 @@ $ kubectl -n demo describe pod -l app=otel-collector
     Restart Count:  3
 ```
 
-我們能看到** `Reason: Error` 加 `Exit Code: 137`。**
+我們能看到 **`Reason: Error` 加 `Exit Code: 137`**。
 
 137 就是 128 + 9，也就是行程被 `SIGKILL` 砍掉。真正動手的是核心的 OOM killer，但這個叢集回報時把它歸類成一般的 `Error`。如果你的排查腳本是去 grep `OOMKilled` 這個字，這次它會什麼都抓不到。**判斷依據要看 exit code 137，不是那個字串。**
 
@@ -533,8 +538,20 @@ flowchart TB
 
 回到開頭那張表。今天做完之後，「空結果的第三種真相」不再是一個假設，它是我按了一行指令就複製出來的狀態，而且複製的過程中，整個系統沒有產生任何一個可以拿來判斷這件事的訊號。
 
+## 今天沒做的事
+
+| 今天碰到的 | 留給後面 |
+| --- | --- |
+| `otel-collector-monitoring` 那個 `:8888` 端點沒有人在抓 | 讓 collector 自己的 metrics 進 Prometheus，這樣「什麼時候開始丟的」才查得到 |
+| `memory_limiter` 是我事後補的，沒有任何機制會提醒下一個人 | 變成新服務上線 checklist 上的一條 |
+| `python.image` 目前是 Operator 的預設值在決定 | 明寫版本，讓升級變成可以被 review 的動作 |
+| CR 給的是預設值，團隊隨時能覆蓋，平台看不到實際狀態 | 從遙測資料本身反過來對帳 |
+| span name 還是 `POST /api/orders`，沒有業務語意 | 這個要等到有一份寫下來的共同約定才動得了 |
+
 ## 小結
-今天的分享其實跟  AIOps 沒太多關係，但是透過 OTel operator 能快速且以統一的形式，替各部門的服務快速注入 OTel 產生 signal 的能力。
-對於沒接觸過得部門來說，trace 是他們很容易為之一亮的事物。
-且至少有全鏈路覆蓋的 trace ，會對於我們之後利用 trace 資料做成`靜態的系統圖譜 model` 會更方便。
+
+總結來說，今天的分享其實跟 AIOps 沒太多關係，但是透過 OTel operator 能快速且以統一的形式，替各部門的服務快速注入 OTel 產生 signal 的能力。對於沒接觸過得部門來說，trace 是他們很容易為之一亮的事物。且至少有全鏈路覆蓋的 trace，會對於我們之後利用 trace 資料做成`靜態的系統圖譜 model` 會更方便。至於今天那個把 collector 壓垮的實驗，它證明的其實是另一件事：注入這條路走通了，不代表資料真的有走完。
+
+> 這個 OOM 實驗我原本以為會看到一堆紅通通的錯誤訊息，結果 app 那邊是 0 筆 :(
+> 最安靜的故障往往最貴。
 

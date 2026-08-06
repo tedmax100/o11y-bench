@@ -6,6 +6,10 @@ tags: [OpenTelemetry, Weaver, 鐵人賽]
 
 # Day8：分層與所有權，哪一層統一哪一層放手
 
+> 治理的難處從來不是「要不要統一」
+> 是「哪一層統一，哪一層放手」
+> 前者是立場，後者才是設計
+
 昨天 live-check 對著 `service.name` 說「這個屬性不存在於 registry」。那不是資料的問題，是我那份 registry 沒有宣告任何 dependency，所以在它眼裡，OTel（OpenTelemetry）官方定義了幾百個的標準屬性全部都是陌生人。一份會把 `service.name` 判成違規的 gate，上線第一天就會被淹沒在假警報裡，然後大家學會忽略它。
 
 今天要把那件事解掉。但真正的題目比「補一行 dependency」大得多：**一份 registry 要給幾十個團隊用，它到底該由誰維護？**
@@ -347,7 +351,7 @@ flowchart TD
 
 **團隊要付多少成本才接得上？** 這個問題我用實際的行數回答：一份 `manifest.yaml` 五行，加上在自己的 model 檔裡把共用的欄位從 `id:` 改成 `ref:`。要學的新概念只有一個，就是 `ref` 跟 `id` 的差別。如果答案變成「先讀完 registry 規格」，那這個設計就失敗了。
 
-**擋下來的時候，對方修得動嗎？** `conflicting_definition` 那條訊息目前只有名字，沒有講「跟誰衝突」。今天那個 `--include-unreferenced` 的訊息反而好得多，它直接列出 `["registry.acme.biz", "registry.orders.local"]` 兩個 group。這是我這條 policy 該補的，把衝突的另一方也放進 Finding 裡。
+**擋下來的時候，對方修得動嘛？** `conflicting_definition` 那條訊息目前只有名字，沒有講「跟誰衝突」。今天那個 `--include-unreferenced` 的訊息反而好得多，它直接列出 `["registry.acme.biz", "registry.orders.local"]` 兩個 group。這是我這條 policy 該補的，把衝突的另一方也放進 Finding 裡。
 
 ## 回到 AIOps：agent 讀到兩份定義會怎樣
 
@@ -371,8 +375,9 @@ registry 是 agent 唯一能事先知道「這個欄位代表什麼」的地方�
 
 ## 小結
 
-今天寫的東西很少，兩份 manifest 加起來不到二十行，policy 也只有十幾行。但這是這系列第一次，registry 上面有了「誰擁有什麼」這個維度。
+總結來說，今天寫的東西很少，兩份 manifest 加起來不到二十行，policy 也只有十幾行，但這是這系列第一次，registry 上面有了「誰擁有什麼」這個維度。比較意外的是那條寫錯的 policy，它在技術上完全能跑、也真的擋到了該擋的東西，唯一的問題是它順便擋掉了不該擋的，而那個「順便」的實際後果，是把平台團隊變成每個新欄位的審批關卡。**規則寫得太寬，代價不會出現在 CI 的離開碼上，會出現在三週後那四個等我 review 的 PR 上。**
 
-比較意外的是那條寫錯的 policy。它在技術上完全能跑、也真的擋到了該擋的東西，唯一的問題是它順便擋掉了不該擋的，而那個「順便」的實際後果，是把平台團隊變成每個新欄位的審批關卡。**規則寫得太寬，代價不會出現在 CI 的離開碼上，會出現在三週後那四個等我 review 的 PR 上。**
-
-明天處理版本演進：base 改了一個定義，怎麼知道那是不是 breaking change，以及 weaver 的 `diff` 在哪些變更上會完全靜音。
+> 「重複定義不是覆寫，是製造一個沒人引用的孤兒」這件事，我是先寫完文章、再回頭 resolve 才發現的。
+> 綠燈、東西在、但沒有人用到它 QQ
+>
+> 明天處理版本演進：base 改了一個定義，下游怎麼知道自己被打到了。

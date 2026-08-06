@@ -5,6 +5,10 @@ tags: [OpenTelemetry, Weaver, 鐵人賽]
 ---
 # Day5：Weaver 上手，schema 是團隊共識
 
+> 觀察只能告訴你欄位叫什麼
+> 至於它代表什麼、值可以有哪些、必不必填
+> 那三件事線路上一個字都沒有
+
 前兩天在處理「資料能不能穩定產生、能不能送達」。今天換一個問題：資料送出來了，但**每個欄位叫什麼、代表什麼、值可以是哪些，由誰決定？**
 
 Day1 那隻 agent 給過答案：沒有人決定。
@@ -32,7 +36,7 @@ ironman-2026/day05/
 
 ## 為什麼 telemetry 需要 schema
 
-先講清楚這裡的 schema **不是**Database的 schema。它不決定資料怎麼存、不做型別轉換、也不會在 runtime 擋下任何一筆資料。它是「這個 span／metric／attribute 叫什麼、代表什麼、必不必填」的**團隊共識**，寫成機器可讀的形式。
+先講清楚這裡的 schema **不是** Database 的 schema。它不決定資料怎麼存、不做型別轉換、也不會在 runtime 擋下任何一筆資料。它是「這個 span／metric／attribute 叫什麼、代表什麼、必不必填」的**團隊共識**，寫成機器可讀的形式。
 
 差別看一個欄位就懂。沒有 schema 的時候：
 
@@ -59,7 +63,7 @@ span.set_attribute("status", 502)           # 另一個服務這樣寫
 
 這些宣告要寫在哪裡、怎麼組織成一個整體，答案就是 **registry**，一堆這樣的宣告收在一起、彼此可以互相引用的集合。schema 是「一句宣告長什麼樣」，registry 是「這些宣告住的地方」。
 
-> 有 schema 能透過像 protobuf 那樣來產生對應語言的程式碼（` weaver registry generate`）。也能透現有運行中的 signal 來產生 schema 也能（`weaver registry infer`）。這都是 weaver 提供的能力。
+> 有 schema 能透過像 protobuf 那樣來產生對應語言的程式碼（`weaver registry generate`）。也能反過來，從現有運行中的 signal 去產生 schema 草稿（`weaver registry infer`）。這都是 weaver 提供的能力。
 
 ### registry 的結構：一個屬性池 + 一堆引用
 
@@ -753,7 +757,7 @@ span.http.server                       server.address = recommended
           renamed_to: http.request.method
 ```
 
-**注意 `deprecated` 是結構化的**（`reason` ＋ `renamed_to`），不是一句寫在 `brief` 裡的散文。這個差別決定了它能不能被自動消費：`reason: renamed` ＋ `renamed_to` 讓工具可以自動產遷移表、讓 MCP server 在 agent 查到舊欄位時直接告訴它新名字、也讓後面講 breaking change 那天 那條「下游還在用 deprecated 欄位」的 policy 寫得出來。
+**注意 `deprecated` 是結構化的**（`reason` ＋ `renamed_to`），不是一句寫在 `brief` 裡的散文。這個差別決定了它能不能被自動消費：`reason: renamed` ＋ `renamed_to` 讓工具可以自動產遷移表、讓 MCP server 在 agent 查到舊欄位時直接告訴它新名字、也讓後面講 breaking change 時那條「下游還在用 deprecated 欄位」的 policy 寫得出來。
 
 **如果這件事只寫在 `brief` 裡，上面三件事一件都做不到。** 這就是這系列反覆的那條線在 deprecation 這個維度上的形狀，同樣的資訊，寫成句子只有人看得懂，寫成欄位才能被自動化。
 
@@ -798,7 +802,7 @@ $ echo $?
 0
 ```
 
-綠燈。這條 metric 現在每一筆訂單都會生出一條新的時間序列，而檢查完全沒有意見。因為它從頭到尾沒有在看基數，只是在看名字。
+綠燈。這條 metric 現在每一筆訂單都會生出一條新的時間序列，而檢查完全沒有意見。因為它從頭到尾沒有在看基數，只是在看名字。這條規則我當初寫完還覺得挺不錯的 XD
 
 這是繼 `-r .` 之後第二次踩到同一類問題的不同版本：**檢查通過，不等於東西是對的。** 但兩者的性質不同，而這個區別值得記住：`-r .` 是**工具用法出錯**（讀不到檔案），可以靠 `stats` 探針發現；這次是**規則本身的能力邊界**（規則寫得比它宣稱要解決的問題窄），只能靠「知道自己這條規則實際在比對什麼」。**命名慣例跟 policy 是一組配套：policy 只認得慣例，慣例一旦破功，policy 就跟著失效。**
 
@@ -806,7 +810,7 @@ $ echo $?
 
 原規則問錯了問題。它問「這個 attribute 叫什麼」，該問的是「**這個 attribute 的值有幾種可能**」，metric label 的成本完全由值域大小決定，跟名字無關。
 
-registry 有辦法回答值域嗎？有，就是前面講的 `enum.members`。所以規則翻轉成一句話：
+registry 有辦法回答值域嘛？有，就是前面講的 `enum.members`。所以規則翻轉成一句話：
 
 > **metric label 只能是值域有界的型別，enum 或 boolean。其他一律視為無界，除非被明確列入白名單。**
 
@@ -909,13 +913,19 @@ $ weaver registry infer --otlp-grpc-port 14317 --registry-path /tmp/inferred
 
 也因為這樣，那份草稿**不該直接 commit 成 registry**，我也沒有把它放進範例 repo。它的 `requirement_level` 全部是 `recommended`、`brief` 全部是空的，收下來等於宣告「這些欄位我們都沒有意見」。它是丟棄式的，該進的是一個 PR 的描述欄，讓人照著它一條一條決定。
 
+## 今天沒做的事
+
+| 今天碰到的 | 留給後面 |
+| --- | --- |
+| `stats` 那個 34 只有我自己在跑，沒有任何機制會在它掉到 0 的時候叫 | 把探針寫進 CI |
+| 那條 policy 只擋 metric label，命名漂移本身完全沒人管 | 用 Rego 把 `userId` / `user_id` 這種東西抓出來 |
+| `required: 17` 是承諾，但沒有任何東西去對帳真實流量 | live-check |
+| `infer` 出來的 1852 行草稿沒有人審 | 那是一場對話，不是一個指令 |
+| 官方那份的 `extends` 我們一次都沒用到 | 等 registry 真的要分層的時候 |
 
 ## 小結
 
-今天寫的東西，一行程式碼都沒改到，也還沒有擋下任何一個 PR。registry 到現在為止就只是一份宣告。
+總結來說，今天寫的東西一行程式碼都沒改到，也還沒有擋下任何一個 PR，registry 到現在為止就只是一份宣告。但它讓一件事變得可能：命名這種爭議，從「開會的時候誰講話比較大聲」變成一份可以被 diff、被 review 的檔案。其實以前 `userId` 還是 `user_id` 這種問題吵完就散了，下次有人加新服務又重來一次；現在至少有個地方可以吵，而且吵完的結果會留下來。對後面的 agent 來說，最有價值的則是 `enum.members` 那種欄位，Day1 那隻 agent 猜 `WARN` 猜錯，就是因為沒有任何地方告訴過它那個欄位只有 `info`／`warn`／`error` 三種值。這件事寫下來要花五分鐘。
 
-但它讓一件事變得可能：命名這種爭議，從「開會的時候誰講話比較大聲」變成一份可以被 diff、被 review 的檔案。以前 `userId` 還是 `user_id` 這種問題吵完就散了，下次有人加新服務又重來一次；現在至少有個地方可以吵，而且吵完的結果會留下來。
-
-對後面的 agent 來說，最有價值的其實是 `enum.members` 那種欄位。Day1 那隻 agent 猜 `WARN` 猜錯，就是因為沒有任何地方告訴過它那個欄位只有 `info`／`warn`／`error` 三種值。這件事寫下來要花五分鐘，但它是機器唯一能事先知道值域的來源。
-
-明天開始讓這份宣告有牙齒，用 Rego policy 把命名漂移抓出來。
+> 明天開始讓這份宣告長出牙齒，用 Rego policy 把命名漂移抓出來。
+> 順便把今天那條「只看名字不看基數」的規則，改成它本來就該問的問題 :)
