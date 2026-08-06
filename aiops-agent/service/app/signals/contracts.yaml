@@ -56,7 +56,7 @@ contracts:
   - deploy-correlation
   exclusions:
   - No up{} for application services (remote_write, not scraped); judge liveness via rate(payment_charges_total[5m]) > 0.
-  - A declined-rate spike ABOVE the objective is an incident, not normal business — do NOT dismiss declines as expected. Break it down with `sum by (git_version, reason) (rate(payment_charges_total{status="declined"}[5m]))` to find which deploy/reason drives it (e.g. the new_validator flag shipping in a release).
+  - A declined-rate spike ABOVE the objective is an incident, not normal business — do NOT dismiss declines as expected. Break it down with `sum by (git_version, reason) (rate(payment_charges_total{status="declined"}[5m]))` to find which deploy/reason drives it.
   logs:
     selector: '{service_name="payment-service"}'
     error_events:

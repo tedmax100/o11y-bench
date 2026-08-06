@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { css } from '@emotion/css';
 import { GrafanaTheme2, SelectableValue } from '@grafana/data';
 import { PluginPage } from '@grafana/runtime';
@@ -64,7 +65,11 @@ function TraceExplorerPage({ agentServiceUrl }: Props) {
   const [list, setList] = useState<TraceSummary[]>([]);
   const [listError, setListError] = useState<string | null>(null);
   const [listLoading, setListLoading] = useState(false);
-  const [selected, setSelected] = useState<string | null>(null);
+  // ?trace=<id> lets anything that knows a trace id link straight into it —
+  // an investigation's conclusion, a log line, a bookmark. Without it the only
+  // way in is to find the trace in the list again.
+  const [searchParams] = useSearchParams();
+  const [selected, setSelected] = useState<string | null>(searchParams.get('trace'));
   const [detail, setDetail] = useState<TraceDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
 

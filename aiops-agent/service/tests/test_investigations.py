@@ -98,3 +98,53 @@ def test_correctness_merged_from_calibration(tmp_path, monkeypatch):
 
     rows = inv.list_investigations(path=p)
     assert rows[0]["correct"] is True
+
+
+# ---- the chat entry point ---------------------------------------------------
+
+
+def test_investigation_instructions_carry_the_same_playbook():
+    """A question asked in Grafana must get the method an alert gets, or the two
+    entry points are not the same agent."""
+    from app.agent import _RCA_PLAYBOOK, _investigation_instructions
+
+    text = _investigation_instructions(["payment-service"])
+    assert _RCA_PLAYBOOK in text
+    assert "payment-service" in text
+    assert "same language" in text  # the rule the model drops first
+    assert "internally" in text  # the tree is for thinking, not for printing
+
+
+def test_record_investigation_marks_the_source(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+
+    from app import investigations as inv
+
+    monkeypatch.setattr(inv.settings, "investigations_enabled", True)
+    findings = NS(summary="s", hypothesis="h", confidence=0.7, suspected_version=None, services=[])
+    inv.record_investigation(
+        "fp-chat",
+        {"labels": {"service_name": "payment-service"}, "annotations": {}},
+        {"answer": "a", "findings": findings, "decisions": []},
+        path=tmp_path / "aiops.db",
+        source="chat",
+    )
+    rows = inv.list_investigations(limit=5, path=tmp_path / "aiops.db")
+    assert rows and rows[0]["source"] == "chat"
+
+
+def test_record_investigation_defaults_to_alert(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+
+    from app import investigations as inv
+
+    monkeypatch.setattr(inv.settings, "investigations_enabled", True)
+    findings = NS(summary="s", hypothesis="h", confidence=0.7, suspected_version=None, services=[])
+    inv.record_investigation(
+        "fp-alert",
+        {"labels": {"service_name": "payment-service"}, "annotations": {}},
+        {"answer": "a", "findings": findings, "decisions": []},
+        path=tmp_path / "aiops.db",
+    )
+    rows = inv.list_investigations(limit=5, path=tmp_path / "aiops.db")
+    assert rows and rows[0]["source"] == "alert"

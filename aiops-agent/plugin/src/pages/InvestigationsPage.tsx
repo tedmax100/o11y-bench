@@ -27,6 +27,27 @@ type Investigation = {
   decisions: Decision[];
   answer: string;
   correct: boolean | null;
+  source?: 'alert' | 'chat';
+  trace_id?: string | null;
+};
+
+// What the executor's read-only dry-run predicted, stored with the proposal so
+// the person approving it can see the size before they agree to it.
+type BlastRadius = {
+  affected_pods?: number;
+  current_revision?: string | null;
+  target_revision?: string | null;
+  namespace?: string;
+  policy_ok?: boolean;
+  policy_reason?: string;
+};
+
+type ActionRequest = {
+  request_id: string;
+  fp: string;
+  action: string;
+  status: string;
+  blast_radius?: BlastRadius | null;
 };
 
 type WrongModalState = {
@@ -66,6 +87,7 @@ function InvestigationsPage({ agentServiceUrl }: Props) {
   const [wrongModal, setWrongModal] = useState<WrongModalState | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [reinvestigatingFps, setReinvestigatingFps] = useState<Set<string>>(new Set());
+  const [proposals, setProposals] = useState<Record<string, ActionRequest[]>>({});
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -77,6 +99,22 @@ function InvestigationsPage({ agentServiceUrl }: Props) {
       }
       const data = await res.json();
       setItems(data.investigations ?? []);
+
+      // Proposals are a separate resource; index them by fingerprint so each
+      // investigation can show what it proposed AND how big that action is.
+      try {
+        const ar = await fetch(`${agentServiceUrl}/actions/requests?limit=100`);
+        if (ar.ok) {
+          const rows: ActionRequest[] = (await ar.json()).requests ?? [];
+          const byFp: Record<string, ActionRequest[]> = {};
+          rows.forEach((r) => {
+            byFp[r.fp] = [...(byFp[r.fp] ?? []), r];
+          });
+          setProposals(byFp);
+        }
+      } catch {
+        // A missing footprint must not cost the list itself.
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setItems([]);
@@ -164,7 +202,8 @@ function InvestigationsPage({ agentServiceUrl }: Props) {
             <div key={it.fp + it.ts} className={styles.card}>
               <div className={styles.cardHead}>
                 <Stack direction="row" gap={1} alignItems="center" wrap="wrap">
-                  <strong>{it.alertname || 'alert'}</strong>
+                  <strong>{it.alertname || (it.source === 'chat' ? 'question' : 'alert')}</strong>
+                  {it.source === 'chat' && <Badge text="chat" color="purple" />}
                   {it.service && <Badge text={it.service} color="blue" />}
                   {it.git_version && <Badge text={it.git_version} color="purple" />}
                   <Badge text={`confidence ${(it.confidence * 100).toFixed(0)}%`} color={confidenceColor(it.confidence)} />
@@ -172,20 +211,53 @@ function InvestigationsPage({ agentServiceUrl }: Props) {
                   {it.correct === false && !reinvestigatingFps.has(it.fp) && <Badge text="wrong ✗" color="red" />}
                   {it.correct === false && reinvestigatingFps.has(it.fp) && <Badge text="re-investigating…" color="orange" />}
                 </Stack>
-                <span className={styles.ts}>{it.ts}</span>
+                <Stack direction="row" gap={1} alignItems="center">
+                  {it.trace_id && (
+                    <a
+                      className={styles.traceLink}
+                      href={`../traces?trace=${it.trace_id}`}
+                      title="Every node, tool call and prompt of this run"
+                    >
+                      看它怎麼想的
+                    </a>
+                  )}
+                  <span className={styles.ts}>{it.ts}</span>
+                </Stack>
               </div>
 
               <div className={styles.summary}>{it.summary || '(no conclusion)'}</div>
 
               {it.decisions.length > 0 && (
                 <div className={styles.decisions}>
-                  {it.decisions.map((d, i) => (
-                    <div key={i} className={styles.decision}>
-                      <Badge text={d.autonomy.toUpperCase()} color={AUTONOMY_COLOR[d.autonomy]} />
-                      <code>{d.action}</code>
-                      <span className={styles.reason}>— {d.reason}</span>
-                    </div>
-                  ))}
+                  {it.decisions.map((d, i) => {
+                    const req = (proposals[it.fp] ?? []).find((r) => r.action === d.action);
+                    const br = req?.blast_radius;
+                    return (
+                      <div key={i} className={styles.decision}>
+                        <Stack direction="row" gap={1} alignItems="center" wrap="wrap">
+                          <Badge text={d.autonomy.toUpperCase()} color={AUTONOMY_COLOR[d.autonomy]} />
+                          <code>{d.action}</code>
+                          <span className={styles.reason}>— {d.reason}</span>
+                        </Stack>
+                        {br && (
+                          <div className={styles.footprint}>
+                            <Badge
+                              text={`${br.affected_pods ?? '?'} pod(s)`}
+                              color={br.policy_ok === false ? 'red' : 'blue'}
+                            />
+                            {br.current_revision && (
+                              <Badge
+                                text={`revision ${br.current_revision} → ${br.target_revision ?? '?'}`}
+                                color="purple"
+                              />
+                            )}
+                            {br.namespace && <Badge text={`ns ${br.namespace}`} color="blue" />}
+                            <span className={styles.reason}>{br.policy_reason}</span>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
 
@@ -290,6 +362,18 @@ const getStyles = (theme: GrafanaTheme2) => ({
   `,
   summary: css`
     font-size: ${theme.typography.size.md};
+  `,
+  traceLink: css`
+    font-size: 12px;
+    white-space: nowrap;
+  `,
+  footprint: css`
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-top: 4px;
+    padding-left: 8px;
   `,
   decisions: css`
     display: flex;

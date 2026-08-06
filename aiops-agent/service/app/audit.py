@@ -23,6 +23,28 @@ from . import store
 logger = logging.getLogger("aiops_agent.audit")
 
 
+def current_trace_id() -> str | None:
+    """The trace this code is running inside, as a 32-char hex string.
+
+    The agent is auto-instrumented, so an investigation already produces a full
+    trace: every LangGraph node, every tool call with its arguments and result,
+    every model call with its prompt and token usage. What was missing is the
+    one string that gets you from a stored conclusion back to that trace.
+
+    None when nothing is recording (unit tests, or a script run outside
+    `opentelemetry-instrument` — which is how every probe in this series ran).
+    """
+    try:
+        from opentelemetry import trace
+
+        ctx = trace.get_current_span().get_span_context()
+        if not ctx.is_valid:
+            return None
+        return format(ctx.trace_id, "032x")
+    except Exception:
+        return None
+
+
 class AuditEntry(BaseModel):
     ts: str
     request_id: str = ""
@@ -54,6 +76,11 @@ def record(
             actor=actor,
             detail=detail or {},
         )
+        # Carried in `detail` so the append-only table keeps its schema: with it,
+        # "who approved this and what ran" joins to "what the agent was thinking".
+        tid = current_trace_id()
+        if tid:
+            entry.detail.setdefault("trace_id", tid)
         store.audit_insert(entry.model_dump(), path)
     except Exception as e:
         logger.warning("audit record failed (%s/%s): %s", phase, verdict, e)

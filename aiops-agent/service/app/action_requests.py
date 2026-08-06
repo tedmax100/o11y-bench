@@ -101,6 +101,7 @@ def create_from_decision(
     rollback: dict | None = None,
     runbook_id: str | None = None,
     params: dict | None = None,
+    blast_radius: dict | None = None,
     path: Path | None = None,
 ) -> ActionRequest | None:
     """Materialize a request from a governance Decision. ESCALATE produces no
@@ -124,6 +125,11 @@ def create_from_decision(
             rollback=rollback,
             runbook_id=runbook_id,
             params=params or {},
+            # The footprint is computed when the proposal is made, not when it is
+            # approved: a suggestion whose size is only known after you agree to
+            # it isn't a suggestion, it's a surprise. The executor still re-runs
+            # the dry-run before acting (the cluster moves between the two).
+            blast_radius=blast_radius,
             idem_key=f"{decision.action}|{target_of(args)}|{fp}",
             created_ts=_fmt(now),
             expires_ts=_fmt(now + timedelta(seconds=settings.approval_ttl_seconds)),

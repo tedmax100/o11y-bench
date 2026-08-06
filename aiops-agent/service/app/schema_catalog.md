@@ -21,13 +21,14 @@ wired.
 | api-gateway | thin proxy router to backend services | `demo-services/services/api-gateway/` | v4.0.0 |
 | user-service | user lookup + auth check | `demo-services/services/user/` | v1.3.0 |
 | order-service | products / cart / orders. Calls user + payment | `demo-services/services/order/` | v3.1.2 |
-| payment-service | charges. Has the `payment_use_new_validator` flag | `demo-services/services/payment/` | v2.4.1 |
+| payment-service | charges (authorise / decline / refund) | `demo-services/services/payment/` | read it live |
 
 **All services live in one monorepo: `tedmax100/o11y-bench`** — that is the
 `repo` for `github_compare` / `github_get_file` and matches the `git_repo`
-label on every signal. **Only `payment-service` currently has real git tags**
-(`v2.4.1` → `v2.5.0`); `github_compare` on the other services 404s, so only run
-deploy correlation for payment-service.
+label on every signal. **Only `payment-service` currently has real git tags**; `github_compare` on
+the other services 404s, so only run deploy correlation for payment-service.
+Which tags exist, and which one an incident sits on, come from a tool result —
+the `git_version` label on the signal, never from this file.
 
 Dependency edges (caller → callee). The **authoritative, queryable** version of
 this graph — plus criticality tier and journey membership — is the Signal Plane
@@ -97,7 +98,7 @@ http.request_received  http.request_failed   cache.miss  deployment.started
 | event | extra fields |
 |-------|--------------|
 | `payment.requested` / `payment.authorized` | `order_id`, `user_id`, `amount_cents`, `payment_id` |
-| `payment.declined` | `order_id`, `reason` (`new_validator_odd_cents` …) |
+| `payment.declined` | `order_id`, `reason` (read the values off a result) |
 | `payment.gateway_error` | `order_id` |
 | `order.created` | `order_id`, `user_id`, `amount_cents` |
 | `order.cancelled` | `user_id`, `reason` (`auth_failed` / `payment_declined` / `unknown_product`), `upstream_status` |
@@ -138,34 +139,24 @@ sum by (service_name) (count_over_time({deployment_environment="demo"} | event="
   `resource.service.version` from the trace you already fetched; do **not** go to
   Loki to "look it up". Never cite a git_version or trace_id that isn't in a tool result.
 
-## Feature flags & incident scenarios
+## Feature flags
 
-**payment-service** has a `payment_use_new_validator` flag (from `flags.json`,
-a ConfigMap). Flipping it `true` and bumping `git_version` `v2.4.1` → `v2.5.0`
-simulates a bad deploy where odd-cents amounts get declined — `payment.declined`
-spikes under `git_version="v2.5.0"` in both Loki (`sum by (git_version, event)`)
-and Prometheus (declined charges by `git_version`).
-
-Trigger:
-
-```bash
-kubectl -n demo create configmap payment-flags \
-  --from-literal=flags.json='{"payment_use_new_validator": true}' \
-  --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n demo patch deployment payment-service --type=merge \
-  -p '{"spec":{"template":{"metadata":{"labels":{"git_version":"v2.5.0"}}}}}'
-```
-
-Other incident scenarios (order latency, user-service cache lag) are **not yet
-implemented** — don't claim to find them.
+Services read feature flags from a `flags.json` ConfigMap (`payment-flags` for
+payment-service), so **behaviour can change without a new image**. Two
+consequences worth carrying into an investigation: a flag flip is a legitimate
+"what changed" hypothesis even when no deploy is visible, and a flag flip that
+ships together with a version bump looks exactly like a code regression from the
+telemetry alone. Which flags exist and what each one does is in the service's
+repo, not in this file — read the code diff (`github_compare` / `github_get_file`)
+or the ConfigMap rather than assuming.
 
 ## Deploy correlation
 
 When a spike correlates with a `git_version` boundary:
 
 1. Repo is always `tedmax100/o11y-bench` (also the `git_repo` label).
-2. Previous version = the `git_version` value just before the spike (e.g.
-   `v2.4.1` if the spike is on `v2.5.0`).
+2. Previous version = the `git_version` value just before the spike — read
+   both values off the breakdown you already ran, don't assume a pair.
 3. `github_compare("tedmax100/o11y-bench", base=<old>, head=<new>)` to see the
    diff (naturally scoped to that service's path).
 4. If a suspicious file shows up, `github_get_file(...)` to read the new code.

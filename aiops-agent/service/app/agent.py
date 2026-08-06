@@ -261,11 +261,11 @@ histogram_quantile(0.95, sum by (le) (rate(http_server_duration_milliseconds_buc
 
 Format example (incident with multiple signals):
 ```
-payment-service 在 14:05 後 decline 率從 0% 跳到 18%，全集中在 v2.5.0、
-reason 是 `new_validator_odd_cents`。看起來跟新部署的 validator 有關。
+order-service 在 14:05 後 5xx 從 0.2% 跳到 12%，全集中在 <the version you
+read off the breakdown>，reason 是 <the reason value you read>。跟那個時間點的部署對得上。
 
 ` ` `promql
-sum by (git_version, reason) (rate(payment_charges_total{{status="declined"}}[5m]))
+sum by (git_version, reason) (rate(<the counter you found>{{status="error"}}[5m]))
 ` ` `
 ```
 
@@ -291,6 +291,11 @@ The JSON must match this shape (only `title` / `expr` / `threshold` are required
 ``` ````
 
 Rules:
+- **NEVER emit a Prometheus-style rule (```` ```yaml ```` with `alert:` / `expr:` /
+  `for:` / `labels:`).** It looks right and is useless here: the plugin only
+  renders the ```` ```alert ```` JSON block as a card with the button, so a YAML
+  rule leaves the user with text they have to copy somewhere by hand. This is the
+  single most common way to get this wrong.
 - `expr` is a PromQL query evaluated as an **instant** value and compared to
   `threshold`; write a ratio/rate that reduces to one number, not a range vector.
 - `comparison` is `"gt"` or `"lt"`; `for_duration` is a Go duration (`"30s"` /
@@ -368,7 +373,7 @@ with GitHub deploys. In-scope intents include:
 - Reading or aggregating logs, metrics, or traces.
 - Root-cause analysis, deploy correlation, "what changed", "why is X slow".
 - **Comparing the code between two deployed versions of a service** ("diff
-  v2.4.1 vs v2.5.0", "what changed in the new version", "show the code the new
+  v1.2.3 vs v1.3.0", "what changed in the new version", "show the code the new
   deploy introduced"). The assistant has GitHub diff tools (`github_compare`,
   `github_get_file`) for exactly this — it is deploy correlation, IN scope.
 - Questions about the telemetry data, dashboards, or the observability stack itself.
@@ -931,9 +936,43 @@ Follow this RCA method (in order; stop once you can state a confident cause; min
    dominant reason, the supporting numbers, a trace id, and a calibrated confidence."""
 
 
-def _past_incident_context(service: str, alertname: str) -> str:
-    """Build a markdown block of past correct investigations for the same
-    service+alertname. Returns an empty string when there are no matches."""
+def _investigation_instructions(services: list[str]) -> str:
+    """The chat equivalent of what `_alert_to_prompt` hands the headless run:
+    the same RCA method, as a system message.
+
+    Until this existed the two entry points were not the same agent. An alert
+    arrived with a hypothesis tree, a five-step method and a confidence rule; a
+    human asking the same thing in Grafana got none of it, and the difference
+    showed up as the agent answering *a* question instead of investigating it.
+
+    It goes in a system message, not appended to the question, for one concrete
+    reason: an English instruction block glued onto a Chinese question makes the
+    model answer half in English. The user's message stays the user's message.
+    """
+    lines = ["## This turn is a root-cause investigation, not a lookup", ""]
+    if services:
+        lines.append(f"Service(s) in question: {', '.join(services)}.")
+    lines.append(
+        "Work through the method below **internally**. Do NOT print the "
+        "hypothesis tree, do not narrate which step you are on, and do not print "
+        "the step-5 checklist — fold all of it into the answer. The reply keeps "
+        "the normal answer style: lead with the conclusion, numbers with units, "
+        "and the matching fenced query blocks so the panels render. Finish with "
+        "ONE short line giving your confidence and what you could not rule out."
+    )
+    lines.append(_RCA_PLAYBOOK)
+    # Last line wins on recency, and this is the rule the model drops first when
+    # a block of English instructions lands on top of a Chinese question.
+    lines.append(
+        "\n**Answer in the same language as the user's question** — a question "
+        "in Chinese gets a Chinese answer, including the confidence line."
+    )
+    return "\n".join(lines)
+
+
+def _past_incident_context(service: str, alertname: str | None = None) -> str:
+    """Build a markdown block of past correct investigations for this service
+    (narrowed to the same alert when there is one). Empty string when none."""
     try:
         rows = store.inv_query_similar(service=service, alertname=alertname, limit=5)
     except Exception as e:
@@ -955,8 +994,12 @@ def _past_incident_context(service: str, alertname: str) -> str:
 
 
 def _inject_past_incidents(turn_messages: list, service: str | None, alertname: str | None) -> None:
-    """Inject past-incident context into the turn messages. Fail-open."""
-    if not service or not alertname:
+    """Inject past-incident context into the turn messages. Fail-open.
+
+    A chat question has no alertname; matching on the service alone is still
+    worth it, because "last time someone investigated this service, the cause
+    was X" is exactly what a human would say to a colleague."""
+    if not service:
         return
     try:
         ctx = _past_incident_context(service, alertname)
@@ -1011,6 +1054,34 @@ async def _inject_runbook(turn_messages: list, labels: dict, annotations: dict):
         return None
 
 
+async def _proposal_footprint(action: str, args: dict) -> dict | None:
+    """The read-only dry-run for a proposal, at the moment it is proposed.
+
+    "Next step" is only a suggestion if it comes with its size. Rolling back two
+    pods in one namespace and rolling back sixty are the same sentence and a very
+    different decision, and the on-call is the one who has to tell them apart.
+    Best-effort: a footprint we cannot compute must not cost the proposal, and
+    the executor re-runs this (fail-closed) before anything actually happens.
+    """
+    from .actions import registry
+
+    spec = registry.get(action)
+    if spec is None or spec.dry_run is None:
+        return None
+    try:
+        br = await spec.dry_run(args)
+    except Exception as e:
+        logger.warning("proposal footprint failed for %s: %s", action, e)
+        return None
+    from .blast_radius import evaluate_policy
+
+    ok, reason = evaluate_policy(br)
+    data = br.model_dump()
+    data["policy_ok"] = ok
+    data["policy_reason"] = reason
+    return data
+
+
 async def run_headless(alert: dict, thread_id: str) -> dict:
     """Run one headless RCA turn for a single firing alert. Returns the final
     prose answer plus structured Findings for the downstream sink."""
@@ -1024,7 +1095,17 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
     turn_messages: list = []
     if service:
         try:
-            turn_messages.append(SystemMessage(content=await capability_for_services([service])))
+            snapshot = await capability_for_services([service])
+            if snapshot:
+                turn_messages.append(SystemMessage(content=snapshot))
+            else:
+                # Not a failure: the service simply has no live data in this
+                # window (a quiet service, or a fixed dataset that never had it).
+                # Logging it as "failed" sent me hunting for a bug that wasn't there.
+                logger.info(
+                    "headless: no capability snapshot for %s — no live inventory in this window",
+                    service,
+                )
         except Exception as e:
             logger.warning("headless: capability snapshot failed for %s: %s", service, e)
         _inject_signal_context(turn_messages, [service])
@@ -1180,13 +1261,15 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
                     step = step_by_action.get(d.action)
                     if step is None:
                         continue
+                    action_args = _subst(step.args, params)
                     action_requests.create_from_decision(
                         thread_id,
                         d,
-                        args=_subst(step.args, params),
+                        args=action_args,
                         rollback=_subst(step.rollback, params) if step.rollback else None,
                         runbook_id=matched_rb.id,
                         params=params,
+                        blast_radius=await _proposal_footprint(d.action, action_args),
                     )
         except Exception as e:
             logger.warning("governance gate failed: %s", e)
@@ -1196,6 +1279,11 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
         "findings": findings,
         "decisions": decisions,
         "uncertainty": uncertainty,
+        # The full message list of the last invocation. The webhook path ignores
+        # it; the eval harness reads it to grade *how* the answer was reached
+        # (which tools, in what order, on what evidence) — a verdict-only grade
+        # can't tell a lucky guess from an investigation.
+        "messages": messages,
     }
 
 
@@ -1287,6 +1375,53 @@ async def _followups_and_done(message: str, answer_parts: list[str]) -> AsyncIte
     yield {"type": "done"}
 
 
+async def _conclude_chat_investigation(
+    message: str, thread_id: str, config: dict, services: list[str]
+) -> AsyncIterator[dict]:
+    """Extract the structured verdict for a chat investigation, emit it, store it.
+
+    The alert path has done this since it was written; chat threw the transcript
+    away the moment the prose was streamed. That is why a question asked in
+    Grafana produced no confidence score, no row in the investigation list, and
+    nothing to replay later. Best-effort throughout: this runs after the user
+    already has their answer, so nothing here may break the turn."""
+    try:
+        graph = await _build_agent()
+        state = await graph.aget_state(config)
+        messages = state.values.get("messages", []) if state else []
+        if not messages:
+            return
+        findings = await extract_findings(messages)
+    except Exception as e:
+        logger.warning("chat findings extraction failed (fp=%s): %s", thread_id, e)
+        return
+
+    yield {
+        "type": "findings",
+        "summary": findings.summary,
+        "hypothesis": findings.hypothesis,
+        "confidence": findings.confidence,
+        "services": list(findings.services or []),
+        "suspected_version": findings.suspected_version,
+    }
+
+    try:
+        from .investigations import record_investigation
+
+        answer = _flatten_content(getattr(messages[-1], "content", None))
+        record_investigation(
+            thread_id,
+            {
+                "labels": {"service_name": services[0] if services else None},
+                "annotations": {"summary": message[:200]},
+            },
+            {"answer": answer, "findings": findings, "decisions": []},
+            source="chat",
+        )
+    except Exception as e:
+        logger.warning("chat investigation record failed (fp=%s): %s", thread_id, e)
+
+
 async def stream_chat(
     message: str, thread_id: str, service_hint: str | None = None
 ) -> AsyncIterator[dict]:
@@ -1348,6 +1483,14 @@ async def stream_chat(
     if resolved:
         _inject_signal_context(turn_messages, resolved)
         await _inject_dependency_health(turn_messages, resolved)
+    # Closed loop: what did we conclude last time someone asked about this
+    # service? Free (a store read), and it is the one piece of context a human
+    # colleague would definitely have.
+    investigating = intent.mode == "investigate"
+    if investigating and resolved:
+        _inject_past_incidents(turn_messages, resolved[0], None)
+    if investigating:
+        turn_messages.append(SystemMessage(content=_investigation_instructions(resolved)))
     turn_messages.append({"role": "user", "content": message})
 
     # Accumulate the answer text so we can suggest follow-ups from it afterward.
@@ -1455,6 +1598,10 @@ async def stream_chat(
                     if text:
                         answer_parts.append(text)
                         yield {"type": "final", "text": text}
+
+    if investigating:
+        async for ev in _conclude_chat_investigation(message, thread_id, config, resolved):
+            yield ev
 
     async for ev in _followups_and_done(message, answer_parts):
         yield ev

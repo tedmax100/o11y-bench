@@ -135,3 +135,37 @@ async def test_dry_run_unavailable_when_k8s_down(monkeypatch):
     monkeypatch.setattr(k8s, "_load_client", _boom)
     out = await dry_run_rollout_undo({"deployment": "x", "namespace": "demo"})
     assert out.available is False and "not available" in out.detail
+
+
+# ---- the refusal has to name what was proposed -----------------------------
+
+
+def test_scale_to_zero_is_refused_for_being_zero_not_for_being_a_singleton():
+    """Both rules refuse, but only one of them tells the on-call what they did."""
+    br = BlastRadius(
+        action="k8s.scale",
+        target="demo/payment-service",
+        namespace="demo",
+        current_replicas=2,
+        target_replicas=0,
+        affected_pods=2,
+        singleton=True,
+    )
+    ok, reason = evaluate_policy(br)
+    assert ok is False
+    assert "zero" in reason
+
+
+def test_a_real_singleton_still_says_singleton():
+    br = BlastRadius(
+        action="k8s.scale",
+        target="demo/user-service",
+        namespace="demo",
+        current_replicas=1,
+        target_replicas=1,
+        affected_pods=0,
+        singleton=True,
+    )
+    ok, reason = evaluate_policy(br)
+    assert ok is False
+    assert "singleton" in reason

@@ -86,3 +86,49 @@ def test_legacy_migration_idempotent(tmp_path, monkeypatch):
     rows = store.cal_load(p)
     assert len(rows) == 1 and rows[0]["correct"] is True and rows[0]["services"] == ["payment"]
     assert len(store.inv_load(p)) == 1
+
+
+# ---- past incidents for a chat question ------------------------------------
+
+
+def _seed_investigation(path, fp, service, alertname, summary, correct=True):
+    import json
+
+    store.init(path)
+    payload = json.dumps(
+        {
+            "fp": fp,
+            "service": service,
+            "alertname": alertname,
+            "summary": summary,
+            "confidence": 0.8,
+        }
+    )
+    store.inv_insert(fp, "2026-08-06T00:00:00Z", payload, path)
+    store.cal_insert(
+        run_id=fp,
+        ts="2026-08-06T00:00:00Z",
+        confidence=0.8,
+        summary=summary,
+        hypothesis="h",
+        suspected_version=None,
+        services=[service],
+        path=path,
+    )
+    store.cal_label(fp, correct, score=1.0 if correct else 0.0, source="test", path=path)
+
+
+def test_inv_query_similar_without_an_alertname_matches_any_investigation(tmp_path):
+    """A chat question has no alertname; matching on the service alone is still
+    the right thing, because that is what a colleague would remember."""
+    path = tmp_path / "aiops.db"
+    _seed_investigation(path, "fp1", "payment-service", "payment-decline-rate-high", "bad deploy")
+    assert store.inv_query_similar("payment-service", path=path)
+    assert store.inv_query_similar("payment-service", "payment-decline-rate-high", path=path)
+    assert not store.inv_query_similar("payment-service", "some-other-alert", path=path)
+
+
+def test_inv_query_similar_still_ignores_runs_that_were_wrong(tmp_path):
+    path = tmp_path / "aiops.db"
+    _seed_investigation(path, "fp2", "order-service", "x", "guessed", correct=False)
+    assert not store.inv_query_similar("order-service", path=path)

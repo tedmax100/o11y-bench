@@ -239,3 +239,96 @@ async def test_rubric_does_not_block_when_actions_disabled(monkeypatch):
     assert rubric_ok is False  # verdict is captured
     # The gate expression in execution.py:
     assert not (not rubric_ok and ex.settings.actions_enabled)  # gate does NOT fire
+
+
+# ---- the IDs the guard could not see ---------------------------------------
+
+
+def test_trace_regex_matches_ids_with_stripped_leading_zeros():
+    """Tempo's search API returns trace IDs with leading zeros stripped — about
+    one in six in this stack is 30 or 31 chars. A {32} pattern skipped exactly
+    those, so an answer citing one was never checked at all."""
+    from app.rubric import _TRACE_ID_RE
+
+    assert _TRACE_ID_RE.search("869290709c6aa24faed123d5b465a6")  # 30
+    assert _TRACE_ID_RE.search("c463250d900592060957bc2cbdfe804")  # 31
+    assert _TRACE_ID_RE.search("171ef2ebf1fc16daf0b0292de66d1985")  # 32
+    assert not _TRACE_ID_RE.search("deadbeef")  # too short to be an ID
+
+
+@pytest.mark.asyncio
+async def test_short_trace_id_is_checked_and_padded(monkeypatch):
+    """A stripped ID must reach Tempo as the canonical 32-char form."""
+    seen: list[str] = []
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"batches": [{"scopeSpans": []}]}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, **kw):
+            seen.append(url)
+            return _Resp()
+
+    monkeypatch.setattr(rubric.httpx, "AsyncClient", lambda **kw: _Client())
+    ok, _ = await rubric.verify_trace_ids("see trace c463250d900592060957bc2cbdfe804")
+    assert ok is True
+    assert seen and seen[0].endswith("/0c463250d900592060957bc2cbdfe804")
+
+
+# ---- the context the judge is handed ---------------------------------------
+
+
+def test_rubric_context_carries_the_intent_rules_need():
+    from app.action_requests import ActionRequest
+    from app.execution import _rubric_context
+
+    req = ActionRequest(
+        request_id="r1",
+        fp="fp1",
+        action="k8s_scale",
+        args={"namespace": "demo", "deployment": "payment-service", "replicas": 60},
+        autonomy="propose",
+        status="pending",
+        runbook_id="payment-decline",
+        params={"service_name": "payment-service", "alertname": "PaymentDeclineRateHigh"},
+        blast_radius={
+            "action": "k8s.scale",
+            "namespace": "demo",
+            "target": "payment-service",
+            "current_replicas": 2,
+            "target_replicas": 60,
+        },
+        created_ts="2026-08-06T00:00:00Z",
+        expires_ts="2026-08-07T00:00:00Z",
+    )
+    context = _rubric_context(req)
+    assert "payment-decline" in context
+    assert "PaymentDeclineRateHigh" in context
+    assert "2" in context and "60" in context  # the ratio rule is now answerable
+
+
+def test_rubric_context_is_never_empty():
+    from app.action_requests import ActionRequest
+    from app.execution import _rubric_context
+
+    req = ActionRequest(
+        request_id="r2",
+        fp="fp2",
+        action="k8s_rollout_restart",
+        args={},
+        autonomy="propose",
+        status="pending",
+        created_ts="2026-08-06T00:00:00Z",
+        expires_ts="2026-08-07T00:00:00Z",
+    )
+    assert _rubric_context(req) == "(none provided)"

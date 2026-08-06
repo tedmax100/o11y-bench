@@ -282,24 +282,30 @@ def inv_load(path: str | Path | None = None) -> list[str]:
 
 def inv_query_similar(
     service: str,
-    alertname: str,
+    alertname: str | None = None,
     limit: int = 5,
     path: str | Path | None = None,
 ) -> list[dict[str, Any]]:
-    """Return up to `limit` past investigations for the same service+alertname
-    that were labeled correct=True (joined with calibration by fp=run_id).
-    Most-recent first. Returns parsed payload dicts."""
+    """Return up to `limit` past investigations for this service that were
+    labeled correct=True (joined with calibration by fp=run_id), most-recent
+    first. `alertname` narrows to the same alert; a chat question has no
+    alertname, so leaving it out matches any past investigation of the service.
+    Returns parsed payload dicts."""
+    where = "json_extract(i.payload, '$.service') = ?"
+    params: list[Any] = [service]
+    if alertname:
+        where += " AND json_extract(i.payload, '$.alertname') = ?"
+        params.append(alertname)
+    params.append(limit)
     with _connect(path) as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT i.payload FROM investigations i
             JOIN calibration c ON c.run_id = i.fp
-            WHERE json_extract(i.payload, '$.service') = ?
-              AND json_extract(i.payload, '$.alertname') = ?
-              AND c.correct = 1
+            WHERE {where} AND c.correct = 1
             ORDER BY i.id DESC LIMIT ?
             """,
-            (service, alertname, limit),
+            params,
         ).fetchall()
     out = []
     for r in rows:

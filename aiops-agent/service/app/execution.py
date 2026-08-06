@@ -322,6 +322,34 @@ async def _check_blast_radius(req: ActionRequest, path: Path | None) -> bool:
     return ok
 
 
+def _rubric_context(req: ActionRequest) -> str:
+    """The incident the action belongs to, in one paragraph.
+
+    Half the judge's own rulebook is about intent — "block rollout_undo when the
+    RCA says this is not a bad deploy", "block a scale that is more than 10x the
+    current replica count". Neither is answerable from the action's arguments,
+    so passing only the runbook id (which is what this used to do) leaves the
+    judge grading the half of its job it can see.
+    """
+    bits: list[str] = []
+    if req.runbook_id:
+        bits.append(f"Runbook: {req.runbook_id}.")
+    interesting = ("service_name", "alertname", "severity", "summary", "description")
+    incident = {k: v for k, v in (req.params or {}).items() if k in interesting}
+    if incident:
+        bits.append("Incident: " + "; ".join(f"{k}={v}" for k, v in incident.items()) + ".")
+    if req.blast_radius:
+        try:
+            from .blast_radius import BlastRadius, format_blast_radius
+
+            bits.append("Blast radius: " + format_blast_radius(BlastRadius(**req.blast_radius)))
+        except Exception:  # a malformed snapshot must not cost us the whole context
+            bits.append(f"Blast radius: {req.blast_radius}")
+    if req.rollback:
+        bits.append(f"Rollback available: {req.rollback}.")
+    return " ".join(bits) or "(none provided)"
+
+
 async def run(request_id: str, path: Path | None = None) -> dict:
     """Execute an approved request through the pipeline. Returns a small result
     dict; the authoritative state is the request's status in the store."""
@@ -410,8 +438,7 @@ async def run(request_id: str, path: Path | None = None) -> dict:
     try:
         from .rubric import check_k8s_write
 
-        context = getattr(req, "runbook_id", "") or ""
-        rubric_ok, rubric_reason = await check_k8s_write(req.action, req.args, context)
+        rubric_ok, rubric_reason = await check_k8s_write(req.action, req.args, _rubric_context(req))
         if not rubric_ok and settings.actions_enabled:
             audit.record(
                 "rubric",

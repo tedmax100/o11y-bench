@@ -249,10 +249,99 @@ def test_tempo_hint_injects_traceql_syntax():
     assert "braces" in str(result) or "predicates" in str(result)
 
 
-def test_tempo_hint_non_parse_passthrough():
+def test_tempo_hint_names_the_prom_loki_label_it_used():
+    """The agent writes `service_name` because that is the name everywhere else;
+    Tempo answers "unexpected IDENTIFIER", which says nothing about that."""
+    exc = ToolException("returned 400: parse error at line 1, col 2: unexpected IDENTIFIER")
+    hint = str(q._tempo_query_hint('{service_name="payment-service"}', exc))
+    assert "`service_name` -> `resource.service.name`" in hint
+
+
+def test_tempo_hint_calls_out_quoted_status():
+    exc = ToolException("returned 500: binary operations must operate on the same type")
+    hint = str(q._tempo_query_hint('{resource.service.name="p" && status="error"}', exc))
+    assert "no quotes" in hint
+
+
+def test_tempo_hint_keeps_the_original_error_text():
     exc = ToolException("connection refused")
-    result = q._tempo_query_hint("{ status=error }", exc)
-    assert str(result) == str(exc)
+    hint = str(q._tempo_query_hint("{ status=error }", exc))
+    assert hint.startswith("connection refused")
+
+
+# ---- empty-result notes ----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_prom_empty_names_the_metric_that_does_not_exist(monkeypatch):
+    async def mock_get_json(base, path, params):
+        if path == "/api/v1/label/__name__/values":
+            return {"data": ["payment_charges_total"]}
+        return {"resultType": "matrix", "result": []}
+
+    monkeypatch.setattr(q, "_get_json", mock_get_json)
+    result = await q._query_prometheus("sum(rate(payment_declines_total[5m]))")
+    assert "payment_declines_total" in result["note"]
+    assert "discover_metrics" in result["hint"]
+
+
+@pytest.mark.asyncio
+async def test_prom_empty_with_real_metric_points_at_the_matchers(monkeypatch):
+    async def mock_get_json(base, path, params):
+        if path == "/api/v1/label/__name__/values":
+            return {"data": ["payment_charges_total"]}
+        return {"resultType": "matrix", "result": []}
+
+    monkeypatch.setattr(q, "_get_json", mock_get_json)
+    result = await q._query_prometheus('sum(rate(payment_charges_total{status="nope"}[5m]))')
+    assert "label matchers" in result["note"]
+    assert "hint" not in result
+
+
+@pytest.mark.asyncio
+async def test_loki_empty_names_the_unindexed_selector_key(monkeypatch):
+    async def mock_get_json(base, path, params):
+        if path == "/loki/api/v1/labels":
+            return {"data": ["service_name", "git_version"]}
+        return {"resultType": "streams", "result": []}
+
+    monkeypatch.setattr(q, "_get_json", mock_get_json)
+    result = await q._query_loki_logs('{service="payment-service"}')
+    assert "Not an indexable stream label: service" in result["note"]
+    assert "discover_log_fields" in result["hint"]
+
+
+@pytest.mark.asyncio
+async def test_loki_empty_note_fails_open(monkeypatch):
+    """A hint is never worth an exception: if the label call fails, the empty
+    result still comes back as an empty result."""
+
+    async def mock_get_json(base, path, params):
+        if path == "/loki/api/v1/labels":
+            raise ToolException("labels endpoint down")
+        return {"resultType": "streams", "result": []}
+
+    monkeypatch.setattr(q, "_get_json", mock_get_json)
+    result = await q._query_loki_logs('{service="payment-service"}')
+    assert result["result"] == []
+    assert "note" not in result
+
+
+@pytest.mark.asyncio
+async def test_loki_strips_the_stats_block(monkeypatch):
+    monkeypatch.setattr(
+        q,
+        "_get_json",
+        AsyncMock(
+            return_value={
+                "resultType": "streams",
+                "result": [{"stream": {"service_name": "x"}, "values": [["1", "line"]]}],
+                "stats": {"summary": {"totalBytesProcessed": 0}},
+            }
+        ),
+    )
+    result = await q._query_loki_logs('{service_name="x"}')
+    assert "stats" not in result
 
 
 # ---- async query functions (httpx mocked) ----------------------------------

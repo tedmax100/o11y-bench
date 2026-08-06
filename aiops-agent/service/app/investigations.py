@@ -24,6 +24,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from . import store
+from .audit import current_trace_id
 from .config import settings
 
 logger = logging.getLogger("aiops_agent.investigations")
@@ -53,9 +54,19 @@ class InvestigationRecord(BaseModel):
     correct: bool | None = None
     # original alert payload — needed to re-run investigation on Wrong label
     alert: dict = Field(default_factory=dict)
+    # "alert" (the webhook fired it) or "chat" (a human asked in Grafana). Both
+    # go through the same graph; only the kickoff differs, and the plugin wants
+    # to show which is which.
+    source: str = "alert"
+    # The trace of the run that produced this row. The reasoning was always
+    # recorded (auto-instrumentation traces every node, tool call and prompt);
+    # without this field there was no way to find it from the conclusion.
+    trace_id: str | None = None
 
 
-def record_investigation(fp: str, alert: dict, result: dict, path: Path | None = None) -> None:
+def record_investigation(
+    fp: str, alert: dict, result: dict, path: Path | None = None, source: str = "alert"
+) -> None:
     """Append a row for a finished headless run. Best-effort — never raises."""
     if not settings.investigations_enabled:
         return
@@ -85,6 +96,8 @@ def record_investigation(fp: str, alert: dict, result: dict, path: Path | None =
             ],
             answer=(result.get("answer") or "")[:2000],
             alert={k: v for k, v in alert.items() if k != "_correction_hint"},
+            trace_id=current_trace_id(),
+            source=source,
         )
         store.inv_insert(rec.fp, rec.ts, rec.model_dump_json(), path)
     except Exception as e:

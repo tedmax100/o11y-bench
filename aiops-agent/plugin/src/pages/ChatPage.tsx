@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { css } from '@emotion/css';
 import { GrafanaTheme2 } from '@grafana/data';
 import { PluginPage } from '@grafana/runtime';
-import { Button, Input, Stack, useStyles2, Spinner, Collapse, Alert } from '@grafana/ui';
+import { Badge, Button, Input, Stack, useStyles2, Spinner, Collapse, Alert } from '@grafana/ui';
 import { testIds } from '../components/testIds';
 import { streamSSE } from '../utils/sse';
 import { PromqlPanel } from '../components/PromqlPanel';
@@ -19,6 +19,14 @@ type ChatEvent =
   | { type: 'status'; phase: string; label: string }
   | { type: 'suggestions'; items: string[] }
   | { type: 'clarify'; prompt: string; options: string[] }
+  | {
+      type: 'findings';
+      summary: string;
+      hypothesis: string;
+      confidence: number;
+      services: string[];
+      suspected_version: string | null;
+    }
   | { type: 'done' };
 
 type ToolCall = {
@@ -47,6 +55,15 @@ type Message = {
   status?: string;
   // LLM-suggested follow-up questions, rendered as clickable chips under the answer.
   suggestions?: string[];
+  // The structured verdict of an investigate-mode turn (the alert path has
+  // always produced one; chat did not until it was wired up). Absent on lookup
+  // turns, where "here is the panel" is the whole answer.
+  findings?: {
+    summary: string;
+    confidence: number;
+    services: string[];
+    suspectedVersion: string | null;
+  };
 };
 
 type ChatPageProps = {
@@ -184,6 +201,33 @@ type MessageBubbleProps = {
   agentServiceUrl: string;
 };
 
+function confidenceColor(c: number): 'green' | 'orange' | 'red' {
+  if (c >= 0.8) {
+    return 'green';
+  }
+  if (c >= 0.5) {
+    return 'orange';
+  }
+  return 'red';
+}
+
+// The verdict line under an investigation's answer. Deliberately plain: it
+// shows what was concluded and how sure the agent claims to be, so the number
+// can be argued with instead of being buried in prose.
+function FindingsBar({ findings }: { findings: NonNullable<Message['findings']> }) {
+  const styles = useStyles2(getStyles);
+  return (
+    <div className={styles.findings}>
+      <Badge text={`confidence ${(findings.confidence * 100).toFixed(0)}%`} color={confidenceColor(findings.confidence)} />
+      {findings.services.map((s) => (
+        <Badge key={s} text={s} color="blue" />
+      ))}
+      {findings.suspectedVersion && <Badge text={findings.suspectedVersion} color="purple" />}
+      <span className={styles.findingsSummary}>{findings.summary}</span>
+    </div>
+  );
+}
+
 function MessageBubble({ message, index, onClarify, onFollowUp, busy, agentServiceUrl }: MessageBubbleProps) {
   const styles = useStyles2(getStyles);
   const segments = message.role === 'assistant' ? splitQueryBlocks(message.text) : [{ kind: 'text' as const, value: message.text }];
@@ -207,6 +251,7 @@ function MessageBubble({ message, index, onClarify, onFollowUp, busy, agentServi
             return <div key={i} className={styles.text}>{seg.value}</div>;
         }
       })}
+      {message.findings && <FindingsBar findings={message.findings} />}
       {message.status && (
         <div className={styles.status}>
           <Spinner inline size="sm" />
@@ -291,7 +336,11 @@ function splitQueryBlocks(text: string): Segment[] {
     return [];
   }
   // group 1: language, group 2: rest of info line (optional count), group 3: body
-  const re = /```(promql|logql|traceql|alert)([^\n]*)\n?([\s\S]*?)```/g;
+  // `json` is in here on purpose: the model gets the alert JSON right far more
+  // often than it gets the fence tag right, and a proposal rendered as a code
+  // block instead of a button is one the user has to hand-carry into Grafana.
+  // A ```json``` block only becomes a card if it validates as an AlertSpec.
+  const re = /```(promql|logql|traceql|alert|json)([^\n]*)\n?([\s\S]*?)```/g;
   const out: Segment[] = [];
   let last = 0;
   let m: RegExpExecArray | null;
@@ -299,9 +348,10 @@ function splitQueryBlocks(text: string): Segment[] {
     if (m.index > last) {
       out.push({ kind: 'text', value: text.slice(last, m.index) });
     }
-    if (m[1] === 'alert') {
+    if (m[1] === 'alert' || m[1] === 'json') {
       const spec = parseAlertSpec(m[3]);
-      // Keep the raw block as text if it isn't valid JSON / lacks the essentials.
+      // Keep the raw block as text if it isn't valid JSON / lacks the essentials
+      // — a ```json``` block that is not an alert spec is just JSON to display.
       out.push(spec ? { kind: 'alert', spec } : { kind: 'text', value: m[0] });
     } else {
       const limitMatch = m[2].match(/\d+/);
@@ -365,6 +415,17 @@ function applyEvent(messages: Message[], evt: ChatEvent): Message[] {
     case 'suggestions':
       updated.suggestions = evt.items;
       break;
+    case 'findings':
+      // An investigate-mode turn ends with the same structured verdict the
+      // alert path produces. Prose alone cannot be graded, filed, or compared;
+      // this is what makes a typed question a first-class investigation.
+      updated.findings = {
+        summary: evt.summary,
+        confidence: evt.confidence,
+        services: evt.services ?? [],
+        suspectedVersion: evt.suspected_version ?? null,
+      };
+      break;
     case 'token':
       updated.text = last.text + evt.text;
       updated.status = undefined; // answer is streaming — stop showing "thinking"
@@ -404,6 +465,19 @@ function applyEvent(messages: Message[], evt: ChatEvent): Message[] {
 }
 
 const getStyles = (theme: GrafanaTheme2) => ({
+  findings: css`
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-top: ${theme.spacing(1)};
+    padding-top: ${theme.spacing(1)};
+    border-top: 1px solid ${theme.colors.border.weak};
+  `,
+  findingsSummary: css`
+    color: ${theme.colors.text.secondary};
+    font-size: 12px;
+  `,
   wrapper: css`
     display: flex;
     flex-direction: column;

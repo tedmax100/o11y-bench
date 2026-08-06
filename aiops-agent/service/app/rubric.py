@@ -28,8 +28,13 @@ from .config import settings
 
 logger = logging.getLogger("aiops_agent.rubric")
 
-# 32 hex chars — Tempo/OTel trace ID format
-_TRACE_ID_RE = re.compile(r"\b([0-9a-f]{32})\b", re.IGNORECASE)
+# A trace ID is 128 bits, so 32 hex chars — but Tempo's search API returns them
+# with leading zeros stripped, and about one in six real IDs in this stack comes
+# back 30 or 31 chars long. A `{32}` pattern silently skips exactly those, which
+# means the guard was not checking the IDs it could not see. 24 is well past the
+# point where a real ID could be shorter (that needs 32 leading zero bits) and
+# still long enough not to collide with ordinary hex-looking words.
+_TRACE_ID_RE = re.compile(r"\b([0-9a-f]{24,32})\b", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +44,9 @@ _TRACE_ID_RE = re.compile(r"\b([0-9a-f]{32})\b", re.IGNORECASE)
 
 async def _tempo_trace_exists(trace_id: str) -> bool:
     """Return True if Tempo has a trace with this ID. Timeout = 3 s."""
-    url = f"{settings.tempo_url.rstrip('/')}/api/traces/{trace_id}"
+    # Tempo answers on both the stripped and the zero-padded form; pad so the
+    # ID we check is the canonical 32-char one regardless of how it was cited.
+    url = f"{settings.tempo_url.rstrip('/')}/api/traces/{trace_id.rjust(32, '0')}"
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
             resp = await client.get(url)

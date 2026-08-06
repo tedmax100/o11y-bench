@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 from .. import store
 from ..agent import run_headless
 from ..calibration import grade_against_truth
+from .process import CheckResult, ProcessSpec, grade_process
 
 _HERE = Path(__file__).parent
 DEFAULT_FIXTURES = _HERE / "fixtures.yaml"
@@ -59,6 +60,11 @@ class Fixture(BaseModel):
     # inconclusive-mode knobs (ignored for culprit fixtures):
     max_confidence: float = 0.6  # appropriately-hedged ceiling
     forbid_services: list[str] = Field(default_factory=list)
+    # Process expectations graded from the transcript (see process.py). A
+    # fixture can assert on *how* the answer was reached even when the verdict
+    # itself is right — a correct culprit reached by rephrasing a query into an
+    # empty result is a regression waiting to happen.
+    process: ProcessSpec = Field(default_factory=ProcessSpec)
 
     def resolved_alert(self, now_iso: str | None = None) -> dict[str, Any]:
         """Copy of the alert with `startsAt: now` resolved to a concrete UTC time.
@@ -92,6 +98,11 @@ class RunResult:
     suspected_version: str | None
     summary: str
     error: str | None = None
+    checks: list[CheckResult] = field(default_factory=list)
+
+    @property
+    def process_ok(self) -> bool:
+        return all(c.passed for c in self.checks)
 
 
 def _dimension_hits(findings: Any, truth: dict[str, Any]) -> tuple[bool, bool | None]:
@@ -155,6 +166,13 @@ async def run_one(
     findings = result["findings"]
     correct, service_hit, version_hit = grade_run(findings, fixture)
     conf = float(getattr(findings, "confidence", 0.0) or 0.0)
+    checks = grade_process(
+        fixture.process, result.get("messages") or [], result.get("answer") or "", conf
+    )
+    # A run is only correct if it got there honestly: the verdict AND the
+    # process. Keeping them one flag is deliberate — a suite that reports them
+    # separately invites reading the number you like.
+    correct = correct and all(c.passed for c in checks)
 
     # Feed calibration: insert a pending record then label it. Direct store calls
     # (not calibration.record_run) so this works regardless of the runtime
@@ -195,6 +213,7 @@ async def run_one(
         services=list(getattr(findings, "services", []) or []),
         suspected_version=getattr(findings, "suspected_version", None),
         summary=getattr(findings, "summary", "") or "",
+        checks=checks,
     )
 
 
@@ -314,6 +333,19 @@ def format_report(
             f"{s.correct_rate:>6.0%} ({sum(1 for r in s.runs if r.correct)}/{s.n}) "
             f"{s.service_rate:>7.0%}  {ver}  {s.mean_confidence:>5.2f}  {s.errors:>3}"
         )
+
+    failed = [
+        (s.fixture_id, r.seed, c)
+        for s in summaries
+        for r in s.runs
+        for c in r.checks
+        if not c.passed
+    ]
+    if failed:
+        lines.append("")
+        lines.append("  failed process checks (the answer may still read fine):")
+        for fid, seed, c in failed:
+            lines.append(f"    x {fid} seed{seed} — {c.name}: {c.detail}")
 
     if diff:
         lines.append("")

@@ -193,6 +193,11 @@ def evaluate_policy(br: BlastRadius) -> tuple[bool, str]:
         )
     if br.cross_namespace:
         return False, "action crosses namespaces"
+    # Scale-to-zero before the singleton rule: both refuse, but only one of them
+    # names what the on-call actually proposed. "denied because singleton" sends
+    # someone off to try replicas=1, which is refused too, for a different reason.
+    if br.action == "k8s.scale" and br.target_replicas == 0:
+        return False, "scaling to zero takes the service fully down"
     if settings.deny_singletons and br.singleton:
         return False, "target is a singleton (single replica) — denied by policy"
     if br.affected_pods > settings.max_blast_pods:

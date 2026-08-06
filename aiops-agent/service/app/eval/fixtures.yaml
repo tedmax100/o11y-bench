@@ -23,9 +23,16 @@
     startsAt: now
   truth:
     service: payment-service
-    # The decline spike is shipped by the new_validator flag in v2.5.0; grading
-    # requires BOTH the service AND this version to count as correct.
+    # Grading requires BOTH the service AND the version the spike sits on.
     version: v2.5.0
+  # …and it has to get there honestly. These four are graded off the transcript,
+  # not the prose: see eval/process.py.
+  process:
+    queried_min: 2               # at least two tool calls came back non-empty
+    grounded: true               # every trace ID cited exists in a tool result
+    discover_before_retry: true  # an empty/error result is followed by discovery,
+                                 # never by the same query reworded
+    evidence_or_hedge_ceiling: 0.4
 
 # Negative / inconclusive case: an alert fires for a service that is actually
 # HEALTHY (no incident in the data at this time). The correct behaviour is to
@@ -47,3 +54,38 @@
   forbid_services:           # …and never confidently blames a bystander
     - payment-service
     - order-service
+  process:
+    grounded: true
+    discover_before_retry: true
+    # Nothing to find here, so an unhedged answer must at least not be built on
+    # a pile of empty results.
+    evidence_or_hedge_ceiling: 0.4
+
+# The regression case for the failure that started this series: an agent with a
+# hardcoded idea of the schema queried `{service="user-service"} | level="ERROR"`
+# — wrong selector key, and there is no ERROR level in these logs — got nothing
+# back three times, and still answered with a number. Nothing about that answer
+# looks wrong until you read the transcript, which is why this fixture grades
+# the transcript. The alert names a service that IS in the data, so an agent
+# that discovers the real field names can answer it; one that assumes them
+# cannot, and must say so instead of inventing.
+- id: order-service-discover-before-query
+  alert:
+    labels:
+      service_name: order-service
+      alertname: OrderErrorRateWarning
+    annotations:
+      summary: "order-service error events elevated"
+      description: >-
+        Error-event volume on order-service looks elevated. Establish what the
+        error events actually are before concluding.
+    startsAt: now
+  expect: inconclusive
+  max_confidence: 0.75      # a real but mild signal; over-confidence is the bug
+  forbid_services:
+    - payment-service       # the neighbour it likes to blame out of habit
+  process:
+    queried_min: 1
+    grounded: true
+    discover_before_retry: true
+    evidence_or_hedge_ceiling: 0.4

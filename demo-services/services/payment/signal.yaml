@@ -4,7 +4,7 @@
 # edit THIS file, never the generated aggregates. SLI metric names are the
 # service's emitted Prometheus names (also declared in the Weaver registry).
 service: payment-service
-role: "charges; has the payment_use_new_validator flag"
+role: "charges (authorise / decline / refund) for checkout"
 tier: 1
 journeys: [checkout]
 git_version: v2.4.1
@@ -33,5 +33,5 @@ logs:
   note: "Selector key is service_name (NOT service). event/reason are structured metadata — filter AFTER the selector with `| event=\"...\"`, never as a {...} selector. There is no level/ERROR line and no event=\"error\"."
 exclusions:
   - "No up{} for application services (remote_write, not scraped); judge liveness via rate(payment_charges_total[5m]) > 0."
-  - "A declined-rate spike ABOVE the objective is an incident, not normal business — do NOT dismiss declines as expected. Break it down with `sum by (git_version, reason) (rate(payment_charges_total{status=\"declined\"}[5m]))` to find which deploy/reason drives it (e.g. the new_validator flag shipping in a release)."
+  - "A declined-rate spike ABOVE the objective is an incident, not normal business — do NOT dismiss declines as expected. Break it down with `sum by (git_version, reason) (rate(payment_charges_total{status=\"declined\"}[5m]))` to find which deploy/reason drives it."
 depends_on: []   # payment-service is a leaf

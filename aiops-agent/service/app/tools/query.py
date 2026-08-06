@@ -241,6 +241,125 @@ async def _get_json(base: str, path: str, params: dict) -> Any:
         raise ToolException(f"{url} returned non-JSON: {resp.text[:300]}") from exc
 
 
+# ---- empty results ---------------------------------------------------------
+# An empty result is the most dangerous shape a tool can return: HTTP 200, no
+# error, and nothing to read. The agent's own transcripts show what it does with
+# one — it rewords the query and asks again, because nothing in the response
+# says "the name you used doesn't exist here". These helpers spend one cheap
+# metadata call to tell it which it is: a name that isn't there, or a window
+# where nothing happened. Both fail open; a hint is never worth an exception.
+
+_PROM_METRIC_RE = re.compile(r"\b([a-zA-Z_:][a-zA-Z0-9_:]*)\s*(?:\{|\[|\)|\s|$)")
+_PROMQL_KEYWORDS = frozenset(
+    {
+        "sum",
+        "avg",
+        "min",
+        "max",
+        "count",
+        "topk",
+        "bottomk",
+        "rate",
+        "irate",
+        "increase",
+        "delta",
+        "idelta",
+        "histogram_quantile",
+        "quantile",
+        "by",
+        "without",
+        "on",
+        "ignoring",
+        "group_left",
+        "group_right",
+        "clamp_min",
+        "clamp_max",
+        "vector",
+        "scalar",
+        "absent",
+        "label_replace",
+        "or",
+        "and",
+        "unless",
+        "le",
+        "offset",
+        "bool",
+        "sum_over_time",
+        "avg_over_time",
+        "max_over_time",
+        "min_over_time",
+        "count_over_time",
+        "stddev",
+        "stdvar",
+    }
+)
+
+
+async def _prom_empty_note(expr: str) -> dict[str, Any] | None:
+    """Which metric names in this expression don't exist in Prometheus at all."""
+    try:
+        data = await _get_json(settings.prometheus_url, "/api/v1/label/__name__/values", {})
+        known = set(data.get("data", []) if isinstance(data, dict) else [])
+    except ToolException:
+        return None
+    if not known:
+        return None
+    used = {
+        m for m in _PROM_METRIC_RE.findall(expr) if m not in _PROMQL_KEYWORDS and not m.isdigit()
+    }
+    missing = sorted(m for m in used if m not in known)
+    if not missing:
+        return {
+            "note": "The metric names exist, but nothing matched in this window. "
+            "Check the label matchers (values are case-sensitive) or widen the range "
+            "before assuming the value is zero."
+        }
+    return {
+        "note": f"No such metric in Prometheus: {', '.join(missing)}.",
+        "hint": "Call discover_metrics(service) for the names this service really "
+        "emits — rewording this query will return empty again.",
+    }
+
+
+_LOKI_SELECTOR_KEY_RE = re.compile(r"([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:=~|!~|!=|=)")
+
+
+async def _loki_empty_note(logql: str, start: datetime, end: datetime) -> dict[str, Any] | None:
+    """Which selector keys aren't indexable labels — the `{service=...}` trap."""
+    selector = _selector(logql)
+    if selector is None:
+        return None
+    try:
+        data = await _get_json(
+            settings.loki_url,
+            "/loki/api/v1/labels",
+            {"start": _epoch_ns(start), "end": _epoch_ns(end)},
+        )
+        labels = set(data.get("data", []) if isinstance(data, dict) else [])
+    except ToolException:
+        return None
+    if not labels:
+        return None
+    used = set(_LOKI_SELECTOR_KEY_RE.findall(selector))
+    unknown = sorted(k for k in used if k not in labels)
+    if not unknown:
+        return {"note": "The stream selector is valid but matched no lines in this window."}
+    return {
+        "note": f"Not an indexable stream label: {', '.join(unknown)}. "
+        f"Indexable labels here: {', '.join(sorted(labels))}.",
+        "hint": "Everything else (event, trace_id, business fields) is structured "
+        'metadata — filter it AFTER the selector with `| field="..."`. '
+        "discover_log_fields(service) lists the fields this service emits.",
+    }
+
+
+def _is_empty_result(result: Any) -> bool:
+    if isinstance(result, dict):
+        inner = result.get("result")
+        return isinstance(inner, list) and not inner
+    return False
+
+
 # ---- Prometheus ------------------------------------------------------------
 
 
@@ -286,6 +405,10 @@ async def _query_prometheus(
     # Digest the series before it reaches the LLM (the chart is rendered from the
     # query, not from this payload). Drops the per-step float dump to last/min/max/avg.
     result = _summarize_series_result(result)
+    if _is_empty_result(result):
+        note = await _prom_empty_note(expr)
+        if note:
+            return {**result, **note}
     if _approx_size(result) <= PROM_CAP_BYTES:
         return result
     return {
@@ -401,11 +524,20 @@ async def _query_loki_logs(
     if isinstance(data, dict) and data.get("status") == "error":
         raise _loki_query_hint(logql, ToolException(f"Loki error: {data.get('error')}"))
     result = data.get("data", data) if isinstance(data, dict) else data
+    # Loki attaches a ~1.5 KB `stats` block (cache counters, chunk bytes) to every
+    # response, empty ones included. It is query telemetry for Grafana, not an
+    # answer to anything the agent asked, so it never reaches the model.
+    if isinstance(result, dict):
+        result = {k: v for k, v in result.items() if k != "stats"}
     # Metric LogQL (count_over_time, sum by ...) returns a matrix/vector — digest
     # it like Prometheus. Log *streams* are left intact (the lines are the answer)
     # and handled by the byte-cap + aggregation fallback below.
     if isinstance(result, dict) and result.get("resultType") in ("matrix", "vector"):
         result = _summarize_series_result(result)
+    if _is_empty_result(result):
+        note = await _loki_empty_note(logql, s, e)
+        if note:
+            return {**result, **note}
     if _approx_size(result) <= LOKI_CAP_BYTES:
         return result
 
@@ -460,17 +592,48 @@ class TempoArgs(BaseModel):
     limit: int = Field(default=20, description="Max traces returned.")
 
 
+# Attribute names that are right in Prometheus/Loki and wrong in Tempo. The
+# agent carries one mental model of "the label for a service" across all three
+# stores, so it writes the Loki one here and gets a parse error at col 2.
+_TEMPO_RENAMES = {
+    "service_name": "resource.service.name",
+    "service": "resource.service.name",
+    "git_version": "resource.service.version",
+    "service_version": "resource.service.version",
+    "http_route": "span.http.route",
+    "http_status_code": "span.http.status_code",
+}
+_TEMPO_BASE_HINT = (
+    'TraceQL predicates go inside braces, e.g. `{ resource.service.name="<svc>" '
+    "&& status=error }`, and attribute names are dotted and scoped "
+    "(`resource.` for resource attrs, `span.` for span attrs). Read git_version "
+    "off the trace's resource.service.version — don't go to Loki for it."
+)
+
+
 def _tempo_query_hint(traceql: str, exc: ToolException) -> ToolException:
+    """Turn a Tempo error into the specific edit that fixes this query.
+
+    Tempo is loud (400/500 with a real message) but its messages are written for
+    someone who already knows TraceQL: "unexpected IDENTIFIER" doesn't say that
+    `service_name` should have been `resource.service.name`, and "binary
+    operations must operate on the same type" doesn't say to drop the quotes
+    around `error`. Both of those are edits we can name, so we name them —
+    otherwise the model spends another call on a rephrase.
+    """
     msg = str(exc)
-    if "400" not in msg and "parse" not in msg.lower():
-        return exc
-    return ToolException(
-        f"{msg}\nHINT: TraceQL predicates must be inside braces, e.g. "
-        '`{ resource.service.name="<svc>" && status=error }`. Use dotted attribute '
-        "names (resource.service.name, span.http.route, status); `status=error` (no "
-        "quotes) selects error spans. Read git_version off the trace's "
-        "resource.service.version — don't go to Loki for it."
-    )
+    lines = [f"{msg}\nHINT: {_TEMPO_BASE_HINT}"]
+
+    wrong = [k for k in _TEMPO_RENAMES if re.search(rf"(?<![.\w]){re.escape(k)}\s*=", traceql)]
+    if wrong:
+        fixes = ", ".join(f"`{k}` -> `{_TEMPO_RENAMES[k]}`" for k in wrong)
+        lines.append(f"This query uses the name it has in Prometheus/Loki, not in Tempo: {fixes}.")
+    if re.search(r"status\s*=\s*[\'\"]", traceql) or "must operate on the same type" in msg:
+        lines.append(
+            "`status` is an intrinsic enum, not a string: write `status=error` "
+            "(no quotes). Same for `kind=server`."
+        )
+    return ToolException("\n".join(lines))
 
 
 async def _query_tempo_traces(

@@ -98,6 +98,24 @@ def load_runbooks(directory: str | Path | None = None) -> list[Runbook]:
     return books
 
 
+_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+
+
+def _norm(name: str | None) -> str:
+    """Alert names differ in case and separators across the tools that emit them
+    (`PaymentDeclineRateHigh`, `payment-decline-rate-high`, `payment_decline_rate_high`
+    are one alert). Compare on the letters and digits alone."""
+    return _NON_ALNUM.sub("", (name or "").lower())
+
+
+def _labels_match(book: Runbook, labels: dict) -> bool:
+    """Trigger labels must be a subset of the alert's, and the trigger has to
+    constrain something — an empty trigger must not match every alert."""
+    if not (book.trigger.alertname or book.trigger.labels):
+        return False
+    return all((labels or {}).get(k) == v for k, v in book.trigger.labels.items())
+
+
 def match_runbook(
     labels: dict, annotations: dict, books: list[Runbook] | None = None
 ) -> Runbook | None:
@@ -116,11 +134,40 @@ def match_runbook(
     for b in books:
         if b.trigger.alertname and b.trigger.alertname != alertname:
             continue
-        if all((labels or {}).get(k) == v for k, v in b.trigger.labels.items()):
-            # require the trigger to actually constrain *something*, so an empty
-            # trigger doesn't match every alert
-            if b.trigger.alertname or b.trigger.labels:
-                return b
+        if _labels_match(b, labels):
+            return b
+
+    # Nothing matched exactly. `PaymentDeclineRateHigh` and
+    # `payment-decline-rate-high` are the same alert to everyone except this
+    # comparison, and a miss here silently costs the whole downstream chain:
+    # no diagnostics, no remediation proposal, no action request. Fall back to a
+    # normalized comparison and say loudly that it happened, so the mismatch gets
+    # fixed at the source instead of being papered over forever.
+    for b in books:
+        if not b.trigger.alertname or _norm(b.trigger.alertname) != _norm(alertname):
+            continue
+        if _labels_match(b, labels):
+            logger.warning(
+                "runbook %s matched alertname %r only after normalization (trigger says %r) "
+                "— align the alert rule or the runbook trigger",
+                b.id,
+                alertname,
+                b.trigger.alertname,
+            )
+            return b
+
+    near = [
+        b.id
+        for b in books
+        if b.trigger.alertname and _norm(b.trigger.alertname) == _norm(alertname)
+    ]
+    if near:
+        logger.warning(
+            "no runbook for alertname=%r; %s has the same name but its trigger labels "
+            "do not match the alert's",
+            alertname,
+            near,
+        )
     return None
 
 

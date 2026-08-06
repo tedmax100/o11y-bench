@@ -91,3 +91,39 @@ def test_approve_after_ttl_expires(tmp_path, monkeypatch):
 def test_approve_missing_request(tmp_path, monkeypatch):
     p = _db(monkeypatch, tmp_path)
     assert approve("does-not-exist", actor="alice", path=p) is None
+
+
+# ---- the proposal carries its own size -------------------------------------
+
+
+def test_create_from_decision_stores_the_footprint(tmp_path, monkeypatch):
+    """A suggestion whose size is only known after you approve it is a surprise,
+    not a suggestion — so the dry-run result is stored with the proposal."""
+    p = _db(monkeypatch, tmp_path)
+    footprint = {
+        "action": "k8s.rollout_undo",
+        "target": "demo/payment-service",
+        "namespace": "demo",
+        "affected_pods": 2,
+        "policy_ok": True,
+        "policy_reason": "within policy (affected 2 pod(s), ns demo)",
+    }
+    req = create_from_decision(
+        "fp1",
+        _decision(Autonomy.PROPOSE),
+        args={"namespace": "demo", "deployment": "payment-service"},
+        blast_radius=footprint,
+        path=p,
+    )
+    assert req is not None
+    stored = get(req.request_id, path=p)
+    assert stored.blast_radius["affected_pods"] == 2
+    assert stored.blast_radius["policy_ok"] is True
+
+
+def test_create_from_decision_without_a_footprint_still_proposes(tmp_path, monkeypatch):
+    """Best-effort: a footprint we could not compute must not cost the proposal."""
+    p = _db(monkeypatch, tmp_path)
+    req = create_from_decision("fp2", _decision(Autonomy.PROPOSE), args={}, path=p)
+    assert req is not None
+    assert get(req.request_id, path=p).blast_radius is None

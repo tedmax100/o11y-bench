@@ -40,6 +40,14 @@ logger = logging.getLogger("aiops_agent.traces")
 # ---- cost model ------------------------------------------------------------
 # USD per 1M tokens, (input, output). Cached input is billed at 0.25x input.
 # A small, intentionally-overridable map; unknown model -> cost is None.
+#
+# This table is hand-entered and nothing reconciles it against a bill, which is
+# the exact shape of failure this series keeps finding: a declaration that
+# nobody checks quietly becomes a lie. Until something does check it, every
+# cost we report carries `cost_basis` so the number says where it came from.
+PRICES_AS_OF = (
+    "2026-08-06, hand-entered from the public price list, never reconciled against billing"
+)
 MODEL_PRICES: dict[str, tuple[float, float]] = {
     "gemini-3.1-flash-lite": (0.10, 0.40),
     "gemini-2.5-flash-lite": (0.10, 0.40),
@@ -285,6 +293,7 @@ def _normalize_trace(raw: dict, *, compact: bool = False) -> dict:
         "cache_read_tokens": total_cache,
         "total_tokens": total_in + total_out,
         "cost": round(sum(costs), 6) if costs else None,
+        "cost_basis": PRICES_AS_OF if costs else None,
         "models": sorted({n["model"] for n in llm_nodes if n["model"]}),
     }
     return {"roots": roots, "rollup": rollup}
