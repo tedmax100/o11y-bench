@@ -1,6 +1,6 @@
 ---
 title: "【Day2】AIOps 要的不是更多資料，是可推斷的資料"
-series: "2026 鐵人賽：賢者大叔的觀測結界"
+series: "2026 鐵人賽：AIOps with OpenTelemetry"
 tags: [OpenTelemetry, AIOps, LLM, 鐵人賽]
 ---
 

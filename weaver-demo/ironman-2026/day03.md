@@ -1,6 +1,6 @@
 ---
 title: "【Day3】OTel Operator：把「持續維護」從人身上搬到迴圈裡"
-series: "2026 鐵人賽：賢者大叔的觀測結界"
+series: "2026 鐵人賽：AIOps with OpenTelemetry"
 tags: [OpenTelemetry, Kubernetes, GitOps, 鐵人賽]
 ---
 # Day3：OTel Operator，把「持續維護」從人身上搬到迴圈裡

@@ -1,6 +1,6 @@
 ---
 title: "【Day1】失敗現場：一個查得動 Prometheus 的 agent，為什麼只拿 4.5/9 分"
-series: "2026 鐵人賽：賢者大叔的觀測結界"
+series: "2026 鐵人賽：AIOps with OpenTelemetry"
 tags: [OpenTelemetry, AIOps, LLM, 鐵人賽]
 ---
 

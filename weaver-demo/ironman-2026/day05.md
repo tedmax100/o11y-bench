@@ -1,6 +1,6 @@
 ---
 title: "【Day5】Weaver 上手：schema 是團隊共識"
-series: "2026 鐵人賽：賢者大叔的觀測結界"
+series: "2026 鐵人賽：AIOps with OpenTelemetry"
 tags: [OpenTelemetry, Weaver, 鐵人賽]
 ---
 # Day5：Weaver 上手，schema 是團隊共識

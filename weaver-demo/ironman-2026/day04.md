@@ -1,6 +1,6 @@
 ---
 title: "【Day4】注入了不代表送達"
-series: "2026 鐵人賽：賢者大叔的觀測結界"
+series: "2026 鐵人賽：AIOps with OpenTelemetry"
 tags: [OpenTelemetry, Kubernetes, 鐵人賽]
 ---
 # Day4：注入了不代表送達

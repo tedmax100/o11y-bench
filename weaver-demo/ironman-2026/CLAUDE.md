@@ -2,7 +2,7 @@
 
 這個目錄是 2026 鐵人賽《AIOps with OpenTelemetry》的文章。寫或改這裡的 `dayNN.md` 時，照這份風格，不要照一般技術文件的寫法。
 
-基準範例是 `day01-ungoverned-baseline.md` 跟 `day02-aiops-fundamentals.md`（敘事與原理的骨架），以及 `day07.md`–`day10.md`（實測與結構化說明的密度）。一篇好的文章是這兩者的合併，不是二選一。
+基準範例是 `day01.md` 跟 `day02.md`（敘事與原理的骨架），以及 `day07.md`–`day10.md`（實測與結構化說明的密度）。一篇好的文章是這兩者的合併，不是二選一。
 
 **聲音的部分改吃 [`ref_blogs/writing-style.md`](../../ref_blogs/writing-style.md)**（從過去五篇鐵人賽日誌萃取出來的）。那份講的是「聽起來像不像本人」，這份講的是「這個系列的結構、證據標準、平台工程角度」。兩份一起用，下面「聲音：雙聲道」那節列了合併之後的結論，衝突處以這份為準。
 
