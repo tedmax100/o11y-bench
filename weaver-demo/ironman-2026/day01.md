@@ -2,24 +2,30 @@
 title: "【Day1】失敗現場：一個查得動 Prometheus 的 agent，為什麼只拿 4.5/9 分"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
 tags: [OpenTelemetry, AIOps, LLM, 鐵人賽]
+status: published
 ---
 
-# Day1：失敗現場，一個查得動 Prometheus 的 agent，為什麼只拿 4.5/9 分
+# Day1：失敗現場，一個查得動 Prometheus 的 agent，卻拿不到 60 分
 
-> 一個查得動 Prometheus 的 agent
-> 跟一個查得對的 agent
+> 一個**查得動** Prometheus 的 agent
+> 跟一個**查得對的** agent
 > 中間隔的不是模型大小
 > 是它有沒有辦法知道自己問錯了
 
-程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day01/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day01)。這一天的所有指令都假設你在那個 repo 的根目錄下跑。
+今日程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day01/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day01)。這一天的所有指令都假設你在那個 repo 的根目錄下跑。
 
-今天單純來看看：**把一隻能查 Prometheus、能查 Loki、能查 Tempo 的 agent，丟進一套它沒見過的可觀測性系統，問它九個真實的排查問題，然後逐題打分。**
+今天單純來看看：**把一隻能查 Prometheus、能查 Loki、能查 Tempo 的 agent，丟進一套它沒見過的可觀測性系統，考它 9 個真實的排查問題，然後逐題打分。**
 
-先說我不是 LLM 領域的高手，這系列也不會教你怎麼把模型調得更聰明。要看那種內容的話，點上一頁看其他位大大的會比較快，畢竟這系列文字不少 :)
+> 先說我不是 LLM 領域的高手，這系列也不會教你怎麼把模型調得更聰明。要看那種內容的話，可以看看其他系列的文章。
 
-## 先講清楚被測的東西長什麼樣
+這整個系列，其實是想把腦裡的想法給跑一遍，主要是想從`治理`的角度出發。
+AI 的出現，讓 Operation 有了很多自動化處理的可能，也伴隨著很多商業服務的出現。
+但這些真的能讓企業能這麼簡單的，就讓 AI 來替你排查問題，來替你修復系統？
+我嘗試了幾次發現，自己太天真了。所以這鐵人賽系列，會從治理開始分享，再來設計一個`可驗證、可回放，閉環已跑通的建議型 agent，預設唯讀，只是自主權尚未解鎖。`。
 
-這 agent 是一個標準的 **ReAct 迴圈**：`模型看到問題 → 決定要下哪個查詢 → 讀到結果 → 決定下一步 → 直到它覺得可以回答了`。三個工具直接打 Prometheus / Loki / Tempo 的原生 HTTP API，沒有中間層、沒有 mock，查到的每一筆資料都是真的。
+## 先聊"被測試的東西"長什麼樣
+
+這 agent 是一個 **ReAct 迴圈**（reason->act->observe）：`模型看到問題 → 決定要下哪個查詢 → 讀到結果 → 決定下一步 → 直到它覺得可以回答了`。三個工具分別是 Prometheus / Loki / Tempo 的原生 HTTP API，no middleware、no mock，都是真的去打剛剛講的那些服務。
 
 ```mermaid
 flowchart LR
@@ -33,9 +39,9 @@ flowchart LR
 
 ![https://ithelp.ithome.com.tw/upload/images/20260802/20104930XUdLz19Rz2.jpg](https://ithelp.ithome.com.tw/upload/images/20260802/20104930XUdLz19Rz2.jpg)
 
-但細想會發現現在的 agent 有些限制跟問題在︰
+但當我們在深入地細想一下，會發現現在的 agent 可能會有限制跟問題在︰
 
-**一，它的 schema 知識是寫死在 prompt 裡的一段散文。** 這段是關鍵，直接貼出來（完整版在 `agent/prompt.md`）：
+**一，它的 schema 知識是寫死在 prompt 裡的一段句子。** （完整版在 `agent/prompt.md`）：
 
 ```markdown
 Every signal carries `service_name`, `git_version`, `git_repo` and
@@ -49,15 +55,35 @@ Every signal carries `service_name`, `git_version`, `git_repo` and
 Severity is on the `level` field, with values `INFO`, `WARN` and `ERROR`.
 ```
 
-但今天這 agent 要面對的環境，早已經不是當初這版 prompt 被建立時的環境了。雖然可能都還是 Prometheus / Loki / Tempo。這段是當初為了讓 agent 少走冤枉路，我親手整理進 prompt 的。當時的效果很好，agent 不用先探索就能直接下對查詢，省了好幾輪 tool call。
+但今天這 agent 要面對的環境，早已經不是當初這版 prompt 被建立時的環境了。雖然工具都還是 Prometheus / Loki / Tempo。這段是當初為了讓 agent 少走冤枉路，整理一些簡單的用法進 prompt 的。當時的效果還行，agent 不用先探索就能直接下查詢，省了好幾輪 tool call，不用特別弄 MCP server 在那邊動態探索也會吃掉不少 token。
 
-**當時我覺得這是一次成功的 prompt engineering。** 現在回頭看，這段話是今天九題裡至少五題失敗的直接原因 QQ
+**當時我覺得這是一次成功的 prompt engineering。** 現在回頭來複驗，今天九題裡至少失敗了五題 QQ
 
-**二，它每題只有 4 次 tool call 的硬預算。** 用完會走進一個叫 `force_answer` 的節點：不給它任何工具，只給一句「你的預算用完了，用你已經收集到的資料回答」。
+**二，它每題只有 4 次 tool call 的硬預算。** 用完會走進一個叫 [`force_answer` 的節點](https://github.com/tedmax100/OTel_AIOps_Agent/blob/main/ironman-2026/day01/agent/baseline_agent.py#L156)：不給它任何工具，只給一句「你的預算用完了，用你已經收集到的資料回答」。
+
+```python=
+# 在 _route 條件路由中，只要次數達到了設定的硬預算（例如 4 次），即使 Agent 的最後一個回覆裡強烈要求要呼叫工具（bool(last.tool_calls) 爲 True），路由也會強制沒收它的請求，直接重導向到 "force_answer" 節點。
+if state["calls_used"] >= TOOL_CALL_BUDGET:
+    return "force_answer"
+```
 
 > LangChain 框架有個變數[`recursion_limit`](https://docs.langchain.com/oss/python/langgraph/graph-api#recursion-limit)。LangGraph 把流程圖中的每一個 Node Execution 都算作一次 step。如果你的 ReAct 迴圈包含 agent（思考）與 tools（執行）兩個節點，一輪 agent -> tools 就會消耗 2 個 step。我們就能在圖的路由邏輯中，記錄已執行的 `tool call 次數`，超過就轉向 `force_answer`。才不會一直無窮迴圈，一直燒 LLM Token 的錢 ^^
+> 假設今天下午系統告警響了，你（或 Webhook）給了 Agent 一個任務：「幫我查 payment-service 為什麼有異常？」
+這時，對話開始，Agent 開始在後台「瘋狂查資料」（這是在同一個 Turn 裡喔，你還沒看到任何回答）：
+第 1 步 (Tool Call 1)：Agent 決定呼叫 query_prometheus 查 CPU。
+系統計數器：1/4
+第 2 步 (Tool Call 2)：看到 CPU 正常，Agent 決定呼叫 query_loki 查 payment 的 error log。
+系統計數器：2/4
+第 3 步 (Tool Call 3)：看到 log 有連線逾時，Agent 決定呼叫 query_tempo 查一條 trace id。
+系統計數器：3/4
+第 4 步 (Tool Call 4)：Agent 想確認是不是資料庫的問題，決定呼叫 query_prometheus 查 db connection pool。
+系統計數器：4/4（預算用完！）
+這時，Agent 還想查第 5 次（例如它想去對照 GitHub 變更），但 LangGraph 的路由判定「次數已達 4 次」，直接拔掉它的工具插頭，強制把它轉到 force_answer 節點！
+系統在後台對 Agent 說：「你的預算用完了，現在不准再查任何東西。用你前 4 步查到的 (1)CPU、(2)Log、(3)Trace、(4)DB 資料，立刻寫結論給我。」
+最後，Agent 吐出結論：「根據我剛剛查到的資料，我認為是...」
+這時，你才在對話框裡看到 Agent 的第一句回答。這整段後台折騰，對你來說只過了 One Turn（你發問 → 它回答）。
 
-**三，沒有任何機制檢查它講出來的數字或 trace id 是不是真的來自某次查詢結果。** 這句話等一下會變得很重要。
+**三，沒有任何機制檢查它講出來的數字或 trace id 是不是真的來自某次查詢結果。** 就它在腦補幻覺囉！
 
 ## 換一套系統，同一隻 agent
 
@@ -65,7 +91,10 @@ Severity is on the `level` field, with values `INFO`, `WARN` and `ERROR`.
 
 **最顯著的差別是：這系統是別部門的。**
 
-這正是我想模擬的處境。一個 agent 在自己部門那套環境調得再好，只要換一個叢集、換一個部門，它面對的就是別人的命名習慣。而這件事在一間公司裡往往不是例外，是常態。這也是為什麼這系列後面有很長一段都在講治理。
+這正是我想模擬的處境。一個 agent 在自己部門那套環境調得再好，只要換一個叢集、換一個部門，它面對的就是別人的命名習慣甚至格式。這件事在一間大公司裡往往不是例外，是常態。
+這也是為什麼這系列後面有很長一段都在講治理。
+
+> 小弟是在平台工程團隊中任職工程師，這系列前半段想聊多點`治理`這概念。
 
 環境用 k3d 起，一個節點、一個 pod：
 
@@ -112,20 +141,18 @@ flowchart TB
     GEN -.-> TEMPO
 ```
 
-agent 走的是任何人從叢集外面連得到的 HTTP API，它不事先知道自己在跟 Kubernetes 講話。沒有 in-cluster 的捷徑，也沒有一份只有它拿得到的 schema 檔。今天量到的分數因此不會被「我幫 agent 開了後門」污染，而它也沒有藉口說它看到的是別的世界，因為**評分器打的是同一組端點、同一份資料**。
+agent 走的是任何人從叢集外面連得到的 HTTP API，它事先不知道自己在跟 k8s 內的服務講話。也沒有給它一份 schema 做架構上的描述。
 
-至於 stack 為什麼是一個 pod 而不是四個。它是被觀察的對象，不是這系列要教的東西。拆成四個 Deployment 只會多四份設定，而 agent 下的每一句查詢一個字都不會變。Collector 的部署形態怎麼影響資料完整性，留到後面談，那時候才值得拆開。
-
-因此提供 9 個問題，3 種遙測訊號（log/metrics/trace）各三題，都是真實排查會問的東西：「過去六小時哪個後端的 5xx 佔比最高」、「retry 噪音跟真的失敗哪個比較大聲」、「給我一條失敗的 `POST /api/orders` trace」。
+我提供 9 個問題，3 種遙測訊號（log/metrics/trace）各三題，都是真實排查會問的東西：「過去六小時哪個後端的 5xx 佔比最高」、「retry 噪音跟真的失敗哪個比較大聲」、「給我一條失敗的 `POST /api/orders` trace」。
 
 ### 九個問題是怎麼挑的
 
 題目要同時滿足兩個條件。
 
-**第一，不先查資料就答不出來。** 我不問「PromQL 的 `rate` 跟 `increase` 差在哪」，那種題目 agent 靠訓練資料就能答得很漂亮，量到的是模型的知識，不是它在這套系統裡的排查能力。
+**第一，不先查資料就答不出來。** 我不問 PromQL 的指令，這種題目 agent 能答得很漂亮，這樣是在考模型的知識，並不是它在這套系統裡的排查能力。
 所以題目必須綁死在這套 stack 的實際數據上：「過去六小時哪個後端的 5xx 佔比最高」，你不去查就不可能知道是 `payment-service` 的 7.9%。
 
-第二，答案要有一個可以被機械驗證的值，這是為了讓評分不需要 LLM。所以題目會刻意要一個數字、一個服務名、一條路徑或一個 trace id，而不是「幫我分析一下系統健康狀況」這種答案好壞見仁見智的問題（畢竟透過 LLM 回答是會獲得具有不確定性答案）。
+第二，答案要有一個可以被機械驗證的值，這是為了讓評分不用仰賴 LLM。所以題目會刻意要一個數字、一個服務名、一條路徑或一個 trace id，而不是「幫我分析一下系統健康狀況」這種答案好壞見仁見智的問題（畢竟透過 LLM 回答是會獲得具有不確定性答案）。
 
 按這兩個條件，metrics / logs / traces 各出三題：
 
@@ -145,9 +172,9 @@ agent 走的是任何人從叢集外面連得到的 HTTP API，它不事先知�
 
 第二題我刻意寫成它需要兩個數字才能回答（retry 的量 vs 真正失敗的量），而 agent 每題只有 4 次 tool call。這是唯一一題直接對著預算上限設計的，後面我們再來分享有預算壓力下 agent 會怎麼抄捷徑。
 
-### 一題長什麼樣：問題、真值、檢查
+### 題長什麼樣？ 問題、真值、檢查
 
-這九題是寫在 `bench/tasks.yaml` 裡的，一題一個 block。拿「哪個後端 5xx 佔比最高」那題當例子：
+這九題是寫在 [`bench/tasks.yaml`](https://github.com/tedmax100/OTel_AIOps_Agent/blob/main/ironman-2026/day01/bench/tasks.yaml) 裡的，一題一個 block。拿「哪個後端 5xx 佔比最高」那題當例子：
 
 ```yaml
 - id: promql-highest-backend-error-ratio
@@ -169,19 +196,20 @@ agent 走的是任何人從叢集外面連得到的 HTTP API，它不事先知�
   partial_checks: [queried, contains]
 ```
 
-寫到這裡你可能會覺得，這不就是 unit test 嘛，我出題目、我同時把答案寫好，跑起來對答案。骨架確實是，但有三個地方不一樣，而這三個地方決定了這套東西能不能一直用下去。
+看到這是不是覺得，這就是 unit test 嘛?，我出題目、我同時把答案寫好，跑起來對答案。有點像！
+但有三個地方不一樣，而這三個地方決定了這套東西能不能一直用下去。
 
-一，我寫的不是答案，是算出答案的那句查詢。`truth.query` 裡沒有任何一個期望值，只有一句 PromQL，評分當下才拿它去打同一套 stack 現算。這不是我想多花力氣，是不得不。遙測每次開 cluster 都重新生成，我今天寫死 `7.9%`，明天重開就是別的數字。白話點講，它比較接近 property-based test 的 oracle：我提供的是一條我自己確信正確的計算路徑，拿它跟 agent 走的那條路徑對答案。
+一，我寫的不是答案，是算出答案的那句查詢。`truth.query` 裡沒有任何一個期望值，只有一句 PromQL，評分當下才拿它去打同一套 stack 現算。這不是我想多花力氣，是不得不。遙測每次開 cluster 都重新生成，我今天寫死 `7.9%`，明天重開就是別的數字。白話點講，它比較接近 property-based test ：我提供的是一條我自己確信正確的計算路徑，拿它跟 agent 走的那條路徑對答案。
 
 二，斷言不是相等，是容差加上形狀。`tol: 0.15` 是相對容差，`contains` 只要求它有講到贏家的名字，`grounded` 只要求它引用的 trace id 曾經在某次工具輸出裡出現過。受測的東西本身就有隨機性，斷言只能寫成「這個範圍內都算對」。
 
 三，多了一個 unit test 沒有的東西：`partial_checks`。一般測試只有紅跟綠，但這裡我需要區分「有查、也講對了服務，只是數字錯」跟「整段是掰的」。**這兩種失敗要用完全不同的方式修，混在同一個 FAIL 裡我就什麼都看不到了。** 那 0.5 分就是這麼來的。
 
-還有一個附帶好處，是我寫題目的時候才發現的。第一題我本來想用 1 小時的視窗，先拿 `truth.query` 去打了一次，真值是 `0`，generator 的錯誤流量根本沒延伸到最近一小時。一道正確答案是「什麼都沒發生」的題目，誰答都會過，等於白出。所以那題最後改成 6 小時。真值用現算的，好處不只是不會過期，是它在你出題的當下就逼你確認這題有沒有鑑別度。
+還有一個附帶好處，是我設計題目時才發現的。第一題我本來想用 1 小時的視窗，先拿 `truth.query` 去打了一次，真值是 `0`，generator 的錯誤流量根本沒延伸到最近一小時。一道正確答案是「什麼都沒發生」的題目，誰答都會過，等於白出。所以那題最後改成 6 小時。真值用現算的，好處不只是不會過期，是它在你出題的當下就逼你確認這題有沒有鑑別度。
 
-在貼分數之前，得先講評分（grade）怎麼做的，否則那張表沒有意義。
+在貼分數之前，得先講`評分（grade）`怎麼做的，否則那張表沒有意義。
 
-現在很流行 LLM-as-judge：讓另一個模型讀 agent 的回答，判斷對不對。後面會再介紹它，但**今天刻意不用**，因為**今天要抓的每一種失敗，都是機械可檢查的。**
+現在很流行 `LLM-as-judge`：讓另一個模型讀 agent 的回答，判斷對不對。後面會再介紹它，但**今天不講**，因為**今天要抓的每一種失敗，都是機械可檢查的。**
 
 ```mermaid
 flowchart TB
@@ -252,7 +280,7 @@ sequenceDiagram
 
 > agent 如果會腦補出看似很專業的資訊給人，這是很危險的。系統出問題的當下會很混亂，人也會緊張，若錯信這錯誤的資訊，做出錯誤的處置，會很危險。若還要人花時間去判斷這回報的資訊真偽，那還不如直接讓工程師人工去排查就好。
 
-## 分數
+## 實際跑分
 
 ```
 Day1 baseline — model gemini-3.1-flash-lite, tool budget 4, 3 seed(s)
@@ -295,6 +323,8 @@ sum(rate(http_requests_total{deployment_environment="demo", job=~"user-service|o
 注意 `"status":"success"`，沒有錯誤，只是空的 result。
 
 這套 stack 沒有 `deployment_environment` 這個 label。它是我 prompt 裡那句「Scope every query with `deployment_environment="demo"`」的產物。在我自己的環境裡，那句話讓 agent 少犯錯；換一個環境，那句話讓它的每一句查詢都保證撈不到東西。
+
+> 這也蠻常發生的，prompt 存在於在某專案的檔案中，該專案直接被複製到其他環境，很常忘記把這裡的細節跟設定一起調整。但與其在 prompt 上下很多功夫，不如給 agent 能探索的能力或是有辦法給它一份靜態檔案來提早認知。
 
 接下來三次呼叫，它換了 `rate` 為 `increase`、換了 `job` 為 `service_name`、最後拿掉服務條件，**但四次都留著 `deployment_environment="demo"`**。四次都沒結果之後，預算用完，它的結論是：
 
@@ -427,23 +457,18 @@ tempo_search {"traceql": "{resource.service.name=\"order-service\"}"}
 
 這個對比會一路貫穿這系列：一個訊號能不能被 agent 用，取決於「它需要多少事先知識才問得出第一個問題」。後面講 schema 的時候會回來處理這件事，把「這個欄位只有哪幾種值」這種現在只存在於某個人腦裡的知識，變成機器讀得到的東西。
 
-## 今天沒做的事
-
-今天沒有解決任何問題，只是分享了一個陽春的 Ops skill 或 AIOps agent 會出現的狀況。
-
-| 今天看到的                           | 留給後面的做法                                 |
-| ------------------------------------ | ---------------------------------------------- |
-| 一個不存在的 label 讓四次查詢全空    | discover-before-query：把探索變成走不掉的路徑  |
-| 空結果 → 編一個數字                 | LLM-as-Judge、決策路徑可回放                  |
-| 預算用完就開始編                     | 截斷策略跟對應的防護，留給後面                 |
-| 大小寫、label vs metadata 沒人講清楚 | schema 是團隊共識，不是觀察結果                |
-| 想探 schema 的時候，手上只有查資料的介面   | 給它一個真的能列舉 label 與 metric 名稱的工具 |
-| 三個評分器 bug 全都靜悄悄            | 每條規則都要有一個「本來就該紅」的 fixture     |
-| trace 表現最好，因為回傳結果自帶結構 | 讓另外兩種訊號也自帶足夠的上下文               |
-
 ## 小結
 
-總結來說，今天簡單演示了 AIOps 其實要的不是更多資料，而是**可推斷的**資料。九題 4.5 分不是模型不夠好，是它每一次猜錯 label 的時候，系統都回它一句 `success`。而我們自己在做 AIOps agent 或 skill 的時候，肯定也要有對應的測試程式與測試資料，不然「這次好像比較準」這種話會一直講下去，卻沒有人能說清楚是哪裡變好了。
+總結來說，今天簡單演示了 AIOps 其實要的不是更多資料，而是**可推斷的**資料。九題 4.5 分不是模型不夠好，是它每一次猜錯 label 的時候，系統都回它一句 `success`。
 
-> 這篇的評分器我來回改了好幾版，前幾版都是綠的，而且綠得很有自信。
-> 三個 bug 全都靜悄悄，最後是靠一題「答案是 0」的爛題目才被發現的 :(
+今天沒有解決任何一個問題，只是把一個陽春的 Ops skill 或 AIOps agent 會出現的狀況攤開來看。攤出來之後，後面要處理的東西大概就長這樣。
+
+最先要處理的是它怎麼問。一個不存在的 label 就讓四次查詢全空，而它從頭到尾沒有回頭懷疑過第一句查詢的前提，所以探索不能是它想到才做的選項，得變成走不掉的路徑。而且它就算真的想探，手上也只有查資料的介面，沒有一個工具能讓它列出這套 stack 到底有哪些 label、哪些 metric 名字。
+
+再來是它怎麼講。查回空的就編一個數字、查得到也另外生一個、預算用完之後開始編，這幾件事的共同點是沒有任何一層在檢查那個數字是從哪裡來的。今天的 `grounded` 只做到 trace id 這一格，剩下的得靠讓它每一步查了什麼、看到什麼都留得下來，再加上一個會去讀那份紀錄的檢查者。順帶一提，量尺自己也要被量，一個評分器壞掉的時候，症狀往往是所有題目都很綠，所以每一條檢查都該配一個「本來就該紅」的例子去驗它。
+
+> Agent 胡說八道不會令人害怕，畢竟這幾乎是常識。害怕的是看的人不懷疑，信以為真，就去執行了。
+
+最後是這套環境有沒有把話講清楚。大小寫、label 還是 metadata、哪個欄位只有哪幾種值，這些現在都只存在於某個人的腦子裡。而 trace 之所以是三種訊號裡唯一滿分的，正是因為它回傳的東西自帶足夠的結構。所以這系列後面有很長一段在講 schema，要處理的就是讓另外兩種訊號也自帶足夠的上下文，而那份共識是團隊坐下來決定的，不是從流量觀察出來的。
+
+而我們自己在做 AIOps agent 或 skill 的時候，肯定也要有對應的測試程式（evaluation）與測試資料（data set），不然「這次好像比較準」這種話會一直講下去，卻沒有人能說清楚是哪裡變好了。
