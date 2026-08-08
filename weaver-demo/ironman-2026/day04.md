@@ -41,7 +41,7 @@ template:
       instrumentation.opentelemetry.io/inject-python: "python-instrumentation"
 ```
 
-值填的是昨天那份 `Instrumentation` CR 的名字，指定要用哪份 instrumentation inject CR。同一個 namespace，所以不用寫 `demo/python-instrumentation`，直接寫名稱就好。
+值填的是昨天那份 `Instrumentation CR` 的名字，指定要用哪份 instrumentation inject CR。同一個 namespace，所以不用寫 `demo/python-instrumentation`，直接寫名稱就好。
 
 除此之外，`23-api-gateway.yaml` 裡原本那一串 `OTEL_SERVICE_NAME`、`OTEL_EXPORTER_OTLP_ENDPOINT`、`OTEL_RESOURCE_ATTRIBUTES` 我一個字都沒動。這是刻意的，因為我想知道這些值在 webhook 手裡會不會被蓋掉。
 
@@ -108,7 +108,7 @@ service.namespace=demo,deployment.environment=demo,service.version=$(GIT_VERSION
 
 不是覆蓋，是接在後面。webhook 額外注入了幾個透過 Downward API 取值的環境變數，再把 `k8s.pod.name`、`k8s.node.name`、`k8s.replicaset.name`、`service.instance.id` 這些我完全沒寫過的 k8s 拓撲屬性接上去。
 
-這件事值得記一下：**中央治理跟團隊自訂不是互斥的，是疊加的。** Operator 幫每個 Pod 補上 k8s 身份，我自己的 `git_repo` 跟 `git_version` 也留著。昨天說「叢集裡早就有答案，只是沒有人把它端出來」，這裡就是第一次真的端出來了一點：Pod 在哪個節點、屬於哪個 ReplicaSet，現在變成 span 上的屬性，而不是要事後去反查。
+**中央治理跟團隊字定義，並不是互斥的，而是疊加的。** Operator 幫每個 Pod 補上 k8s 身份，我自己的 `git_repo` 跟 `git_version` 也留著。昨天說「叢集裡早就有答案，只是沒有人把它端出來」，這裡就是第一次真的端出來了一點：Pod 在哪個節點、屬於哪個 ReplicaSet，現在變成 span 上的屬性，而不是要事後去反查。
 
 ## 那些值是誰決定的：`Instrumentation` CR 才是控制面
 
@@ -145,14 +145,14 @@ FIELDS:
 
 有幾個欄位對平台團隊來說份量特別重。
 
-**`sampler` 是一個一行改完全公司的開關。** 它的 `type` 是列舉，值域是固定的八個：
+**`sampler` 是一個一行改完全公司的開關。** 它的 `type` 是列舉，有八個值能選：
 
 ```
 always_on / always_off / traceidratio / parentbased_always_on
 parentbased_always_off / parentbased_traceidratio / jaeger_remote / xray
 ```
 
-想像一個很常見的情境：Tempo 的儲存成本上升，決定把採樣從全收改成 10%。在沒有這個 CR 的世界裡，這代表要通知幾十個團隊各自去改自己的設定，然後追蹤誰改了誰沒改，這件事會拖幾個月。有 CR 的話：
+想像一個很常見的情境：Tempo 的儲存成本上升，決定把採樣從全收改成 10%（或者臨時想把某服務的採樣從 10% 變成 100% 為了 troubleshooting 用）。在沒有這個 CR 的世界裡，這代表要通知幾十個團隊各自去改自己的設定，然後追蹤誰改了誰沒改，這件事會拖幾個月。有 CR 的話：
 
 ```yaml
 spec:
@@ -552,6 +552,11 @@ flowchart TB
 
 總結來說，今天的分享其實跟 AIOps 沒太多關係，但是透過 OTel operator 能快速且以統一的形式，替各部門的服務快速注入 OTel 產生 signal 的能力。對於沒接觸過得部門來說，trace 是他們很容易為之一亮的事物。且至少有全鏈路覆蓋的 trace，會對於我們之後利用 trace 資料做成`靜態的系統圖譜 model` 會更方便。至於今天那個把 collector 壓垮的實驗，它證明的其實是另一件事：注入這條路走通了，不代表資料真的有走完。
 
+另一件事情是動手「把監控系統壓垮，體驗一次資料無聲蒸發的恐怖現場」**。但至少 Sidecar OTel collector 會有 `refused_spans` 指標，能夠快速的讓工程師或是 agent 知道沒資料是因為被拒收了。所以平台團隊是能針對這指標做統一的監控跟告警的，等於主動的替各服務安裝了一個「會大聲求救的警報器」。
+
+
+
+> 「症狀出現的地方，不一定是問題發生的根因。」
 > 這個 OOM 實驗我原本以為會看到一堆紅通通的錯誤訊息，結果 app 那邊是 0 筆 :(
 > 最安靜的故障往往最貴。
 

@@ -9,11 +9,15 @@ tags: [OpenTelemetry, Kubernetes, GitOps, 鐵人賽]
 > 宣告式的 CR 是一個不會停下來的承諾
 > 差別要等到某個東西被改壞的那天才看得出來
 
-昨天講到，語意是一份共同的約定。一個團隊自己怎麼命名永遠不算錯，但只要資料要被別人讀，命名一不一致就變成治理問題。
+昨天講到，`語意`是一份`共同的約定`。一個團隊自己怎麼命名永遠不算錯，但只要資料要被別人讀，命名一不一致就變成`治理問題`。
 
-看到今天的標題你可能會想：不是在講 AIOps 嗎，怎麼突然跳到一個 Kubernetes operator？
+談到語意與遙測資料，大家第一個想到的通常是 **OpenTelemetry（OTel）**。但現實是：要幾十個團隊主動學習，並在程式碼裡裝 SDK、維護版本、遵守統一規範，門檻高到幾乎不可能落實。
 
-我先把這條因果鏈講白，因為接下來好幾天都會待在這一段：
+這也是為什麼 k8s 上的 OTel Operator 成了平台團隊的救星——它能把這件事從「拜託開發者改 code」變成「由平台自動注入與調和」，大幅度地降低導入的門檻。
+
+看到今天的標題你可能會想：不是在講 AIOps 嗎，怎麼突然跳到一個 k8s operator？
+
+我先把這條因果鏈講白，因為接下來好幾天都在分享這一 part：
 
 ```mermaid
 flowchart LR
@@ -25,13 +29,13 @@ flowchart LR
 
 Day1 那隻 agent 會把 60 筆 log 看成 0 筆，是因為它猜的 label 值跟那套 stack 對不上。要讓這種事不再發生，得先讓「所有服務照同一套規範送資料」這件事真的做得到。而在幾十個服務的規模下，這靠公告跟好意是達不成的，得有一個機制。
 
-所以順序是這樣：先有施力點，才有規範；先有規範，資料才一致；資料一致，agent 的判斷才有東西可以站。中間任何一環是靠人盯著，這條鏈就斷了。
+所以順序是這樣：先有`施力點`，才好推行`規範`；先有`規範`，資料才`一致`；資料一致，agent 的判斷才有東西可以站，`正確性`跟`可推理性`才可能大幅提昇。中間任何一環是靠人盯著，這條鏈就斷了。
 
-今天不會出現任何 agent，一次都不會。這是刻意的，這幾天在蓋的是後面那隻 agent 要站的地板。
+接著幾天的文章，都是在蓋的是後面那隻 agent 要站的地基。
 
-那就進到今天的問題：**約定寫好了，怎麼送到幾十個服務上？**
+今天的探討的主題是：**約定寫好了，怎麼送到幾十個服務上？**
 
-這件事沒有想像中理所當然。Day1 那兩套 stack 會用不同的 label 表達「哪個服務」，不是因為誰不願意統一，而是它們各自安裝、各自維護，中間根本沒有一個東西在盯著。你就算寫出一份完美的 registry，只要每個服務的 OpenTelemetry（以下都簡稱 OTel）設定還是各自散在自己的 Dockerfile 裡，那份 registry 就只是一份沒有施力點的文件。
+這件事沒有想像中那麼理所當然。Day1 那兩套 stack 會用不同的 label 表達「哪個服務」，不是因為誰不願意統一，而是它們各自安裝、各自維護，中間根本沒有一個東西在盯著。你就算寫出一份完美的 registry，只要每個服務的 OpenTelemetry（以下都簡稱 OTel）設定還是各自散在自己的 Dockerfile 裡，那份 registry 就只是一份沒有施力點的文件。
 
 而且這種差異不是一次性的，它會持續長出來。OTel 一直在演進，SDK 一直在出新版；而每個服務自己在映像檔裡打包 `opentelemetry-instrument`、自己釘版本、自己決定什麼時候升級，那升級這件事實際上就永遠不會發生。產品團隊只會用，不會花時間盯著框架的 changelog，這很合理，那本來就不是他們的工作。再加上專案換手、人來來去去，接手的人只知道照著上一版的 Dockerfile 抄。**於是各服務之間的差異愈積愈多，而沒有任何一個地方看得到全貌。**
 
@@ -53,7 +57,6 @@ Day1 那隻 agent 會把 60 筆 log 看成 0 筆，是因為它猜的 label 值�
 
 而 OTel 在企業內真正麻煩的地方，剛好沒有一件是一次性的。Collector 設定要跟著流量規模調整，sidecar 要注入到每一個新起的 Pod，SDK 版本要在幾十個服務之間慢慢推。
 
-> 我踩過最蠢的一次，是有人為了 debug 把 Collector 的 replicas 調成 0，忘了調回來。過了兩週才有人發現「欸最近怎麼都查不到 trace」，那兩週的資料就是沒了，補不回來。叢集從頭到尾沒有任何意見，因為沒有人告訴過它「這裡應該要有一個 Collector」。
 
 ## Operator pattern：宣告期望，讓迴圈去逼近它
 
@@ -88,7 +91,10 @@ return ctrl.Result{Requeue: true, RequeueAfter: 1 * time.Second}, nil
 
 順帶提一個你自己動手很可能會撞到的東西。`kubectl delete otelcol` 之後物件卡在 `Terminating` 不消失，通常不是壞了，是 `Finalizer` 在等 Operator 清掉那些沒辦法掛 `ownerReference` 的 cluster-scoped 子資源，像 `ClusterRole` 之類。連刪除都不是一次性動作，要等調和確認清乾淨才算數。
 
+
+
 ### 兩個 CR，兩種完全不同的行為
+OTel Operator 能提供兩種 CR 給產品團隊選用，`OTel Collector CR` 與`Instrumentation CR`。`Collector CR` 是能讓產品團隊選擇對應類型的 sidecar collector，例如可能 Java 專案選擇用 `common-collector`，PHP 專案比較特別有`fpm-collector`和`octance-collector` 等等的做選擇。而 `Instrumentation CR` 顧名思義，就是讓開發團隊選擇用對應程式語言的 auto-intrumentation 做注入。 
 
 | | `OpenTelemetryCollector` | `Instrumentation` |
 | --- | --- | --- |
@@ -100,13 +106,14 @@ return ctrl.Result{Requeue: true, RequeueAfter: 1 * time.Second}, nil
 
 Operator 一共有四種 CR，另外兩個今天有印象就好：`TargetAllocator` 管多個 Collector 副本怎麼分工抓 Prometheus target，`OpAMPBridge` 則是透過 OpAMP 協議遠端下發設定跟升級，適合 Collector 跑在 k8s 之外的情況。它們處理的都是規模變大之後才浮現的問題。
 
+
 ## 為什麼「注入」比「教會每個團隊寫 OTel」划算
 
 > 有關 OpenTelemetry 本身，[小弟以前也寫過一系列](https://ithelp.ithome.com.tw/users/20104930/ironman/4960)。對開發團隊來說，產生遙測資料有兩條路：自己呼叫 OTel API 埋點，或是靠 auto-instrument 機制自動注入。這節要比的就是這兩條路的成本落在誰身上。
 
 `Instrumentation` CR 值得單獨講一下，因為它解決的不是「少改幾行程式碼」，是一個平台工程的成本問題。
 
-沒有 auto-instrumentation 的話，平台團隊走的是「出一個 library，請大家自己接上去」。這條路有兩筆代價。一是每個團隊都得先認識 OTel API/SDK，怎麼建 tracer、怎麼設屬性、怎麼跟框架整合，這是疊加在每個團隊身上的重複成本，不是平台付一次就結束。二是平台團隊自己的成本也不會少，光出一份 library 加文件通常不夠讓幾十個團隊動起來，還得巡迴演講、辦訓練、一個團隊一個團隊盯進度。
+沒有 auto-instrumentation 的話，平台團隊通常走的是「出一個 library，請大家自己接上去」。這條路有兩筆代價。一是每個團隊都得先認識 OTel API/SDK，怎麼建 tracer、怎麼設屬性、怎麼跟框架整合，這是疊加在每個團隊身上的重複成本，不是平台付一次就結束。二是平台團隊自己的成本也不會少，光出一份 library 加文件通常不夠讓幾十個團隊動起來，還得巡迴演講、辦訓練、一個團隊一個團隊盯進度。還得替各種程式語言+框架，各語言版本出這 library，維護成本非常高。
 
 > 講到這裡，很多平台團隊會走上第三條路：自己包一層 wrapper 把 OTel API 藏起來，讓大家用「我們公司的埋點函式庫」。OTel 官方寫過一篇〈[Don't Wrap OpenTelemetry](https://opentelemetry.io/blog/2026/dont-wrap-opentelemetry/)〉勸退，核心概念摘幾條：
 >
@@ -122,6 +129,9 @@ auto-instrumentation 把等式換掉。Pod 帶對 annotation 就在建立的當�
 這是這系列第一個平台工程判準，後面會反覆用到：一個機制的成本，會不會隨團隊數線性成長。
 
 回頭看會發現，包一層 wrapper 跟自動注入表面上都在講降低門檻，方向卻是相反的。前者製造一個要自己維護、還會跟標準漂移的分岔版本，後者讓大家直接用官方 SDK，只是連接上去這一步都不用自己做。而官方那句「治理需求交給 code generation」，正好也是這系列後面要走的路：共用的東西留在 SDK 初始化設定（exporter、sampling、resource attribute），埋點規範則在 compile-time 生成出來。這裡先記著就好，Weaver 是後面的主角。
+
+> 都套用 OTel operator 後，平台團隊能很輕鬆掌握各服務所用到的 Collector 版本與設定，注入的 OTel instrumenation 是第幾版。而且還能對這些 CR 做更新，等到開發團隊下次對 deployment rollout 或是 restart 就會套用新版本的設定了。治理更新的主動權就掌握在平台團隊中了。
+> 此外 OTel sidecar collector 的設定能用 OpAMP 協議直接動態更新。這有時候很好用，例如想要再不重啟服務下，降低 min-log-level 從 WARN 變成 DEBUG，這時就能做到了，只是這部份，不在這系列的主題中，就點到為止。
 
 ## 裝起來：一次性的安裝，換來持續的調和
 
