@@ -1,164 +1,186 @@
 ---
-title: "【Day36】狀態機撞牆測試：九條測試證明了意圖，沒有證明機制"
+title: "【Day36】那 20 筆標註其實一直都在，只是治理平面看不到"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
 tags: [OpenTelemetry, AIOps, Governance, 鐵人賽]
 ---
 
-# Day36：狀態機撞牆測試，順便撞出兩個沒人管的狀態
+# Day36：把第一批非自我標註接上去，然後答案還是一樣
 
-> 九條測試都綠的
-> 而且測的東西都對
-> 只是它們全部都是一個執行緒
-> 依序呼叫兩次，然後停在「第二次回 None」
+> 我以為今天要做的是產出資料
+> 結果資料兩個月前就產好了
+> 躺在一個沒有人接過去的資料庫裡
+> 而那件事沒有任何地方會報錯
 
-昨天畫出真實的呼叫關係，結論是提案那條路一直是活的，斷掉的是提案之後那一段。今天就從斷點的第一格開始：`action_requests.py`，那個把治理的判斷變成一列可以被人按的紀錄的狀態機。
+昨天量到的那行是 `non-self=0`，結論是這隻 agent 沒有任何外部標註，所以自主權在校準那一格永遠解不開。今天原本的計畫是去產出那批標註，把數字推過 20。實際做下來，工作內容跟我想的不太一樣。
 
-程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day36/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day36)。這一天的指令都假設你在那個 repo 的根目錄下跑，不需要叢集，也不需要 LLM。
+程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day36/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day36)。
 
-## 為什麼一個判斷不能只是一個判斷
+## 標註要從哪裡來
 
-治理平面算出來的東西是一個 `Decision`，它是一個 pydantic 物件，活在記憶體裡，函式回傳完就沒了。但「這個行動被允許到什麼程度」這件事必須撐得比一次函式呼叫久，因為中間要插進去一個人。
+先講為什麼這件事卡住。`label_run()` 這個函式在這個 repo 裡有三個呼叫點：`main.py` 的一個 HTTP endpoint（人在 plugin 上按對／錯）、`calibration.py` 的 CLI（一次標一筆）、還有 `execution.py` 的自我驗證（agent 執行完之後自己回頭查一下）。
 
-人要看得到它、要能按、按完要留下是誰按的、而且隔天有人問起的時候要查得到。所以它得變成一列有狀態的紀錄。`action_requests.py` 的 docstring 把職責切得很清楚：這支檔案管**一個請求現在在哪個狀態、以及它可以合法地移動到哪裡**；執行的時候發生什麼事是 `execution.py` 的；到底會不會真的動到叢集是 `actions.py` 那道 kill switch 的。
+第三個那條路產出來的標註，來源會寫成 `remediation-verified` 或 `remediation-failed`，而昨天量過了，那兩個字串正好是 `_SELF_LABEL_SOURCES` 排除掉的東西。前兩條路是人工的，一次一筆，要湊 20 筆得有人坐在那裡按 20 次。
 
-狀態總共 13 個，畫出來長這樣（灰色那幾個是執行管線之後才會用到的，今天不碰）：
-
-```mermaid
-stateDiagram-v2
-    [*] --> proposed
-    [*] --> approved: AUTO 且 kill switch 開著
-    proposed --> approved: 人按核准
-    proposed --> rejected: 人按拒絕
-    proposed --> expired: TTL 過了
-    approved --> executing: executor 認領
-    executing --> refused: kill switch 關著／沒有實作
-    executing --> aborted: 前置檢查擋下
-    executing --> succeeded
-    executing --> failed
-    executing --> verify_failed
-    refused --> [*]
-    rejected --> [*]
-    expired --> [*]
-```
-
-`Status` 是一個 `StrEnum`，13 個值裡有 7 個標著 `(7b-4+)`，也就是還沒走到的那一段。今天要撞的是前半段那幾條線。
-
-## 讓一個轉移安全的是那句 SQL
-
-所有的狀態轉移都走同一個函式，`store.ar_transition()`，而它的核心只有一句 SQL：
-
-```sql
-UPDATE action_requests SET status=? WHERE request_id=? AND status=?
-```
-
-最後那個 `AND status=?` 是重點。它不是「先讀出來看一下是不是 proposed，是的話再寫進去」，而是把讀跟寫壓成同一句原子操作，然後看 `cur.rowcount > 0`。這叫 compare-and-set，兩個人同時按核准的時候，第二個人的 UPDATE 會匹配到 0 列，函式回 `False`，`approve()` 因此回 `None`。
-
-這個設計是對的。我今天想確認的是它在**真的併發**的時候也是對的，因為現有那三條相關的測試（double approve、approve after TTL、approve missing）都是單執行緒依序呼叫，只證明了「第二次呼叫看到狀態已經變了」。那證明的是意圖，不是機制。
-
-## 四個探測
-
-寫了一支 `probe_lifecycle.py`，用一個暫存 SQLite 檔加真的模組，沒有 mock。四個探測各印出那一列最後長什麼樣。
-
-### 一、八個執行緒同時按核准
-
-```
-[1] 8 threads approve the same request simultaneously
-    approve() returned a request 1 time(s) out of 8
-    after                  status=approved   actor=human-2 outcome=''
-```
-
-八個執行緒，恰好一個贏。連跑三次，贏的分別是 `human-2`、`human-1`、`human-1`、`human-0`，誰贏是隨機的，但**數量永遠是 1**。CAS 在真的併發下守住了，這一格是好的。
-
-### 二、同樣過期的請求，approve 跟 reject 給出不同的故事
-
-```
-[2] the same stale request: approve() vs reject()
-    approve() -> None
-    approved path          status=expired    actor=None outcome='approval TTL elapsed before action'
-    reject()  -> a request
-    rejected path          status=rejected   actor=human outcome=''
-```
-
-兩列一模一樣的請求，`expires_ts` 都被我改到 60 秒前。走 approve 那條路的結果是 `expired`，而且 `outcome` 那欄留下了原因；走 reject 那條路的結果是 `rejected`，`actor` 是那個人。
-
-翻回程式碼，原因很單純：`approve()` 開頭有一行 `_expire_if_stale()`，`reject()` 沒有。
-
-從「會不會出事」的角度看，這不是 bug，兩邊都是終局狀態，沒有東西會被執行。但從稽核軌跡的角度看，**這兩列紀錄講的是兩個不同的故事**：一個說「它逾時了，沒人來得及處理」，另一個說「有人看過並且決定不做」。前者該問的是為什麼沒人看到，後者該問的是那個人為什麼判斷不做。事後翻紀錄的人分不出來這兩件事。
-
-這個形狀在這系列出現過很多次，都是同一句話的變形：一份看起來像結論的紀錄，沒有講清楚它其實是逾時。
-
-### 三、沒有人碰的過期請求，會一直待在待辦清單裡
-
-```
-[3] a stale request nobody touches
-    listed under status=proposed: 1
-    stored                 status=proposed   actor=None outcome=''
-```
-
-這個是我覺得比較有實務影響的一個。`_expire_if_stale()` 全專案只有一個呼叫點，就是 `approve()` 裡面那一行。也就是說**過期是被動觸發的**：沒有人去按那顆核准，那列紀錄就會用 `proposed` 的身分一直躺在那裡，`list_requests(status="proposed")` 撈得到它，plugin 那頁也會把它畫出來。
-
-TTL 存在的理由寫在 `config.py` 的註解裡，講得很好：核准會走味，一個在時窗內沒被處理的請求要讓它過期，免得世界已經動了之後還有人拿著舊的前置條件去行動（那是典型的 TOCTOU）。設計意圖是對的，但目前那個時窗只有在有人來敲門的時候才會被檢查。
-
-實務上會怎樣：凌晨兩點出了一次事故，agent 提了一個回滾建議。沒有人處理。早上九點有人打開面板，看到一列 `proposed`，上面寫著回滾 payment-service 到 rev 24。那個提案是七小時前的世界算出來的，而畫面上沒有任何東西告訴他這件事，除非他自己去看 `created_ts`。他按下去，`approve()` 才在那一刻發現它過期了，然後回 `None`。運氣好的話畫面會跳一個 409，運氣不好的話他會以為自己按了。
-
-### 四、executor 認領到一半死掉
-
-```
-[4] the pod dies between claim and outcome
-    executor claimed it: True
-    after the crash        status=executing  actor=human outcome=''
-    a restarted executor re-claims it: False
-    approve() on it now: None
-```
-
-`execution.py` 認領一個請求的方式是 `approved → executing` 的 CAS，這樣兩個 executor 不會搶到同一列。問題是認領成功之後如果那個 pod 被砍掉（重新部署、OOMKilled、節點被驅逐），那列紀錄就永遠停在 `executing`。
-
-重啟後的 executor 沒辦法重新認領，因為它找的是 `approved`；人也沒辦法做任何事，因為 `approve()` 找的是 `proposed`。**這一列就卡在一個既不是終局、也沒有人會再看它一眼的狀態**，而且全專案沒有任何地方在掃 `executing` 的殘留。
-
-> 我在別的地方踩過同一個坑，那次是一個訂單狀態卡在「處理中」三個月，沒有人發現，因為報表只看成功跟失敗兩種。
-> 卡住的東西最可怕的地方不是它壞了，是它不會叫 QQ
-
-## 這三件事的共通點
-
-第二、三、四個發現長得不一樣，但骨架是同一個：**這個狀態機的推進完全依賴有人來敲門**。核准要人按、過期要靠有人試著按、卡在執行中的那列要靠有人發現。沒有任何一個角色在背景把時間的流逝變成狀態的變化。
-
-昨天畫的那張圖是靜態的 import 關係，今天這個是動態的：
+畫出來是這樣，灰的那一格是我以為今天要蓋的東西：
 
 ```mermaid
 flowchart LR
-    H["人／HTTP endpoint"] -->|"approve"| P["proposed"]
-    P --> A["approved"]
-    A -->|"executor 認領"| E["executing"]
-    E -.->|"pod 死掉"| STUCK["卡住，沒有人在看"]
-    P -.->|"沒有人來按"| STALE["過期了，但還顯示成 proposed"]
+    E1["main.py endpoint<br/>人在 plugin 上按"] --> L["label_run()"]
+    E2["calibration.py CLI<br/>一次一筆"] --> L
+    E3["execution.py 自我驗證<br/>remediation-verified/-failed"] --> L
+    E4["批次的外部評分<br/>（我以為要蓋的）"]:::todo --> L
+    L --> DB[("calibration 表")]
+    DB --> G{"cal_count_by_source<br/>exclude 自我標註"}
+    E3 -.->|"被排除"| G
 
-    classDef bad fill:#fadbd8,stroke:#c0392b,color:#78281f
-    class STUCK,STALE bad
+    classDef todo fill:#f4f6f7,stroke:#95a5a6,stroke-dasharray:4 3,color:#566573
 ```
 
-這在目前的狀態下沒有造成任何傷害，因為 kill switch 是關的，卡住的那列本來也不會動到叢集。但這十天的目標是把那個開關打開，而開關打開之後，這兩個虛線框就從「一列難看的紀錄」變成「一個沒有人知道的、進行中的變更」。
+所以我需要一個批次的、而且判斷來源不是 agent 自己的入口。這在 o11y-bench 那邊是現成的：整個 benchmark 的重點就是拿事先寫好的 ground truth 去評一次 RCA 對不對。我打算把它接成第四個入口。
 
-## 這道門的成本落在誰身上
+然後我打開 `app/eval/harness.py`，看到它的 docstring 這樣寫：
 
-平台工程的角度今天很具體。一個提案卡在畫面上，成本是誰的？
+```
+Grading reuses `calibration.grade_against_truth` (service + optional version
+match) so the harness stays decoupled from how correctness is judged. Each run is
+also inserted+labeled into the calibration store, so a harness pass produces the
+dense, unbiased CE data that production alone never gathers.
+```
 
-如果過期只在按下去的那一刻才算，那成本就落在**值班的人**身上：他要自己去看時間戳、自己判斷這個建議還新不新鮮、按下去被拒絕之後自己想辦法理解為什麼。而他手上有的資訊是最少的，因為他不知道 TTL 是 900 秒（那寫在服務端的設定檔裡）。
+第四個入口早就存在了，而且是我自己在 eval 那幾天寫的。
 
-反過來，如果清單本身就會把過了時窗的提案標出來，或者乾脆讓它們自己走到 `expired`，那成本就落在平台團隊身上，代價是多一支背景工作、多一個要維護的東西。這是這系列反覆問的同一個問題：一道 gate 擋下來之後，對方能不能自己修好。目前這道門擋下來的訊息是 HTTP 409 加一句 `request not approvable (missing, expired, or already decided)`，三種原因擠在同一句話裡，而它們對值班的人來說是三件完全不同的事。
+## 那為什麼昨天量出來是 0
+
+答案在同一支檔案往下二十行：
+
+```python
+DEFAULT_STORE = _HERE / "eval.db"  # separate from prod aiops.db unless overridden
+```
+
+eval harness 每跑一次 fixture，就把那一輪的信心值插進去、再用 ground truth 標上對錯，全部寫進 `app/eval/eval.db`。而 `governance.decide()` 去問標註數的時候走的是 `store.cal_count_by_source()`，那個函式沒指定 path 就吃 `settings.store_path`，預設值是 `aiops.db`。
+
+兩個檔案，沒有任何一條路把它們接起來：
+
+```mermaid
+flowchart LR
+    H["app/eval/harness.py<br/>跑 fixture、拿 ground truth 評分"] --> ED[("app/eval/eval.db<br/>35 筆，全部已標註")]
+    P["正式的 alert webhook 跑的調查"] --> AD[("aiops.db<br/>0 筆")]
+    AD --> G["governance.decide()<br/>問：非自我標註有幾筆？"]
+    ED -.->|"沒有這條線"| AD
+
+    classDef gap stroke-dasharray:4 3,stroke:#c0392b,color:#78281f
+    class ED gap
+```
+
+打開來看，eval 那邊有 35 筆，全部都有標註：
+
+```
+by source/correct:
+  {'source': 'eval-harness', 'correct': 0, 'n': 15}
+  {'source': 'eval-harness', 'correct': 1, 'n': 20}
+```
+
+**這個分開存是對的，不是 bug。** eval 跑的是合成的事故、用的是 fixture 裡寫死的答案，如果它們默默混進正式的歷史紀錄，那「這隻 agent 過去表現如何」這句話就被污染了。我當初那行註解寫得很清楚，也寫了 `unless overridden`。
+
+問題是那個 override 從來沒有人做。整個 repo 裡唯一會產出外部判斷的流程，跟唯一需要外部判斷的關卡，中間沒有橋，而且橋不存在這件事在任何地方都不會亮紅燈。昨天要不是我去量那個數字，它可以繼續這樣躺著。
+
+> 這個形狀在 Series 1 出現過好幾次了，只是那時候的主角是 label 名字不一致。今天換成兩個資料庫檔案，本質沒變：兩邊各自都正常，直到有一個東西需要同時讀懂兩邊。
+
+## 橋要怎麼搭才不算作弊
+
+接下來的問題比寫程式難：那 35 筆到底該不該算數。
+
+我想到三種做法。第一種是讓治理平面直接去讀 `eval.db`，最省事，但等於把合成事故的成績直接當成營運歷史，而且以後正式跑的紀錄還是在另一邊，會愈接愈亂。第二種是把紀錄複製過去，但把來源洗成 `manual` 之類的，這個我連想都不該想。第三種是複製過去、**但把 `source` 原封不動留著**，讓那 35 列在資料庫裡永遠標著 `eval-harness`，誰去查都看得出來這批是哪裡來的。
+
+我做的是第三種，寫成一支 `promote_labels.py`：
+
+```bash
+# 從 o11y-bench 主 repo 的根目錄跑
+python3 ironman-2026/day36/promote_labels.py           # 先看會搬什麼
+python3 ironman-2026/day36/promote_labels.py --apply
+```
+
+幾個刻意的設計：只搬已經有標註的（`correct IS NOT NULL`）、`source` 保留、同一個 `run_id` 已經在目標裡就跳過（可以重複跑）、預設是乾跑，`--apply` 是唯一會寫東西的參數。最後一項是這系列一路的預設值：會改變狀態的東西不要是預設行為。
+
+搬之前先印一次現況，搬完再印一次：
+
+```
+source .../app/eval/eval.db
+  35 labeled record(s) with source='eval-harness'
+  0 already present in the target, 35 to promote
+
+before
+  target     labeled=0   non-self=0   overconfidence=None
+  k8s.rollout_undo   -> propose  calibration unproven (0 labeled run(s) < 20); autonomy withheld
+  k8s.scale          -> propose  calibration unproven (0 labeled run(s) < 20); autonomy withheld
+
+promoted 35 record(s)
+
+after
+  target     labeled=35  non-self=35  overconfidence=-0.0029
+  k8s.rollout_undo   -> propose  calibration ok (overconfidence -0.0029, 35 runs)
+  k8s.scale          -> propose  calibration ok (overconfidence -0.0029, 35 runs)
+```
+
+`calibration unproven` 變成 `calibration ok`。兩道校準門今天都開了。
+
+再跑一次昨天那支探測，最後那格：
+
+```
+[4] the real store, right now
+    recorded=35 labeled=35 non-self=35 overconfidence=-0.0029
+    k8s.rollout_undo   -> propose  high confidence but action is approval-gated
+                          calibration ok (overconfidence -0.0029, 35 runs)
+```
+
+**判斷結果一模一樣，還是 PROPOSE。** 這正是昨天量到的那件事：擋在前面的是 `requires_approval`，校準那格根本不是決定去向的那一格。今天做的事情把三道鎖裡的第二道打開了，而門一樣不會動。
+
+我覺得這個結果比「終於變成 AUTO」有用得多。如果昨天沒有先去量那個順序，今天我會在這裡卡很久，反覆檢查標註是不是沒寫進去、`source` 是不是打錯，因為畫面上的結論一個字都沒變。
+
+## 那 35 筆到底有多少資訊量
+
+這一段是今天最該講清楚的東西，因為數字很容易讓人放心。
+
+門檻寫的是 20 筆，我搬過去 35 筆，看起來很寬裕。但那 35 筆長這樣：
+
+| fixture | 跑了幾次 |
+| --- | --- |
+| `payment-decline-service` | 15 |
+| `order-service-discover-before-query` | 10 |
+| `user-service-no-incident` | 10 |
+
+三個 fixture，兩個日子跑出來的。也就是說，這隻 agent 累積的「外部判斷」是**三個場景各跑十幾次**，而不是三十五個不同的事故。它證明的是在這三題上的穩定度，跟「它面對沒看過的事故有多可靠」是兩件事。
+
+那個門檻設定叫 `governance_min_human_labeled_runs`，單位是 run。`run` 是這個系統裡唯一數得出來的東西，所以門檻就寫在 run 上，但真正該問的是`獨立事故數`（白話講就是「你考過幾種題型」，不是「你同一題寫了幾遍」）。這兩個數字在這裡差了一個數量級。
+
+還有一件事我得寫出來，因為設定的名字會誤導人。`eval-harness` 這個來源之所以算「非自我標註」，是因為 `_SELF_LABEL_SOURCES` 只排除 `remediation-verified` 跟 `remediation-failed`，它是一份黑名單，不是白名單。而 harness 的判斷是拿 fixture 裡寫死的 truth 去比對，確實不是 agent 自己說了算，所以它通過 ARE（Agentic Reliability Engineering，代理式可靠性工程）§6.2 那條約束的字面要求。但錯誤訊息裡那句 `insufficient human/grader labels` 有個 `human`，而這 35 筆沒有任何一筆是人看過的。
+
+> 我沒有把 `eval-harness` 加進黑名單，也沒有改那句訊息。改了就等於今天什麼都沒推進，而它現在是不是該算數，我覺得是可以爭論的。爭論本身寫下來比我單方面決定有用。
+
+## 這條橋的維護成本落在誰身上
+
+平台工程的角度今天很直接：我做的是一次性的複製，而 eval harness 以後每跑一次還是會寫進 `eval.db`。也就是說**這兩個數字從今天起就開始分岔**，而要它們對得上，得有人記得再跑一次 `promote_labels.py`。
+
+一個要靠人記得的步驟，就是一個遲早會被忘記的步驟。而它被忘記的時候，症狀是治理平面用一份過時的校準紀錄在做授權判斷，畫面上沒有任何東西會說「這份紀錄停在兩個月前」。這跟昨天那個過期提案是同一個病：時間流逝本身不會讓任何東西前進。
+
+真正該做的設計不是把橋做得更順手，是讓 harness 寫入的時候就決定好這批紀錄要不要進治理的視野，而那需要一個現在還不存在的東西：一份說明「哪些來源、以什麼權重、算不算數」的設定。現在這件事是靠 `_SELF_LABEL_SOURCES` 那個兩元素的 tuple 在兼任的。
+
+順帶一提，這也是「產品團隊要付多少成本」的一個例子。如果哪天有第二隻 agent、或別的團隊接進來，他們要做的第一件事不是接 API，是搞懂自己的 eval 結果要寫到哪個檔案才會被算進去，而這件事目前只寫在一行程式碼註解裡。
 
 ## 今天沒做的事
 
-- **三個洞都只是量出來，沒有補。** 沒有加背景過期、沒有給 `executing` 殘留一個回收機制、`reject()` 那個不對稱也沒動。要改哪一個、怎麼改，得先看它們在開關打開之後的實際影響。
-- **`probe_lifecycle.py` 不是測試。** 它印東西給人看，沒有斷言，也沒有進 `tests/`。把這四條變成會紅的測試是下一步該做的事。
-- **沒有撞 `execution.py` 那一側。** 今天只到「認領」那一格為止，認領之後的乾跑、rubric 檢查、settle window 都沒碰。
-- **409 那句話沒改。** 三種原因擠在一起這件事今天只講了，沒動它。
-- **併發只測到 8 個執行緒、同一個 process。** 兩個 replica 同時打同一個 SQLite 檔是另一回事，那牽涉到 SQLite 的鎖行為，今天沒測。
+- **沒有真的跑一輪 o11y-bench 的 grader。** 那需要把整套 stack 起來加 LLM 呼叫，今天搬的是六月跟八月已經跑出來的紀錄。所以這批標註的新鮮度是既定的，不是我今天決定的。
+- **`_SELF_LABEL_SOURCES` 跟那句 `human/grader` 的訊息都沒改。** 上面那段 blockquote 講了為什麼。
+- **沒有增加 fixture。** 三個場景這件事今天只量出來、寫下來，補題目是另一件事。
+- **沒有做自動同步。** 一次性的腳本，要靠人記得再跑。
+- **校準曲線一個字都沒看。** 上面那個 `-0.0029` 是整體的過度自信，它過關了，但那只是一個平均數。分箱之後長什麼樣，是下一步的事。
+- **三道鎖還是三道。** 今天開了第二道，另外兩道沒碰。
 
 ## 小結
 
-總結來說，今天沒有改任何一行產品程式碼，做的事情是拿現有那九條測試沒走過的路徑各走一次。CAS 那一格通過了，八個執行緒搶同一列，恰好一個贏，這是今天唯一的好消息。剩下三個發現都指向同一件事：這個狀態機只有在有人按的時候才會動，時間本身不會讓任何一列紀錄前進。
+總結來說，今天實際做的事情跟計畫差很多：要產出的資料早就存在，缺的是一條沒有人接過的路，而接上去之後畫面上的結論一個字都沒變。這聽起來很像白工，但它讓「現在為什麼不能自動執行」這個問題從兩個模糊的原因收斂成一個明確的原因，而那個原因是可以被討論的——某個特定的行動，在某個特定的場景下，該不該保留人工核准。
 
-這件事在開關關著的時候是無害的，所以它可以在 repo 裡躺很久都沒有人發現。而這十天要做的正是把開關打開，所以它現在變成一個要排進去的東西，而不是一則觀察。
+比較有價值的反而是那三個 fixture 的分佈。一個寫成「20 次」的門檻，被三個場景各跑十幾次就滿足了，這件事在設定檔上完全看不出來。這個系列反覆在講的資料品質，今天輪到治理自己的資料被檢查一次。
 
-> 寫這支探測腳本花的時間，比我讀完那九條測試的時間還短。
-> 早知道每次看到「這裡有測試」就先花十分鐘撞一下，前面三十幾天可以少寫幾篇認錯的文章 XD
+> 那個 `-0.0029` 的整體過度自信漂亮到我差點想直接寫進小結。
+> 然後我順手把分箱印出來，看到其中一格的 gap 是 1.0 QQ

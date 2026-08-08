@@ -15,8 +15,11 @@ from app.governance import Autonomy, decide
 # ---- helpers ----------------------------------------------------------------
 
 
-def _plant(run_id: str, *, source: str, correct: bool = True, path=None) -> None:
-    """Insert + label a CE record in one call."""
+def _plant(
+    run_id: str, *, source: str, correct: bool = True, grading_mode="culprit", path=None
+) -> None:
+    """Insert + label a CE record in one call. Defaults to the mode the
+    governance gate counts; pass None to plant a row of unknown provenance."""
     store.cal_insert(
         run_id=run_id,
         ts="2026-01-01T00:00:00Z",
@@ -25,6 +28,7 @@ def _plant(run_id: str, *, source: str, correct: bool = True, path=None) -> None
         hypothesis="",
         suspected_version=None,
         services=[],
+        grading_mode=grading_mode,
         path=path,
     )
     store.cal_label(run_id, correct, score=None, source=source, path=path)
@@ -202,6 +206,45 @@ def test_human_label_gate_allows_auto_with_enough_human_labels(tmp_path, monkeyp
     spec = ActionSpec(name="test.action", description="t", reversible=True, requires_approval=False)
     d = decide(spec, 0.9, _calib(labeled=30, overconfidence=0.0), path=p)
     assert d.autonomy is Autonomy.AUTO
+
+
+def test_human_label_gate_ignores_rows_of_unknown_grading_mode(tmp_path, monkeypatch):
+    """50 human labels with no recorded grading_mode → AUTO still withheld.
+
+    `correct` answers a different question depending on how the run was graded,
+    and a row that never said which one cannot be counted toward a curve that
+    assumes one of them. Fail-closed on unknowns."""
+    p = tmp_path / "g3.db"
+    monkeypatch.setattr(gov.settings, "governance_min_labeled_runs", 20)
+    monkeypatch.setattr(gov.settings, "governance_min_human_labeled_runs", 20)
+
+    for i in range(50):
+        _plant(f"u{i}", source="ui", grading_mode=None, path=p)
+
+    from app.actions import ActionSpec
+
+    spec = ActionSpec(name="test.action", description="t", reversible=True, requires_approval=False)
+    d = decide(spec, 0.9, _calib(labeled=50, overconfidence=0.0), path=p)
+    assert d.autonomy is Autonomy.PROPOSE
+    assert "self-produced labels cannot unlock AUTO" in d.calibration_note
+
+
+def test_human_label_gate_ignores_inconclusive_rows(tmp_path, monkeypatch):
+    """Hedging verdicts don't count toward the culprit-graded floor."""
+    p = tmp_path / "g4.db"
+    monkeypatch.setattr(gov.settings, "governance_min_labeled_runs", 20)
+    monkeypatch.setattr(gov.settings, "governance_min_human_labeled_runs", 20)
+
+    for i in range(20):
+        _plant(f"i{i}", source="eval-harness", grading_mode="inconclusive", path=p)
+    for i in range(5):
+        _plant(f"c{i}", source="eval-harness", grading_mode="culprit", path=p)
+
+    from app.actions import ActionSpec
+
+    spec = ActionSpec(name="test.action", description="t", reversible=True, requires_approval=False)
+    d = decide(spec, 0.9, _calib(labeled=25, overconfidence=0.0), path=p)
+    assert d.autonomy is Autonomy.PROPOSE  # only 5 culprit rows clear the floor
 
 
 def test_human_label_gate_skipped_when_min_is_zero(monkeypatch):

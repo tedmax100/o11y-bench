@@ -40,6 +40,11 @@ logger = logging.getLogger("aiops_agent.store")
 # caller; combined with WAL + busy_timeout it avoids "database is locked".
 _write_lock = threading.Lock()
 
+# What a calibration row's `correct` is a verdict *about*. Defined here because
+# this module owns the schema; calibration.py re-exports them.
+CULPRIT = "culprit"  # "the blame was right" — the reading the CE math assumes
+INCONCLUSIVE = "inconclusive"  # "it appropriately declined to blame anyone"
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS calibration (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,7 +59,12 @@ CREATE TABLE IF NOT EXISTS calibration (
     suspected_version TEXT,
     services  TEXT NOT NULL DEFAULT '[]',  -- json array
     error_dimension TEXT,                  -- which part was wrong (root_cause/scope/action/other)
-    correction_note TEXT                   -- free-text human correction
+    correction_note TEXT,                  -- free-text human correction
+    -- What question `correct` answers. "culprit" = the blame was right, which is
+    -- the only reading the calibration math assumes. "inconclusive" = the run
+    -- appropriately hedged on a non-incident, a different question entirely.
+    -- NULL = unknown provenance; the governance gate treats it as not eligible.
+    grading_mode TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_calibration_run_id ON calibration(run_id);
 
@@ -147,6 +157,7 @@ CREATE INDEX IF NOT EXISTS idx_rb_feedback_ts ON runbook_feedback(ts);
 _MIGRATIONS = [
     "ALTER TABLE calibration ADD COLUMN error_dimension TEXT",
     "ALTER TABLE calibration ADD COLUMN correction_note TEXT",
+    "ALTER TABLE calibration ADD COLUMN grading_mode TEXT",
 ]
 
 
@@ -190,15 +201,30 @@ def cal_insert(
     hypothesis: str,
     suspected_version: str | None,
     services: list[str],
+    grading_mode: str | None = None,
     path: str | Path | None = None,
 ) -> None:
-    """Append a pending calibration record (correct=NULL until labeled)."""
+    """Append a pending calibration record (correct=NULL until labeled).
+
+    `grading_mode` records what `correct` will mean for this row — see the column
+    comment in the schema. Production runs leave it None until something judges
+    them; the eval harness knows its fixture's mode and says so."""
     with _write_lock, _connect(path) as conn:
         conn.execute(
             "INSERT INTO calibration "
-            "(run_id, ts, confidence, summary, hypothesis, suspected_version, services) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (run_id, ts, confidence, summary, hypothesis, suspected_version, json.dumps(services)),
+            "(run_id, ts, confidence, summary, hypothesis, suspected_version, services, "
+            "grading_mode) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (
+                run_id,
+                ts,
+                confidence,
+                summary,
+                hypothesis,
+                suspected_version,
+                json.dumps(services),
+                grading_mode,
+            ),
         )
 
 
@@ -210,37 +236,61 @@ def cal_label(
     source: str,
     error_dimension: str | None = None,
     correction_note: str | None = None,
+    grading_mode: str | None = None,
     path: str | Path | None = None,
 ) -> bool:
     """Atomically set the verdict on the *most recent* record for run_id. One
     UPDATE — no whole-file rewrite, no read-modify-write race. Returns True if a
-    row matched."""
+    row matched.
+
+    `grading_mode` is the question this verdict answers; whoever judges knows it,
+    the run itself does not. None leaves whatever the row already had, so a
+    labeler that has no opinion can't erase one."""
     with _write_lock, _connect(path) as conn:
         cur = conn.execute(
             "UPDATE calibration SET correct=?, score=?, source=?, "
-            "error_dimension=?, correction_note=? "
+            "error_dimension=?, correction_note=?, grading_mode=COALESCE(?, grading_mode) "
             "WHERE id = (SELECT id FROM calibration WHERE run_id=? "
             "            ORDER BY id DESC LIMIT 1)",
-            (1 if correct else 0, score, source, error_dimension, correction_note, run_id),
+            (
+                1 if correct else 0,
+                score,
+                source,
+                error_dimension,
+                correction_note,
+                grading_mode,
+                run_id,
+            ),
         )
         return cur.rowcount > 0
 
 
 def cal_count_by_source(
-    *, exclude_sources: tuple[str, ...] = (), path: str | Path | None = None
+    *,
+    exclude_sources: tuple[str, ...] = (),
+    modes: tuple[str, ...] | None = None,
+    path: str | Path | None = None,
 ) -> int:
-    """Count labeled calibration records, optionally excluding specific sources.
-    Used by governance to count human/grader labels without remediation self-labels."""
-    placeholders = ",".join("?" * len(exclude_sources))
+    """Count labeled calibration records, optionally excluding specific sources
+    and restricting to specific `grading_mode`s. Used by governance to count
+    human/grader labels without remediation self-labels.
+
+    `modes` must match whatever the caller feeds `compute_calibration` — a floor
+    counted over a wider set than the curve is computed over is not a floor.
+    NULL grading_mode never matches a mode filter (fail-closed on unknowns)."""
+    where = ["correct IS NOT NULL"]
+    params: list[Any] = []
+    if exclude_sources:
+        placeholders = ",".join("?" * len(exclude_sources))
+        where.append(f"(source IS NULL OR source NOT IN ({placeholders}))")
+        params.extend(exclude_sources)
+    if modes is not None:
+        placeholders = ",".join("?" * len(modes))
+        where.append(f"grading_mode IN ({placeholders})")
+        params.extend(modes)
     with _connect(path) as conn:
-        if exclude_sources:
-            return conn.execute(
-                f"SELECT COUNT(*) FROM calibration WHERE correct IS NOT NULL "
-                f"AND (source IS NULL OR source NOT IN ({placeholders}))",
-                list(exclude_sources),
-            ).fetchone()[0]
         return conn.execute(
-            "SELECT COUNT(*) FROM calibration WHERE correct IS NOT NULL"
+            f"SELECT COUNT(*) FROM calibration WHERE {' AND '.join(where)}", params
         ).fetchone()[0]
 
 
@@ -250,7 +300,7 @@ def cal_load(path: str | Path | None = None) -> list[dict[str, Any]]:
     with _connect(path) as conn:
         rows = conn.execute(
             "SELECT run_id, ts, confidence, correct, score, source, summary, "
-            "hypothesis, suspected_version, services FROM calibration ORDER BY id"
+            "hypothesis, suspected_version, services, grading_mode FROM calibration ORDER BY id"
         ).fetchall()
     out: list[dict[str, Any]] = []
     for r in rows:
@@ -290,19 +340,25 @@ def inv_query_similar(
     labeled correct=True (joined with calibration by fp=run_id), most-recent
     first. `alertname` narrows to the same alert; a chat question has no
     alertname, so leaving it out matches any past investigation of the service.
-    Returns parsed payload dicts."""
+    Returns parsed payload dicts.
+
+    Only `culprit`-graded rows qualify. On an `inconclusive` row, correct=True
+    means "it rightly blamed nobody" — retrieving that as a solved past incident
+    would feed the agent a non-incident as precedent, which is the opposite of
+    what this context is for. Rows with no recorded mode are excluded too: this
+    output goes into a prompt, so unknown provenance fails closed."""
     where = "json_extract(i.payload, '$.service') = ?"
     params: list[Any] = [service]
     if alertname:
         where += " AND json_extract(i.payload, '$.alertname') = ?"
         params.append(alertname)
-    params.append(limit)
+    params.extend([CULPRIT, limit])
     with _connect(path) as conn:
         rows = conn.execute(
             f"""
             SELECT i.payload FROM investigations i
             JOIN calibration c ON c.run_id = i.fp
-            WHERE {where} AND c.correct = 1
+            WHERE {where} AND c.correct = 1 AND c.grading_mode = ?
             ORDER BY i.id DESC LIMIT ?
             """,
             params,

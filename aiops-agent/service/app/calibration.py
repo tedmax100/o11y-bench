@@ -57,6 +57,10 @@ class CalibrationRecord(BaseModel):
     # Filled in when correct=False: which part was wrong + human-supplied note.
     error_dimension: str | None = None  # root_cause | scope | action | other
     correction_note: str | None = None
+    # What question `correct` answers for this row. "culprit" = was the blame
+    # right (the only reading the ECE/Brier math assumes); "inconclusive" = did
+    # the run appropriately hedge on a non-incident. None = unknown.
+    grading_mode: str | None = None
 
 
 # ---- store (durable SQLite via app.store; `path` = db path) -----------------
@@ -111,10 +115,15 @@ def label_run(
     source: str = "manual",
     error_dimension: str | None = None,
     correction_note: str | None = None,
+    grading_mode: str | None = None,
     path: Path | None = None,
 ) -> bool:
     """Fill in the verdict for the most recent record matching run_id (atomic
-    UPDATE in the store). Returns True if a record was updated."""
+    UPDATE in the store). Returns True if a record was updated.
+
+    `grading_mode` says what this verdict is a verdict *about* — see the
+    CalibrationRecord field. Leave it None if you don't know; None never
+    overwrites a mode the row already carries."""
     ok = store.cal_label(
         run_id,
         correct,
@@ -122,6 +131,7 @@ def label_run(
         source=source,
         error_dimension=error_dimension,
         correction_note=correction_note,
+        grading_mode=grading_mode,
         path=path,
     )
     if not ok:
@@ -163,15 +173,58 @@ def grade_against_truth(findings: Any, truth: dict) -> bool:
 # ---- calibration math (pure) -----------------------------------------------
 
 
-def compute_calibration(records: list[CalibrationRecord], n_bins: int = 10) -> dict[str, Any]:
+CULPRIT = store.CULPRIT
+INCONCLUSIVE = store.INCONCLUSIVE
+
+
+def filter_by_mode(
+    records: list[CalibrationRecord], modes: tuple[str, ...] | None
+) -> list[CalibrationRecord]:
+    """Keep only records whose `grading_mode` is in `modes`. `None` keeps
+    everything; a NULL mode never matches a filter (fail-closed on unknowns)."""
+    if modes is None:
+        return list(records)
+    return [r for r in records if r.grading_mode in modes]
+
+
+def hedging_rate(records: list[CalibrationRecord]) -> dict[str, Any]:
+    """How often the agent appropriately declined to blame anyone, over the
+    `inconclusive` records. Deliberately *not* a calibration number: on these
+    runs `correct` and `confidence` answer different questions, so ECE over them
+    is a category error (a run that says 0.0 and correctly refuses to guess is
+    scored as a maximal miss). The bare rate is the honest summary."""
+    rows = [r for r in filter_by_mode(records, (INCONCLUSIVE,)) if r.correct is not None]
+    if not rows:
+        return {"labeled": 0, "hedged": 0, "rate": None, "mean_confidence": None}
+    hedged = sum(1 for r in rows if r.correct)
+    return {
+        "labeled": len(rows),
+        "hedged": hedged,
+        "rate": round(hedged / len(rows), 4),
+        "mean_confidence": round(sum(r.confidence for r in rows) / len(rows), 4),
+    }
+
+
+def compute_calibration(
+    records: list[CalibrationRecord],
+    n_bins: int = 10,
+    *,
+    modes: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
     """Expected/Maximum Calibration Error + Brier score + reliability bins over
     the *labeled* records. Equal-width bins on [0,1] by stated confidence.
 
     ECE = Σ_b (n_b/N)·|acc_b − conf_b|   (lower is better; 0 = perfectly calibrated)
     MCE = max_b |acc_b − conf_b|         (worst single bin)
     Brier = mean((conf − correct)²)      (proper score; lower is better)
+
+    All three assume `correct=1` means "the claim stated at confidence c was
+    right". Only `culprit` rows mean that, so `modes` restricts which rows are
+    eligible — see `hedging_rate` for the `inconclusive` ones. `modes=None`
+    computes over everything, which is what the ad-hoc reports want and what the
+    governance gate must not do.
     """
-    labeled = [r for r in records if r.correct is not None]
+    labeled = [r for r in filter_by_mode(records, modes) if r.correct is not None]
     n = len(labeled)
     if n == 0:
         return {"count": 0, "labeled": 0, "ece": None, "mce": None, "brier": None, "bins": []}

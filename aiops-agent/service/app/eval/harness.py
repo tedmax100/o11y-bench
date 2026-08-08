@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 from .. import store
 from ..agent import run_headless
 from ..calibration import grade_against_truth
+from ..investigations import record_investigation
 from .process import CheckResult, ProcessSpec, grade_process
 
 _HERE = Path(__file__).parent
@@ -191,6 +192,10 @@ async def run_one(
             hypothesis=getattr(findings, "hypothesis", "") or "",
             suspected_version=getattr(findings, "suspected_version", None),
             services=list(getattr(findings, "services", []) or []),
+            # What `correct` will mean for this row: "culprit" fixtures grade the
+            # blame, "inconclusive" ones grade the hedge. The governance gate
+            # only computes its curve over the former.
+            grading_mode=fixture.expect,
             path=store_path,
         )
         store.cal_label(
@@ -198,7 +203,20 @@ async def run_one(
             correct,
             score=1.0 if correct else 0.0,
             source="eval-harness",
+            grading_mode=fixture.expect,
             path=store_path,
+        )
+        # Also record the investigation, under the *same* id. The past-incident
+        # library is a JOIN of these two tables on run_id=fp, so a harness that
+        # writes only calibration can never make it non-empty however many runs
+        # it grades. `run_id` (not thread_id) is deliberate: they differ by two
+        # characters ("seed0" vs "s0"), and a JOIN across that gap fails silently.
+        record_investigation(
+            run_id,
+            fixture.resolved_alert(scenario_time),
+            {"answer": result.get("answer") or "", "findings": findings, "decisions": []},
+            path=store_path,
+            source="eval",
         )
     except Exception:  # calibration feedback is best-effort
         pass

@@ -1240,7 +1240,11 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
             from .runbook import _subst, incident_params
             from .signals.dq import dq_verdict
 
-            calib = compute_calibration(load_records())
+            # Only the grading modes whose `correct` means what the calibration
+            # math assumes — see settings.governance_calibration_modes.
+            calib = compute_calibration(
+                load_records(), modes=tuple(settings.governance_calibration_modes)
+            )
             decisions = propose_remediations(
                 [s.action for s in matched_rb.remediation],
                 findings.confidence,

@@ -133,6 +133,13 @@ class Settings(BaseSettings):
     # Of those, at least this many must be human/grader labels (source not
     # "remediation-verified/-failed"). Self-produced labels alone cannot unlock AUTO.
     governance_min_human_labeled_runs: int = 20
+    # Which `grading_mode`s may enter the calibration curve the gate reads. The
+    # ECE/overconfidence math assumes `correct=1` means "the claim stated at this
+    # confidence was right", and only `culprit` rows mean that: an `inconclusive`
+    # row's `correct` says "it hedged appropriately", which is a different
+    # question on the same column. Mixing them lets one mode's error cancel the
+    # other's. Rows with no recorded mode are excluded (fail-closed).
+    governance_calibration_modes: list[str] = ["culprit"]
 
     # --- Draft runbook synthesis (knowledge-loop §1 閉環二) ----------------
     # When an investigation is labeled correct=True and no active runbook matched

@@ -110,7 +110,13 @@ def decide(
     ):
         from . import store
 
-        human_labeled = store.cal_count_by_source(exclude_sources=_SELF_LABEL_SOURCES, path=path)
+        # Count over the same rows the curve is computed over — a floor counted
+        # on a wider set than the curve is not a floor.
+        human_labeled = store.cal_count_by_source(
+            exclude_sources=_SELF_LABEL_SOURCES,
+            modes=tuple(settings.governance_calibration_modes),
+            path=path,
+        )
     good, cal_note = _calibration_verdict(calib, human_labeled=human_labeled)
     dq_note = dq.get("note", "") if dq else "DQ not evaluated"
 

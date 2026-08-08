@@ -68,6 +68,56 @@ def test_empty():
     assert c["labeled"] == 0 and c["ece"] is None
 
 
+# ---- grading mode ----------------------------------------------------------
+
+
+def _rec_mode(conf, correct, mode):
+    return CalibrationRecord(
+        run_id="r", ts="t", confidence=conf, correct=correct, grading_mode=mode
+    )
+
+
+def test_mode_filter_excludes_other_modes_and_unknowns():
+    recs = [
+        _rec_mode(0.9, True, "culprit"),
+        _rec_mode(0.9, True, "inconclusive"),
+        _rec_mode(0.9, True, None),
+    ]
+    assert compute_calibration(recs)["labeled"] == 3  # no filter → everything
+    assert compute_calibration(recs, modes=("culprit",))["labeled"] == 1
+    # A row that never said which question it answers is not eligible.
+    assert compute_calibration(recs, modes=("culprit", "inconclusive"))["labeled"] == 2
+
+
+def test_mixing_modes_cancels_opposite_errors():
+    """The Day39 finding, pinned: one mode's underconfidence hides the other's
+    overconfidence when they are averaged into a single number."""
+    culprit = [_rec_mode(0.6, True, "culprit")] * 10  # says 0.6, always right
+    inconclusive = [_rec_mode(0.4, False, "inconclusive")] * 10  # says 0.4, never right
+
+    mixed = compute_calibration(culprit + inconclusive)
+    assert mixed["overconfidence"] == 0.0  # looks perfectly calibrated
+
+    only_culprit = compute_calibration(culprit + inconclusive, modes=("culprit",))
+    assert only_culprit["overconfidence"] == -0.4  # underconfident, and visible
+
+
+def test_hedging_rate_reports_inconclusive_rows_only():
+    recs = [
+        _rec_mode(0.1, True, "inconclusive"),
+        _rec_mode(0.7, False, "inconclusive"),
+        _rec_mode(0.9, True, "culprit"),
+        _rec_mode(0.5, None, "inconclusive"),  # unlabeled
+    ]
+    h = cal.hedging_rate(recs)
+    assert h["labeled"] == 2 and h["hedged"] == 1 and h["rate"] == 0.5
+    assert h["mean_confidence"] == 0.4
+
+
+def test_hedging_rate_empty():
+    assert cal.hedging_rate([])["rate"] is None
+
+
 # ---- verdict sources -------------------------------------------------------
 
 

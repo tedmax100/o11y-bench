@@ -91,7 +91,9 @@ def test_legacy_migration_idempotent(tmp_path, monkeypatch):
 # ---- past incidents for a chat question ------------------------------------
 
 
-def _seed_investigation(path, fp, service, alertname, summary, correct=True):
+def _seed_investigation(
+    path, fp, service, alertname, summary, correct=True, grading_mode=store.CULPRIT
+):
     import json
 
     store.init(path)
@@ -113,9 +115,11 @@ def _seed_investigation(path, fp, service, alertname, summary, correct=True):
         hypothesis="h",
         suspected_version=None,
         services=[service],
+        grading_mode=grading_mode,
         path=path,
     )
-    store.cal_label(fp, correct, score=1.0 if correct else 0.0, source="test", path=path)
+    if correct is not None:
+        store.cal_label(fp, correct, score=1.0 if correct else 0.0, source="test", path=path)
 
 
 def test_inv_query_similar_without_an_alertname_matches_any_investigation(tmp_path):
@@ -132,3 +136,49 @@ def test_inv_query_similar_still_ignores_runs_that_were_wrong(tmp_path):
     path = tmp_path / "aiops.db"
     _seed_investigation(path, "fp2", "order-service", "x", "guessed", correct=False)
     assert not store.inv_query_similar("order-service", path=path)
+
+
+def test_inv_query_similar_ignores_a_correctly_hedged_non_incident(tmp_path):
+    """`correct=1` on an inconclusive run means "it rightly blamed nobody".
+    Serving that as precedent would hand the agent a non-incident as a solved
+    case — the exact opposite of what the context is for."""
+    path = tmp_path / "aiops.db"
+    _seed_investigation(
+        path,
+        "fp3",
+        "user-service",
+        "x",
+        "nothing wrong here",
+        correct=True,
+        grading_mode=store.INCONCLUSIVE,
+    )
+    assert not store.inv_query_similar("user-service", path=path)
+
+
+def test_inv_query_similar_ignores_rows_of_unknown_grading_mode(tmp_path):
+    """This output goes into a prompt; unknown provenance fails closed."""
+    path = tmp_path / "aiops.db"
+    _seed_investigation(
+        path, "fp4", "api-gateway", "x", "who knows", correct=True, grading_mode=None
+    )
+    assert not store.inv_query_similar("api-gateway", path=path)
+
+
+def test_inv_query_similar_needs_both_tables(tmp_path):
+    """A calibration row with no investigation row retrieves nothing, however
+    well it was graded — the library is a JOIN, and the two tables have
+    different writers."""
+    path = tmp_path / "aiops.db"
+    store.cal_insert(
+        run_id="lonely",
+        ts="2026-08-06T00:00:00Z",
+        confidence=0.9,
+        summary="s",
+        hypothesis="h",
+        suspected_version=None,
+        services=["payment-service"],
+        grading_mode=store.CULPRIT,
+        path=path,
+    )
+    store.cal_label("lonely", True, score=1.0, source="eval-harness", path=path)
+    assert not store.inv_query_similar("payment-service", path=path)

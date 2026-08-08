@@ -11,7 +11,7 @@ from sse_starlette.sse import EventSourceResponse
 from . import action_requests, audit, breaker, execution
 from .agent import lifespan, stream_chat
 from .alerts import AlertProvisioningDisabled, AlertSpec, build_alert_rule, provision_alert
-from .calibration import label_run
+from .calibration import CULPRIT, label_run
 from .config import settings
 from .investigations import get_investigation, list_investigations
 from .traces import analyze_trace, get_trace, list_traces, stream_trace_chat
@@ -110,6 +110,9 @@ async def investigations_label(fp: str, req: LabelRequest):
         source="ui",
         error_dimension=req.error_dimension,
         correction_note=req.correction_note,
+        # A human pressing correct/wrong on an investigation is judging whether
+        # the blame was right — the one reading the calibration math assumes.
+        grading_mode=CULPRIT,
     )
     if not ok:
         raise HTTPException(status_code=404, detail=f"no calibration record for fingerprint {fp}")

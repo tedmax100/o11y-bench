@@ -8,15 +8,15 @@ date: 2026-07-24
 
 ## 前言
 
-這個系列橫跨 43 天、分兩段（Series 1 是 Day1-33，Series 2 是 Day34-43，日號續著編下去），走完你會得到三個層次的東西，由淺到深：
+這個系列橫跨 40 天、分兩段（Series 1 是 Day1-31，Series 2 是 Day32-40，日號續著編下去），走完你會得到三個層次的東西，由淺到深：
 
 **一套可以直接搬回團隊用的治理工程能力。** Series 1 的 Day1-13 走完，你手上會有：能講清楚 Operator CRD 在幹嘛的知識、一份可執行的 CI Gate workflow、一份新服務上線 checklist。這是最實際的產出——別人問「怎麼在我們團隊落地 OTel 治理」，你有真的跑過一遍、有截圖有 diff 的答案，不是轉述文件。
 
 **對「可觀測性資料要怎麼設計才能被 agent 用」這個問題,一個誠實而非行銷式的答案。** 這是這次系列真正的價值所在。Series 1 的 Day14-21 會親手證明「決策級遙測」在這個系統裡目前只做到哪一步——`context.py` 有 enrichment/correlation，但 projection 有沒有收斂成單一物件、有沒有 baseline、有沒有 confidence score，Day20-21 會逐項對照 CEL 的三個職責誠實打勾或留白，而不是照搬書上一個漂亮 JSON 範例就宣稱做到了。這種「概念 vs 實作現況」的落差本身，比任何完美案例都更有教學價值——因為讀者接下來要做的事，正是補上這個落差，這個系列等於幫他們畫好了地圖。這份誠實還有第二層：整個系列刻意分成兩段,而不是把「agent 能給建議」跟「agent 能自主執行、能自我學習」硬塞進同一段——這個分段本身,就是「概念 vs 現況」誠實態度的延伸,承認後者需要治理平面、校準機制都到位,不是一段就能誠實交代完的東西。
 
-**一套可重複驗證、不會退化的 agent 品質保證機制。** Series 1 Day24 把真實踩過的坑寫成 eval fixture，而 Day23 讓這件事變得更迫切：那份注入給 agent 的 catalog 把環境裡唯一那個事故的答案也寫了進去，所以在拿掉洩題之前，任何分數都不算數；Series 2 的 Day41 和 Day43 再把預算壓力下的 fast-path 幻覺、histogram bucket 假象值兩個坑也收進來。這代表系列結束後留下的不是一篇篇文章,而是一個 `eval/harness.py` 跑得動的回歸測試集。下次改 agent 邏輯,這些 fixture 會告訴你有沒有把舊坑踩回去——這是比「寫文章記錄教訓」更持久的資產。
+**一套可重複驗證、不會退化的 agent 品質保證機制。** Series 1 Day24 把真實踩過的坑寫成 eval fixture，而 Day23 讓這件事變得更迫切：那份注入給 agent 的 catalog 把環境裡唯一那個事故的答案也寫了進去，所以在拿掉洩題之前，任何分數都不算數；Series 2 的 Day39 和 Day40 再把預算壓力下的 fast-path 幻覺、histogram bucket 假象值兩個坑也收進來。這代表系列結束後留下的不是一篇篇文章,而是一個 `eval/harness.py` 跑得動的回歸測試集。下次改 agent 邏輯,這些 fixture 會告訴你有沒有把舊坑踩回去——這是比「寫文章記錄教訓」更持久的資產。
 
-如果要用一句話收斂:你會學到——治理(Operator/Weaver)、資料設計(Signal Plane/CEL)、agent 決策、evaluation 這四件事不是四個獨立主題,而是一條因果鏈:治理不好 → 資料不可信 → agent 決策依據是假的 → eval 分數低。Series 1 的 Day30 先畫一次「正向循環」的前半段(治理 → 拓撲/CEL → agent 建議),Series 2 的 Day43 把後半段(執行/治理平面 → 校準/SLO → 回饋治理與拓撲)接上去,合起來才是這整個系列真正要教的東西——不是「這裡有一堆很酷的技術」,而是「這些技術為什麼非得按這個順序疊起來不可」。這個因果鏈的直覺,才是 43 天寫完後最值錢、也最難從單篇文章學到的東西。
+如果要用一句話收斂:你會學到——治理(Operator/Weaver)、資料設計(Signal Plane/CEL)、agent 決策、evaluation 這四件事不是四個獨立主題,而是一條因果鏈:治理不好 → 資料不可信 → agent 決策依據是假的 → eval 分數低。Series 1 的 Day31 先畫一次「正向循環」的前半段(治理 → 拓撲/CEL → agent 建議),Series 2 的 Day40 把後半段(執行/治理平面 → 校準/SLO → 回饋治理與拓撲)接上去,合起來才是這整個系列真正要教的東西——不是「這裡有一堆很酷的技術」,而是「這些技術為什麼非得按這個順序疊起來不可」。這個因果鏈的直覺,才是 40 天寫完後最值錢、也最難從單篇文章學到的東西。
 
 ---
 
@@ -126,7 +126,7 @@ Day33 收尾時把三件事列成「結構性的、要下一個系列才處理�
 `actions.py`(118, **沒有自己的測試檔**)／`action_requests.py`(230, 9 測)／
 `governance.py`(181, 12 測)／`breaker.py`(107, 7 測)／`calibration.py`(288, 11 測)／
 `blast_radius.py`(223, 9 測)。
-（這一行的數字在 Day35 重量過一次，原本寫的 1199 行／362 測／governance 15 測／
+（這一行的數字在 Day33 重量過一次，原本寫的 1199 行／362 測／governance 15 測／
 blast_radius 14 測都不對，已改成實測值：`wc -l`、`grep -c "^def test_"`、
 `pytest --collect-only -q`。全套 354 是本機少了 `respx` 因而沒收進 `test_rubric.py`
 的數字。）
@@ -134,7 +134,7 @@ blast_radius 14 測都不對，已改成實測值：`wc -l`、`grep -c "^def tes
 有標註 endpoint、SQLite 有專屬 table 加 migration，`governance._calibration_verdict()`
 會算 overconfidence 並用它擋 AUTO。
 
-原本 Series 2 那天（現在的 Day40）寫「過去案例注入／investigation→draft runbook 合成／runbook feedback
+原本 Series 2 那天（現在的 Day38）寫「過去案例注入／investigation→draft runbook 合成／runbook feedback
 這三個閉環設計已寫好、尚未實作」，三句都不對：`_inject_past_incidents` 在 `agent.py`
 有三個呼叫點、`draft_runbook.py` 255 行而且 `draft_runbook_enabled` 預設 True、
 `runbook_feedback` 表在 `execution.py` 有三個寫入點外加一支健康報告 endpoint。
@@ -150,11 +150,11 @@ o11y-bench 現成的 grader 是合格的非自我標註來源，`governance_min_
 
 於是 Series 2 的重心整個換掉：**不是蓋出執行/治理平面，是讓已經蓋好的防護網第一次
 真的被跑過、被證明會擋。** 天數維持 10 天，但每一天的動詞從「介紹這支檔案」變成
-「讓它第一次拿到真實輸入」。排程風險也跟著換了位置——不在工程，在 LLM 變異：Day33
+「讓它第一次拿到真實輸入」。排程風險也跟著換了位置——不在工程，在 LLM 變異：Day31
 量到同一份程式碼連跑三次總分在 2.5–3.5 之間跳，所以校準曲線那天大概只能誠實標成
 「樣本數不足，先看形狀」。
 
-### v9：Series 2 續編號成 Day34-43，並跟已寫的 Day34-35 對帳
+### v9：Series 2 續編號（當時是 Day34-43），並跟已寫的頭兩天對帳
 
 兩件事。
 
@@ -165,7 +165,7 @@ DayNN 從此都只有一個意思。
 
 **二、跟已寫的 Day34-35 對帳。** 三處就地更正（已改在 v8 那段裡）：
 
-| v8 原本寫的 | Day35 實測 |
+| v8 原本寫的 | Day33 實測 |
 |---|---|
 | 六支檔案共 1199 行 | **1147 行** |
 | `governance.py` 15 測、`blast_radius.py` 14 測 | **12 測**、**9 測** |
@@ -174,17 +174,52 @@ DayNN 從此都只有一個意思。
 另外三個 v8 沒查到的，會影響後面幾天的排法：
 
 1. **`actions.py` 沒有自己的測試檔。** kill switch 那條「關著要丟 `ActionDisabled`」的
-   路徑沒有直接測試，而那正是 Day41 要打開的東西。
+   路徑沒有直接測試，而那正是 Day39 要打開的東西。
 2. **治理平面不是冷的。** `governance.py` 被 `agent.py` 與 `action_requests.py`
    兩邊 import，提案那條路一直是活的；冷的只有 `execution.py`／`breaker.py`（只有
    `main.py` 的 endpoint 進得去）。但治理只在 `if matched_rb and matched_rb.remediation`
    底下跑，所以**整個平面的唯一入口是一次 alertname 字串比對**，比不中就整格安靜消失。
 3. **plugin 上沒有 Approve 按鈕。** 核准只存在成 `POST /actions/requests/{id}/approve`，
-   `InvestigationsPage.tsx` 只把提案列出來。Day41 跑完整鏈路時，人按 approve 那一步
+   `InvestigationsPage.tsx` 只把提案列出來。Day39 跑完整鏈路時，人按 approve 那一步
    目前得用 curl，或者那天要順手把按鈕接上去。
 
-Day35 還修掉 Day14 那支 `importgraph.py` 的一個盲點：它看不到 `from . import x`，
+Day33 還修掉 Day14 那支 `importgraph.py` 的一個盲點：它看不到 `from . import x`，
 在 `app/` 上會多報三個假孤兒。`app/signals/` 沒人用那種寫法，所以 Day14 那張圖不受影響。
+
+### v10：壓縮成 40 天（合併兩處），Day34-43 全體往前挪兩天
+
+**動機。** 目標是整個系列在 40 天內收完，而 v9 排出來是 43 天。從 Day14 之後找可合併的地方，
+結論是兩處，剛好省下三天，而且都不是硬擠的。
+
+**一、原 Day30+31+32 合併成新的 Day30。** 這三篇是全系列最短的三篇（125／146／102 行），
+而且文本自己就承認它們是一條線（原 Day32 開頭寫著「Day28 確認了…Day30 補上…今天是這條線的
+最後一段」）。三篇講的是同一件事的三個層次：使用者從哪個門進來（入口）、agent 輸出的東西能不能
+被操作（格式）、那一次回答花了多少（帳單）。合併後 234 行，跟 Day19（408）、Day23（379）比
+還算短。程式碼那邊三個資料夾也併成 `day30/`（`chat_probe.py`／`chat_turn.py`／`render_probe.py`／
+`trace_tree.py` 四支腳本共存）。
+
+**二、原 Day41+42 合併成新的 Day39。** 「把 `actions_enabled` 打開」跟「刻意讓每一道門紅一次」
+本來就該同一天：開關打開這件事，只有在同一天證明防護網會攔你才是可信的，拆兩天會讓第一天懸在半空。
+
+**連帶影響。**
+
+| 原 | 現 |
+| --- | --- |
+| Day1-29 | 不動 |
+| Day30+31+32 | **Day30**（合併） |
+| Day33（Series 1 回顧日） | Day31 |
+| Day34-40 | Day32-38 |
+| Day41+42 | **Day39**（合併） |
+| Day43 | Day40 |
+
+Series 1 從 33 天變 **31 天**（仍過得了鐵人賽 30 天的門檻，可以獨立完賽），
+Series 2 從 10 天變 **9 天**，總天數 43→**40 天**。
+
+**考慮過但沒採用的方案。** 合併 Day15+16（拓撲那兩篇）同樣自然，但改號會從 Day17 一路推到底，
+等於動 24 篇文章加 24 個資料夾，省的天數一樣、成本差三倍。這也再一次證明 CLAUDE.md 那條
+「交叉引用不要寫死日號」是對的：這次實際要手改的交叉引用不到五處，其餘全是天數敘述
+（「三十三天」→「三十一天」、「這十天」→「這九天」）。
+
 
 ---
 
@@ -206,7 +241,7 @@ Day35 還修掉 Day14 那支 `importgraph.py` 的一個盲點：它看不到 `fr
 
 ---
 
-# Series 1（33 天）：OTel 治理 + 讓 AI agent 能推理的決策級事件
+# Series 1（31 天）：OTel 治理 + 讓 AI agent 能推理的決策級事件
 
 ## 第一階段：平台工程視角的治理（Day1-13）
 
@@ -247,10 +282,8 @@ Day35 還修掉 Day14 那支 `importgraph.py` 的一個盲點：它看不到 `fr
 - **Day27**（已寫）下一步建議要連「多大」一起講——`blast_radius.py` 本身沒問題（八個提案跑一輪，ALLOW/REFUSE 都對，並用 generation/resourceVersion 前後比對證明六次乾跑真的沒動任何東西），問題全在它被放的位置。**兩個真正的發現**：(1) `footprint at proposal time: None`——範圍是在人按下 Approve 之後、進執行管線才算的，等於唯一需要這個數字的人拿不到；改成提案當下就跑一次乾跑，把 footprint ＋ policy 判決存進 ActionRequest，執行前那次保留（職責不同：提案那次給人看、執行那次防 TOCTOU）。(2) **`PaymentDeclineRateHigh` 比不到 runbook `payment-decline-rate-high`，整條「診斷→建議」被一次字串比對安靜關掉**（0 decisions、0 action requests；Day23 看到 `runbook: None` 時我以為只是告警名字亂取）；加上正規化 fallback 比對，但比中要留 warning，label 對不上也要留 warning。第三個小坑：scale 到 0 的拒絕理由被 singleton 規則搶走，會把人推去試 `replicas=1`（一樣被拒、理由才是真的 singleton），改成歸零有自己的理由。未做：plugin 卡片還沒渲染範圍、只有 undo/scale 兩種動作有乾跑（沒乾跑的動作直接跳過這道門）、量尺只有 affected pods（沒讀拓撲的 tier/journey）、正規化可能把兩個真的不同的告警比在一起。
 - **Day28**（已寫）**大綱裡「決策不可回放」的預設結論是錯的**——`agent.py` 沒有呼叫 `audit.record` 是真的，但記錄推理過程的根本不是那一層。第一次跑探測 Tempo 是空的，差點就照原本結論收工；停下來才發現**這系列前面每一支探測腳本都是在 host 上直接呼叫 `run_headless()`，沒經過 `opentelemetry-instrument`，所以一個 span 都沒有**。改從叢集裡被 instrument 的服務走 `/webhook/alert` 進去，一次調查產生 46 個 span（fastapi 4／httpx 12／langchain 30），`opentelemetry-instrumentation-langchain` 把每個 LangGraph node、每次工具呼叫（含 `gen_ai.tool.call.arguments`／`result`）、每次模型呼叫（含 `gen_ai.system_instructions`／`input.messages`／token 用量）都變成 span——Day22 那張圖等於有了逐格錄影。**真正缺的只是一個欄位**：investigation row 跟 audit 都沒有 trace id，要回放得先去 log 撈。加了 `current_trace_id()`（拿不到回 None，不拋例外），investigation 多一個 `trace_id`、audit 寫進 `detail`。順帶在正式路徑上看到 Day26 的守門真的擋下一次幻覺 trace ID。成本首次可見：一次調查 26,123 tokens。誠實記的代價：那條 trace 帶著完整 system prompt 跟每則訊息，可回放等於可外洩（呼應 Day7 的 PII）。未做：plugin 沒畫出連結、Tempo 1h 保留期讓昨天的推理過程今天就沒了、audit 與 trace 的職責分界只寫在腦子裡、沒量 instrumentation 開銷。
 - **Day29**（已寫，動手日）整條鏈跑一次，六段：治理 checklist（13/13）→ 意圖編成 alert rule → Signal Plane 編譯＋洩題掃描 →告警進去出診斷（信心 0.7、帶 `trace_id`）→ 提案帶 footprint（2 pods、rev 25→24、policy_ok）→ 固定資料上打分。**第一次跑是 3 ok / 3 failed，三個紅燈沒有一個是主功能壞掉**：(1) 我把 JSON 解析寫成 bash 裡的 `python3 -c`，跳脫疊三層 → 拆成 `report.py`；(2) **洩題掃描誤判**——它掃到 runbook 唯讀診斷「查出來」的 `v2.5.0`，也就是說這個檢查只有在事故沒發生時才會綠，而它的用途正是在有事故的環境上驗量尺；改成只掃「人寫的」區塊，量出來的標 `read`；(3) `capability snapshot failed` 其實是「這個服務在這份資料裡沒有 inventory」，`capability_for_services()` 照設計回 None 而 `SystemMessage(content=None)` 才炸——訊息描述技術現象而不是實際情況，跟 Day25/Day27 同一種病。**兩個環境不能同時存在也不等價**：stack image 自己佔 9090/3100/3200 且沒有 k8s API，同樣三個 fixture 在活叢集是 2/2、1/2、2/2，在固定資料是 1/1、0/1、0/1——fixture 是跟著它被寫出來的環境長的。誠實記：叢集裡的 image 是舊的，這條鏈證明的是程式碼不是部署。未做：`-n 1` 只有一顆種子、固定資料上兩個 fixture 仍紅、`e2e.sh` 沒進 CI。
-- **Day30**（已寫）**使用者這一側的路徑**——前面每一天的驗證都是從告警那頭進去的（`/webhook/alert`／`run_headless`），而產品要用的樣子是人在 Grafana 打字。並排列出兩條路徑的清單才看到：chat 有意圖閘門／服務解析／clarify／面板，但**沒有 RCA playbook、沒有 findings（信心分數）、沒有過去事故、沒有 investigation 紀錄與 `trace_id`**——原因只是 `_RCA_PLAYBOOK` 這個常數只有 `_alert_to_prompt()` 一個呼叫點。補上三件事：investigate 模式注入同一份 playbook（放 system message，不是黏在問句後面）、回合結束抽 findings 並發 `findings` 事件＋存一列（`source=chat`）、過去事故查詢的 alertname 改成可選。前端也接了三處：對話下方的信心橫幅、investigation 列表的 `chat` 標記與「看它怎麼想的」連結（Trace Explorer 吃 `?trace=`）、提案列的影響範圍。兩個坑都跟「話對誰講」有關：英文指令黏在中文問句後面會讓模型換語言；假設樹在告警路徑沒人看、在 chat 會整棵印出來，要明說「內部想，不要印」。誠實記：信心分數還是模型自講的（同一題跑出過 1.0，而它自己寫『沒找反證』）。
-- **Day31**（已寫）**答案怎麼變成面板與那顆按鈕**——契約有兩端，今天兩端都斷過。(1) `/alerts/provision` 第一次真的按下去拿到 `invalid alert rule: folder does not exist`，而那個 folder 是 `AlertSpec` 的預設值選的、使用者從沒看過，改成送規則前先確認 folder、沒有就建（409 也算成功）；真的寫進 Grafana（uid `bfudlf17fvw8wb`，帶 `X-Disable-Provenance` 才能在 UI 編輯）。(2) 問「幫我設一個告警」拿到一份**完全正確的 Prometheus YAML 規則**，plugin 只認 ```alert``` JSON，所以卡片不出現、使用者得自己複製貼上；在 prompt 明寫禁止項之後 JSON 對了但 fence 變成 ```json，卡片還是不出現 → 接收端改成寬容：```json 只要驗得成 AlertSpec 就當提案。**只靠 prompt 的契約是機率性的，發送端要求＋接收端寬容兩件事都要做。** 另記：這個解析在 plugin(TS) 與服務端(Python) 有兩份，跨語言收斂不了，只能讓其中一份有測試並互相標註。還講了面板的設計：面板不是把 agent 查到的資料畫出來，是把它用的查詢再跑一次（這也是 Day25 敢把 72KB 壓成 5KB 的前提）。
-- **Day32**（已寫）**Trace Explorer：看它怎麼想的，以及那一次多少錢**——`/traces/{id}` 把 OTLP-JSON 轉成節點樹，一次 chat 調查攤開來是 55 spans／5 次模型呼叫／1 次工具呼叫／18,070 tokens／$0.001964。四個以前只能猜的數字：一次「調查」其實是五次模型呼叫（意圖閘門、兩次推理、findings 抽取、後續問題）；錢有 53% 花在第一次推理的**輸入**（10,039 tokens，也就是前二十天做的 context）；**慢的是想不是查**（tools 39ms vs 每次思考 1.5 秒）；Day30 加的 findings 抽取是看得見的 15%。改動：價格表加 `PRICES_AS_OF`、rollup 附 `cost_basis`——沒有人對帳的價格表就是這系列講過很多次的『宣告會慢慢變成謊話』，沒辦法讓它變準，至少讓它不假裝準（呼應 Day20 溯源）。未做：成本沒進指標、span 全取樣（配 Tempo 1h 保留期＝昨天的推理今天就沒了）、Trace Explorer 的 AI 分析沒被任何 rubric 檢查。
-- **Day33**（已寫，回顧日）**那個數字交出來了，而且是倒退的**：同一小時、同一座 Day1 stack、同一支 grader（`bench/grade.py` 直接 import 沒改），Day1 那隻 5.5/9（當時記錄 4.5/9）、今天這隻連跑三次是 3.5／2.5／3.5、拿掉治理資產 2.5/9——同一份程式碼跑三次總分就在 2.5-3.5 之間跳，logs 那欄 1.0→0.0，所以數字只能當訊號。**倒退的原因是治理資產屬於另一座環境**：它去查 `http_server_requests_total`、用 `service_name`、用 `span.http.request.method`，在 demo-services 全對、在 Day1 那座 stack 全錯。今天這隻犯的錯跟 Day1 那隻是同一種（帶著寫死的環境知識自信地查不存在的東西），差別只在誰的寫死知識剛好對。所以結論不是「治理沒用」而是**治理是環境的函數**：對的環境是資產、錯的環境是負債、完全沒有更差。三段照計畫走：換到什麼（四項都不是「更聰明」而是「更容易被檢查」）；價值講人的反應（新服務上線從讀十幾篇文件變成跑一支腳本；值班的人不需要相信它、可以查它）；還缺什麼分兩類（能補沒補的八項 vs 結構性三項：信心分數沒校準、授權層級沒走過、回饋迴圈沒閉合，四支檔案都在 repo 裡但刻意不展開）。`day33/rerun_bench.py` 支援 `--which today|baseline` 與 `--no-governance`。
+- **Day30**（已寫）**使用者到底拿到了什麼：入口、格式、帳單**——前面每一天的驗證都是從告警那頭進去的（`/webhook/alert`／`run_headless`），而產品要用的樣子是人在 Grafana 打字。這天從使用者那一側看回來，分三段。**(1) 入口**：並排列出兩條路徑的清單才看到，chat 有意圖閘門／服務解析／clarify／面板，但**沒有 RCA playbook、沒有 findings（信心分數）、沒有過去事故、沒有 investigation 紀錄與 `trace_id`**，原因只是 `_RCA_PLAYBOOK` 這個常數只有 `_alert_to_prompt()` 一個呼叫點。補上三件事：investigate 模式注入同一份 playbook（放 system message，不是黏在問句後面）、回合結束抽 findings 並存一列（`source=chat`）、過去事故查詢的 alertname 改成可選。兩個坑都跟「話對誰講」有關：英文指令黏在中文問句後面會讓模型換語言；假設樹在告警路徑沒人看、在 chat 會整棵印出來，要明說「內部想，不要印」。**(2) 格式**：契約兩端都斷過。`/alerts/provision` 第一次按下去拿到 `folder does not exist`，而那個 folder 是 `AlertSpec` 的預設值選的、使用者從沒看過 → 送規則前先確認 folder、沒有就建（409 也算成功）；問「幫我設一個告警」拿到一份**完全正確的 Prometheus YAML 規則**，plugin 只認 ```alert``` JSON，在 prompt 明寫禁止項之後 JSON 對了但 fence 變成 ```json → 接收端改成寬容。**只靠 prompt 的契約是機率性的，發送端要求＋接收端寬容兩件事都要做。** 另記：這個解析在 plugin(TS) 與服務端(Python) 有兩份，跨語言收斂不了。還講了面板的設計：面板不是把 agent 查到的資料畫出來，是把它用的查詢再跑一次（這也是 Day25 敢把 72KB 壓成 5KB 的前提）。**(3) 帳單**：`/traces/{id}` 把 OTLP-JSON 轉成節點樹，一次 chat 調查攤開來是 55 spans／5 次模型呼叫／1 次工具呼叫／18,070 tokens／$0.001964。四個以前只能猜的數字：一次「調查」其實是五次模型呼叫；錢有 53% 花在第一次推理的**輸入**（10,039 tokens，也就是前二十天做的 context）；**慢的是想不是查**（tools 39ms vs 每次思考 1.5 秒）；前面補的 findings 抽取是看得見的 15%。價格表加 `PRICES_AS_OF`、rollup 附 `cost_basis`——沒辦法讓它變準，至少讓它不假裝準（呼應 Day20 溯源）。誠實記：信心分數還是模型自講的（同一題跑出過 1.0，而它自己寫『沒找反證』）。未做：成本沒進指標、span 全取樣（配 Tempo 1h 保留期＝昨天的推理今天就沒了）、兩份 parser 還是兩份。
+- **Day31**（已寫，回顧日）**那個數字交出來了，而且是倒退的**：同一小時、同一座 Day1 stack、同一支 grader（`bench/grade.py` 直接 import 沒改），Day1 那隻 5.5/9（當時記錄 4.5/9）、今天這隻連跑三次是 3.5／2.5／3.5、拿掉治理資產 2.5/9——同一份程式碼跑三次總分就在 2.5-3.5 之間跳，logs 那欄 1.0→0.0，所以數字只能當訊號。**倒退的原因是治理資產屬於另一座環境**：它去查 `http_server_requests_total`、用 `service_name`、用 `span.http.request.method`，在 demo-services 全對、在 Day1 那座 stack 全錯。今天這隻犯的錯跟 Day1 那隻是同一種（帶著寫死的環境知識自信地查不存在的東西），差別只在誰的寫死知識剛好對。所以結論不是「治理沒用」而是**治理是環境的函數**：對的環境是資產、錯的環境是負債、完全沒有更差。三段照計畫走：換到什麼（四項都不是「更聰明」而是「更容易被檢查」）；價值講人的反應（新服務上線從讀十幾篇文件變成跑一支腳本；值班的人不需要相信它、可以查它）；還缺什麼分兩類（能補沒補的八項 vs 結構性三項：信心分數沒校準、授權層級沒走過、回饋迴圈沒閉合，四支檔案都在 repo 裡但刻意不展開）。`day31/rerun_bench.py` 支援 `--which today|baseline` 與 `--no-governance`。
   1. **換到了什麼。** 把 Day13 那張「Day1 的失敗／現在有什麼／還缺什麼」的表擴到整個 Series 1。**這天要交出那個數字**：Day1 開場是 4.5/9，重跑同一組題目（用修好洩題之後的量尺）現在是多少。這筆帳 Day19、Day21、Day23 各記了一次，是全系列唯一能閉合自己迴圈的地方，沒有它讀者會覺得講了三十天治理卻從沒證明它有用。
   2. **價值講人的反應，不是技術清單。** 照 CLAUDE.md 那條小結原則：「新服務上線從讀十幾篇文章變成跑一支腳本」比「達成了資料一致性治理」有份量。
   3. **還缺什麼，這段可以寫滿。** 素材不用現想，前面每一天的「今天沒做的事」加起來就是。分兩類：**能補只是沒補的**（`regress.sh` 沒進 CI、live-check 沒接真服務、17 個 `required` 從沒對帳、Day13 checklist 那兩個洞、`eval/fixtures.yaml` 只有兩個 case、MCP 分層要靠一個已 deprecated 的 flag、`unjudgeable` 只講洞沒補洞、correlation 沒動）；**結構性的、要下一個系列才處理的**（agent 自己的決策路徑不可回放——`audit.record` 在 `execution.py` 裡 12 次、`agent.py` 零次；以及 `governance.py`／`calibration.py`／`breaker.py`／`action_requests.py` 這四支檔案都已經在 repo 裡，但要先有校準跟授權層級才講得清楚）。**「檔案已經存在但刻意不展開」比空口預告 Series 2 有說服力得多。**
@@ -258,38 +291,37 @@ Day35 還修掉 Day14 那支 `importgraph.py` 的一個盲點：它看不到 `fr
 
 ---
 
-# Series 2（10 天，Day34-43）：治理成熟度與學習迴圈——建議之後呢？
+# Series 2（9 天，Day32-40）：治理成熟度與學習迴圈——建議之後呢？
 
 這個系列的前提：Series 1 做出的是「唯讀建議」，這裡處理三件事——這個建議能不能被授權自主執行（治理平面）、agent 說的信心準不準（校準）、系統能不能從過去的對錯中變聰明（CLL）。這裡才真正需要 ARE 的四平面架構語言，因為這正是它要解決的問題。
 
 **但要先講清楚這個系列不是什麼**（見 v8）。那六支檔案都已經在 repo 裡而且有測試，所以這十天不是一個「把執行平面蓋出來」的施工日誌。它們共同的狀態是**寫好了、測試過了、但從來沒有拿到過真實輸入**：`actions_enabled` 是 `False`、`calibration` 表裡沒有足夠的標註、過去事故庫因此是空的。所以這十天的動詞是「跑跑看」跟「證明它會擋」，不是「做出來」。這跟 Series 1 那條「該紅的還會不會紅」是同一個標準，只是對象從 registry 換成了防護網。
 
-**日號續著 Series 1 編下去**（Day34-43），文章檔案就是 `day34.md`–`day43.md`，跟 Series 1 平鋪在同一層。這是為了讓「Day5」永遠只指一件事——outline 前面提到的所有 DayNN 一律是 Series 1 的日號。
+**日號續著 Series 1 編下去**（Day32-40），文章檔案就是 `day32.md`–`day40.md`，跟 Series 1 平鋪在同一層。這是為了讓「Day5」永遠只指一件事——outline 前面提到的所有 DayNN 一律是 Series 1 的日號。
 
-整個系列的樞紐在 Day38：**沒有標註，後面五天全部做不了。** 排這張表的時候要把它當成關鍵路徑，而不是其中一天。
+整個系列的樞紐在 Day36：**沒有標註，後面五天全部做不了。** 排這張表的時候要把它當成關鍵路徑，而不是其中一天。
 
-- **Day34**（已寫）概念日（獨立一天，純結構、不碰程式碼）：ch06 代理式可靠性架構全貌——這天的目的是先把書的結構性語言講完整，讓 Day35 之後的每一天都是「填一格」而不是「邊做邊定義新名詞」。建議拆成五個段落，剛好對應五張圖：
+- **Day32**（已寫）概念日（獨立一天，純結構、不碰程式碼）：ch06 代理式可靠性架構全貌——這天的目的是先把書的結構性語言講完整，讓 Day33 之後的每一天都是「填一格」而不是「邊做邊定義新名詞」。建議拆成五個段落，剛好對應五張圖：
   1. **四平面總覽圖**——Signal/Reasoning/Execution/Governance 四個方框＋箭頭，標出 ARE §4.2 的「正交性」原則（失效不自動波及）；同時把 Series 1 已經蓋好的部分（Signal=Series1 Phase2 訊號平面、Reasoning=Series1 Day19-26 推理平面的雛形）標成「已完成」。Execution/Governance **不要標成「這系列要蓋」**——那兩格的程式碼也已經在 repo 裡了（見 v8），要標的是第三種狀態：「蓋好了，但沒有人按過開關」。這張圖同時是總覽也是進度條，而這個系列要推進的是那個第三種顏色。
-  2. **平面間的契約介面圖**——不畫平面內部細節，只畫「平面之間傳的是什麼格式」：訊號平面→推理平面傳的是**訊號契約**（§4.3：name/version/owner/支援決策/新鮮度保證/最小觀測視窗/信心門檻/排除條件/schema，對應 Series 1 的 `signals/contract.py`）；推理平面→執行平面傳的是**候選行動**（§4.4：proposal id/觸發訊號/領先假設/排序後的行動選項/意圖對齊/風險/信心/所需授權層級，對應 Series 1 Day19-27 `agent.py`/`investigations.py`/`rubric.py` 的輸出，這裡第一次把書的完整詞彙貼回那幾天做出來的東西）；執行平面的行動本身是**行動契約**（§4.5：意圖/前置條件/執行邏輯/爆炸半徑限制/自動逆轉/成功標準/結果訊號，對應這系列 Day35-36 要拆的 `actions.py`/`blast_radius.py`/`action_requests.py`）。三個契約畫成三個介面框，箭頭方向就是資料流方向。
+  2. **平面間的契約介面圖**——不畫平面內部細節，只畫「平面之間傳的是什麼格式」：訊號平面→推理平面傳的是**訊號契約**（§4.3：name/version/owner/支援決策/新鮮度保證/最小觀測視窗/信心門檻/排除條件/schema，對應 Series 1 的 `signals/contract.py`）；推理平面→執行平面傳的是**候選行動**（§4.4：proposal id/觸發訊號/領先假設/排序後的行動選項/意圖對齊/風險/信心/所需授權層級，對應 Series 1 Day19-27 `agent.py`/`investigations.py`/`rubric.py` 的輸出，這裡第一次把書的完整詞彙貼回那幾天做出來的東西）；執行平面的行動本身是**行動契約**（§4.5：意圖/前置條件/執行邏輯/爆炸半徑限制/自動逆轉/成功標準/結果訊號，對應這系列 Day33-34 要拆的 `actions.py`/`blast_radius.py`/`action_requests.py`）。三個契約畫成三個介面框，箭頭方向就是資料流方向。
   3. **授權層級與人在迴圈圖**——治理平面的分級授權（唯讀觀察→提議→可逆執行→有邊界不可逆→人類核准，§4.6）畫成一條光譜；旁邊疊一張人在迴圈的三種模式圖（§4.7：迴圈之上＝定義意圖與政策，週-月節奏；迴圈之中＝特定決策被治理平面路由給人審查；迴圈之上監看＝透過 SLO 與稽核軌跡監督整體運作），誠實註明「這系列的 repo 目前只有『迴圈之上監看』被 eval/harness.py 撐起來一部分，『迴圈之中』的審查介面還是設計層次」。
-  4. **參考架構時間軸圖**——書裡 §4.8 用一個結帳服務延遲事件走了一次 t=15s 訊號偵測→t=18s 推理提案→t=22s 治理核准→t=23s 執行實施→t=180s 結果驗證的完整時間軸。這裡不用書的案例，改用這個 repo 自己的一個真實/半真實事件（例如把「2/9 分事件」或某個 payment 相關 bench task 改編成同樣節奏的假設性時間軸），畫一條時間軸，每個時間點標上四平面裡對應哪一支檔案「應該」被觸發——並誠實加註：這是示範性重演，不是 repo 目前真的自動跑得動的時間軸，因為 Day35-36 才要真正把執行/治理平面接上去。
-  5. **成熟度定位圖（預告）**——畫一次 L1-L5 的階梯（§4.9），在階梯上標出這個 repo 現在大概卡在哪一級（多半是 L2：訊號標準化、有諮詢式建議，但還沒有被授權的自主寫入），細節留給 Day42 展開，這裡只是先讓讀者知道「後面幾天在往上爬哪一段階梯」。
+  4. **參考架構時間軸圖**——書裡 §4.8 用一個結帳服務延遲事件走了一次 t=15s 訊號偵測→t=18s 推理提案→t=22s 治理核准→t=23s 執行實施→t=180s 結果驗證的完整時間軸。這裡不用書的案例，改用這個 repo 自己的一個真實/半真實事件（例如把「2/9 分事件」或某個 payment 相關 bench task 改編成同樣節奏的假設性時間軸），畫一條時間軸，每個時間點標上四平面裡對應哪一支檔案「應該」被觸發——並誠實加註：這是示範性重演，不是 repo 目前真的自動跑得動的時間軸，因為 Day33-34 才要真正把執行/治理平面接上去。
+  5. **成熟度定位圖（預告）**——畫一次 L1-L5 的階梯（§4.9），在階梯上標出這個 repo 現在大概卡在哪一級（多半是 L2：訊號標準化、有諮詢式建議，但還沒有被授權的自主寫入），細節留給 Day40 展開，這裡只是先讓讀者知道「後面幾天在往上爬哪一段階梯」。
 
-  這五段講完，Day35 開始就可以直接說「現在來實作契約介面圖裡的第三個框」，不用重新鋪陳。
-- **Day35**（已寫，動手日）先讀現況，不要蓋新東西——原計畫是「沿用 Day14 那支 `importgraph.py` 把六支檔案的呼叫關係畫出來」，實際做出來多了一層：**那支工具本身有盲點**。它只認得 `from .mod import Name`，遇到 `from . import store`（這個 codebase 有 16 處）會把 `module=None` 轉成空字串然後丟掉整條邊，於是在 `app/` 上多報了三個假孤兒（`store`／`breaker`／`execution`）。`app/signals/` 沒人用那種寫法，所以 Day14 那張圖是對的，「工具在它被寫出來的資料夾上是對的，換一個資料夾就開始漏，而且漏的時候不報錯」正好是 Day33「治理是環境的函數」換了一個對象。修完（加 `--focus` 一次讀一個平面）之後孤兒剩 `main` 一個。**兩個修正昨天說法的發現**：(1) 治理平面不是冷的，`governance.py` 有 `agent`／`action_requests` 兩個 importer，提案那條路一直是活的，冷的只有 `execution`／`breaker`（只有 `main.py` 的 endpoint 進得去），所以「沒有人按過的開關」要精確成「提案通、提案之後那段斷」；(2) 治理只在 `if matched_rb and matched_rb.remediation` 底下跑，**整個平面的唯一入口是一次 alertname 字串比對**，比不中就整格從圖上消失而且沒有任何地方會說「治理沒跑」，Day27 那個 `runbook: None` 當時被我當成命名問題。逐條讀 `actions.py` 的註冊表設計（typed 註冊、兩個風險旗標是給治理讀的、`impl` 仍是 `None`、kill switch 長在 `registry.execute()` 裡而不是呼叫端），並發現 `actions.py` 沒有自己的測試檔。平台工程：拆出三個不同擁有者（行動性質與總開關屬平台團隊，「某服務願意讓 agent 自動做到哪一級」該屬服務團隊但 repo 裡沒有地方寫）。未做：一次治理判斷都沒真的跑、`decisions = []` 分不出「沒行動可提」與「沒比中 runbook」、`actions.py` 測試沒補、importgraph 只看 import 看不到呼叫。
-- **Day36**（已寫，動手日）`action_requests.py` 狀態機——13 個 `Status` 畫一次轉移圖（7 個標著 `(7b-4+)` 還沒走到），講 `ar_transition()` 那句 `UPDATE ... WHERE request_id=? AND status=?` 為什麼是安全的關鍵。`probe_lifecycle.py`（暫存 SQLite ＋真模組，無 mock 無叢集無 LLM）撞四條現有 9 條測試沒走過的邊。**唯一的好消息是 CAS**：8 個執行緒同時 approve，恰好 1 個贏，連跑三次贏家隨機但數量恆為 1（現有測試是單執行緒依序呼叫，只證明意圖沒證明機制）。**三個發現骨架相同——這個狀態機只有在有人按的時候才會動，時間本身不會讓任何一列前進**：(1) `reject()` 沒有 TTL 檢查而 `approve()` 有，同樣過期的兩列一個變 `expired` 留下原因、一個變 `rejected` 記上那個人，稽核軌跡上是兩個不同的故事；(2) `_expire_if_stale()` 全專案只有 `approve()` 一個呼叫點，所以沒人按的提案會用 `proposed` 的身分留在清單與 plugin 頁面上，值班的人早上看到的是七小時前的世界算出來的建議而畫面不會說；(3) `executing` 沒有回收機制，認領後 pod 被砍那列就永遠停在那，executor 找 `approved`、`approve()` 找 `proposed`，兩邊都碰不到它。平台工程：過期只在按下去那刻才算，成本就落在資訊最少的值班者身上；409 那句 `missing, expired, or already decided` 把三種完全不同的原因擠成一句。未做：三個洞只量不補、探測腳本沒有斷言也沒進 `tests/`、沒撞 `execution.py` 那一側、併發只測單 process。
-- **Day37**（動手日）`governance.py` 的授權判斷逐條讀——irreversible→ESCALATE、`confidence < low`→ESCALATE、high 但 `requires_approval`→PROPOSE、calibration unproven→降級 PROPOSE。重點放在 `_calibration_verdict()` 那兩道門：`governance_min_labeled_runs = 20` 是總標註數，`governance_min_human_labeled_runs = 20` 另外要求其中的非自我標註數，而 `_SELF_LABEL_SOURCES` 只排除 `remediation-verified`／`remediation-failed`。**「自己說自己修好了」不能解鎖自主權**，這是 ARE §6.2 constraint 1 最字面的一行程式碼。這天結束時要能講出一句話：現在按下去會發生什麼——答案是 PROPOSE，因為標註數是 0。
-- **Day38**（動手日，**整個系列的關鍵路徑**）把 grader 接成標註來源，產出第一批非自我標註——`label_run` 目前有三個入口（`main.py` 的 endpoint、`calibration.py` 的 CLI、`execution.py` 的自我驗證），但沒有一條是批次的。這天做的是把 o11y-bench 的 grader 接成第四個入口，跑到 `cal_count_by_source(exclude_sources=_SELF_LABEL_SOURCES)` ≥ 20。**誠實記的地方在這裡**：20 是設定檔的地板，不是統計上夠的數字，而且要分佈在不同信心區間才講得出「它說 0.7 的時候實際對幾成」。Day33 已經量到同一份程式碼連跑三次分數在 2.5–3.5 之間跳，所以這天的產出應該標成「樣本數」而不是「結論」。
-- **Day39**（動手日）第一張校準曲線——`compute_calibration` 第一次有東西可算，把 overconfidence 這個數字交出來，並對照 `governance_max_overconfidence = 0.1` 看它過不過。這天最該寫的是**兩種紅燈的差別**：「calibration unproven（標註不夠）」跟「overconfident（標註夠但它太有自信）」在 `_calibration_verdict` 裡回的是兩句不同的話，而它們對值班的人意義完全不同——前者是還沒開始量，後者是量完了不該信。順帶回應 Day30 那個「agent 自己寫『沒找反證』卻給 1.0」的實測。
-- **Day40**（動手日）過去事故庫第一次非空——因為 `inv_query_similar` 是 `JOIN calibration WHERE correct = 1`，Day38 的標註一進去它就自己活了，這天不用寫新程式碼。要做的是 A/B：同一組 fixture，注入過去事故 vs 不注入，分數有沒有差。**這個實驗很可能是負面結果**，要先想好負面結果怎麼寫——Day25 已經有過一次「分數變好但因果證不了」，那次的處理方式（抓逐字稿去看新機制到底有沒有被觸發）就是這天的模板。同時把 `draft_runbook.py` 與 `runbook_feedback` 這兩個已經在跑的閉環接回 ARE 的 CLL 五步驟講一次。
-- **Day41**（動手日）把 `actions_enabled` 打開——這是這個系列真正的那顆按鈕。在真實叢集上跑一次完整鏈路：提案帶 blast radius 乾跑 → 人按 approve → executor 執行 → settle window → verify → 失敗自動 rollback。`test_execution.py` 那 13 條測試已經 monkeypatch 過這條路，所以這天證明的不是邏輯，是**它在真的會壞的東西上會不會壞**。Day26 留下的那個洞要在這天補掉：BLOCK 之後的 abort 包在 `actions_enabled` 裡，關著的時候連 audit 都不會寫，而現在它要開了。
-- **Day42**（動手日）反向驗證：讓防護網紅一次——照 Series 1 那條「該紅的還會不會紅」的標準，這天刻意把每一道門弄壞給它看：把 overconfidence 灌超過 0.1 確認 AUTO 自動降級成 PROPOSE、把標註來源全換成自我標註確認 AUTO 不解鎖、連續失敗打到 `breaker.py` 的 runaway 與 flapping 兩種模式並確認熔斷後**只能人工重置**。這天的產出是一份跟 `day12/regress.sh` 同構的斷言清單，每一條寫死預期離開碼。**一個從來沒有紅過的防護網，跟一個不存在的防護網，證據等級是一樣的。**
-- **Day43**（回顧日）成熟度定位 + 跨系列的正向循環——把 Day34 那張 L1-L5 階梯拿回來，這次用 Day39 的實測數字定位，不是用猜的。五大旗艦 SLO（ARR/DQ-SLO/RL-SLO/AE-SLO/CE）各自定義並標出哪幾個現在真的量得出來、哪幾個還是設計。最後畫橫跨 Series 1+2 全部 43 天的正向循環：治理→拓撲/CEL→agent 建議→執行/治理平面→校準/SLO→回饋治理與拓撲。收尾要回答 Series 1 Day33 那個沒答完的問題：**治理是環境的函數，那自主權是什麼的函數**——照這十天做下來，答案是標註數量與校準誤差，而那兩個東西都得靠時間累積，買不到也求不來。
+  這五段講完，Day33 開始就可以直接說「現在來實作契約介面圖裡的第三個框」，不用重新鋪陳。
+- **Day33**（已寫，動手日）先讀現況，不要蓋新東西——原計畫是「沿用 Day14 那支 `importgraph.py` 把六支檔案的呼叫關係畫出來」，實際做出來多了一層：**那支工具本身有盲點**。它只認得 `from .mod import Name`，遇到 `from . import store`（這個 codebase 有 16 處）會把 `module=None` 轉成空字串然後丟掉整條邊，於是在 `app/` 上多報了三個假孤兒（`store`／`breaker`／`execution`）。`app/signals/` 沒人用那種寫法，所以 Day14 那張圖是對的，「工具在它被寫出來的資料夾上是對的，換一個資料夾就開始漏，而且漏的時候不報錯」正好是 Day31「治理是環境的函數」換了一個對象。修完（加 `--focus` 一次讀一個平面）之後孤兒剩 `main` 一個。**兩個修正昨天說法的發現**：(1) 治理平面不是冷的，`governance.py` 有 `agent`／`action_requests` 兩個 importer，提案那條路一直是活的，冷的只有 `execution`／`breaker`（只有 `main.py` 的 endpoint 進得去），所以「沒有人按過的開關」要精確成「提案通、提案之後那段斷」；(2) 治理只在 `if matched_rb and matched_rb.remediation` 底下跑，**整個平面的唯一入口是一次 alertname 字串比對**，比不中就整格從圖上消失而且沒有任何地方會說「治理沒跑」，Day27 那個 `runbook: None` 當時被我當成命名問題。逐條讀 `actions.py` 的註冊表設計（typed 註冊、兩個風險旗標是給治理讀的、`impl` 仍是 `None`、kill switch 長在 `registry.execute()` 裡而不是呼叫端），並發現 `actions.py` 沒有自己的測試檔。平台工程：拆出三個不同擁有者（行動性質與總開關屬平台團隊，「某服務願意讓 agent 自動做到哪一級」該屬服務團隊但 repo 裡沒有地方寫）。未做：一次治理判斷都沒真的跑、`decisions = []` 分不出「沒行動可提」與「沒比中 runbook」、`actions.py` 測試沒補、importgraph 只看 import 看不到呼叫。
+- **Day34**（已寫，動手日）`action_requests.py` 狀態機——13 個 `Status` 畫一次轉移圖（7 個標著 `(7b-4+)` 還沒走到），講 `ar_transition()` 那句 `UPDATE ... WHERE request_id=? AND status=?` 為什麼是安全的關鍵。`probe_lifecycle.py`（暫存 SQLite ＋真模組，無 mock 無叢集無 LLM）撞四條現有 9 條測試沒走過的邊。**唯一的好消息是 CAS**：8 個執行緒同時 approve，恰好 1 個贏，連跑三次贏家隨機但數量恆為 1（現有測試是單執行緒依序呼叫，只證明意圖沒證明機制）。**三個發現骨架相同——這個狀態機只有在有人按的時候才會動，時間本身不會讓任何一列前進**：(1) `reject()` 沒有 TTL 檢查而 `approve()` 有，同樣過期的兩列一個變 `expired` 留下原因、一個變 `rejected` 記上那個人，稽核軌跡上是兩個不同的故事；(2) `_expire_if_stale()` 全專案只有 `approve()` 一個呼叫點，所以沒人按的提案會用 `proposed` 的身分留在清單與 plugin 頁面上，值班的人早上看到的是七小時前的世界算出來的建議而畫面不會說；(3) `executing` 沒有回收機制，認領後 pod 被砍那列就永遠停在那，executor 找 `approved`、`approve()` 找 `proposed`，兩邊都碰不到它。平台工程：過期只在按下去那刻才算，成本就落在資訊最少的值班者身上；409 那句 `missing, expired, or already decided` 把三種完全不同的原因擠成一句。未做：三個洞只量不補、探測腳本沒有斷言也沒進 `tests/`、沒撞 `execution.py` 那一側、併發只測單 process。
+- **Day35**（動手日）`governance.py` 的授權判斷逐條讀——irreversible→ESCALATE、`confidence < low`→ESCALATE、high 但 `requires_approval`→PROPOSE、calibration unproven→降級 PROPOSE。重點放在 `_calibration_verdict()` 那兩道門：`governance_min_labeled_runs = 20` 是總標註數，`governance_min_human_labeled_runs = 20` 另外要求其中的非自我標註數，而 `_SELF_LABEL_SOURCES` 只排除 `remediation-verified`／`remediation-failed`。**「自己說自己修好了」不能解鎖自主權**，這是 ARE §6.2 constraint 1 最字面的一行程式碼。這天結束時要能講出一句話：現在按下去會發生什麼——答案是 PROPOSE，因為標註數是 0。
+- **Day36**（動手日，**整個系列的關鍵路徑**）把 grader 接成標註來源，產出第一批非自我標註——`label_run` 目前有三個入口（`main.py` 的 endpoint、`calibration.py` 的 CLI、`execution.py` 的自我驗證），但沒有一條是批次的。這天做的是把 o11y-bench 的 grader 接成第四個入口，跑到 `cal_count_by_source(exclude_sources=_SELF_LABEL_SOURCES)` ≥ 20。**誠實記的地方在這裡**：20 是設定檔的地板，不是統計上夠的數字，而且要分佈在不同信心區間才講得出「它說 0.7 的時候實際對幾成」。Day31 已經量到同一份程式碼連跑三次分數在 2.5–3.5 之間跳，所以這天的產出應該標成「樣本數」而不是「結論」。
+- **Day37**（動手日）第一張校準曲線——`compute_calibration` 第一次有東西可算，把 overconfidence 這個數字交出來，並對照 `governance_max_overconfidence = 0.1` 看它過不過。這天最該寫的是**兩種紅燈的差別**：「calibration unproven（標註不夠）」跟「overconfident（標註夠但它太有自信）」在 `_calibration_verdict` 裡回的是兩句不同的話，而它們對值班的人意義完全不同——前者是還沒開始量，後者是量完了不該信。順帶回應 Day30 那個「agent 自己寫『沒找反證』卻給 1.0」的實測（那一天現在是合併過的 Day30）。
+- **Day38**（動手日）過去事故庫第一次非空——因為 `inv_query_similar` 是 `JOIN calibration WHERE correct = 1`，本來以為 Day36 的標註一進去它就自己活了。要做的是 A/B：同一組 fixture，注入過去事故 vs 不注入，分數有沒有差。**這個實驗很可能是負面結果**，要先想好負面結果怎麼寫——Day25 已經有過一次「分數變好但因果證不了」，那次的處理方式（抓逐字稿去看新機制到底有沒有被觸發）就是這天的模板。同時把 `draft_runbook.py` 與 `runbook_feedback` 這兩個已經在跑的閉環接回 ARE 的 CLL 五步驟講一次。
+- **Day39**（動手日）**把 `actions_enabled` 打開，然後當場讓防護網紅一次**——這是這個系列真正的那顆按鈕，而按下去只有在同一天證明防護網會攔你，才算可信，所以兩件事合成一天。前半：在真實叢集上跑一次完整鏈路（提案帶 blast radius 乾跑 → 人按 approve → executor 執行 → settle window → verify → 失敗自動 rollback）。`test_execution.py` 那 13 條測試已經 monkeypatch 過這條路，所以這天證明的不是邏輯，是**它在真的會壞的東西上會不會壞**。Day24 留下的那個洞要在這天補掉：BLOCK 之後的 abort 包在 `actions_enabled` 裡，關著的時候連 audit 都不會寫，而現在它要開了。後半：照 Series 1 那條「該紅的還會不會紅」的標準，刻意把每一道門弄壞給它看——把 overconfidence 灌超過 0.1 確認 AUTO 自動降級成 PROPOSE、把標註來源全換成自我標註確認 AUTO 不解鎖、把 `grading_mode` 全灌成 `inconclusive` 確認校準曲線算不出東西（Day37 那個欄位的反向驗證）、連續失敗打到 `breaker.py` 的 runaway 與 flapping 兩種模式並確認熔斷後**只能人工重置**。這天的產出是一份跟 `day12/regress.sh` 同構的斷言清單，每一條寫死預期離開碼。**一個從來沒有紅過的防護網，跟一個不存在的防護網，證據等級是一樣的。**
+- **Day40**（回顧日）成熟度定位 + 跨系列的正向循環——把 Day32 那張 L1-L5 階梯拿回來，這次用 Day37 的實測數字定位，不是用猜的。五大旗艦 SLO（ARR/DQ-SLO/RL-SLO/AE-SLO/CE）各自定義並標出哪幾個現在真的量得出來、哪幾個還是設計。最後畫橫跨 Series 1+2 全部 40 天的正向循環：治理→拓撲/CEL→agent 建議→執行/治理平面→校準/SLO→回饋治理與拓撲。收尾要回答 Series 1 Day31 那個沒答完的問題：**治理是環境的函數，那自主權是什麼的函數**——照這九天做下來，答案是標註數量與校準誤差，而那兩個東西都得靠時間累積，買不到也求不來。另外要誠實收一句 Day36-38 反覆撞到的那個形狀：每個零件都對、都有測試，壞的一直是零件中間那條沒有擁有者的接縫。
 
 ---
 
 ## 兩個系列怎麼安排
 
 - 兩個系列可以獨立完賽：Series 1 單獨結束在「agent 給出有信心分數的下一步建議」，是一個完整的故事，不需要讀者知道 Series 2 存在。
-- Series 2 開頭 Day34 那張四平面對照圖，直接把 Series 1 的產出（Phase2 的 Signal Plane、Day19-26 的 Reasoning Plane）標成「已完成」，避免 Series 2 讀者覺得需要重看一次 Series 1 才懂。Execution/Governance 那兩格標成「已蓋好、沒開過」，那才是這個系列真正的主題。
-- Series 2 的關鍵路徑是 Day38（產出第一批非自我標註），Day39-42 全部卡在它後面。如果那天的標註數跑不出來，能照常寫的只有 Day35-37 這三天的「讀現況」，後面六天會全部變成紙上談兵——所以那天要排最多的緩衝，而不是當成中間的一天。
+- Series 2 開頭 Day32 那張四平面對照圖，直接把 Series 1 的產出（Phase2 的 Signal Plane、Day19-26 的 Reasoning Plane）標成「已完成」，避免 Series 2 讀者覺得需要重看一次 Series 1 才懂。Execution/Governance 那兩格標成「已蓋好、沒開過」，那才是這個系列真正的主題。
+- Series 2 的關鍵路徑是 Day36（產出第一批非自我標註），Day37-39 全部卡在它後面。如果那天的標註數跑不出來，能照常寫的只有 Day33-35 這三天的「讀現況」，後面四天會全部變成紙上談兵——所以那天要排最多的緩衝，而不是當成中間的一天。
