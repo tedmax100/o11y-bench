@@ -26,11 +26,15 @@ def _drift(**kw):
 # A clean schema-alignment artifact, so the topology tests below stay pure and
 # do not depend on whether schema_alignment.json happens to be on disk.
 _CLEAN_SCHEMA = {"checked": 5, "declared_metrics": 6, "undeclared": [], "note": "ok"}
+# Same idea for environment fit: these tests are about topology and schema, so
+# they run as if someone had already confirmed the catalog belongs here.
+_CLEAN_ENV = {"proven_good": True, "score": 1.0, "note": "injected knowledge resolves here (16/16)"}
 
 
-def _patch(monkeypatch, drift, schema=_CLEAN_SCHEMA):
+def _patch(monkeypatch, drift, schema=_CLEAN_SCHEMA, env=_CLEAN_ENV):
     monkeypatch.setattr(dq_mod, "get_last_drift", lambda: drift)
     monkeypatch.setattr(dq_mod, "schema_alignment", lambda: schema)
+    monkeypatch.setattr(dq_mod, "fit_verdict", lambda: env)
 
 
 def test_no_reconcile_is_unproven(monkeypatch):
@@ -115,3 +119,47 @@ def test_schema_is_checked_before_topology(monkeypatch):
         schema={"checked": 5, "declared_metrics": 6, "undeclared": ["a: b"], "note": "n"},
     )
     assert "registry does not declare" in dq_verdict()["note"]
+
+
+# ---- environment fit (s6) --------------------------------------------------
+
+
+def test_unmeasured_environment_is_unproven(monkeypatch):
+    """Nobody has asked whether the catalog belongs here. That is not evidence
+    that it does, so autonomy stays withheld."""
+    _patch(
+        monkeypatch,
+        _drift(),
+        env={"proven_good": False, "score": None, "note": "env fit unproven"},
+    )
+    v = dq_verdict()
+    assert v["proven_good"] is False and "unproven" in v["note"]
+
+
+def test_catalog_from_another_environment_degrades(monkeypatch):
+    """The twin-stack case: every store answers, nothing resolves."""
+    _patch(
+        monkeypatch,
+        _drift(),
+        env={
+            "proven_good": False,
+            "score": 0.0,
+            "note": "only 0/16 of the injected knowledge resolves against these stores "
+            "(metric orders_total (order-service)); the catalog may belong to another environment",
+        },
+    )
+    v = dq_verdict()
+    assert v["proven_good"] is False and v["score"] == 0.0
+    assert "another environment" in v["note"]
+
+
+def test_env_fit_is_checked_before_schema_and_topology(monkeypatch):
+    """Order matters: a catalog pointed at the wrong stack makes every other
+    dimension a measurement of the wrong system, so it is reported first."""
+    _patch(
+        monkeypatch,
+        None,  # no reconcile either
+        schema={"checked": 5, "declared_metrics": 6, "undeclared": ["a: b"], "note": "n"},
+        env={"proven_good": False, "score": 0.0, "note": "belongs to another environment"},
+    )
+    assert "another environment" in dq_verdict()["note"]

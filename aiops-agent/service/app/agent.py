@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -26,6 +27,7 @@ from .runbook import (
     run_diagnostics,
 )
 from .signals.context import build_signal_context
+from .signals.envfit import compute_env_fit, get_last_fit
 from .signals.health import evaluate_dependency_health
 from .tools import (
     discover_log_fields_tool,
@@ -1033,6 +1035,21 @@ async def _inject_dependency_health(turn_messages: list, services: list[str]) ->
         logger.warning("dependency health injection failed for %s: %s", services, e)
 
 
+async def _refresh_env_fit() -> None:
+    """Re-measure whether the injected catalog resolves against the stores we
+    are actually pointed at (s6). Read-only, off the agent budget, and cached:
+    only re-run when nobody has measured this environment or the measurement has
+    gone stale. Best-effort — a failure leaves the fit unproven, which the DQ
+    verdict already treats as "do not grant autonomy"."""
+    try:
+        fit = get_last_fit()
+        age = time.time() - fit.computed_ts if fit else None
+        if fit is None or age is None or age > settings.dq_max_env_fit_age_seconds:
+            await compute_env_fit()
+    except Exception as e:
+        logger.warning("env fit refresh failed: %s", e)
+
+
 async def _inject_runbook(turn_messages: list, labels: dict, annotations: dict):
     """Match a runbook to the alert; inject its rendered guidance (Tier 0) and,
     if enabled, the results of auto-running its read-only diagnostics (Tier 1).
@@ -1484,6 +1501,7 @@ async def stream_chat(
 
     if snapshot:
         turn_messages.append(SystemMessage(content=snapshot))
+    await _refresh_env_fit()
     if resolved:
         _inject_signal_context(turn_messages, resolved)
         await _inject_dependency_health(turn_messages, resolved)

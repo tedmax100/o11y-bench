@@ -21,6 +21,7 @@ import logging
 import time
 
 from ..config import settings
+from .envfit import fit_verdict
 from .reconcile import get_last_drift
 from .weaver import alignment_path
 
@@ -40,9 +41,16 @@ def schema_alignment() -> dict | None:
 
 
 def dq_verdict() -> dict:
-    """{proven_good, score, note} for governance. proven-good requires a recent
-    reconcile with no observed-but-undeclared edges, agreement ≥ floor, and
-    contract SLIs that the schema registry actually declares."""
+    """{proven_good, score, note} for governance. proven-good requires injected
+    knowledge that resolves against the live stores, a recent reconcile with no
+    observed-but-undeclared edges, agreement ≥ floor, and contract SLIs that the
+    schema registry actually declares."""
+    # Asked first on purpose: if the catalog belongs to another environment,
+    # every other dimension is measuring the wrong system.
+    env = fit_verdict()
+    if not env["proven_good"]:
+        return {"proven_good": False, "score": env["score"], "note": env["note"]}
+
     schema = schema_alignment()
     if schema is None or not schema.get("checked"):
         return {

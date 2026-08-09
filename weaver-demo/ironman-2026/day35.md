@@ -1,10 +1,9 @@
 ---
-title: "【Day34】五個旗艦 SLO 算出來：兩個是 0，一個是 0/0，一個量到的是我的手"
+title: "【Day35】五個旗艦 SLO 算出來：兩個是 0，一個是 0/0，一個量到的是我的手"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
 tags: [OpenTelemetry, AIOps, Governance, SLO, 鐵人賽]
 ---
-
-# Day34：階梯上的位置，跟一份七筆的人工標註
+# Day35：階梯上的位置，跟一份七筆的人工標註
 
 > 這三十四天做出來的東西
 > 有一半的價值不在它能做什麼
@@ -13,7 +12,7 @@ tags: [OpenTelemetry, AIOps, Governance, SLO, 鐵人賽]
 
 昨天在真實叢集上按下那顆核准，四道門全部放行，最後被一張因為叢集重建而失效的憑證擋在最後一毫秒。今天是最後一天，做的事情是驗收：把那本書給的五個量尺拿出來，對著這座系統自己的資料算一次，然後在成熟度階梯上標出真正的位置。
 
-程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day34/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day34)。今天全部唯讀，跑的是從叢集裡撈出來的一份資料庫快照，不需要叢集也不需要 LLM（Large Language Model，大型語言模型）。
+程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day35/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day34)。今天全部唯讀，跑的是從叢集裡撈出來的一份資料庫快照，不需要叢集也不需要 LLM（Large Language Model，大型語言模型）。
 
 ## 開場先修一個我這三天都搞錯的東西
 
@@ -74,7 +73,7 @@ flowchart TB
 
 ```bash
 # 從 o11y-bench 主 repo 的根目錄跑，預設是對複製出來的一份做乾跑
-python3 ironman-2026/day34/fix_grading_mode.py
+python3 ironman-2026/day35/fix_grading_mode.py
 ```
 
 ```
@@ -117,19 +116,19 @@ python3 ironman-2026/day34/fix_grading_mode.py
 
 先把定義寫清楚，再看這座系統各自量到什麼：
 
-| SLO | 問的問題 | 公式 | 這座系統 |
-| --- | --- | --- | --- |
-| ARR（Autonomous Resolution Rate，自主解決率） | 它多常願意自己收掉一個事故 | 自主解決的事故 / 偵測到的事故 | 0 / 3 = 0% |
-| DQ-SLO（Decision Quality，決策品質） | 它動手的時候對不對 | 成功的自主決策 / 全部自主決策 | 0 / 0，算不出來 |
-| RL-SLO（Reasoning Latency，推理延遲） | 從偵測到做出決定要多久 | 決策時間 − 偵測時間 | n=11，但 8 筆是假的 |
-| AE-SLO（Action Effectiveness，行動有效性） | 動作有沒有真的達到目的、有沒有副作用 | 有效的復原 / 全部復原 | 0 / 1 = 0% |
-| CE（Calibration Error，校準誤差） | 它講的信心跟實際結果差多少 | 分箱之後 \|信心 − 實際正確率\| 的平均 | 叢集 0.5643、開發機 0.1743 |
+| SLO                                           | 問的問題                             | 公式                                  | 這座系統                   |
+| --------------------------------------------- | ------------------------------------ | ------------------------------------- | -------------------------- |
+| ARR（Autonomous Resolution Rate，自主解決率） | 它多常願意自己收掉一個事故           | 自主解決的事故 / 偵測到的事故         | 0 / 3 = 0%                 |
+| DQ-SLO（Decision Quality，決策品質）          | 它動手的時候對不對                   | 成功的自主決策 / 全部自主決策         | 0 / 0，算不出來            |
+| RL-SLO（Reasoning Latency，推理延遲）         | 從偵測到做出決定要多久               | 決策時間 − 偵測時間                  | n=11，但 8 筆是假的        |
+| AE-SLO（Action Effectiveness，行動有效性）    | 動作有沒有真的達到目的、有沒有副作用 | 有效的復原 / 全部復原                 | 0 / 1 = 0%                 |
+| CE（Calibration Error，校準誤差）             | 它講的信心跟實際結果差多少           | 分箱之後\|信心 − 實際正確率\| 的平均 | 叢集 0.5643、開發機 0.1743 |
 
 跑出來長這樣：
 
 ```bash
 # 從 o11y-bench 主 repo 的根目錄跑
-python3 ironman-2026/day34/slo_report.py
+python3 ironman-2026/day35/slo_report.py
 ```
 
 ```
@@ -270,7 +269,7 @@ flowchart LR
 
 這一段照系統的層級寫，不照天數寫。上面那份「今天沒做的事」是這一天欠的，下面這些是這整套東西欠的。
 
-- **Act 那一格從來沒有成功過一次。** `executions` 表只有一列，`success=0`，而那次失敗是 Kubernetes 回的 401。`execute → verify → settle window → 驗證失敗自動回滾` 的後半段至今沒有被真實輸入走過，而 ARR、DQ-SLO、AE-SLO 三個 SLO 全部卡在這裡：不是量不準，是分母是零。一個沒有成功執行過的自動修復系統，嚴格講只是一個提案系統。
+- **Act 那一格從來沒有成功過一次。** `executions` 表只有一列，`success=0`，而那次失敗是 Kubernetes 回的 401。`execute → verify → settle window → 驗證失敗自動回滾` 的後半段至今沒有被真實輸入走過，而 ARR、DQ-SLO、AE-SLO 三個 SLO 全部卡在這裡：不是量不準，是分母是零。一個沒有成功執行過的自動修復系統，嚴格講目前只是一個提案系統。
 - **學習迴圈只接上了管線，還沒有累積。** 42 筆標註來自三個 fixture，門檻的單位是 run 而真正該問的是獨立事故數，這兩個數字差一個數量級。更關鍵的是沒有任何機制讓 SLO 惡化自己收緊自主權：CE 上升的時候信心門檻不會自己升上去，DQ 掉下來的時候也不會自動多送幾件給人看。error budget 這件事現在連手動版本都沒有。
 - **觀測基礎撐不起長時間的事故。** Tempo 只留一小時，所以超過一小時的事故，「去抓那條 trace」這一步結構上必失敗；指標沒有 pod 級的 label，多 replica 的 counter 疊成一條 series，`rate()` 會生出憑空的流量；評測只有一顆種子，同一份程式碼連跑三次分數會在 2.5 到 3.5 之間跳。這三件都不是 agent 的問題，但它們決定了 agent 的天花板。
 - **沒有一個使用者不是我。** SAR 那個 23.1% 的三個核准者全是我在測試，`rejected` 是 0 因為那顆按鈕還沒接起來，分母裡十筆是沒有人打開過的。整套治理最核心的假設「錯誤訊息夠好，對方就能自己修好」，從來沒有被第二個團隊驗證過。這一項我覺得是最被低估的。

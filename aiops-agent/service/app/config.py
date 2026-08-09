@@ -201,6 +201,13 @@ class Settings(BaseSettings):
     # dangerous as "confidently wrong" — both must earn AUTO.
     dq_min_score: float = 0.9  # declared/observed agreement floor for proven-good
     dq_max_reconcile_age_seconds: int = 3600  # a reconcile older than this → DQ stale
+    # Environment fit (s6): the catalog we inject is knowledge about one
+    # environment. Measured against a twin stack that renames everything and
+    # changes nothing else, the same catalog scored 1.0 at home and 0.0 there.
+    # Below the floor, the knowledge probably belongs somewhere else, so DQ is
+    # not proven-good and AUTO is withheld until someone re-points or re-derives it.
+    dq_min_env_fit: float = 0.9  # fraction of injected knowledge that must resolve
+    dq_max_env_fit_age_seconds: int = 3600  # a fit measurement older than this → stale
     # Dependency-health blame propagation (s4): before the agent loop, run each
     # neighbour's error SLI live (read-only, off the agent budget) so the agent
     # knows whether the symptom is inherited from a failing downstream dep. A
