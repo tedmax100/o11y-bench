@@ -1,179 +1,274 @@
 ---
-title: "【Day25】空結果不是答案，是一個沒有人回答的問題"
+title: "【Day25】整條鏈跑一次：兩次我差點用推論代替實測"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
-tags: [OpenTelemetry, AIOps, Prometheus, Loki, Tempo, 鐵人賽]
+tags: [OpenTelemetry, AIOps, Kubernetes, Tracing, Evaluation, 鐵人賽]
 ---
 
-> 三個 store 都會拒絕你
-> 只是有兩個拒絕得很有禮貌
-> 禮貌到你以為它答應了
+# Day25：從結論走回推理過程，然後把六段接起來跑一次
 
-昨天新加的那個 fixture 兩次都失敗，兩次都是同一個動作：一句查詢回空的，然後它換一句查詢再問一次。當時我把這件事記在 agent 頭上，說它沒有先 discover。今天回頭看工具那一側，發現這個帳算得有點快：**那個空結果本身，什麼也沒告訴它。**
+> 每一段單獨跑都是綠的
+> 這句話跟「整條鏈是通的」
+> 中間隔著一次真的把它們接起來
 
-今天的主角是 `app/tools/query.py`，agent 直接打 Prometheus / Loki / Tempo 原生 HTTP API 的那 539 行。
+前面二十四天，每一天都在自己那一段裡驗證自己那一段。今天要把它們接起來跑一次：一個新服務的上線檢查 → 意圖編成告警規則 → 服務自己的宣告編成拓撲 → 一個告警進去，診斷跟下一步建議出來 → 同一隻 agent 對著固定資料被打分。
+
+而在接之前先補一個缺口，因為那條鏈少了它就少一段：從一份結論走回它的推理過程。今天這兩件事各讓我犯了一次同樣的錯，所以放在一起講。
 
 程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day25/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day25)。
 
-## 先量，不要相信自己寫過的註解
+## 先問清楚「回放」到底要回答什麼
 
-`query.py` 的 docstring 開頭列了一份「對著 live stack 探過」的怪癖清單，是我當初一邊撞一邊記的。今天要動這個檔案，第一件事是把那份清單重跑一次，因為版本會變、行為會變，而**一份沒有人重跑過的怪癖清單，跟一份猜出來的沒有差別**。
+我大綱裡本來寫好的結論是：`audit.record` 在執行那一側被呼叫了 24 次，寫入類動作每一步都有紀錄，但 `agent.py` 一次都沒有呼叫它，所以「要改叢集」可回放、「怎麼推理出這個結論」不可回放。grep 一次就能得到這個結論，而且它讀起來很有力。**問題是它是錯的。**
 
-`probe_apis.py` 就是那份清單的可執行版本：每個怪癖給兩個呼叫，天真的那個跟會動的那個並排。不經過 agent、不花 token，因為這些是 store 的性質，跟模型怎麼想無關。
+寫之前我先把「可回放」拆成六個具體問題，因為這個詞太模糊，模糊的詞很容易讓人用一個模糊的答案打發過去：
 
-```console
-$ uv run python ../../otel-aiops-agent/ironman-2026/day25/probe_apis.py
+1. 它的結論是什麼
+2. 它有多少信心
+3. 它呼叫了哪些工具、順序是什麼
+4. 每一句查詢實際上問了什麼
+5. 它做決定之前，模型看到的是什麼
+6. 這次調查花了多少 token
 
-Prometheus — 'what metrics does this service have?'
-GET /api/v1/metadata           -> 200 {"status":"success","data":{}}
-GET /api/v1/targets            -> 200 {"status":"success","data":{"activeTargets":[],…}}
-GET /api/v1/series?match[]=…   -> 200, 25 distinct metric name(s)
+前兩題是「結果」，後四題是「過程」。系統裡有三個地方在記東西：investigation 那張表、audit log、以及 agent 自己身為一個被 instrument 的服務所產生的 trace。所以就一個一個問。
 
-Loki — the selector key
-{service="payment-service"}              -> 200, 0 stream(s)
-{service_name="payment-service"}         -> 200, 5 stream(s)
+## 然後我發現我這幾天的實驗全部沒有 trace
 
-Tempo — three ways to get it wrong, all of them loud
-start/end in nanoseconds   -> 400 invalid start: strconv.ParseInt: parsing "1786019415980873984": value out of range
-Loki's label name          -> 400 invalid TraceQL query: parse error at line 1, col 2: syntax error: unexpected IDENTIFIER
-status as a string         -> 500 binary operations must operate on the same type: status = `error`
-the one that works         -> 200, 20 trace(s)
+`replay_probe.py` 寫好第一次跑，Tempo 裡什麼都沒有，於是我差點就要收工寫「果然沒有」。
+
+還好停下來想了一下：**這幾天所有的探測腳本，都是我在 host 上直接呼叫 `run_headless()` 的。** 那條路徑沒有經過 `opentelemetry-instrument`，SDK 根本沒有啟動，當然一個 span 也不會產生。叢集裡那個 agent 才是被 instrument 的那一個，而它這幾天沒有被我驅動過任何一次真的調查。
+
+所以要問「決策有沒有被 trace」，得從被 instrument 的服務走進去：
+
+```bash
+kubectl -n demo port-forward svc/aiops-agent 8090:8000
+curl -X POST localhost:8090/webhook/alert -H 'x-webhook-secret: <secret>' -d '{"alerts":[…]}'
 ```
 
-先講一個我自己寫錯的地方。docstring 裡寫「Loki 的 `start`/`end` 不給奈秒會靜默回空」，這一版的 Loki（3.2.0）兩種單位都收，同一個窗回同一組欄位。那句話在我寫下它的當下大概是對的，現在不是了，所以今天順手改掉。**會過期的不只是連結，還有你對工具行為的記憶。**
+日誌立刻就不一樣了，每一行都掛著同一個 trace id：
 
-真正該記在清單上的是另一條：selector 鍵寫成 `service` 的時候，Loki 回 200，回零筆，沒有任何一個欄位在說「這個標籤我沒有索引」。
+```console
+[trace_id=fe6b426e8e7a63d37d61d4fcc4b07722 span_id=d52c49561f874a4e resource.service.name=aiops-agent]
+  - HTTP Request: GET http://prometheus.demo.svc:9090/api/v1/query?query=sum+by+%28git_version…
+[trace_id=fe6b426e8e7a63d37d61d4fcc4b07722 …] - rubric: trace ID hallucination detected —
+  missing in Tempo: ['4b2a9c8d7e6f5a4b3c2d1e0f9a8b7c6d']
+[trace_id=fe6b426e8e7a63d37d61d4fcc4b07722 …] - headless RCA done conf=0.95
+```
 
-## 兩種靜默、一種吵鬧
+順帶一提，中間那行是前幾天那個守門在正式路徑上抓到一次真的幻覺，而且是它自己編了一個漂亮的 32 位十六進位。它被擋下來、被要求重查，然後那次調查的結論最後是對的。**兩天前寫的東西在完全沒有預期的情況下上場，這種時刻蠻爽的 :)**
 
-把上面那三段排在一起會看到一個形狀：
+## trace 裡面比我以為的完整得多
+
+把那條 trace 從 Tempo 撈出來：
+
+```console
+spans in Tempo for that trace: 46
+  by instrumentation: {'fastapi': 4, 'httpx': 12, 'langchain': 30}
+   6 ChatGoogleGenerativeAI.chat
+   5 execute_task agent
+   5 execute_task route_after_agent
+   3 execute_task tools
+   2 invoke_agent LangGraph
+   2 execute_tool query_tempo_traces
+   1 execute_tool query_prometheus
+```
+
+`opentelemetry-instrumentation-langchain` 把 LangGraph 的每一個 node、每一次工具呼叫、每一次模型呼叫都變成了 span。三十個 span 裡有 `execute_task agent`（模型在想）、`execute_task route_after_agent`（前面畫過的那個條件分支真的走了哪一邊）、`execute_tool ...`（每一次查詢）。前面畫的那張四個 node 的圖，在這裡是一條可以逐格播放的實際錄影。
+
+打開一個工具 span 看屬性：
+
+```console
+execute_tool query_prometheus
+    gen_ai.operation.name      = execute_tool
+    gen_ai.tool.name           = query_prometheus
+    gen_ai.tool.call.arguments = {"input_str": "{'expr': 'sum by (git_version, reason) (rate(…
+    gen_ai.tool.call.result    = {"output": {"resultType": "vector", "result": [{"metric":
+                                 {"git_version": "v2.5.0", "reason": "new_validator"}…
+    gen_ai.task.status         = success
+```
+
+模型那一種更完整，`gen_ai.system_instructions`（整份系統 prompt）、`gen_ai.input.messages`（它看到的每一則訊息）、`gen_ai.usage.input_tokens` / `output_tokens` 全都在，還有 LangGraph 自己的 `langgraph_node`、`langgraph_step`。也就是說，那六個問題裡的後四題，答案一直都在 Tempo 裡躺著。
+
+> 這裡有一件事值得記：這些 span 是**別人寫的 instrumentation 幫我產生的**，我沒有為此寫過任何一行程式碼。這正是這系列一直在講的那條因果鏈的另一端：遵守 semantic convention 的好處，是別人做的工具可以直接看懂你的東西。gen_ai 這組慣例還在演進，但它現在已經足夠讓一次 agent 調查被完整重播。
+
+## 那到底缺什麼
+
+缺的東西很小，小到有點好笑：沒有任何欄位把「這個結論」連到「那條 trace」。
+
+investigation 那張表記了 fp、時間、結論、信心、governance 決策，但沒有 trace id。audit log 記了誰在什麼時候提了什麼動作，也沒有 trace id。所以要從一份結論走到它的推理過程，唯一的路是去日誌裡用時間或 fp 撈，撈到那行 `trace_id=...`，再貼進 Grafana。
+
+```mermaid
+flowchart LR
+    C["結論<br/>investigation row"] -.->|"以前：要去 log 裡撈"| L["應用日誌"]
+    L -.-> T["trace<br/>36-46 個 span"]
+    C -->|"現在：一個欄位"| T
+    A["audit：誰批准了什麼"] --> T
+```
+
+改法是兩個地方各加一行：記錄調查的時候問一次「我現在在哪條 trace 裡」，寫進去；每一筆 audit 進來的時候做同樣的事。它回 `None` 的情況也要處理好，因為那正是我一開始撞到的那種：在 host 上跑、沒有 instrumentation、沒有 trace。拿不到就不寫，不要拋例外，也不要寫一個假的。
+
+接上之後，同一支探測腳本的輸出：
+
+```console
+latest investigation: fp=383238a67e692abb ts=2026-08-06T14:12:07Z
+  conclusion : High payment decline rate caused by a code regression in version v2.5.0…
+  confidence : 0.9
+  trace_id   : f1f393acce6a9cdb26d91a1565d4abe0
+
+question                                 where it lives     answerable
+--------------------------------------------------------------------------
+what did it conclude                     investigation row  yes
+how confident was it                     investigation row  yes
+which tools did it call, in what order   trace              yes
+what exactly did each query ask          trace              yes
+what did the model see before it decided trace              yes
+how many tokens did it cost              trace              yes
+
+tokens on this investigation: 26123
+
+the tool calls, in order (from the trace alone):
+  - query_prometheus: {'expr': 'sum by (git_version, reason) (rate(payment_charges_total…
+  - k8s_deployment_status: {'service': 'payment-service'}
+  - query_prometheus: {'expr': 'sum by (git_version, reason) (rate(payment_charges_total…
+  - query_tempo_traces: {'traceql': '{resource.service.name="payment-service" && status=error}'}
+```
+
+> 26,123 個 token 一次調查。這個數字以前也是查不到的，現在它跟推理過程長在同一條 trace 上。真的要上生產環境的話，這個欄位可以直接接成一張「每次告警花多少錢」的儀表板，而且它跟成本中心的關聯是天然的，因為 span 上有 service name ^^
+
+## 接起來：先講順序，因為順序不是我排的
+
+缺口補完，可以接了。
 
 ```mermaid
 flowchart TB
-    A["agent 問了一句話"] --> P{"哪個 store"}
-    P -->|Prometheus| P1["metadata 是空物件<br/>200，看起來像正常回答"]
-    P -->|Loki| L1["錯的 selector 鍵<br/>200 + 零筆"]
-    P -->|Tempo| T1["400 / 500<br/>而且訊息是真的訊息"]
-    P1 --> S["模型得自己猜發生什麼事"]
-    L1 --> S
-    T1 --> R["模型有東西可以照著改"]
+    S1["1 治理<br/>新服務上線檢查 13 項"] --> S2["2 意圖<br/>穩定狀態 → alert rule"]
+    S2 --> S3["3 Signal Plane<br/>宣告編譯 + 洩題掃描"]
+    S3 --> S4["4 調查<br/>告警 → 診斷 + 信心分數"]
+    S4 --> S5["4b 下一步<br/>提案 + 影響範圍"]
+    S5 --> S6["5 評測<br/>固定資料上打分"]
 ```
 
-Prometheus 的 `/api/v1/metadata` 在 OTel remote-write 之下永遠是 `{}`，`/api/v1/targets` 也是空的（因為沒有人在 scrape，資料是被推進來的）。這兩個端點正是「這個服務有哪些指標」最直覺的問法，而它們的回答是一個語法完全正確的空物件。要拿到真的答案得繞去 `/api/v1/series?match[]=...`，那才是 `discover_metrics` 在做的事，25 個指標名字是這樣來的。
-
-Loki 那個更兇一點，因為 `{service="payment-service"}` 是一句**完全合法**的 LogQL，它只是永遠不會匹配到東西。Day1 那隻 agent 就死在這裡，昨天那個 fixture 也是。
-
-Tempo 三種寫法全部大聲拒絕，連時間單位給錯都會回一個 `value out of range`。三個 store 裡它最不客氣，但**對一個要自己修正的 agent 來說，會吵的那個才是最好的介面**。
-
-> 這件事在人身上也一樣。一個查不到東西就回空表格的 dashboard，跟一個明講「你這個 label 不存在」的錯誤訊息，值班的時候後者省下來的時間不是幾分鐘的等級。只是我們平常太習慣前者了 XD
-
-## 那就讓空結果自己解釋
-
-治理那一段講過一句話：**一道 gate 擋下來之後如果還要平台團隊親自去解釋，它的維護成本會隨團隊數線性成長。** 工具是同一個道理，只是對面那個「使用者」是模型。一個回空的工具如果不說明為什麼空，代價就是模型多花一次呼叫去猜，而預算只有六次。
-
-所以 `query.py` 這天多了兩個小函式，只在結果是空的時候才跑：
-
-- Prometheus：把 expression 裡用到的指標名字抓出來，跟 `/api/v1/label/__name__/values` 對一次。名字根本不存在，就直說；名字存在，那問題在 matcher 或時間窗，也直說。
-- Loki：把 selector 裡的鍵抓出來，跟 `/loki/api/v1/labels` 對一次，指名哪個鍵不是可索引標籤，並把可索引的那五個列出來。
+前四段跑在活的 k3d 叢集上，最後一段會啟動預先建好的 stack image。這兩件事不能同時發生，因為那個 image 自己要佔 9090／3100／3200，正好是前面幾段 port-forward 用的埠。所以 `e2e.sh` 的最後一段做的第一件事是把 port-forward 關掉。這不是設計，是現實逼出來的順序，而它剛好也是對的順序：先在真的環境裡看它會不會動，再到固定資料上量它有多準。
 
 ```console
-{'resultType': 'matrix_summary', 'result': [],
- 'note': 'No such metric in Prometheus: payment_declines_total.',
- 'hint': 'Call discover_metrics(service) for the names this service really emits — '
-         'rewording this query will return empty again.'}
+── 1. governance: shipping-v1 onboarding checklist ──
+13/13 通過
 
-{'resultType': 'streams', 'result': [],
- 'note': 'Not an indexable stream label: service. Indexable labels here: '
-         'deployment_environment, git_repo, git_version, service_name, service_namespace.',
- 'hint': 'Everything else (event, trace_id, business fields) is structured metadata — '
-         'filter it AFTER the selector with `| field="..."`. discover_log_fields(service) …'}
+── 2. intent: steady state -> alert rules ──
+  - alert: checkout-success-rate
+    expr: sum(rate(orders_attempts_total{app_outcome=~"authorized"}[30m]))
+          / sum(rate(orders_attempts_total[30m]))
+
+── 3. signal plane: compile + leak check ──
+compiled 5 fragments → topology.yaml (5 nodes, 6 edges, journeys=['checkout'])
+                     + contracts.yaml (5 contracts)
+runbook payment-bad-deploy matched alertname 'PaymentDeclineRateHigh' only after
+  normalization (trigger says 'payment-decline-rate-high') — align the alert rule
+  or the runbook trigger
+no answer tokens in anything handed to the model.
+
+── 4. investigation: alert -> diagnosis ──
+{"accepted":["383238a67e692abb"],"skipped":[]}
+conclusion : Code regression in payment-service v2.5.0 introduced a spike in decline
+             rate due to the new_validator reason.
+confidence : 0.7
+trace_id   : abb6fac796db47d684ed5238a5e37b36
+next step  : k8s.rollout_undo -> propose
+
+── 4b. next step: the proposal and its footprint ──
+action    : k8s.rollout_undo (proposed)
+footprint : 2 pod(s), revision 25->24, policy_ok=True
+policy    : within policy (affected 2 pod(s), ns demo)
+
+── 5. evaluation: scored against fixed data ──
+  payment-decline-service              100% (1/1)   100%   100%   0.90
+  user-service-no-incident               0% (0/1)   100%   n/a    0.10
+  order-service-discover-before-query    0% (0/1)     0%   n/a    0.60
+
+── end to end ──
+6 ok, 0 failed
 ```
 
-兩條都 fail-open。多打的那一次 metadata 查詢如果失敗，空結果就照原樣回去，不會因為補不到一句提示而讓整個工具呼叫炸掉。**提示是加值，不是前提。**
+有幾行是這幾天的東西第一次在同一條鏈上一起出現。第三段那句 warning 是前幾天加的：告警名字跟 runbook 的 trigger 拼法不同，比對還是成功了，但它吵了一聲，而那正是這條鏈以前斷掉的地方。第四段的 `trace_id` 是今天上半段加的那個欄位，第 4b 段的 `footprint` 讓提案跟它的大小終於在同一行上。而第三段那句「no answer tokens」是洩題掃描：在打分之前先確認 prompt 裡沒有答案，**它排在評測前面，是因為在它綠掉之前，第五段那些數字沒有意義。**
 
-順帶一提，那句 `hint` 裡明講「rewording this query will return empty again」是刻意的。昨天那兩次失敗都是換句話再問，所以這句話直接對著那個行為講。
+## 三個紅燈，沒有一個是主功能壞掉
 
-## 改防呆的時候，才看到空結果其實不空
+上面那個 6 ok 是修完的樣子。第一次跑出來是 3 ok / 3 failed，而三個失敗長得完全不一樣。
 
-寫測試的時候我把那個 Loki 空回應整包印出來，發現它有將近三千個字元。裡面沒有半行 log，全部是 `stats`：快取命中數、下載的 chunk bytes、各層的耗時，而且因為什麼都沒查到，數字全是 0。
+**第一個是我自己的手藝。** 第 4、4b 兩段是 SyntaxError：我把 JSON 解析寫成 bash 函式裡的 `python3 -c` 字串，跳脫字元疊了三層。修法是把它拆成一支 `report.py`。沒什麼好講的，但它佔掉的時間比後面兩個加起來還多 XD
+
+**第二個是檢查本身錯了。** 第三段的洩題掃描報了兩個 leak：
 
 ```
-with stats: 2892 B   |   without: 39 B
+[LEAK] injected #2: ## Runbook diagnostics auto-run: payment-bad-deploy
+         culprit version: 'v2.5.0'
+           | - result: {"service": "payment-service", …, "git_version": "v2.5.0", "revision": "25", …
 ```
 
-**一則「我什麼都沒找到」的回答，用了 2,892 個字元。** 這包東西是給 Grafana 畫查詢統計用的，對 agent 來說是純雜訊，但它會照樣進到對話裡、照樣算 token、照樣稀釋掉旁邊那些真的有訊息的字。丟掉之後剩 39 B，補上 `note` 跟 `hint` 之後 404 B，而這 404 B 每個字都在講事情。
+那個 `v2.5.0` 不是誰寫進 prompt 的，是 runbook 的唯讀診斷當場去叢集查出來的。事故是真的，服務真的跑在 v2.5.0 上，而那支掃描器只認字串，分不出「人寫下的答案」跟「機器量到的事實」。
 
-這種東西不會有人抱怨，因為它不會壞。它只是讓每一輪對話都胖一點，然後在某一次長調查裡把有用的上下文擠掉。
-
-## 錯誤訊息要指名要改哪個字
-
-Tempo 那一側的問題不是不吭聲，是它的訊息是寫給已經懂 TraceQL 的人看的。`unexpected IDENTIFIER` 沒有告訴你 `service_name` 在這裡該寫成 `resource.service.name`；`binary operations must operate on the same type` 沒有告訴你把 `error` 的引號拿掉。
-
-而這兩個錯，都是昨天 A/B 那兩份逐字稿裡真的出現過的。模型腦袋裡「服務的標籤叫什麼」只有一份，跨三個 store 共用，所以它在 Tempo 裡寫了 Loki 的名字。
-
-所以今天把 `_tempo_query_hint` 從一段固定文字改成會讀查詢內容的東西：
-
-```python
-_TEMPO_RENAMES = {
-    "service_name": "resource.service.name",
-    "service": "resource.service.name",
-    "git_version": "resource.service.version",
-    "http_route": "span.http.route",
-    "http_status_code": "span.http.status_code",
-}
-```
+這件事的意思是：這個檢查只有在事故沒發生的時候才會綠。而它的用途正好是在有事故的環境上驗證量尺，所以它會在最該用的時候變紅。一個在系統正常運作時會亮紅燈的檢查，等於教所有人忽略它。修法是把注入分成兩類：人寫的（schema catalog、契約、runbook 散文）要掃，量出來的（診斷結果、依賴健康、能力快照）標成 `read` 不判：
 
 ```console
-returned 400: parse error at line 1, col 2: unexpected IDENTIFIER
-HINT: TraceQL predicates go inside braces, … attribute names are dotted and scoped …
-This query uses the name it has in Prometheus/Loki, not in Tempo:
-  `service_name` -> `resource.service.name`.
-`status` is an intrinsic enum, not a string: write `status=error` (no quotes).
+[ok  ] system prompt (schema catalog)
+[ok  ] injected #1: ## Runbook: payment-bad-deploy — payment-service decline-rat
+[read] injected #2: ## Runbook diagnostics auto-run: payment-bad-deploy
+[read] injected #3: ## Dependency health (live) — payment-service
+[ok  ] injected #4: An alert just fired. Investigate the root cause and conclude
 ```
 
-改的過程還撿到一個純粹的 bug。舊的守衛是「訊息裡要有 `400` 或 `parse` 才給提示」，而 `status="error"` 那個錯誤回的是 **500**，訊息裡也沒有 `parse` 這個字。也就是說最常見的那個寫法錯誤，一直是整段跳過提示直接丟回去的 :(
+**第三個是一句話騙了我十分鐘。** 評測那段的 log 洗出一整排：
 
-## 那分數呢
-
-把改動放上去之後，昨天 0/2 的那個 fixture 兩次都過了：
-
-```console
-$ uv run python -m app.eval run -n 2 --only order-service-discover-before-query
-  order-service-discover-before-query   100% (2/2)    100%    n/a   0.70    0
+```
+headless: capability snapshot failed for user-service: 2 validation errors for SystemMessage
+  content.str Input should be a valid string [input_value=None]
 ```
 
-看起來很好，但我去把逐字稿抓出來看了一次：
+我以為 pydantic 出了什麼相容性問題，追進去才發現：`capability_for_services()` 在那個服務沒有任何即時資料的時候，照設計回 `None`，然後 `SystemMessage(content=None)` 才炸掉、被外層 except 抓住、印成 failed。
 
-```console
-0. query_prometheus [ok]  sum by (git_version, reason) (rate(orders_total{...}[5m]))
-1. github_compare [ok]
-2. k8s_pod_status [ok]  order-service
-3. query_tempo_traces [error]  { resource.service.name = "order-service" status = "error" }
-```
+真相是「這個服務在這份資料裡沒有東西可以列」，一句正常的事實，被寫成一行看起來像 bug 的錯誤。這跟前面那個 Loki 空結果、那個 singleton 拒絕理由是同一種病：**訊息描述的是它撞到的技術現象，不是它遇到的實際情況。**
 
-四次呼叫沒有任何一次拿到空結果，所以今天寫的那兩段提示**一次都沒有觸發**。分數會變好，比較可能是因為這次跑的時候 order-service 有活的流量、昨天那個時段沒有。
+## 固定資料上的分數，跟活叢集上的不一樣
 
-所以正確的講法是：這個 fixture 今天是綠的，但**它綠的原因不是我今天做的事**。要證明因果，得讓兩次跑的資料條件一樣，而這件事現在做不到，因為 fixture 的時鐘是 `now`，而 `now` 的資料每分鐘都在變。這是評測本身的缺口，不是 agent 的。
+第五段有一件事要誠實講。同樣三個 fixture：
 
-> 我本來已經在腦袋裡寫好一段「工具講清楚之後，agent 就會做對」的漂亮結論了。抓逐字稿只是想補一張圖，結果補出一個反例 QQ
+| fixture | 活的 k3d | 固定 stack image |
+| --- | --- | --- |
+| payment-decline-service | 2/2 | 1/1 |
+| user-service-no-incident | 1/2 | 0/1 |
+| order-service-discover-before-query | 2/2 | 0/1 |
+
+那個 stack image 裡沒有 Kubernetes API，所以 k8s 工具全部退化成 unavailable；它的資料也是生成器烘出來的，`order-service` 那些業務指標的形狀跟活叢集不一樣，agent 一路查回空的。
+
+所以這兩個環境量到的不是同一件事。固定資料量的是「同一份輸入下，agent 的行為穩不穩」，活叢集量的是「在會動的真實系統上它撐不撐得住」。我原本以為固定資料是活叢集的嚴格替代品，跑完才知道兩邊都需要。而 fixture 是跟著它被寫出來的環境長的：那兩個 fixture 是對著活叢集寫的，搬到固定資料上，它們量的東西悄悄變了。
+
+> 這件事在真實團隊裡的版本是「在 staging 綠得很漂亮」。差別只在我這裡兩邊都是自己寫的，所以沒有人可以怪 XD
+
+還有一段沒有接上：第四段那些新東西（`trace_id`、提案的 footprint），跑的是我在 host 上起的那份服務，因為叢集裡那個 agent 跑的是舊 image。這條鏈今天是通的，但它通的是「我這台機器上的程式碼」。要讓叢集裡那份也一樣，得重新 build image、推進 k3d、重新部署，而那就是那條從程式碼到跑著的系統之間、永遠會被低估的距離。
 
 ## 對值班的人來說差在哪
 
-這幾個改動聽起來都很小，一句 note、一段 hint、丟掉一包 stats。但把它們放回半夜三點那個場景就不小。
+事後檢討會上最常出現的一句話是「它為什麼會這樣判斷」。沒有那個 trace 欄位的時候，這句話的成本是：先在 investigation 列表找到那次調查，抄下 fp 跟時間，去 Loki 撈那段時間的 agent 日誌，找到 trace id，貼進 Grafana，然後才開始看。這中間任何一步斷掉（日誌輪替、時間對不上、fp 不知道去哪找），這個問題就變成無解，而無解的下場通常是「那就不要相信它了」。有那個欄位之後，這句話的成本是一個連結。**而這個差別會決定一件事：出事之後，這個 agent 是被檢討，還是被移除。**
 
-agent 手上只有六次工具呼叫。一次空查詢如果沒有人解釋，它最好的情況是花第二次去 discover，最壞的情況是連著三次都在換句話問同一個不存在的名字，然後拿著三個空結果去寫結論。**而那個結論會長得跟一份查得很認真的結論一模一樣**，因為空結果不會在回答裡留下疤痕。
+把六段拼起來之後，這條鏈能替值班的人回答的問題是這樣一串：告警燒起來 → 三十秒後有一個結論跟一個信心分數 → 旁邊有一個「下一步做什麼」的提案，寫著它會換掉兩個 pod、從 revision 25 回到 24、在 policy 範圍內 → 而如果你不信，有一個 trace id 可以打開看它是怎麼想的 → 而如果你想知道它平常準不準，有一組 fixture 的分數可以看。沒有任何一段是「相信它」，每一段都給了一個可以自己去查的東西，這是這系列從第一天那個憑空生出 814 的 agent 走到今天，唯一真正想換到的東西。
 
-現在至少那句「你這個標籤不是可索引標籤，可索引的是這五個」會進到對話裡。它不保證模型會照做，但**它把「模型猜錯了」跟「沒有人告訴過它」這兩件事分開了**，而這條界線就是昨天那個評測想量的東西。
+反過來說也有代價要誠實講：那條 trace 裡有完整的系統 prompt 跟每一則訊息。前面撞過一次類似的事（live-check 吃到自己 coding agent 的遙測，裡面有 PII）。推理過程可回放，等於推理過程可外洩，這件事在真的環境裡要先想清楚保存期限跟誰能看。
 
 ## 今天沒做的事
 
-- **byte cap 的三個常數沒有被驗證過。** Loki 8 KB、Tempo 8 KB、Prometheus 16 KB 是當初拍的，今天量到一次 72 KB 壓成 5 KB，但「壓多少才不影響判斷」沒有實驗。
-- **`_summarize_series_result` 會丟掉尖峰的形狀。** 它保留 last/min/max/avg 加最多八個取樣點，序列夠平的時候連取樣點都不留。一個持續五分鐘的尖峰在 6 小時的窗裡會不會被抹掉，我沒有測。
-- **空結果的提示只做了 Prometheus 跟 Loki。** Tempo 的空結果（查得到語法、查不到 trace）目前還是裸的，而昨天已經知道那常常是保留期到了，不是真的沒有。
-- **沒辦法證明今天的改動有沒有用。** fixture 的時鐘是 `now`，兩次跑的資料不一樣。要做 A/B 得先有一份不會動的資料。
+- **plugin 還沒把那個連結畫出來。** 欄位存進去了，但 investigation 列表上還沒有一個「看它怎麼想的」按鈕。
+- **Tempo 只留一小時。** 這是前面就記過的帳，而它在這裡的意思是：昨天那次調查的推理過程，今天已經沒了。要留住得改保留期，或把 span 另外落地。
+- **叢集裡的 image 是舊的。** 這條鏈今天證明的是程式碼，不是部署。
+- **`agent.py` 還是一次都沒有呼叫 `audit.record`。** 我原本以為這是問題，現在覺得未必：推理過程有 trace，而 audit 是給「誰動了叢集」用的。但兩者的職責分界目前只寫在我腦子裡，沒有寫在程式碼裡。
+- **第五段只有一顆種子。** 為了讓整條鏈在一次 demo 裡跑完，`-n 1`，所以那三個數字只能當訊號。
+- **固定資料上的兩個 fixture 還是紅的**，而且紅的原因是資料形狀不同，不是 agent 變差。
+- **這支 `e2e.sh` 沒有進 CI。** 它現在是「我手動跑一次」的東西，而依賴鏈這麼長的腳本，沒有人定期跑它就會壞在下一次。
+- **沒有量 instrumentation 的開銷。** 36 到 46 個 span、每個模型 span 都帶著完整 prompt，這在高頻告警下的體積跟成本我沒有量。
 
 ## 小結
 
-總結來說，今天大部分時間花在讀三個 store 的臉色，而不是寫程式。Prometheus 跟 Loki 會用一個語法正確的空回答打發你，Tempo 會直接罵人但罵的是行話，三種都不是能直接拿來行動的東西，得由工具那一層翻譯過。真正的收穫是把「模型猜錯」跟「沒人告訴它」分開了：以前這兩種失敗在報表上長得一樣，現在前者還是 agent 的問題，後者是我的問題。至於今天的改動到底讓分數變好了沒有，老實說量不出來，因為我的 fixture 還吃著會流動的資料。
+總結來說，今天最有價值的兩個資訊都是「我差點沒去量」的東西。上半段那個 grep 的結論看起來很有力，而且我第一次跑探測拿到空結果的時候，它還被「證實」了一次；下半段第一次跑出來的 3 ok / 3 failed，三個紅燈裡一個是我的手藝、一個是檢查器自己的判準錯了、一個是錯誤訊息在說謊，沒有一個是主要功能壞掉，但它們單獨跑的時候全部都是綠的。
 
-> 「工具講清楚，agent 就會做對」這句話我今天差點就寫進小結了。
-> 幸好多跑了一次逐字稿。
+兩件事其實是同一件：**推論很便宜，而它最會配合你已經想好的結論。** 每一段都通不代表接起來也通，程式碼裡沒有那個呼叫不代表那件事沒有被記錄，這兩句都只能用一次真的跑來證明。
+
+> 這系列寫到現在，我最常犯的錯不是查錯資料，是先想好結論再去找證據，而空結果最會配合這種人 QQ
+> 另外這條鏈跑通之後我才發現，這幾天所有的驗證都是從告警那頭進去的。人在 Grafana 打字的那一頭，其實還缺了一段 :(

@@ -1,198 +1,237 @@
 ---
-title: "【Day18】圖準了，但太吵：一個 100% 配兩個驚嘆號"
+title: "【Day18】40 rps 的假流量：聚合遙測為什麼撐不起決策"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
-tags: [OpenTelemetry, AIOps, Signal Plane, 鐵人賽]
+tags: [OpenTelemetry, AIOps, CEL, 決策級遙測, 鐵人賽]
 ---
 
-# Day18：圖準了，但太吵
+# Day18：訊號跟情境的差別，是一個 JSON 欄位的差別
 
-> 一份報告裡最危險的不是錯的數字
-> 是一個正確的數字
-> 沒講清楚自己回答的是哪個問題
+> 一個裸值加上一個時間戳
+> 撐得起「發生了什麼」
+> 撐不起「該不該做什麼」
 
-前面把拓撲對帳跑起來、把 schema 對齊接上之後，那個資料品質判定第一次拿到 `proven_good: True`。照理說接下來該往前走，但我把注入給 agent 的那段 context 印出來看的時候，看到這個：
+昨天讓依賴健康分析順著拓撲走，也發現五個節點裡只有兩個判得動。那是「圖」的覆蓋率問題。今天往下挖一層，問一個更基本的：**就算每個節點都判得動，那些數字本身憑什麼被信任？**
 
-```
-Topology data-quality (last reconcile, 30 traces): declared/observed agreement 100%.
+這是概念日，沒有新的程式碼。但有一段是真的踩到的。
 
-### api-gateway
-- downstream (dependencies — could be blocking this): order-service,
-  payment-service (⚠ declared, not seen in recent traces), user-service
+## 一段沒有人打的流量
 
-### payment-service
-- upstream (callers — degrade if this fails):
-  api-gateway (⚠ declared, not seen in recent traces), order-service
-```
-
-**標題那行說一致性 100%，往下兩行就有兩個 ⚠。** 而那兩個 ⚠ 講的是同一條邊。
-
-今天處理的就是這件事。程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day18/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day18)，改的是 agent 服務自己的 `reconcile.py` 跟 `context.py`。
-
-## 為什麼一份「正確」的報告會是壞的
-
-先講清楚這不是 bug。那三行每一行單獨看都是對的：對帳確實觀察到的邊全部都有宣告（所以 100%）、`api-gateway → payment-service` 確實沒在取樣裡出現、而那條邊確實同時是 api-gateway 的下游跟 payment-service 的上游。
-
-問題是它們擺在一起之後，讀的人會拿到三個互相打架的訊息。而這裡的「讀的人」是一個模型，它不會停下來問「這個 100% 跟這兩個驚嘆號是不是在講同一件事」，它只會把整段當成事實照單全收。
-
-這是可觀測性裡那個老問題換了一個位置。告警疲勞不是因為告警錯了，是因為**大部分告警是對的但不重要，於是值班的人學會了全部略過**，然後真的那一次也跟著被略過。同一件事發生在注入給 agent 的 context 裡，代價一模一樣：一個大部分時候是雜訊的 ⚠，會讓那個符號整個貶值。
-
-前面查過那條 `api-gateway → payment-service` 的來歷，它是活的，只是那批取樣沒抽到。所以現在這個 ⚠ 有很高的機率根本不是漂移，是取樣的產物。
-
-## 三個問題，各自的成因
-
-拆開來看是三件不同的事。
-
-```mermaid
-flowchart TB
-    D["reconcile 回報<br/>一條 unobserved 的邊"] --> P1["問題一：講兩次<br/>caller 的 downstream 一次<br/>callee 的 upstream 一次"]
-    D --> P2["問題二：沒有證據就下判斷<br/>「沒看到」不等於<br/>「有機會看到卻沒看到」"]
-    S["dq_score 只算<br/>observed → declared 這個方向"] --> P3["問題三：標題說 100%<br/>因為 unobserved 根本不進分母"]
-    P1 --> N["讀的人收到<br/>互相矛盾的三段訊息"]
-    P2 --> N
-    P3 --> N
-```
-
-**問題一**是純粹的呈現。一條邊有兩個端點，而 `_annotate()` 對上游跟下游都套用了，於是同一個事實被講成兩次，讀起來像兩個獨立的問題。
-
-**問題二**比較本質。原本的判斷條件只有一行：這條邊在不在 `unobserved_edges` 裡。但「我沒看到 A 呼叫 B」有兩種完全不同的來源：A 在取樣裡跑了三十次，每次都沒呼叫 B；或者 A 根本沒出現在取樣裡。前者是證據，後者是沉默。而報告把它們寫成同一句話。
-
-**問題三**是前面就量出來的那件事：`dq_score` 算的是「觀察到的邊裡有幾成是宣告過的」，`unobserved` 那個方向不進分母。所以一份宣告了六條邊、只有一條在跑的圖，分數照樣是 100%。這個設計本身沒錯（未宣告的邊是比較危險的那一種），錯的是報告沒有講出這個分數不涵蓋什麼。
-
-## 讓「沒看到」帶著證據
-
-先補證據。`reconcile.py` 在掃 trace 的時候，順手記下每個服務出現在幾筆取樣的 trace 裡：
-
-```python
-def services_from_trace(raw: dict) -> set[str]:
-    """Every service that appears anywhere in one trace. Used to tell 'this
-    caller ran and never made the call' apart from 'this caller never ran'."""
-```
-
-這個東西是免費的，同一批 trace 已經抓回來了，只是原本只從裡面挑邊。跑起來長這樣：
+昨天的事故收拾完之後，flag 關掉、payment 重啟、所有壓力程序停掉，我順手查了一下 payment 的吞吐量，想確認環境真的乾淨了：
 
 ```console
-unobserved: [('api-gateway', 'payment-service')]
-caller_samples: {'webapp': 30, 'api-gateway': 30, 'order-service': 25,
-                 'user-service': 17, 'payment-service': 10}
+$ curl -sG localhost:9090/api/v1/query --data-urlencode \
+    'query=sum by (status) (rate(payment_charges_total[2m]))'
+{'status': 'error'}       0.0
+{'status': 'authorized'}  40.86
 ```
 
-api-gateway 出現在三十筆 trace 裡，一次都沒呼叫 payment-service。**這是一句有份量的話，而原本的報告只會說「沒看到」。**
+**每秒四十筆授權成功的付款。** 而這個時候本機沒有任何壓力程序在跑，pod 的日誌裡連一筆 `charge requested` 都沒有。
 
-於是 `context.py` 那個標記函式就有東西可以判斷了：
+去看原始的 counter：
 
-```python
-seen = drift.evidence_for(edge[0])
-if seen >= _MIN_CALLER_EVIDENCE:
-    return f" (⚠ not seen in {seen} sampled traces of {edge[0]})"
-return " (not exercised in this sample)"
+```console
+$ curl -sG localhost:9090/api/v1/query --data-urlencode 'query=payment_charges_total'
+series count: 2
+labels: [__name__, deployment_environment, git_repo, git_version, job,
+         reason, service_name, service_namespace, service_version, status,
+         telemetry_auto_version, telemetry_sdk_language, telemetry_sdk_name,
+         telemetry_sdk_version]
+
+$ kubectl -n demo get deploy payment-service -o jsonpath='{.spec.replicas}'
+2
 ```
 
-呼叫方被跑過夠多次，才給 ⚠，而且把次數寫進去；不夠的時候退成一句沒有警示符號的描述。門檻現在是 5，這個數字沒有什麼理論根據，就是一個「至少要多看幾眼才算數」的下限。
+兩個 replica，而那份 label 裡沒有任何東西可以分辨它們：沒有 pod、沒有 instance、沒有 `service.instance.id`。**兩個各自獨立累加的計數器，寫進同一條時間序列。**
+
+Prometheus 看到的就是一條上上下下跳的線，因為它一下拿到 A pod 的值、一下拿到 B pod 的值。`rate()` 的職責是處理 counter reset，於是每一次交錯它都當成「重啟了」，然後補上它以為漏掉的量。四十筆從來沒發生過的付款就是這樣長出來的。
+
+這件事重要的不是它是一個 bug。它當然是，而且是遙測管線設定的問題，不是應用程式的問題。重要的是：**那份 JSON 裡沒有任何一個欄位有機會告訴你這件事。**
+
+## 訊號跟情境
+
+ARE（Agentic Reliability Engineering，代理式可靠性工程）那本書把這個落差講得很清楚。它區分兩個詞：
+
+> *Signals* are facts about the system. *Context* is facts about the system *and the situation*.
+
+`訊號`是關於系統的事實：這個指標現在是這個值、這行 log 在這個時間點被寫出來、這條 trace 的延遲是這麼多。`情境`是關於系統**跟當下處境**的事實：這個指標是這個值，**而且它已經連續上升三十五分鐘，對照的那條基準線本身昨天才移動過**；這行 log 是這一小時裡第七行同類的，**而它來自一個依賴剛剛被 patch 過的服務**。
+
+差別在於情境帶著時間、拓撲、歷史的結構。**光有訊號你只能反應，有情境才能判斷。**
+
+前面那個四十筆假付款正好卡在這條線上。`0.0` 跟 `40.86` 這兩個數字本身是訊號，它們是 Prometheus 誠實計算出來的結果。但要判斷「這個數字能不能用」，需要的東西一個都不在那份回應裡：這條 series 背後有幾個發射源、上一次它的來源集合變過是什麼時候、這個服務二十分鐘前才重啟過。
+
+## 情境豐富層
+
+書裡給這個中間層一個名字：CEL（Context Enrichment Layer，情境豐富層）。它坐在訊號平面跟推理平面中間，職責是把訊號變成情境。
 
 ```mermaid
 flowchart TB
-    E["一條宣告的邊 A → B"] --> O{"取樣裡看到<br/>A 呼叫 B 嗎？"}
-    O -->|"看到了"| N["不標任何東西"]
-    O -->|"沒看到"| C{"A 出現在<br/>幾筆取樣的 trace 裡？"}
-    C -->|"≥ 5"| W["⚠ not seen in N sampled traces of A<br/>（有機會看到卻沒看到，是證據）"]
-    C -->|"< 5"| Q["not exercised in this sample<br/>（沒有警示符號，因為這是沉默）"]
+    subgraph SP["訊號平面"]
+        M["metric"]
+        L["log"]
+        T["trace"]
+    end
+    subgraph CEL["情境豐富層"]
+        E["enrichment<br/>補上 baseline / 趨勢<br/>拓撲位置 / 近期變更"]
+        C["correlation<br/>把分開抵達、<br/>其實在講同一件事的訊號聚在一起"]
+        P["projection<br/>短期推估<br/>五分鐘後會是多少、信心區間多寬"]
+    end
+    RP["推理平面<br/>只讀情境，不讀原始訊號"]
+    M --> E
+    L --> E
+    T --> E
+    E --> C --> P --> RP
+    P -.->|"grounding：每一段情境<br/>都走得回原始訊號"| SP
 ```
 
-> 這個門檻應該要跟著取樣總數走才對，抓 30 筆跟抓 300 筆時的「夠多次」不會是同一個數字。我先寫成常數，因為要把它做對得先有取樣涵蓋率，而那個東西前面就欠著了。
+三個職責各自回答一個不同的問題。
 
-## 一條邊只講一次
+`enrichment`（豐富化）回答「這個值算不算異常」。一個訊號進來，補上它的基準線（這個服務在這個時段的正常長什麼樣）、它的趨勢（正在往哪個方向跑、多快）、它的拓撲位置（誰依賴它）、以及它的變更情境（這附近最近部署過什麼）。昨天那個 `impact` 判斷，也就是「呼叫方的歸因失敗量跟三十分鐘前比有沒有漲」，就是最小版本的 enrichment，它做的正是「補上基準線」這件事。
 
-第二個改動只有一行，把上游那側的標記拿掉：
+`correlation`（關聯）回答「這些東西是不是同一件事」。分開抵達的訊號被聚成一組，推理平面讀到的是一幅完整的畫面而不是一堆散落的事件。Day17 那個平鋪掃描給出的二十二個候選，裡面有十一條在講同一批 402 回應，那就是一份**沒有做 correlation** 的輸出長什麼樣子。
 
-```python
-up = topo.upstream(svc)
-if up:
-    # Deliberately unannotated: the same edge is already flagged on the
-    # caller's own downstream line, and saying it twice reads as two
-    # independent problems.
-    rendered = ", ".join(up)
+`projection`（推估）回答「接下來會怎樣」。在底下的訊號支撐得起的時候，給出短期的推估值跟信心區間。這是三個裡面最有野心的一個，也是這個系列不會做到的一個。
+
+## 溯源
+
+除了三職責之外，書把另一個性質放在同一層，而且講得比三職責還重：
+
+> Every piece of context the CEL emits is traceable back to the underlying signals that produced it.
+
+`grounding`（溯源）的意思是，CEL 吐出來的每一段情境，都走得回產生它的原始訊號。推理平面提出一個假設的時候，貢獻的情境元素會被附上去，而從那些元素可以回頭找到原始訊號。
+
+書裡對這件事的立場很硬：一個沒有溯源的介入，是事後沒有人有辦法辯護的介入。
+
+而這正是前面那個四十筆假付款真正的教訓。假設有一個 agent 讀到那個數字，說「payment 吞吐量正常」，這句話在當下是無從反駁的，因為**沒有任何路徑可以從那句結論走回去問「你這個數字是從幾個計數器加起來的」**。溯源不是為了追責，是為了讓一個結論可以被檢查。
+
+## 兩種 JSON 的形狀
+
+把上面的東西落到具體的資料形狀上。這是真的從那座 stack 抓下來的聚合遙測：
+
+```json
+{
+  "status": "success",
+  "data": {
+    "resultType": "matrix",
+    "result": [
+      {
+        "metric": { "status": "authorized" },
+        "values": [
+          [1785943222, "1.9540119740520538"],
+          [1785943822, "1.8540353391634758"],
+          [1785944422, "12.476348438426095"],
+          [1785945022, "31.05294953900738"]
+        ]
+      }
+    ]
+  }
+}
 ```
 
-選擇留在呼叫方那側，是因為**呼叫方才是那條邊的擁有者**。前面設計那份 `signal.yaml` 的時候就是這樣決定的，每個服務只宣告自己打出去的邊。既然宣告的責任在呼叫方，那「這條邊沒被走到」的通知也該出現在呼叫方的區塊裡，這樣看到的人跟能處理的人是同一個。
+這份 JSON 是完全誠實的。它沒有說謊，它只是**只回答了一個問題**：你問的那句 PromQL 在這些時間點算出來是多少。
 
-## 讓分數承認自己漏了什麼
+它沒有回答、而且結構上也沒有地方可以回答的東西：這個值正不正常（沒有基準線）、這個服務該多少才算合格（沒有目標值）、它從哪裡來（沒有發射源的身分，所以那兩個 replica 的問題無處可藏）、後面那兩個十倍的跳動是事故還是假象（沒有可信度）、以及誰會被它影響（沒有拓撲）。
 
-第三個改動是在 DQ 那行後面補一句，只在「分數滿分但有邊沒被走到」的時候出現：
+決策級遙測要換的就是這個形狀。同一個事實，寫成一個帶著自己上下文的物件：
+
+```json
+{
+  "signal": "payment-service.error_rate",
+  "value": 0.557,
+  "unit": "ratio",
+  "observed_at": "2026-08-05T15:15:00Z",
+
+  "objective": { "target": "declined_rate < 1%", "breaching": true },
+  "baseline": { "window": "30m", "value": 0.002 },
+  "trajectory": { "direction": "rising", "since": "2026-08-05T14:52:00Z" },
+
+  "topology": {
+    "tier": 1,
+    "journey": "checkout",
+    "upstream": ["api-gateway", "order-service"],
+    "downstream": []
+  },
+  "impact": [
+    { "service": "order-service", "attributed_failures_delta": 0.004,
+      "verdict": "flat", "note": "topologically adjacent, not materially impacted" }
+  ],
+
+  "trust": {
+    "emitters": 2,
+    "series_distinguishes_emitters": false,
+    "freshness_guarantee_seconds": 60,
+    "caveats": ["counter conflated across 2 replicas — rate() unreliable across restarts"]
+  },
+
+  "grounding": {
+    "promql": "(sum(rate(payment_charges_total{status=\"declined\"}[5m])) or vector(0)) / clamp_min(sum(rate(payment_charges_total[5m])) or vector(0), 1)",
+    "logql": "sum by (git_version, reason) (count_over_time({service_name=\"payment-service\"} | event=~\"payment.declined|payment.gateway_error\" [5m]))",
+    "exemplar_trace_id": "47c189ff6a548f1b9910ef14f685fefc"
+  }
+}
+```
+
+**先把話講清楚：這個物件現在沒有任何一支程式會吐出來。** 它是這個系列想收斂到的形狀，不是已經有的東西。裡面的值全部是真的（`0.557` 是昨天量到的、那個 `trace_id` 是 Loki 裡真的一行 `payment.declined` 帶著的），但把它們組成一個物件這件事，目前是手工的。
+
+值得注意的是這份 JSON 裡面有多少東西**是前面幾天已經做出來的**。`objective` 來自契約、`topology` 那一段來自拓撲、`impact` 是昨天那個 `attribution` 判斷、`grounding` 裡的那兩句查詢就是契約裡宣告的權威查詢。書裡也是這麼講的：
+
+> The CEL is not a new system the team has to build. It is a layer assembled from primitives the earlier chapters have already installed.
+
+真正還缺的其實只有兩塊：`trust` 那一段（今天那個假流量就是因為沒有它才會沒人發現），跟把這些東西收斂成**一個物件**而不是散在各處。
+
+## 現在長什麼樣子
+
+那「散在各處」目前具體是什麼樣子？這是同一個服務、現在真的跑出來的東西：
 
 ```
-declared/observed agreement 100%. That score only grades edges seen in
-traffic; 1 declared edge(s) were not exercised in this sample and are
-marked below.
-```
-
-這句話做的事情是把標題跟底下的標記接起來，而不是讓它們互相打臉。讀到這裡的模型現在知道：100% 是一個單向的分數，另一個方向的東西寫在下面。
-
-## 改完之後
-
-同一座 stack、同一批流量、同一次對帳：
-
-```
-Topology data-quality (last reconcile, 30 traces): declared/observed agreement 100%.
-That score only grades edges seen in traffic; 1 declared edge(s) were not
-exercised in this sample and are marked below.
-
-### api-gateway
-- downstream (dependencies — could be blocking this): order-service,
-  payment-service (⚠ not seen in 30 sampled traces of api-gateway), user-service
-
+## Signal context (topology v1.0.0)
 ### payment-service
+- criticality: tier-1 (revenue/edge-critical); journey: checkout (4/4)
 - upstream (callers — degrade if this fails): api-gateway, order-service
+- downstream (dependencies): none (leaf — not blocked by anything downstream)
+- SLI (authoritative — cite these exact queries, don't re-derive):
+    error: (sum(rate(payment_charges_total{status="declined"}[5m])) or vector(0)) / ...
+           [ratio]  target: declined_rate < 1%
+- signal freshness guarantee: ≤60s (older samples are stale)
+- caveat: No up{} for application services (remote_write, not scraped); judge
+  liveness via rate(payment_charges_total[5m]) > 0.
 ```
 
-⚠ 從兩個變一個，而且那一個帶著它的證據。payment-service 那個區塊乾淨了，因為那條邊不歸它管。
+資訊密度其實不低，tier、journey、上下游、權威查詢、目標值、新鮮度，甚至還有兩條 caveat。**但它是一段散文。**
 
-差別不在字數，在於**現在每一個符號都還有意義**。前面那版讀完之後，一個合理的反應是「這裡有兩個警告但分數是滿分，大概都可以不用理」；這一版讀完之後，那個 ⚠ 是一句具體的話：api-gateway 跑了三十次，沒有一次走過這條路。
+它是寫給一個會讀自然語言的消費者看的，這在對象是 LLM 的時候完全說得通，也是目前這個 repo 刻意的選擇。代價是它沒有欄位、沒有型別、沒有辦法被程式檢查有沒有缺東西，而且它跟依賴健康那一段、跟 DQ（Data Quality，資料品質）那一行，是三段各自獨立生出來的文字。
 
-四條新測試釘住這幾個行為，其中兩條是專門盯著退化的：
-
-```python
-def test_context_withholds_warning_without_evidence(monkeypatch):
-    """The caller barely ran, so its unused edges are silence, not drift."""
-
-def test_context_does_not_repeat_the_edge_on_the_callee(monkeypatch):
-    """The same missing edge must be stated once, on the caller's side."""
+```mermaid
+flowchart LR
+    A["contracts.yaml"] --> C1["context.py<br/>一段散文"]
+    B["topology.yaml"] --> C1
+    B --> C2["health.py<br/>另一段散文"]
+    A --> C2
+    D["reconcile 結果"] --> C3["dq.py<br/>一行判定"]
+    C1 --> X["三段文字<br/>各自注入"]
+    C2 --> X
+    C3 --> X
+    X --> LLM["agent"]
 ```
 
-整包 325 條通過。
+同一份事實在三個地方各講一次，就是昨天跟前天那兩個問題的來源：重複的 ⚠、以及互相打臉的 100%。**那不是三個各自的 bug，是這個形狀必然會長出來的東西。**
 
-## 值班的時候差在哪
+## 誰該負責產生情境
 
-凌晨三點，agent 跟你說「order-service 在噴錯，而它下游的 payment-service 那條邊有警告」。
+從平台工程的角度，CEL 這個概念真正的主張其實是一句組織上的話：**豐富化不該發生在消費端。**
 
-如果那個警告是取樣造成的，你會白跑一趟去查 payment，而真正的問題還在原地。更糟的是第二次、第三次也是這樣之後，你會開始跳過所有帶 ⚠ 的段落，然後某一次那個 ⚠ 是真的。**這就是為什麼「多報一點總比漏報好」在有人值班的系統裡是錯的**，多報的成本不是那一次的白工，是把整個警示機制的可信度花掉。
+如果不做這一層，事情不會消失，只是移位，每一個消費者各自去補。值班的人憑經驗知道「payment 剛重啟過，這個數字先別信」；某個 dashboard 的作者手動加了一條基準線；而 agent 什麼都不知道，於是它拿到什麼就信什麼。**同一份判斷被重複做了三次，品質參差，而且沒有一次被記錄下來。**
 
-換到 agent 身上更直接。它不會累，但它會照著 context 裡的東西排優先順序。一段充滿低價值警告的 context，會讓它把推理預算花在追不存在的問題上，而它每題只有四次工具呼叫。
+這跟前面講過的那條判準是同一件事的另一面：一個機制的成本會不會隨消費者數量線性成長。把基準線、目標值、可信度做進資料本身，成本付一次；讓每個消費者自己補，成本乘以消費者數量，而且新來的那個消費者通常就是 agent，也就是最沒有能力補的那一個。
 
-## 誰決定什麼東西該被標出來
-
-從平台工程的角度，今天做的事其實是在替產品團隊過濾。
-
-那段 context 是平台團隊產的，讀它的是 agent，而最後為結論負責的是被叫醒的那個人。中間沒有任何一個環節會有人說「這個警告不重要，別理它」，所以**「什麼東西值得被標出來」這個決定，只能在產生它的地方做**。這跟前面那道 CI gate 的判準是同一件事的反面：那次講的是被擋下來的人要能自己修好，這次講的是不該擋的東西就不要擋。
-
-而這裡有一個平台團隊很容易做錯的選擇。把所有查到的東西都端出去，看起來比較「透明」，也比較安全，因為漏掉東西的責任比較大。但那等於把過濾的工作推給下游，而下游是一個沒有上下文的模型跟一個半夜被吵醒的人。**願意把不確定的訊號降級成一句不帶警示符號的描述，是平台團隊在替這兩者承擔一部分判斷責任。**
-
-## 今天沒做的事
-
-那個 `_MIN_CALLER_EVIDENCE = 5` 是拍腦袋的常數，沒有跟取樣總數連動。要做對得先有涵蓋率，那個東西前面就欠著。
-
-沒有處理歷史。一條邊這次沒被走到跟連續三天沒被走到，現在還是同一句話，而後者才是真的該有人去看的。前面提過這件事，今天依然沒做，因為對帳結果只存在記憶體裡，重開就沒了。
-
-沒有動 `undeclared_edges` 那一側的呈現。觀察到但沒宣告的邊現在還是每個沾到的服務各印一次，跟今天修掉的那個重複是同一個形狀，只是它比較少見所以還沒有咬到我。
-
-也沒有量這個改動對 agent 實際輸出的影響。今天全部是看那段注入的文字本身，沒有跑一次完整的 RCA 去比對改前改後的結論差在哪。
+至於誰來付這一次的成本，前面幾天的分工已經給了答案。宣告歸產品團隊：自己的 SLI（Service Level Indicator，服務水準指標）、自己的目標值、自己打出去的邊，只有他們知道。豐富化則必然歸平台團隊，因為基準線、拓撲位置、跨服務的關聯，都要站在看得到全部服務的位置才做得出來。
 
 ## 小結
 
-總結來說，今天沒有讓那張圖變得更準，準確度一個字都沒動，改的全部是怎麼把已經知道的事情講出來。
+總結來說，今天那個四十筆假付款不是一個很嚴重的 bug，它甚至沒有影響任何使用者。但它示範了一件事：**一份聚合遙測 JSON，在它自己的格式裡沒有任何位置可以承認自己不可靠。**
 
-比較有感的是那個 `caller_samples`。它的資料早就在手上了，同一批 trace 掃過去的時候順手數一下就有，而它把「沒看到」從一句判斷變成一句有證據的話。**我原本以為要降噪就得少講一點，結果實際做出來是多講了一個數字，然後噪音就不見了。** 少的不是資訊，是那個沒有依據的警示符號。
+訊號跟情境的差別，攤開來就是資料形狀的差別。一個裸值加時間戳，跟一個帶著基準線、目標值、拓撲位置、可信度、以及回頭走得回原始查詢的物件。前者只能支撐「發生了什麼」，後者才撐得起「該不該做什麼」。
 
-還有一個地方值得記著：那個 100% 從頭到尾沒有錯，它只是回答了一個比讀者以為的更窄的問題。而在報告裡，一個沒有講清楚自己邊界的正確數字，跟一個錯的數字造成的後果差不多。
+而 CEL 三職責裡，這個系列做到哪一步、哪一項是空的，明天逐項對照，不打模糊仗。
 
-> 那個 100% 我盯了很久，一直想它到底哪裡不對。
-> 它沒有不對，是我問的問題比它答的大 QQ
+> 那四十筆假付款是我自己壓測留下來的。
+> 環境我以為清乾淨了，圖表比我記得清楚 ^^

@@ -1,263 +1,275 @@
 ---
-title: "【Day14】讀現況：Signal Plane 到底做到哪一步了"
+title: "【Day14】那張圖準不準：邊對不對，跟名單上該有誰"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
-tags: [OpenTelemetry, AIOps, Signal Plane, 鐵人賽]
+tags: [OpenTelemetry, AIOps, Tempo, Loki, Signal Plane, 鐵人賽]
 ---
 
-# Day14：讀現況，Signal Plane 到底做到哪一步了
+# Day14：拓撲對帳，跟一個問了三次才問對的問題
 
-> 設計稿寫的是當初打算做成什麼樣
-> 程式碼寫的是後來真的做成什麼樣
-> 中間那段沒有人會回頭補
+> 一張沒有人驗過的架構圖
+> 跟一張畫錯的架構圖
+> 在會議室的投影幕上長得一模一樣
 
-昨天那份上線 checklist 在 `shipping-v0` 上跑出 7/13，而第一階段就停在那裡。前面十三天做的所有事情，回答的是同一個問題：這份資料值不值得相信。從今天開始換一個問題，這份資料能不能被推理。
-
-這兩件事的差別，用第一天那隻 agent 來講最清楚。就算它現在查得到 `app.outcome` 只有三個值、查得到那條 metric 的正確 PromQL，它拿到「order-service 的錯誤率是 3%」之後，還是不知道 order-service 在整個系統裡是什麼位置、它掛掉會影響誰、以及這 3% 到底該怪它自己還是怪它下游的 payment-service。那些東西不在遙測資料裡，在架構圖裡、在值班手冊裡、在資深工程師的腦子裡。
-
-而我手上其實已經有一個寫到一半的東西在處理這件事。agent 服務底下有一個叫 `signals` 的模組，寫的時候是照著一份設計稿走的，但那是好幾個月前的事了。所以第二階段的第一天不做新東西，先搞清楚它現在真正長什麼樣。
-
-程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day14/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day14)，只有一支 `importgraph.py`。今天被讀的那個模組是 agent 服務自己的原始碼，不在範例 repo 裡，重現步驟寫在那個資料夾的 `README.md`。
-
-## 設計文件會過期，import 關係不會
-
-要知道一個模組現在長什麼樣，最沒用的做法是去讀它的設計稿。設計稿寫的是當初打算做成什麼樣，中間砍掉的、順手加的、做到一半放著的，它一個字都不會更新。
-
-所以我寫了一支很短的工具去讀 AST（Abstract Syntax Tree，程式碼被解析之後的語法樹），把 package 內部真實的 import 關係印出來。用 AST 而不是 `grep`，是因為 `grep "^from"` 只抓得到檔案開頭那幾行，而**一個藏在函式內部、或藏在 `if __name__ == "__main__"` 底下的 `import`，一樣是一條真的依賴邊**。今天最重要的那個發現，剛好就藏在這種邊裡面。
-
-```python
-for node in ast.walk(tree):
-    if not isinstance(node, ast.ImportFrom) or node.level == 0:
-        continue
-    head = (node.module or "").split(".")[0]
-    if node.level == 1 and head in siblings:
-        found.add(head)
-```
-
-`ast.walk` 會走完整棵樹，不管那個 `import` 縮排幾層。`node.level == 1` 是「同一層的兄弟模組」（`from .topology import ...`），`level == 2` 就指到 package 外面去了，今天不看。
-
-## 八個模組，真正的形狀
-
-```console
-$ python3 ironman-2026/day14/importgraph.py aiops-agent/service/app/signals
-# aiops-agent/service/app/signals  (8 modules)
-
-module     imports                             imported by
----------------------------------------------------------------------
-compile    contract, topology                  —
-context    contract, reconcile, topology       —
-contract   —                                   compile, context, health, weaver
-dq         reconcile                           —
-health     contract, topology                  —
-reconcile  topology                            context, dq
-topology   —                                   compile, context, health, reconcile
-weaver     contract                            —
-
-nothing in this package imports: compile, context, dq, health, weaver
-  compile    runnable as a CLI: yes
-  context    runnable as a CLI: NO
-  dq         runnable as a CLI: NO
-  health     runnable as a CLI: NO
-  weaver     runnable as a CLI: yes
-```
-
-（這張表是那支腳本從 AST 直接數出來的，不是我照著檔案開頭抄的。八個模組加起來 1346 行，`wc -l` 數得出來。）
-
-看第二欄跟第三欄的分佈，這八個模組其實是三層：
-
-```mermaid
-flowchart TB
-    subgraph DEF["定義層：宣告的事實，自己不 import 任何人"]
-        TOPO["topology.py<br/>服務圖：誰呼叫誰、誰是 tier-1"]
-        CTR["contract.py<br/>信號契約：這個服務的 SLI 是哪條、正確查詢怎麼寫"]
-    end
-    subgraph DER["推導層：拿定義去對現實"]
-        REC["reconcile.py<br/>宣告的邊 vs Tempo 看到的邊"]
-    end
-    subgraph CON["消費層：把上面的東西變成一段話或一個判定"]
-        CTX["context.py<br/>組出注入 agent 的 Signal context"]
-        HLT["health.py<br/>現場跑鄰居的 SLI，判斷該怪誰"]
-        DQ["dq.py<br/>資料品質判定"]
-    end
-
-    TOPO --> REC --> CTX
-    TOPO --> CTX
-    CTR --> CTX
-    TOPO --> HLT
-    CTR --> HLT
-    REC --> DQ
-    CTX --> AG["agent.py"]
-    HLT --> AG
-    DQ --> AG
-```
-
-`topology.py` 跟 `contract.py` 是底，它們誰都不 import，卻被四個模組 import。這其實就是第一階段那個 registry 的形狀在另一個維度上重演一次：**先有一份被宣告下來、大家都指向它的事實，其他東西才有辦法互相對照。** 差別在於 registry 宣告的是「這個欄位叫什麼」，`topology.yaml` 宣告的是「這個服務在哪裡」。
-
-那個 `nothing in this package imports` 的清單有五個，但它們不是同一回事。`context`、`health`、`dq` 是被 package 外面的 `agent.py` 呼叫的，也就是 agent 每跑一次 RCA（Root Cause Analysis，根因分析）就會經過的路；`compile` 跟 `weaver` 這兩個是自己有 `__main__` 的命令列工具，只在有人手動敲的時候才會動。後面那兩個等一下會各出一次事。
-
-## 那兩份定義檔不是手寫的，是編出來的
-
-`topology.yaml` 現在長這樣：五個節點、六條邊、一條叫 `checkout` 的使用者旅程，另外五份服務契約。但這兩份檔案沒有任何一個人在維護：
-
-```console
-$ uv run python -c "
-from app.signals.compile import load_fragments, compile_signals
-f = load_fragments(); t, c = compile_signals(f)
-print('fragments:', len(f))
-print('nodes:', len(t.nodes), 'edges:', len(t.edges), 'journeys:', list(t.journeys))
-print('contracts:', len(c.contracts))
-"
-fragments: 5
-nodes: 5 edges: 6 journeys: ['checkout']
-contracts: 5
-```
-
-五份 fragment 編出五個節點。來源是每個服務自己 repo 裡的 `signal.yaml`：
-
-```console
-$ ls demo-services/services/*/signal.yaml
-demo-services/services/api-gateway/signal.yaml
-demo-services/services/order/signal.yaml
-demo-services/services/payment/signal.yaml
-demo-services/services/user/signal.yaml
-demo-services/services/webapp/signal.yaml
-```
-
-這個設計是照 ARE（Agentic Reliability Engineering，代理式可靠性工程）那本書的立場來的：一個服務有多重要、屬於哪條使用者旅程、它的 SLI（Service Level Indicator，服務水準指標）是哪一條，這些是那個服務的團隊才知道的事，不該是某個中央 wiki 頁面上的一列。所以每個服務自己宣告，`compile.py` 只負責把五份合成兩份。
-
-從平台工程的角度，這裡有個決定值得講清楚：**跨服務的那張圖是「每個服務各自宣告自己打出去的邊」聯集起來的，沒有任何一條邊是中央維護的。** 這樣一來，新加一個服務不需要去改一份公用檔案，也不會有兩個團隊同時改同一行的問題。而 `checkout` 那條旅程的順序，是從邊的集合拓撲排序推出來的，不是有人手排的。
-
-跟第一階段的 registry 對照，這是同一個模式的第二次出現：分散貢獻、集中編譯、產物進版控。前面講 codegen 的時候得出過「生成物要 commit 進版控，因為 diff 才是那個會說話的東西」，這兩份編譯出來的 YAML 同理。
-
-> 這裡有個成本要老實記：多一層編譯，就多一個「來源改了但沒有人重編」的機會。現在沒有任何東西在擋這件事，靠的是我記得。這跟前面那個「policy 檔還在但規則沒被執行」是同一個形狀的坑，只是換了個位置。
-
-## 注入給 agent 的那段話長什麼樣
-
-`context.py` 是純函式，不打任何網路，所以不用起 stack 就跑得出來：
-
-```console
-$ uv run python -c "from app.signals.context import build_signal_context; \
-    print(build_signal_context(['order-service']))"
-
-## Signal context (topology v1.0.0)
-### order-service
-- criticality: tier-1 (revenue/edge-critical); journey: checkout (3/4)
-- upstream (callers — degrade if this fails): api-gateway
-- downstream (dependencies — could be blocking this): payment-service, user-service
-- SLI (authoritative — cite these exact queries, don't re-derive):
-    error: (sum(rate(orders_total{status="error"}[5m])) or vector(0))
-           / clamp_min(sum(rate(orders_total[5m])) or vector(0), 1) [ratio]  target: error_rate < 1%
-    latency: histogram_quantile(0.95, sum by (le) (rate(order_create_duration_seconds_bucket[5m]))) [s]
-- Logs (authoritative — use THIS selector & event values):
-    stream selector: {service_name="order-service"}
-    failure events: order.cancelled
-    note: order.cancelled carries reason=auth_failed|payment_declined|unknown_product.
-          Selector key is service_name (NOT service). No event="order_failed"/"error" exists.
-- caveat: status=cancelled is a business outcome, not a service error — exclude it from
-  the error SLI; check `reason` to see if a downstream dep is the cause.
-```
-
-（這段是原樣貼的，只做了兩件事：把太長的查詢折行，以及刪掉 throughput 那條 SLI 跟開頭那段講給模型聽的說明，不然版面會爆掉。完整輸出照那個資料夾 `README.md` 裡的指令跑得出來。）
-
-把這段跟第一天那份失敗紀錄擺在一起看，前兩缺剛好各被補到一塊。
-
-`缺語意`那一塊，看倒數第三行那句 `Selector key is service_name (NOT service)`。第一天那隻 agent 就是死在這種地方，它猜 `WARN` 是大寫，60 筆 log 變成 0 筆。這裡不只把 selector 的 key 寫死了，連「有哪些 event 值」跟「沒有 `event="error"` 這種東西」都寫進去了。第一階段在 registry 裡做的 `enum` 值域，在這裡變成了一句直接餵給模型的話。
-
-`缺情境`那一塊是 `upstream` 跟 `downstream` 那兩行。這是第一階段完全沒有碰過的東西，registry 再完整也不會告訴你 order-service 的下游是 payment-service。而最後那句 caveat 更直接，它等於預先告訴 agent「你等一下會看到一堆 cancelled，那不是故障」。
-
-> 我以前覺得這種東西寫在 prompt 裡就好，反正都是給模型看的字串。後來發現差別很大：寫在 prompt 裡的是一份對所有服務都一樣的通則，寫在契約裡的是「這個服務的這條 SLI」，而且它可以被程式檢查、可以在服務改版的時候一起改。第一天那段害慘我的 schema 散文，就是前者。
-
-不過這裡也有個不太舒服的細節。那段 SLI 的 PromQL 是寫死在契約裡的，包括 `clamp_min` 那個防除零、包括 histogram 要用 `_bucket` 加 `sum by (le)`。會寫死是因為讓模型每次自己推導，它就會每次都踩同一批坑。**這等於承認一件事：在「讓 agent 自己算對」跟「把算好的答案交給它」之間，我選了後者。** 它換到的是穩定，付出的是那條查詢從此得有人維護。
-
-## 第三缺目前是空的
-
-第一天那三缺裡的第三個是`缺信任度`，也就是「agent 講出來的東西有沒有辦法驗證」。這一塊在 `signals` 模組裡有對應的東西，叫 `dq.py`，DQ 是 Data Quality。它的想法是：宣告出來的那張圖如果跟真實流量對不上，那 agent 拿著它做的判斷就不該被信任。
-
-現在跑起來是這樣：
+昨天那張九宮格，中間「對帳」那一欄三格全是空的，而其中一格的具體長相是這樣：
 
 ```console
 $ uv run python -c "from app.signals.dq import dq_verdict; print(dq_verdict())"
 {'proven_good': False, 'score': None, 'note': 'topology not reconciled against live traces; DQ unproven'}
 ```
 
-`proven_good` 是 `False`。不是因為圖畫錯了，是因為**從來沒有人跑過那個對帳**，所以它沒有任何證據可以說圖是對的。這個預設值是刻意的：沒有證據就不算通過，可信度要用跑出來的結果換，不是預設就有。
+DQ 是 Data Quality（資料品質）。這句 `DQ unproven` 的意思不是圖畫錯了，是從來沒有人去驗過。今天就是去驗那一次，而驗完會發現要問的其實是兩個問題：那些邊對不對，以及**那張圖上該有誰**。
 
-這件事對值班的人為什麼重要，可以想像凌晨三點那個場景。agent 跟你說「order-service 的錯誤是 payment-service 造成的，建議先看 payment」，你要不要照做，取決於那張「order 呼叫 payment」的圖是不是還準。而服務拓撲是整個系統裡最容易悄悄過期的東西之一，某個團隊上週把呼叫改成走訊息佇列了，圖上那條邊還在。**一張過期的圖不會讓 agent 說不出話，只會讓它非常有自信地把你指向錯的地方。**
+程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day14/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day14)。要跑的 `reconcile.py` 是 agent 服務自己的原始碼，我一個字都沒改，這個資料夾裡放的是「跑之前該先確認什麼」的兩支工具。驗證環境是 Tempo 2.6.0、Loki 3.x、Prometheus，都跑在同一座 k3d 叢集裡。
 
-所以那個 `proven_good: False` 現在的意義是誠實，不是壞掉。它是這個模組目前唯一一個把「我不知道」講出來的地方。
+## 一張沒人對過的圖，比沒有圖更危險
 
-## 那個沒有人呼叫的模組
+`topology.yaml` 宣告了六條邊：誰呼叫誰。agent 拿它來決定「這個服務的錯誤該怪它自己，還是怪它下游」。
 
-最後回到 `importgraph.py` 那個清單。`weaver.py` 這個名字看起來就是第一階段的東西接進來的地方，它做的事情也確實是：把 Weaver registry 裡宣告的 metric 名字撈出來，跟這五份契約引用的 metric 比對，看看有沒有對不上。
+問題是這種宣告的圖有一個很難察覺的失效模式。它不會壞掉，它只會慢慢跟現實脫節。某個團隊上週把同步呼叫改成走訊息佇列了，某個服務三個月前就沒有人在打了，而那份 YAML 一個字都不會變。**沒有圖的時候 agent 會說「我不知道依賴關係」，有一張過期的圖，它會很有自信地把你指向一個早就不存在的方向。**
 
-手動跑一次是會動的：
+所以這張圖必須是一份持續跟遙測對齊的東西，不是一頁 wiki。而要對齊，得先回答一個問題：怎麼從 trace 裡看出一條邊。
 
-```console
-$ uv run python -m app.signals.weaver
-weaver registry declares 6 Prom metrics: ['order_create_duration_seconds', 'orders_total',
-  'payment_charge_duration_seconds', 'payment_charges_total', 'user_auth_checks_total',
-  'user_lookups_total']
-✓ all contract SLIs reference metrics declared in the Weaver registry
-```
-
-綠燈，而且是真的綠燈，六個 metric 都對得上。但問題在於，這個綠燈只有在我手動敲那行指令的時候才會出現。
-
-翻一遍 CI 設定，跑的是 `weaver.sh check --policy`，那是第一階段那道 registry 自己的 gate。至於這支把 registry 跟 Signal Plane 接起來的檢查，CI 一次都沒跑過。它有單元測試，但測的是那個正規表示式解析得對不對、那個比對函式行為對不對，用的是 `tmp_path` 裡臨時寫出來的假 registry，不是真的那一份。
+答案比想像中簡單，而且不需要任何額外的埋點。用 httpx 加 FastAPI 的自動注入時，服務 A 呼叫服務 B，A 會產一個 CLIENT span，B 會產一個 SERVER span，而 B 的 SERVER span 的 parent 就是 A 的 CLIENT span。也就是說，`service.name` 剛好在呼叫的那一刻改變。
 
 ```mermaid
 flowchart LR
-    subgraph P1["第一階段：治理"]
-        REG["Weaver registry"] --> GATE["CI: weaver check --policy"]
-    end
-    subgraph P2["第二階段：Signal Plane"]
-        FRAG["各服務的 signal.yaml"] --> CTRC["contracts.yaml"]
-        CTRC --> AGENT["注入 agent 的 SLI 查詢"]
-    end
-    REG -.->|"weaver.py：寫好了<br/>但只有手動敲才會跑"| CTRC
+    W["span: POST /api/orders<br/>service.name = webapp"] --> G["span: POST /api/orders<br/>service.name = api-gateway"]
+    G --> O["span: create order<br/>service.name = order-service"]
+    O --> P["span: POST /charge<br/>service.name = payment-service"]
+    W -.->|"父子之間服務變了<br/>= 一條觀察到的邊"| G
 ```
 
-所以現在這兩個階段是兩條平行線，中間那條虛線在程式碼裡存在、在流程裡不存在。而它要擋的東西一點都不假設性：registry 裡某個 metric 改了名字，契約裡那條 PromQL 不會有任何反應，agent 照樣拿著一條查不到東西的查詢去問 Prometheus，然後拿回一個 `status: success` 加空陣列。第一天那個坑，會用一模一樣的形狀再發生一次，只是這次它的源頭是兩份檔案沒有對齊。
+所以判斷條件只有一行：一個 span 的服務跟它 parent 的服務不一樣，那就是一條觀察到的邊。
 
-這也讓我對前面那段「這是同一個模式的第二次出現」的滿意打了折。模式是同一個沒錯，但第一階段那個模式之所以有用，是因為它接了 CI；這一個沒有。**一個沒有被自動跑的檢查，跟一個不存在的檢查，在事情出錯的當下是同一個東西。**
+```python
+for sid, svc in svc_of.items():
+    psvc = svc_of.get(parent_of.get(sid))
+    if psvc and svc and psvc != svc:
+        edges.add((psvc, svc))
+```
 
-## 攤成一張九宮格
+把一批 trace 這樣掃過去，取聯集，就得到「觀察到的邊」的集合。跟宣告的那六條做集合運算，就是兩份清單：宣告了但沒觀察到，以及觀察到但沒宣告。
 
-`weaver.py` 這件事讓我想把整個模組重新排一次，因為我懷疑它不是單一個案。
+## 第一次跑，六條邊全滅
 
-第二天講過 agent 缺的是三件事：`缺語意`（欄位叫什麼、值有哪些，前後服務講不講同一種語言）、`缺情境`（這些訊號彼此的關係是資料自己講清楚的，還是機器腦補出來的）、`缺信任度`（它說「我判斷是這個」的時候，這句話有沒有辦法被驗證）。那是一條軸。
+```console
+$ uv run python -m app.signals.reconcile
+topology v1.0.0 reconciled against 0 traces
+  declared=6 observed=0 dq_score=None
+  declared but not observed (stale or low traffic):
+      api-gateway → order-service
+      api-gateway → payment-service
+      api-gateway → user-service
+      order-service → payment-service
+      order-service → user-service
+      webapp → api-gateway
+```
 
-今天讀完程式碼之後，我發現還有另一條軸，而且它跟第一條完全垂直。同一件事在這個系統裡會經過三個階段：先被`宣告`下來（有人坐下來把它寫進一份檔案），再拿去`對帳`（跟真實跑出來的東西比一次，確認它還準），最後才被`消費`（真的送到 agent 面前）。三缺乘上三個階段，就是九格：
+六條邊，一條都沒觀察到。如果照字面讀，這份報告在說「你宣告的整張圖跟現實完全對不上」。
 
-|  | 宣告 | 對帳 | 消費 |
-| --- | --- | --- | --- |
-| **缺語意** | registry、`contract.py` 的 SLI 與 log selector | `weaver.py`（寫好了，沒人跑）、live-check | MCP、注入的那段 `service_name (NOT service)` |
-| **缺情境** | `topology.yaml`、`compile.py` 編出來的圖 | `reconcile.py`（寫好了，沒跑過） | `context.py` 的 upstream／downstream、`health.py` |
-| **缺信任度** | 意圖：什麼叫正常、門檻是多少 | `dq.py`（`proven_good: False`） | 空的 |
+而它其實只是在說沒有流量。`traces_sampled` 是 0，那一行就寫在最上面，但它排在報告的第一行、字很小，而下面那六條紅通通的邊佔了整個畫面。`dq_score` 給的是 `None` 而不是 `0.0`，這個區分是對的（沒有資料，跟資料顯示一致性為零，是兩件事），但這個區分只活在那個回傳值裡，沒有活在人看到的畫面上。
 
-排完之後那個形狀很清楚：**第一欄幾乎滿的，第三欄大致有東西，中間那一欄三格全是「寫好了但沒有在跑」。**
+會沒有流量，是因為 `reconcile` 在搜尋的時候套了一個過濾器 `{ trace:duration > 5ms }`。這個過濾器是必要的，我寫了一支小工具去看那段時間 Tempo 裡到底有什麼：
 
-而中間那欄正好是唯一會說「你手上這份東西已經不準了」的一欄。宣告那欄只會告訴你當初打算長怎樣，消費那欄只會把它照實端到 agent 面前，兩邊都沒有能力發現中間差了多少。所以這三格空著的代價不是少了一個功能，是這個系統目前沒有任何一條路徑會主動告訴你資料已經漂掉了，跟第一階段那個「檢查通過但其實是錯的」是同一個形狀，只是換到了另一層。
+```console
+$ python3 ironman-2026/day14/tempo_probe.py http://localhost:3210 120
+http://localhost:3210 → Tempo 2.6.0 (rev e85bbc57d)
+  last 120s: 214 traces
+    slowest seen           : 1ms
+    survives the >5ms filter: 0
+    ⚠ reconcile would sample 0 traces here and report every declared
+      edge as unobserved. That is 'no traffic', not 'the graph is wrong'.
+```
 
-右下角那一格也要老實講。agent 那邊確實有兩道 LLM-as-a-judge 的守門，其中一道會去驗回答裡的每個 trace id 是不是真的存在，那算是信任度的消費端做了一半。但那兩道守門看的是 agent 講出來的話，不是它讀進去的資料。Signal Plane 這一側沒有任何東西會跟 agent 說「你正在用的這張圖，可信度是多少」。`dq.py` 算得出那個分數，但它現在只送給治理層決定要不要放行自動執行，沒有進到 agent 的推理裡。
+214 筆 trace，最長 1 毫秒，全部是 kubelet 打的 `GET /health` 跟 `GET /healthz`。健康檢查會把 Tempo 灌滿，而且它們不跨服務，一條邊都貢獻不了。不濾掉它們，那個取樣上限會被探針吃光。**但同一個過濾器，在沒有應用流量的時候會把畫面清成全空，而全空跟「圖全錯」在報告上長得一模一樣。**
 
-> 這張表是我今天讀完程式碼才排出來的，不是設計稿裡本來就有的。排出來之前我對這個模組的印象是「s1 到 s4 都做完了」，排完才看到那一整欄的洞。
+在拿到這個結論之前我先繞了一大圈：`kubectl port-forward` 把 Tempo 轉到本機 3200，curl 得到回應、reconcile 拿到 0 筆、collector 說它送出了四萬多個 span 而且零失敗、Tempo 的 log 說它正在寫 block，每一個元件都說自己沒事，資料卻不在。真相是那句 port-forward 根本沒成功（`bind: address already in use`），本機 3200 早就被另一座 k3d 叢集的 load balancer 佔著，那座叢集裡也有一個 Tempo，版本 2.10.3，資料本來就停在兩小時前。兩個東西共用一個埠號，失敗的那個安靜地退場，而活著的那個照常回答問題。我後來把「這個位址上的 Tempo 到底是哪一版」加進那支探針工具的第一行輸出，就是因為這件事：**一個對帳工具在報告差異之前，得先能證明它在跟正確的對象講話。**
+
+> 這是這個系列第幾次遇到「空結果沒有錯誤訊息」我已經數不清了。第一天是 Prometheus 回 `status: success` 加空陣列，這次是一個對帳報告的空集合。形狀完全一樣：查詢成功、結果是空的、而空的原因有兩種，工具不告訴你是哪一種。
+
+## 那條邊到底存不存在
+
+灌了 70 秒的流量再跑一次，這次像樣了：
+
+```console
+topology v1.0.0 reconciled against 50 traces
+  declared=6 observed=5 dq_score=1.0
+  declared but not observed (stale or low traffic):
+      api-gateway → payment-service
+```
+
+取樣 50 筆 trace，宣告六條、觀察到五條，`dq_score` 是 1.0。那個 1.0 的意思要看清楚，它算的是「觀察到的邊裡面，有幾成是宣告過的」。1.0 代表沒有任何一條真實流量走在圖上沒有的路徑上，這是刻意選的方向，因為`未宣告的邊`是比較危險的那一種：它代表有人加了一個依賴而沒有人知道。
+
+剩下那條 `api-gateway → payment-service` 是宣告了但沒觀察到。到這裡，一份正常的排查會停在「這條邊大概是舊的，去問問看還有沒有人在用」。我沒有停在那裡，因為那個括號裡寫著 `stale or low traffic`，兩種可能塞在同一個清單裡。
+
+先去翻原始碼，api-gateway 確實有這條路（`POST /api/payments` 直接代理到 payment 的 `/charge`），只是 `load.sh` 的端點組合裡沒有直接打它，付款都是經由 order-service 進去的。手動打了十二次之後再跑，結果沒變，還是 `unobserved`。於是我去 Tempo 裡撈一筆真的走過那條路的 trace，把同一個函式套上去：
+
+```console
+$ uv run python -c "... edges_from_trace(raw) ..."
+edges in that one payment trace: {('api-gateway', 'payment-service')}
+```
+
+**那條邊看得見，是對帳沒有看到它。** 問題出在取樣：`reconcile` 預設抓 50 筆 trace，而那段時間 Tempo 裡的 trace 由結帳流量主導，我那十二筆付款請求根本沒被抽中。同一份程式碼、同一個視窗、同一座 stack，只把取樣數往上調：
+
+```console
+max_traces=50   sampled=50   observed=5  dq=1.0  unobserved=[('api-gateway', 'payment-service')]
+max_traces=100  sampled=100  observed=5  dq=1.0  unobserved=[('api-gateway', 'payment-service')]
+max_traces=300  sampled=300  observed=6  dq=1.0  unobserved=[]
+```
+
+50 跟 100 說這條邊死了，300 說一切正常。而預設值是 50。
+
+```mermaid
+flowchart TB
+    U["一條邊出現在<br/>「宣告了但沒觀察到」"] --> Q{"為什麼沒看到？"}
+    Q -->|"這條路真的沒人走了"| A["圖過期了<br/>該去改 signal.yaml"]
+    Q -->|"走的人太少<br/>沒被抽樣抽到"| B["圖是對的<br/>是對帳的取樣不夠"]
+    Q -->|"那段時間沒有應用流量"| C["什麼都不能斷定<br/>traces_sampled=0"]
+    A --> S["報告上長得一模一樣"]
+    B --> S
+    C --> S
+```
+
+三種原因，一種呈現。而它們的處置完全相反：第一種要去改宣告，第二種要去改對帳的參數，第三種什麼都不該做。這件事讓我對這個模組的評價往下修了一格。它不是壞掉，它做的事情是對的，但它**把一個統計取樣的結果，用一個斷言的語氣印出來**。`observed` 是一個下界，不是一個事實；`unobserved` 是「我沒看到」，不是「它不存在」。這兩個詞現在讀起來的份量是一樣的。
+
+> 稀有路徑本來就是最難用取樣看到、也最值得知道的東西。錯誤處理的分支、降級的備援路徑、只有月底才會走的結算流程，全部都是低流量高風險。而一個照流量比例取樣的對帳，剛好對它們最盲。
+
+## 那更前面的問題：這張圖上該有誰
+
+上面整件事有個前提我沒有質疑過：那張圖上的五個服務，是誰決定的。
+
+答案是我。`topology.yaml` 裡那五個節點，是五個服務各自的 `signal.yaml` 編出來的，而那五份檔案是人寫的。如果有第六個服務跑起來卻沒有人寫那份宣告，這整套東西不會有任何反應。
+
+agent 服務裡本來就有一個函式在做這件事，`list_service_names()`，讀的是 Loki 的 `label/service_name/values`，而 `topology.py` 也早就有一支 CLI 把它接起來了。跑一次：
+
+```console
+$ uv run python -m app.signals.topology validate
+topology v1.0.0 aligns with 5 live services
+```
+
+宣告五個，活著五個，完全對齊。這是第一個答案，而它是錯的。
+
+> 順帶一提，那個 `start`／`end` 不是可有可無的。Loki 的 label values 端點沒給時間範圍會回一個空陣列而不是報錯，這個坑我在別的地方踩過一次。又是同一個形狀：查詢成功、結果是空的、沒有任何東西說你少給了參數。
+
+會去懷疑，是因為前面翻 Tempo 的時候看到過一個不在那五個裡面的名字。所以我把同一個問題分別問了三個 store：
+
+```console
+$ curl -s ".../loki/api/v1/label/service_name/values" | jq -c .data
+["api-gateway","order-service","payment-service","user-service","webapp"]
+
+$ curl -s ".../api/v1/label/service_name/values" | jq -c .data
+["aiops-agent","api-gateway","order-service","payment-service","user-service","webapp"]
+
+$ curl -s ".../api/v2/search/tag/resource.service.name/values" | jq -c '[.tagValues[].value]|sort'
+["aiops-agent","api-gateway","order-service","payment-service","user-service","webapp"]
+```
+
+Loki 說五個，Prometheus 說六個，Tempo 說六個。多出來的那個是 `aiops-agent`，也就是這個系列從第一天用到現在的那隻 agent 自己。它跑在同一個 namespace 裡、有 trace、有 metric，就是沒有 log 進 Loki。我把視窗拉到七天，Loki 還是沒看過它。
+
+原因查得到：demo 那組服務共用一份 `o11y_shared/logging.py`，裡面把 OTLP 的 logger provider 接起來了；agent 服務沒有這個東西，它的 log 只進 stdout。所以這不是資料掉了，是這個服務從一開始就沒有把 log 送進來，而它的另外兩種訊號都好好的。
+
+```mermaid
+flowchart TB
+    A["aiops-agent<br/>正在跑，有流量"] --> M["metric → Prometheus ✓"]
+    A --> T["trace → Tempo ✓"]
+    A --> L["log → 只進 stdout ✗"]
+    L --> Q["list_service_names 只讀 Loki"]
+    Q --> R["所以它不存在<br/>而報告說「完全對齊」"]
+```
+
+`list_service_names()` 沒有 bug，它做的事情跟它的 docstring 一字不差，「Loki 裡現在有哪些 `service_name`」。問題出在呼叫它的那一行，把這個答案當成了「現在有哪些服務」。這兩句話在五個服務都乖乖送三種訊號的時候是同一件事，在第六個服務只送兩種的時候就不是了。而**偏偏是那些不完整的服務最需要被發現**，因為「這個服務沒有送 log」本身就是一件該有人知道的事。
+
+所以現在這個檢查有一個很難看的性質：一個服務越不合規，它越不容易被這個檢查抓到。這跟前面那份上線 checklist 的第八項是同一種諷刺，那次是命名寫錯的服務躲過了值域檢查，這次是不送 log 的服務躲過了存在性檢查。
+
+## 那就三個都問，然後多一個離開碼
+
+改法本身沒什麼技術含量，把三個 store 都問一遍，取聯集：
+
+```console
+$ python3 ironman-2026/day14/topology_watch.py \
+    --topology aiops-agent/service/app/signals/topology.yaml \
+    --loki ... --prom ... --tempo ... --lookback 6h
+
+# topology watch — declared 5, lookback 6h
+  loki        sees  5: api-gateway, order-service, payment-service, user-service, webapp
+  prometheus  sees  6: aiops-agent, api-gateway, order-service, payment-service, user-service, webapp
+  tempo       sees  6: aiops-agent, api-gateway, order-service, payment-service, user-service, webapp
+  ~ 'aiops-agent' is missing from loki but present in others
+  ✗ live 'aiops-agent' is not declared (seen by prometheus, tempo)
+```
+
+`exit=1`。而只問 Loki 的版本，也就是一開始那個答案，`exit=0`。同一座叢集、同一個時間、同一份拓撲，一個說有漂移，一個說完全對齊。
+
+那行 `~` 是我後來才加的，它單獨列出「有些 store 看得到、有些看不到」的服務。這一行本身就是一個訊號：一個服務只出現在三分之二的 store 裡，通常代表它的遙測有一塊沒接上，而不是它半死不活。這個資訊比最後那行漂移判定更早、也更可行動。
+
+前面抱怨過對帳報告把三種原因塞進同一個畫面，這支腳本至少把最後一種拆出來了：
+
+```console
+$ python3 ironman-2026/day14/topology_watch.py --topology ... --loki http://localhost:9999
+  ! loki did not answer (Connection refused) — treating it as no evidence
+  no source answered; cannot tell alignment from silence
+$ echo $?
+2
+```
+
+| 碼 | 意思 | 排程上該怎麼反應 |
+| --- | --- | --- |
+| 0 | 宣告的跟活著的一致 | 什麼都不用做 |
+| 1 | 有漂移 | 通知擁有那個服務的團隊 |
+| 2 | 問不到，什麼都不能斷定 | 通知平台團隊，這是監控自己壞了 |
+
+2 跟 0 分開是這支腳本唯一真正重要的設計。**把「查不到」算成「沒有漂移」，這個排程就變成一個永遠不會響的告警**，而那正是這個系列從第一天追到現在的那個形狀，只是這次它會發生在一個沒有人盯著的 cron 裡。
+
+而一放上排程，`--lookback` 這個參數的性質就變了。手動跑的時候它只是「我想看多久以前」，排程跑的時候它變成一條規則：一個服務多久沒有訊號，就算它死了。六小時對這組 demo 服務很夠，但對一個只有月底跑的結算服務，六小時的視窗每天都會把它報成死的，然後那個團隊會在兩週內學會忽略這個通知。這跟前面那個取樣問題是同一件事的另一個版本，低頻的東西最容易被誤判成不存在，而低頻不代表不重要。
+
+> 這個參數該設多少，答案不在平台團隊手上。只有那個服務的團隊知道自己的正常閒置週期有多長，所以合理的設計大概是讓它跟著服務走，寫進各自那份 `signal.yaml`，而不是一個全公司一體適用的數字。今天沒有做到這一步。
+
+## 誰擁有宣告，誰擁有對帳，誰收到通知
+
+從平台工程的角度，這裡有幾條界線要畫清楚。
+
+那六條邊的宣告是**產品團隊擁有的**，寫在各自服務的 `signal.yaml` 裡，每個服務只宣告自己打出去的邊，這個設計讓新加服務不用去改一份公用檔案。而對帳這件事剛好相反，它必然是**平台團隊的**，因為它要跨所有服務去看 Tempo，任何單一團隊都拿不到全貌。所以介面是：平台團隊提供對帳，產品團隊收到「你宣告的這條邊我沒看到」的通知，然後由他們決定那是該刪的舊邊還是流量太低。平台團隊不該替他們決定，因為只有那個團隊知道那條路是不是只有月底才會走。
+
+而漂移有兩個方向，該找的人不一樣：
+
+```mermaid
+flowchart TB
+    D{"哪個方向的漂移"} -->|"宣告了<br/>但沒有任何訊號"| A["服務下線忘了改宣告？<br/>還是遙測斷了？"]
+    D -->|"活著<br/>但沒有宣告"| B["有服務上線<br/>沒走上線流程"]
+    A --> AO["找那個服務的團隊<br/>只有他們知道是哪一種"]
+    B --> BO["找平台團隊<br/>這是流程漏洞，不是誰的疏忽"]
+    D -->|"只有部分 store 看得到"| C["遙測有一塊沒接上"] --> CO["找那個團隊<br/>但帶上「哪個 store 看不到」"]
+```
+
+「活著但沒有宣告」多半根本不是漂移，是有一個服務上線的時候沒有走上線流程，那是平台團隊的流程漏洞。今天這個 `aiops-agent` 剛好是這一種，而它的擁有者是我自己，這其實蠻公平的。
+
+至於通知該長什麼樣，那行 `seen by prometheus, tempo` 是刻意留的。收到通知的人第一個問題一定是「你憑什麼說它活著」，先把證據放進訊息裡，可以省掉一輪來回。同樣的道理套回對帳報告上，那句 `stale or low traffic` 把判斷丟回給讀的人卻沒給他判斷需要的東西，至少得補上「這條邊上一次被觀察到是什麼時候」跟「這次取樣涵蓋了多少比例的流量」。
+
+## 值班的時候會怎樣
+
+把這件事放回凌晨三點。agent 說「order-service 在噴錯，但它的下游 payment-service 是健康的，所以問題應該在 order-service 自己」。
+
+如果那張圖裡 `order-service → payment-service` 這條邊因為取樣不足被判定成不存在，agent 就不會去看 payment，也不會把它列進候選。你拿到的是一段推理完整、語氣肯定、而且少了一整個分支的結論。**它不會告訴你它少看了哪裡，因為它自己也不知道。**
+
+反過來，如果 `dq_score` 跟那份 `unobserved` 清單有跟著送到值班的人面前，至少你會知道「這個判斷是建立在一張有兩條邊沒被驗證的圖上」。這個資訊現在算得出來，`context.py` 也真的會把漂移標記注進去，但前提是有人跑過對帳。而今天之前，沒有人跑過。
 
 ## 今天沒做的事
 
-沒有跑 `health.py`。它是這個模組裡唯一一個會打真實查詢的，要一套跑著的 stack 才驗得出來，今天全部是離線就跑得出來的東西。它那個「下游不健康就先查下游」的規則到底準不準，留給後面。
-
-沒有跑拓撲對帳，所以 `dq.py` 那個 `proven_good` 也就只能是 `False`。那張宣告的圖跟 Tempo 裡真的看得到的呼叫關係差多少，今天完全沒有量，只知道沒有人量過。
-
-`weaver.py` 沒有接進 CI，也沒有接進 `contract.py` 的載入流程。要接哪一邊其實是個設計問題，接 CI 是「改壞了 PR 會紅」，接載入流程是「跑起來就會知道」，兩者的失敗時機差很多，留給後面處理。
-
-也沒有處理 `compile.py` 的重編問題。fragment 改了但沒重編，現在沒有任何東西會發現，而這正好是前面那份回歸腳本最擅長的形狀，只是我還沒把它寫進去。
+- **對帳跟那支 watch 都沒有排程。** 今天全部是手動敲的，而一個要靠人記得跑的資料品質檢查，跟前面那些「寫好了但沒有在跑」的東西是同一個問題。要真的排上去，得先決定 exit 2 的時候通知誰、以及連續幾次 exit 1 才值得吵人。
+- **沒有處理取樣。** 最直接的做法是把取樣數調高，但那只是把界線往後推。比較對的方向大概是讓對帳留下歷史，用「這條邊連續幾天沒被看到」取代「這一次沒看到」。
+- **`unobserved` 沒有帶上時間。** 一條邊上次被觀察到是十分鐘前還是三個月前，是決定要不要動手刪它的關鍵，而現在這兩者在報告上完全一樣。
+- **沒有量「取樣涵蓋率」。** 要判斷 50 筆夠不夠，得先知道那個視窗裡總共有多少筆，而那個數字現在只有我手動用探針工具問出來。
+- **沒有把 `list_service_names()` 改掉。** 今天做的是一支獨立的腳本，agent 服務裡那個只讀 Loki 的函式一個字都沒動，所以 `topology validate` 那條路現在依然會給出那個假綠燈。要決定的是「多一個資料源」還是「換一個資料源」，兩者對其他呼叫端影響不同。
+- **沒有處理服務改名。** 一個服務從 `user-service` 改叫 `identity-service`，這支腳本會報成一個死掉加一個新增，而不是一次更名。
+- **`--lookback` 沒有下放到各服務自己宣告。**
 
 ## 小結
 
-總結來說，今天沒有寫任何新功能，只寫了一支七十行的工具去讀自己幾個月前寫的東西。有點無聊，但比我預期的有用。
+總結來說，今天做的事其實只有「把一支寫好很久的程式跑起來，然後把一個問題問三次而不是一次」。但跑之前我以為的結果是「圖大概八成準」，跑完拿到的是三個不同的答案，取決於我把取樣數設成多少；而那個「完全對齊」的綠燈，是因為我問的那個 store 剛好是唯一看不到第六個服務的那一個。
 
-`topology.yaml` 那五個節點六條邊我本來以為是手寫的，翻完才想起來它是編出來的，而那五份 `signal.yaml` 分散在各個服務底下，是這整個設計裡我最滿意的一段。至於 `weaver.py` 沒有人呼叫這件事，講難聽點就是第一階段那十三天的成果，目前並沒有真的流進第二階段，中間隔著一行沒有人敲的指令。
+比較有價值的大概是那條 `api-gateway → payment-service`，它被報成一條死掉的邊，實際上活得好好的，而我是靠著撈一筆單獨的 trace、把同一個函式套上去，才證明它存在。**一個對帳工具說「這裡有差異」的時候，你還是得有辦法去驗證那個差異本身。** 這跟第一天寫評分器時得出的那句「一個會給錯答案的評分器比沒有評分器更糟」是同一件事，只是這次的受測物換成了一張圖。
 
-那張九宮格中間整欄的空白，大概是接下來幾天真正要處理的東西。明天先把那張圖跟真實流量對一次，看看它到底準不準。
+要繼續往下做之前，這張圖上的節點至少得先是活的、邊至少得先被驗過。接下來要處理的是圖以外的東西：那些宣告出來的欄位，跑起來之後到底有沒有照著送。
 
-> 翻自己幾個月前寫的東西，最尷尬的不是寫得爛。
-> 是有一半的我已經忘記自己寫過了 QQ
+> 那一個多小時，我對著一座根本不相干的 Tempo 做根因分析。查得很認真，方法也沒錯，就是查錯了那一台 XD
+> 然後又寫了一個「誰漏了宣告」的檢查，第一個被漏掉的是它自己。這種巧合我只能說「很棒！」

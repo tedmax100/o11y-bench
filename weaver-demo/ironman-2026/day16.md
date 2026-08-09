@@ -1,184 +1,198 @@
 ---
-title: "【Day16】這張圖上該有誰：一個問了三次才問對的問題"
+title: "【Day16】圖準了，但太吵：一個 100% 配兩個驚嘆號"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
-tags: [OpenTelemetry, AIOps, Loki, Signal Plane, 鐵人賽]
+tags: [OpenTelemetry, AIOps, Signal Plane, 鐵人賽]
 ---
 
-# Day16：這張圖上該有誰，一個問了三次才問對的問題
+# Day16：圖準了，但太吵
 
-> 一份宣告漏掉一個服務
-> 這套機制不會報錯
-> 它會安靜地把那個服務當成不存在
+> 一份報告裡最危險的不是錯的數字
+> 是一個正確的數字
+> 沒講清楚自己回答的是哪個問題
 
-昨天那份對帳的結論是取樣不夠，`api-gateway → payment-service` 明明活著卻被報成死掉的邊。但那整件事有個更前面的前提我沒有質疑過：**那張圖上的五個服務，是誰決定的。**
+前面把拓撲對帳跑起來、把 schema 對齊接上之後，那個資料品質判定第一次拿到 `proven_good: True`。照理說接下來該往前走，但我把注入給 agent 的那段 context 印出來看的時候，看到這個：
 
-答案是我。`topology.yaml` 裡那五個節點，是五個服務各自的 `signal.yaml` 編出來的，而那五份檔案是人寫的。如果有第六個服務跑起來卻沒有人寫那份宣告，這整套東西不會有任何反應。
+```
+Topology data-quality (last reconcile, 30 traces): declared/observed agreement 100%.
 
-今天要處理的就是這件事，順便讓它從「我想到才敲一次」變成一個排程跑得動的東西。
+### api-gateway
+- downstream (dependencies — could be blocking this): order-service,
+  payment-service (⚠ declared, not seen in recent traces), user-service
 
-程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day16/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day16)，一支 `topology_watch.py`。驗證環境是 Loki 3.x、Tempo 2.6.0、Prometheus，都跑在同一座 k3d 叢集裡。
+### payment-service
+- upstream (callers — degrade if this fails):
+  api-gateway (⚠ declared, not seen in recent traces), order-service
+```
 
-## 現成的答案：問 Loki
+**標題那行說一致性 100%，往下兩行就有兩個 ⚠。** 而那兩個 ⚠ 講的是同一條邊。
 
-agent 服務裡本來就有一個函式在做這件事：
+今天處理的就是這件事。程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day16/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day16)，改的是 agent 服務自己的 `reconcile.py` 跟 `context.py`。
+
+## 為什麼一份「正確」的報告會是壞的
+
+先講清楚這不是 bug。那三行每一行單獨看都是對的：對帳確實觀察到的邊全部都有宣告（所以 100%）、`api-gateway → payment-service` 確實沒在取樣裡出現、而那條邊確實同時是 api-gateway 的下游跟 payment-service 的上游。
+
+問題是它們擺在一起之後，讀的人會拿到三個互相打架的訊息。而這裡的「讀的人」是一個模型，它不會停下來問「這個 100% 跟這兩個驚嘆號是不是在講同一件事」，它只會把整段當成事實照單全收。
+
+這是可觀測性裡那個老問題換了一個位置。告警疲勞不是因為告警錯了，是因為**大部分告警是對的但不重要，於是值班的人學會了全部略過**，然後真的那一次也跟著被略過。同一件事發生在注入給 agent 的 context 裡，代價一模一樣：一個大部分時候是雜訊的 ⚠，會讓那個符號整個貶值。
+
+前面查過那條 `api-gateway → payment-service` 的來歷，它是活的，只是那批取樣沒抽到。所以現在這個 ⚠ 有很高的機率根本不是漂移，是取樣的產物。
+
+## 三個問題，各自的成因
+
+拆開來看是三件不同的事。
+
+```mermaid
+flowchart TB
+    D["reconcile 回報<br/>一條 unobserved 的邊"] --> P1["問題一：講兩次<br/>caller 的 downstream 一次<br/>callee 的 upstream 一次"]
+    D --> P2["問題二：沒有證據就下判斷<br/>「沒看到」不等於<br/>「有機會看到卻沒看到」"]
+    S["dq_score 只算<br/>observed → declared 這個方向"] --> P3["問題三：標題說 100%<br/>因為 unobserved 根本不進分母"]
+    P1 --> N["讀的人收到<br/>互相矛盾的三段訊息"]
+    P2 --> N
+    P3 --> N
+```
+
+**問題一**是純粹的呈現。一條邊有兩個端點，而 `_annotate()` 對上游跟下游都套用了，於是同一個事實被講成兩次，讀起來像兩個獨立的問題。
+
+**問題二**比較本質。原本的判斷條件只有一行：這條邊在不在 `unobserved_edges` 裡。但「我沒看到 A 呼叫 B」有兩種完全不同的來源：A 在取樣裡跑了三十次，每次都沒呼叫 B；或者 A 根本沒出現在取樣裡。前者是證據，後者是沉默。而報告把它們寫成同一句話。
+
+**問題三**是前面就量出來的那件事：`dq_score` 算的是「觀察到的邊裡有幾成是宣告過的」，`unobserved` 那個方向不進分母。所以一份宣告了六條邊、只有一條在跑的圖，分數照樣是 100%。這個設計本身沒錯（未宣告的邊是比較危險的那一種），錯的是報告沒有講出這個分數不涵蓋什麼。
+
+## 讓「沒看到」帶著證據
+
+先補證據。`reconcile.py` 在掃 trace 的時候，順手記下每個服務出現在幾筆取樣的 trace 裡：
 
 ```python
-async def list_service_names(lookback: str = "now-6h") -> list[str]:
-    """The set of service_name values actually present in Loki right now."""
-    data = await _get_json(
-        settings.loki_url,
-        "/loki/api/v1/label/service_name/values",
-        {"start": _epoch_ns(start), "end": _epoch_ns(end)},
-    )
+def services_from_trace(raw: dict) -> set[str]:
+    """Every service that appears anywhere in one trace. Used to tell 'this
+    caller ran and never made the call' apart from 'this caller never ran'."""
 ```
 
-而 `topology.py` 也早就有一支 CLI 把它接起來了。跑一次：
+這個東西是免費的，同一批 trace 已經抓回來了，只是原本只從裡面挑邊。跑起來長這樣：
 
 ```console
-$ uv run python -m app.signals.topology validate
-topology v1.0.0 aligns with 5 live services
+unobserved: [('api-gateway', 'payment-service')]
+caller_samples: {'webapp': 30, 'api-gateway': 30, 'order-service': 25,
+                 'user-service': 17, 'payment-service': 10}
 ```
 
-宣告五個，活著五個，完全對齊。這是今天的第一個答案，而它是錯的。
+api-gateway 出現在三十筆 trace 裡，一次都沒呼叫 payment-service。**這是一句有份量的話，而原本的報告只會說「沒看到」。**
 
-> 順帶一提，那個 `start`／`end` 不是可有可無的。Loki 的 label values 端點沒給時間範圍會回一個空陣列而不是報錯，這個坑我在別的地方踩過一次。又是同一個形狀：查詢成功、結果是空的、沒有任何東西說你少給了參數。
+於是 `context.py` 那個標記函式就有東西可以判斷了：
 
-## 同一個問題問三次
-
-會去懷疑，是因為前一天翻 Tempo 的時候，看到過一個不在那五個裡面的名字。所以我把同一個問題分別問了三個 store：
-
-```console
-$ curl -s ".../loki/api/v1/label/service_name/values" | jq -c .data
-["api-gateway","order-service","payment-service","user-service","webapp"]
-
-$ curl -s ".../api/v1/label/service_name/values" | jq -c .data
-["aiops-agent","api-gateway","order-service","payment-service","user-service","webapp"]
-
-$ curl -s ".../api/v2/search/tag/resource.service.name/values" | jq -c '[.tagValues[].value]|sort'
-["aiops-agent","api-gateway","order-service","payment-service","user-service","webapp"]
+```python
+seen = drift.evidence_for(edge[0])
+if seen >= _MIN_CALLER_EVIDENCE:
+    return f" (⚠ not seen in {seen} sampled traces of {edge[0]})"
+return " (not exercised in this sample)"
 ```
 
-Loki 說五個，Prometheus 說六個，Tempo 說六個。多出來的那個是 `aiops-agent`，也就是這個系列從第一天用到現在的那隻 agent 自己。它跑在同一個 namespace 裡、有 trace、有 metric，就是沒有 log 進 Loki。我把視窗拉到七天，Loki 還是沒看過它。
-
-原因查得到：demo 那組服務共用一份 `o11y_shared/logging.py`，裡面把 OTLP 的 logger provider 接起來了；agent 服務沒有這個東西，它的 log 只進 stdout。所以**這不是資料掉了，是這個服務從一開始就沒有把 log 送進來，而它的另外兩種訊號都好好的。**
+呼叫方被跑過夠多次，才給 ⚠，而且把次數寫進去；不夠的時候退成一句沒有警示符號的描述。門檻現在是 5，這個數字沒有什麼理論根據，就是一個「至少要多看幾眼才算數」的下限。
 
 ```mermaid
 flowchart TB
-    A["aiops-agent<br/>正在跑，有流量"] --> M["metric → Prometheus ✓"]
-    A --> T["trace → Tempo ✓"]
-    A --> L["log → 只進 stdout ✗"]
-    L --> Q["list_service_names 只讀 Loki"]
-    Q --> R["所以它不存在<br/>而報告說「完全對齊」"]
+    E["一條宣告的邊 A → B"] --> O{"取樣裡看到<br/>A 呼叫 B 嗎？"}
+    O -->|"看到了"| N["不標任何東西"]
+    O -->|"沒看到"| C{"A 出現在<br/>幾筆取樣的 trace 裡？"}
+    C -->|"≥ 5"| W["⚠ not seen in N sampled traces of A<br/>（有機會看到卻沒看到，是證據）"]
+    C -->|"< 5"| Q["not exercised in this sample<br/>（沒有警示符號，因為這是沉默）"]
 ```
 
-## 一個假綠燈是怎麼長出來的
+> 這個門檻應該要跟著取樣總數走才對，抓 30 筆跟抓 300 筆時的「夠多次」不會是同一個數字。我先寫成常數，因為要把它做對得先有取樣涵蓋率，而那個東西前面就欠著了。
 
-把這件事講清楚：`list_service_names()` 沒有 bug，它做的事情跟它的 docstring 一字不差，「Loki 裡現在有哪些 `service_name`」。問題出在呼叫它的那一行，把這個答案當成了「現在有哪些服務」。
+## 一條邊只講一次
 
-這兩句話在五個服務都乖乖送三種訊號的時候是同一件事，在第六個服務只送兩種的時候就不是了。而**偏偏是那些不完整的服務最需要被發現**，因為「這個服務沒有送 log」本身就是一件該有人知道的事。
+第二個改動只有一行，把上游那側的標記拿掉：
 
-所以現在這個檢查有一個很難看的性質：一個服務越不合規，它越不容易被這個檢查抓到。這跟前面那份上線 checklist 的第八項是同一種諷刺，那次是命名寫錯的服務躲過了值域檢查，這次是不送 log 的服務躲過了存在性檢查。
-
-## 那就三個都問
-
-改法本身沒什麼技術含量，把三個 store 都問一遍，取聯集：
-
-```console
-$ python3 ironman-2026/day16/topology_watch.py \
-    --topology aiops-agent/service/app/signals/topology.yaml \
-    --loki ... --prom ... --tempo ... --lookback 6h
-
-# topology watch — declared 5, lookback 6h
-  loki        sees  5: api-gateway, order-service, payment-service, user-service, webapp
-  prometheus  sees  6: aiops-agent, api-gateway, order-service, payment-service, user-service, webapp
-  tempo       sees  6: aiops-agent, api-gateway, order-service, payment-service, user-service, webapp
-  ~ 'aiops-agent' is missing from loki but present in others
-  ✗ live 'aiops-agent' is not declared (seen by prometheus, tempo)
+```python
+up = topo.upstream(svc)
+if up:
+    # Deliberately unannotated: the same edge is already flagged on the
+    # caller's own downstream line, and saying it twice reads as two
+    # independent problems.
+    rendered = ", ".join(up)
 ```
 
-`exit=1`。而只問 Loki 的版本，也就是今天一開始那個答案：
+選擇留在呼叫方那側，是因為**呼叫方才是那條邊的擁有者**。前面設計那份 `signal.yaml` 的時候就是這樣決定的，每個服務只宣告自己打出去的邊。既然宣告的責任在呼叫方，那「這條邊沒被走到」的通知也該出現在呼叫方的區塊裡，這樣看到的人跟能處理的人是同一個。
 
-```console
-  loki        sees  5: api-gateway, order-service, payment-service, user-service, webapp
-  ✓ declared set matches the live set (5 services)
+## 讓分數承認自己漏了什麼
+
+第三個改動是在 DQ 那行後面補一句，只在「分數滿分但有邊沒被走到」的時候出現：
+
+```
+declared/observed agreement 100%. That score only grades edges seen in
+traffic; 1 declared edge(s) were not exercised in this sample and are
+marked below.
 ```
 
-`exit=0`。同一座叢集、同一個時間、同一份拓撲，一個說有漂移，一個說完全對齊。
+這句話做的事情是把標題跟底下的標記接起來，而不是讓它們互相打臉。讀到這裡的模型現在知道：100% 是一個單向的分數，另一個方向的東西寫在下面。
 
-那行 `~` 是我後來才加的，它單獨列出「有些 store 看得到、有些看不到」的服務。這一行本身就是一個訊號：**一個服務只出現在三分之二的 store 裡，通常代表它的遙測有一塊沒接上，而不是它半死不活。** 這個資訊比最後那行漂移判定更早、也更可行動。
+## 改完之後
 
-## 第三種離開碼
+同一座 stack、同一批流量、同一次對帳：
 
-前一天抱怨過一件事：對帳報告把「圖錯了」「流量太低」「根本沒流量」三種原因塞進同一個畫面。今天這支腳本至少把最後一種拆出來了：
+```
+Topology data-quality (last reconcile, 30 traces): declared/observed agreement 100%.
+That score only grades edges seen in traffic; 1 declared edge(s) were not
+exercised in this sample and are marked below.
 
-```console
-$ python3 ironman-2026/day16/topology_watch.py --topology ... --loki http://localhost:9999
-  ! loki did not answer (Connection refused) — treating it as no evidence
-  no source answered; cannot tell alignment from silence
-$ echo $?
-2
+### api-gateway
+- downstream (dependencies — could be blocking this): order-service,
+  payment-service (⚠ not seen in 30 sampled traces of api-gateway), user-service
+
+### payment-service
+- upstream (callers — degrade if this fails): api-gateway, order-service
 ```
 
-| 碼 | 意思 | 排程上該怎麼反應 |
-| --- | --- | --- |
-| 0 | 宣告的跟活著的一致 | 什麼都不用做 |
-| 1 | 有漂移 | 通知擁有那個服務的團隊 |
-| 2 | 問不到，什麼都不能斷定 | 通知平台團隊，這是監控自己壞了 |
+⚠ 從兩個變一個，而且那一個帶著它的證據。payment-service 那個區塊乾淨了，因為那條邊不歸它管。
 
-2 跟 0 分開是這支腳本唯一真正重要的設計。**把「查不到」算成「沒有漂移」，這個排程就變成一個永遠不會響的告警**，而那正是這個系列從第一天追到現在的那個形狀，只是這次它會發生在一個沒有人盯著的 cron 裡。
+差別不在字數，在於**現在每一個符號都還有意義**。前面那版讀完之後，一個合理的反應是「這裡有兩個警告但分數是滿分，大概都可以不用理」；這一版讀完之後，那個 ⚠ 是一句具體的話：api-gateway 跑了三十次，沒有一次走過這條路。
 
-## 變成排程之後才會遇到的問題
+四條新測試釘住這幾個行為，其中兩條是專門盯著退化的：
 
-```cron
-*/30 * * * * cd /path/to/repo && python3 ironman-2026/day16/topology_watch.py \
-    --topology ... --loki $LOKI_URL --prom $PROM_URL --tempo $TEMPO_URL \
-    --lookback 6h >> /var/log/topology_watch.log 2>&1
+```python
+def test_context_withholds_warning_without_evidence(monkeypatch):
+    """The caller barely ran, so its unused edges are silence, not drift."""
+
+def test_context_does_not_repeat_the_edge_on_the_callee(monkeypatch):
+    """The same missing edge must be stated once, on the caller's side."""
 ```
 
-一放上排程，`--lookback` 這個參數的性質就變了。手動跑的時候它只是「我想看多久以前」，排程跑的時候它變成一條規則：**一個服務多久沒有訊號，就算它死了。**
+整包 325 條通過。
 
-六小時對這組 demo 服務很夠，但對一個只有月底跑的結算服務，六小時的視窗每天都會把它報成死的，然後那個團隊會在兩週內學會忽略這個通知。這跟前一天那個取樣問題是同一件事的另一個版本，低頻的東西最容易被誤判成不存在，而低頻不代表不重要。
+## 值班的時候差在哪
 
-> 這個參數該設多少，答案不在平台團隊手上。只有那個服務的團隊知道自己的正常閒置週期有多長，所以合理的設計大概是讓它跟著服務走，寫進各自那份 `signal.yaml`，而不是一個全公司一體適用的數字。今天沒有做到這一步。
+凌晨三點，agent 跟你說「order-service 在噴錯，而它下游的 payment-service 那條邊有警告」。
 
-## 誰收到這個通知
+如果那個警告是取樣造成的，你會白跑一趟去查 payment，而真正的問題還在原地。更糟的是第二次、第三次也是這樣之後，你會開始跳過所有帶 ⚠ 的段落，然後某一次那個 ⚠ 是真的。**這就是為什麼「多報一點總比漏報好」在有人值班的系統裡是錯的**，多報的成本不是那一次的白工，是把整個警示機制的可信度花掉。
 
-從平台工程的角度，這支腳本比前一天那個對帳更敏感，因為它會主動去戳別人。
+換到 agent 身上更直接。它不會累，但它會照著 context 裡的東西排優先順序。一段充滿低價值警告的 context，會讓它把推理預算花在追不存在的問題上，而它每題只有四次工具呼叫。
 
-漂移有兩個方向，而它們該找的人不一樣。
+## 誰決定什麼東西該被標出來
 
-```mermaid
-flowchart TB
-    D{"哪個方向的漂移"} -->|"宣告了<br/>但沒有任何訊號"| A["服務下線忘了改宣告？<br/>還是遙測斷了？"]
-    D -->|"活著<br/>但沒有宣告"| B["有服務上線<br/>沒走上線流程"]
-    A --> AO["找那個服務的團隊<br/>只有他們知道是哪一種"]
-    B --> BO["找平台團隊<br/>這是流程漏洞，不是誰的疏忽"]
-    D -->|"只有部分 store 看得到"| C["遙測有一塊沒接上"] --> CO["找那個團隊<br/>但帶上「哪個 store 看不到」"]
-```
+從平台工程的角度，今天做的事其實是在替產品團隊過濾。
 
-「宣告了但沒有任何訊號」是那個服務的團隊要回答的，可能是服務下線了忘記改宣告，也可能是遙測斷了，而**這兩件事平台團隊從外面分不出來**。「活著但沒有宣告」則多半根本不是漂移，是有一個服務上線的時候沒有走上線流程，那是平台團隊的流程漏洞，不是那個團隊的疏忽。
+那段 context 是平台團隊產的，讀它的是 agent，而最後為結論負責的是被叫醒的那個人。中間沒有任何一個環節會有人說「這個警告不重要，別理它」，所以**「什麼東西值得被標出來」這個決定，只能在產生它的地方做**。這跟前面那道 CI gate 的判準是同一件事的反面：那次講的是被擋下來的人要能自己修好，這次講的是不該擋的東西就不要擋。
 
-今天這個 `aiops-agent` 剛好是第二種，而它的擁有者是我自己。這其實蠻公平的：第一個被這個檢查抓到的服務，是寫這個檢查的人自己漏掉的那一個。
-
-至於通知該長什麼樣，那行 `seen by prometheus, tempo` 是刻意留的。收到通知的人第一個問題一定是「你憑什麼說它活著」，先把證據放進訊息裡，可以省掉一輪來回。這條判準前面講 CI gate 的時候用過，換到排程通知上同樣成立。
+而這裡有一個平台團隊很容易做錯的選擇。把所有查到的東西都端出去，看起來比較「透明」，也比較安全，因為漏掉東西的責任比較大。但那等於把過濾的工作推給下游，而下游是一個沒有上下文的模型跟一個半夜被吵醒的人。**願意把不確定的訊號降級成一句不帶警示符號的描述，是平台團隊在替這兩者承擔一部分判斷責任。**
 
 ## 今天沒做的事
 
-沒有把它接上任何排程。上面那段 cron 是寫給讀者的，我自己還是手動跑。要真的排上去，得先決定 exit 2 的時候通知誰、以及連續幾次 exit 1 才值得吵人。
+那個 `_MIN_CALLER_EVIDENCE = 5` 是拍腦袋的常數，沒有跟取樣總數連動。要做對得先有涵蓋率，那個東西前面就欠著。
 
-沒有把 `list_service_names()` 改掉。今天做的是一支獨立的腳本，agent 服務裡那個只讀 Loki 的函式一個字都沒動，所以 `topology validate` 那條路現在依然會給出那個假綠燈。這件事該修，但要決定的是「多一個資料源」還是「換一個資料源」，兩者對那個函式的其他呼叫端影響不同。
+沒有處理歷史。一條邊這次沒被走到跟連續三天沒被走到，現在還是同一句話，而後者才是真的該有人去看的。前面提過這件事，今天依然沒做，因為對帳結果只存在記憶體裡，重開就沒了。
 
-沒有處理服務改名。一個服務從 `user-service` 改叫 `identity-service`，這支腳本會報成一個死掉加一個新增，而不是一次更名。要認出更名得比對更多東西，今天沒有碰。
+沒有動 `undeclared_edges` 那一側的呈現。觀察到但沒宣告的邊現在還是每個沾到的服務各印一次，跟今天修掉的那個重複是同一個形狀，只是它比較少見所以還沒有咬到我。
 
-也沒有把 `--lookback` 下放到各服務自己宣告。上面那段旁白講的東西，現在還是一個全域參數。
+也沒有量這個改動對 agent 實際輸出的影響。今天全部是看那段注入的文字本身，沒有跑一次完整的 RCA 去比對改前改後的結論差在哪。
 
 ## 小結
 
-總結來說，今天寫的東西很少，就是把一個問題問三次而不是一次，然後多一個離開碼。
+總結來說，今天沒有讓那張圖變得更準，準確度一個字都沒動，改的全部是怎麼把已經知道的事情講出來。
 
-但那個 `aiops-agent` 讓我有點在意。它不是一個特別隱密的東西，它就跑在同一個 namespace、有 trace 有 metric、我每天都在用它，而我手上那個「檢查有沒有服務漏掉宣告」的機制，看不到它。原因也不複雜，就是那個機制問的是 Loki，而它剛好是唯一沒有進 Loki 的那個。
+比較有感的是那個 `caller_samples`。它的資料早就在手上了，同一批 trace 掃過去的時候順手數一下就有，而它把「沒看到」從一句判斷變成一句有證據的話。**我原本以為要降噪就得少講一點，結果實際做出來是多講了一個數字，然後噪音就不見了。** 少的不是資訊，是那個沒有依據的警示符號。
 
-要繼續往下做之前，這張圖上的節點至少得先是活的、邊至少得先被驗過。接下來要處理的是圖以外的東西：那些宣告出來的欄位，跑起來之後到底有沒有照著送。
+還有一個地方值得記著：那個 100% 從頭到尾沒有錯，它只是回答了一個比讀者以為的更窄的問題。而在報告裡，一個沒有講清楚自己邊界的正確數字，跟一個錯的數字造成的後果差不多。
 
-> 寫了一個「誰漏了宣告」的檢查，第一個被漏掉的是它自己。
-> 這種巧合我只能說「很棒！」XD
+> 那個 100% 我盯了很久，一直想它到底哪裡不對。
+> 它沒有不對，是我問的問題比它答的大 QQ

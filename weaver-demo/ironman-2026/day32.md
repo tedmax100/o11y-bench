@@ -1,192 +1,173 @@
 ---
-title: "【Day32】建議之後呢：四個平面，跟一組沒有人按過的開關"
+title: "【Day32】過去事故庫沒有活過來：一個 JOIN，兩張表，兩個不同的寫入者"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
 tags: [OpenTelemetry, AIOps, Governance, 鐵人賽]
 ---
 
-# Day32：建議之後呢，四個平面跟一組沒有人按過的開關
+# Day32：35 筆標註進去了，過去事故庫還是 0 筆
 
-> 一個沒有人按過的開關
-> 跟一個不存在的開關
-> 平常看起來完全一樣
-> 只有在事故當下才分得出來
+> 這三天我做的事情很像同一件
+> 每個零件單獨看都是對的
+> 也都有測試
+> 壞掉的一直是它們中間那條縫
 
-昨天那隻 agent 在同一組題目上拿了 3.5/9，比三十一天前那隻還低，而低的原因是我做出來的治理資產屬於另一座環境。收尾的時候我留了三句話：信心分數沒校準、授權層級沒走過、回饋迴圈沒閉合。今天開始的九天，就是去處理那三句。
+昨天補了 `grading_mode`，關卡從一個抵銷出來的綠燈退回「還沒量夠」的紅燈。今天要驗收的是另一個本來以為會自己活過來的東西：過去事故庫。
 
-先講清楚今天不動手。這是一個純概念日，沒有指令、沒有輸出、沒有程式碼連結。之所以要花一整天講結構，是因為接下來每一天都是「填一格」，而如果那張格子圖沒有先畫出來，後面九天就會變成邊做邊定義新名詞，讀起來像在追一個永遠沒補完的伏筆。
+程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day32/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day32)。
 
-今天要交代的是一套架構語言，來源是 [《代理式可靠性工程》（Agentic Reliability Engineering，簡稱 ARE）](https://learning.oreilly.com/library/view/agentic-reliability-engineering/0642572294809/) 第六章。前面三十一天我刻意只借了它零星幾個詞（`決策級遙測`、`silent decay`），沒有把它的骨架整套搬進來，因為那時候的內容不需要。現在需要了。
+## 本來以為不用寫程式的一天
 
-## 四個平面，跟一張假裝成總覽圖的進度條
+agent 在組 prompt 的時候會呼叫一個 `_past_incident_context()`，把這個服務過去被判定正確的調查撈出來，變成一段「以前發生過這些事」貼進去。它撈的方式是一個 JOIN：
 
-ARE 把一套代理式可靠性系統拆成四個`平面`（plane）：訊號平面（Signal Plane）、推理平面（Reasoning Plane）、執行平面（Execution Plane）、治理平面（Governance Plane）。
+```sql
+SELECT i.payload FROM investigations i
+JOIN calibration c ON c.run_id = i.fp
+WHERE ... AND c.correct = 1
+```
 
-它用「平面」而不是「層」是刻意的。層意味著上層吃下層、失效會往上傳染，腦子裡的模型是一疊相依關係。平面意味著`正交`：每個平面各自運作，只透過明確的介面相交，一個平面壞掉不應該自動汙染另外三個。書裡把這件事寫成四句話：壞掉的訊號不應該直接觸發執行、推理錯誤不應該繞過治理、執行失敗不應該汙染意圖、治理規則改動不應該逼你重寫自動化。
+原本的盤算很單純：Day31 把 35 筆標註灌進 `calibration`，`correct = 1` 的有 20 筆，那這個查詢就應該開始有東西了。今天要做的是 A/B，同一組 fixture 跑兩次，一次注入過去事故一次不注入，看分數有沒有差。
 
-每個平面的職責一句話講完，但更重要的是它「絕對不做」什麼：
+實際量出來是這樣：
 
-| 平面 | 負責 | 絕對不做 |
-| --- | --- | --- |
-| 訊號 | 讓真相可被觀測：收集、正規化、加上擁有者與拓撲情境、發布可查詢的系統狀態 | 不判斷什麼重要、不推論因果、不觸發行動 |
-| 推理 | 把結構化的真相變成有邊界、對齊意圖的判斷：假設、比較、算信心 | 不執行。它的輸出永遠是提案，不是命令 |
-| 執行 | 照著被核准的決定改變系統，然後把結果訊號送回訊號平面 | 不決定要做什麼、不推論替代方案、不覆寫治理 |
-| 治理 | 在 runtime 判斷「這個行動現在准不准」 | 不推論狀態。狀態是推理平面的事，它只管`權限` |
+```
+[1] the real store
+    calibration labeled rows: 35
+    investigations rows:      0
+    retrievable precedent:    0
+```
 
-其實這張表最有用的地方不是拿來背，是拿來當一份體檢表。書裡講得很直接：如果你的監控系統直接觸發腳本，你把訊號跟執行壓成一格了，架構裡根本沒有留下推理的機會；如果你的自動化裡面寫著 policy 判斷，你把執行跟治理壓成一格了，policy 在自動化被改動的當下就變得看不見也管不住；而如果你的 AI 系統又決定又執行，那是最危險的一種壓縮，因為它拿掉的正是讓自主性有邊界的那道檢查。
+`investigations` 表是空的。JOIN 的另外一半從來沒有人寫過。
 
-拿這份體檢表照一次這個 repo，得到的不是「有／沒有」兩種答案，是三種：
+## 兩張表，兩個寫入者
+
+追下去的結果是這樣：`calibration` 跟 `investigations` 這兩張表，在正式的告警路徑上是同一個函式接連寫的，`webhook.py` 裡的 `_investigate_and_sink()` 先 `record_run()` 再 `record_investigation()`，兩個都用同一個 `fp`，所以 JOIN 對得起來。
+
+而 eval harness 走的是另一條路。它的 docstring 寫得很清楚，受測單元是 `run_headless`，也就是**繞過 webhook 直接叫 agent**。這個設計是對的，eval 要測的是 agent，不是 webhook 的收件邏輯。但副作用是：`record_investigation()` 那一行在 webhook 裡，harness 沒有它。
 
 ```mermaid
 flowchart TB
-    subgraph S["訊號平面 Signal Plane"]
-        S1["signals/topology.py<br/>contract.py<br/>reconcile.py<br/>dq.py / context.py / health.py"]
-    end
-    subgraph R["推理平面 Reasoning Plane"]
-        R1["agent.py<br/>rubric.py<br/>investigations.py"]
-    end
-    subgraph E["執行平面 Execution Plane"]
-        E1["actions.py 118 行<br/>action_requests.py 230 行<br/>blast_radius.py 223 行<br/>breaker.py 107 行"]
-    end
-    subgraph G["治理平面 Governance Plane"]
-        G1["governance.py 181 行<br/>calibration.py 288 行"]
-    end
+    W["webhook.handle_alert<br/>正式告警路徑"] --> RH1["run_headless"]
+    W --> C1[("calibration")]
+    W --> I1[("investigations")]
+    H["eval/harness.py<br/>唯一在產出標註的東西"] --> RH2["run_headless"]
+    H --> C2[("calibration")]
+    H -.->|"沒有這一步"| I2[("investigations")]
+    C1 --- J{"JOIN<br/>c.run_id = i.fp"}
+    I1 --- J
+    J --> P["過去事故庫"]
 
-    S -->|"訊號"| R
-    R -->|"候選行動"| G
-    G -->|"准／不准"| E
-    E -->|"結果訊號"| S
-
-    classDef done fill:#d5f5e3,stroke:#27ae60,color:#145a32
-    classDef never fill:#fdebd0,stroke:#e67e22,color:#7e5109
-    class S1,R1 done
-    class E1,G1 never
+    classDef gap stroke-dasharray:4 3,stroke:#c0392b,color:#78281f
+    class I2 gap
 ```
 
-綠色那兩格是前三十一天蓋出來的。橘色那兩格**不是「還沒蓋」，是「蓋好了、測試過了、但從來沒有拿到過真實輸入」**。這六支檔案加起來 1147 行（`wc -l` 數的，不是估的），而它們共同的狀態長這樣：`actions_enabled` 的預設值是 `False`、`calibration` 表裡的標註數不夠、過去事故庫因此是空的。
+所以事情變成：**唯一會產出標註的流程，剛好是唯一不寫另一半的流程。** 標註灌得再多，JOIN 都是 0。
 
-所以這九天的動詞不是「做出來」，是「跑跑看」跟「證明它會擋」。這跟前三十一天那條「該紅的還會不會紅」是同一個標準，只是對象從 registry 換成了防護網。
+還有一個更小、但更陰的東西。就算今天直接在 harness 裡補一行 `record_investigation(thread_id, ...)`，JOIN 還是對不起來，因為那兩個 id 不一樣：
 
-> 我原本以為這個系列會是一份施工日誌，翻完 repo 才發現要寫的是驗收報告。
-> 這兩件事的心情差很多：施工你可以決定蓋到哪裡停，驗收是那個東西會自己告訴你它行不行 QQ
+```python
+thread_id = f"eval-{fixture.id}-s{seed}-{run_nonce}"      # 給 LangGraph 用的
+run_id    = f"eval-{fixture.id}-seed{seed}-{run_nonce}"   # 寫進 calibration 的
+```
 
-## 平面之間傳的是什麼：三份契約
+`s0` 跟 `seed0`，差兩個字元。這種東西不會報錯，JOIN 只會安靜地回零筆，而零筆跟「這個服務以前沒出過事」在畫面上長得一模一樣。Day2 講缺情境的時候用的例子是 Prometheus 回 HTTP 200 加空陣列，兩年後我在自己的 SQL 裡又寫了一個一樣的東西 QQ
 
-平面的邊界如果只靠「大家記得不要越界」，那就只是一份設計文件上的宣告。要讓邊界真的成立，中間傳的東西得有形狀。ARE 在這裡給了三份契約，剛好對應三個交界。
+## 順手把昨天那個欄位用上
+
+修的部分有兩個。第一個是讓 harness 也寫 `investigations`，而且用 `run_id` 當 fp，不是 `thread_id`。
+
+第二個是昨天埋的伏筆。原本那句 `WHERE ... AND c.correct = 1`，在有了 `grading_mode` 之後可以講得精確：
+
+```sql
+WHERE ... AND c.correct = 1 AND c.grading_mode = 'culprit'
+```
+
+為什麼要加這個，昨天算過一次：在 `inconclusive` 那批紀錄上，`correct = 1` 的意思是「它正確地誰都沒有怪」。把那種紀錄當成一次成功解決的過去事故餵給 agent，等於在告訴它「上次這個服務出事，結論是沒出事」，這跟這段 context 想做的事情正好相反。
+
+`NULL` 也一起排除掉。這段輸出是要進 prompt 的，來源不明的東西不進 prompt，這個預設值我覺得沒什麼好猶豫。
+
+## 四個探測
+
+```bash
+# 從 o11y-bench 主 repo 的根目錄跑
+python3 ironman-2026/day32/probe_past_incidents.py
+```
+
+```
+[2] a graded run with no investigation row (what the harness writes today)
+    retrieved: []
+
+[3] the same run, both tables, same id
+    retrieved: ['both']
+
+[4] rows that must never come back as precedent
+    +hedged-non-incident    (correct=1 but it blamed nobody)
+     retrieved: ['both']  -> excluded
+    +wrong-run              (graded wrong)
+     retrieved: ['both']  -> excluded
+    +unlabeled              (no verdict yet)
+     retrieved: ['both']  -> excluded
+    +unknown-mode           (correct=1, but nobody said what that means)
+     retrieved: ['both']  -> excluded
+```
+
+第三格是修好之後該有的樣子。第四格那四列每一列都寫進兩張表、都對得上 JOIN 的 id，只差在標註的內容，而四個都沒有被撈出來。其中 `hedged-non-incident` 那一列，在昨天改之前是會被撈出來的。
+
+這四條也補成了單元測試，因為它們是那種「壞掉不會有人發現」的規則。
+
+## 那個 A/B 今天做不了
+
+原本今天的主菜是 A/B：同一組 fixture，注入過去事故 vs 不注入，比分數。做不了，理由很實際。
+
+要跑出過去事故，得先有一輪真的 harness 執行寫進兩張表，而那需要整套 stack 起來加 LLM 呼叫。今天做的是把管線接上跟把規則釘住，接上之後第一次真的跑，才會有第一批可以拿來 A/B 的資料。
+
+我本來想用合成資料硬做一個 A/B，想想還是算了。**注入的東西是我自己編的，那量到的就是「編得好不好」，不是「這個機制有沒有用」。** Day23 已經有過一次分數變好但因果證不了的經驗，那次至少資料是真的跑出來的，今天連那個都沒有。
+
+> 講一句我自己的判斷：這種「先把管線接好、實驗留給有真資料的那天」的取捨，在做 eval 的時候比想像中常見。硬要在這一天生一個數字出來，最後那個數字會變成後面每一天都在小心繞開的東西。
+
+## 知識迴圈的另外兩條，也掛在同一組管線上
+
+ARE（Agentic Reliability Engineering，代理式可靠性工程）講持續學習的時候，重點不是模型會不會變聰明，而是**系統有沒有把每一次事故的結論留下來、而且下次真的讀得到**。這個 repo 裡有三條這樣的迴圈，今天可以一起看：
 
 ```mermaid
 flowchart LR
-    S["訊號平面"] --> C1["訊號契約<br/>signal contract"]
-    C1 --> R["推理平面"]
-    R --> C2["候選行動<br/>candidate action"]
-    C2 --> G["治理平面"]
-    G --> C3["行動契約<br/>action contract"]
-    C3 --> E["執行平面"]
-
-    classDef contract fill:#eaf2f8,stroke:#2874a6,color:#1b4f72
-    class C1,C2,C3 contract
+    R["一次調查"] --> L{"被標註"}
+    L -->|"correct=1"| PI["過去事故庫<br/>下次同服務的 prompt 讀得到"]
+    L -->|"correct=1 且<br/>沒有 runbook 命中"| DR["draft_runbook<br/>生一份 SOP 草稿"]
+    L -->|"任何結果"| CE["校準紀錄<br/>治理平面的授權依據"]
+    RB["runbook 被用過之後"] --> FB["runbook_feedback<br/>這份 SOP 到底有沒有用"]
 ```
 
-**訊號契約**（§4.3）宣告的是：這個訊號代表什麼、訊號平面保證什麼、它是設計來支撐哪些決策的。書裡列的欄位是 name / version / owner / 支援的決策 / 新鮮度保證 / 最小觀測視窗 / 信心門檻 / 排除條件 / schema。這件事第二階段做過了，`signals/contract.py` 那 161 行裡的 `SignalContract` 有 `freshness_seconds`、有 `supported_decisions`、有每個 SLI 的權威 PromQL 跟單位。當時我是為了讓 agent 不要每次都自己重推一次查詢才寫的，現在回頭看，那就是這份契約。
+三條的起點都是同一件事：**有人（或有東西）對那一次調查下了一個判斷。** 沒有那個判斷，三條全部不會動。
 
-書裡有一句話值得抄下來：推理平面應該讀契約，不是讀原始資料流。理由不是效能，是`校準`。推理的品質不會好過它能依賴的假設，而契約提供的正是那些假設（多新、樣本夠不夠、什麼時候不該信）。沒有那些保證，每一次判斷都是在賭。
+`draft_runbook` 那條的觸發條件是「被標成正確、而且當時沒有任何 runbook 命中」，設計得挺好：那正好是「agent 找到了根因，而我們對這個告警還沒有 SOP」的時刻，知識最值得被留下來。而它目前唯一的入口是 plugin 上那顆按鈕，也就是說**它只在有人按的時候才會長出東西**。這句話跟 Day30 那個狀態機的結論是同一句。
 
-**候選行動**（§4.4）是推理平面的輸出，也是這個系列後面每一天都會回頭指的那個東西。書裡給的結構是提案 id、觸發訊號、領先假設、排序後的行動選項、意圖對齊、風險估計、信心分數、所需的授權層級。它有兩個作用：治理平面可以在不重做一次推理的前提下評估它，而當人回頭問「它為什麼那樣做」的時候，這份提案就是稽核紀錄本身。
+順帶一提，昨天那個 `grading_mode` 讓這條路順便安全了一點：UI 那條標註路徑現在一律標成 `culprit`，所以不會有「在一個沒出事的告警上按了正確，然後系統認真幫你生一份 SOP 草稿」這種事。這個我不是刻意設計的，是改完之後才發現的。
 
-這裡有個我一直沒講清楚的對照。第三階段做的假設樹、信心分數、`rubric.py` 的守門、`blast_radius.py` 的影響範圍，其實一直在往這個結構長，只是當時我沒有名字可以叫它。今天把書的詞彙貼回去之後才看得出來缺哪幾格：意圖對齊那格是空的，所需授權層級那格也是空的，而後者正是治理平面要讀的第一個欄位。
+## 接縫沒有擁有者
 
-**行動契約**（§4.5）是執行平面的目錄。書裡的立場很硬：執行平面不能執行不在目錄裡的東西，自由生成行動明確被排除在職責之外。這聽起來很綁手綁腳，而那個綁手綁腳就是安全性質本身。書裡那句話我覺得講得非常好：可靠性的失敗很少是因為缺少行動，是因為不安全的行動，而「行動不夠」這個問題比「行動不安全」好解得多。
+平台工程的角度，這三天可以收在同一句話上。
 
-`actions.py` 的 docstring 就是照這個寫的：agent 只能講出一個已經被註冊過的行動名字，而且就算講對了，執行還要再過一道 master kill switch。目前註冊表裡只有兩個東西，`k8s.rollout_undo` 跟 `k8s.scale`，每個都帶著 `reversible` 跟 `requires_approval` 兩個旗標。那兩個旗標不是給人看的註解，是治理平面真的會讀的欄位。
+`webhook.py`、`eval/harness.py`、`governance.py`、`store.py` 這幾支，每一支都有清楚的職責、有 docstring、有測試，而且測試都是綠的。壞掉的每一次都在**兩支檔案中間**：兩個 store 沒有橋、兩張表沒有共同的寫入者、一個欄位被兩種語意共用、一個 id 差兩個字元。
 
-## 授權不是開關，是一條光譜
+這種東西之所以難抓，是因為它不屬於任何一支檔案的責任範圍。寫 harness 的人（我）沒有理由去想 webhook 寫了哪些表；寫治理的人（也是我）沒有理由去確認校準紀錄是誰產的。**每個人都在自己的邊界內做對的事，而缺陷長在邊界上。**
 
-第三張圖是這九天真正的主題。ARE §4.6 的核心主張是：治理要放進 runtime，而不是放在 runtime 外面的簽核流程裡。變更審查會議、簽核工作流、寫成 SOP 的 runbook，這些機制在「行動很稀少、時間壓力很低」的時候是有效的，在「行動連續發生、時間壓力很高」的時候會整組失效，而後者正是 agent 運作的常態。
+一個團隊要抓到這種東西，靠的不是更嚴格的 code review，是**有沒有一個地方會定期去問「這條路端到端真的通嗎」**。這三天我做的每一件事，本質上都是在手動扮演那個角色，而手動扮演的東西遲早會停。
 
-治理平面不重做判斷，它只回答一個問題：這個提案、帶著這個信心、在現在這些條件下，准不准。而答案不是二元的，是分級的。
+> 舉個現實案例，我看過一個團隊每個服務的健康檢查都是綠的，然後整條下單流程掛了兩個小時。那次事後檢討的結論不是「健康檢查寫得不好」，是沒有任何一個東西在檢查「這幾個服務串起來還能不能下單」。今天這個 JOIN 就是同一個形狀，只是規模小很多。
 
-```mermaid
-flowchart LR
-    L1["唯讀觀察"] --> L2["提議<br/>PROPOSE"]
-    L2 --> L3["可逆執行<br/>AUTO"]
-    L3 --> L4["有邊界的<br/>不可逆"]
-    L4 --> L5["人類核准<br/>ESCALATE"]
+## 今天沒做的事
 
-    classDef here fill:#d5f5e3,stroke:#27ae60,color:#145a32
-    classDef cold fill:#f2f3f4,stroke:#95a5a6,color:#5d6d7e
-    class L1,L2 here
-    class L3,L4,L5 cold
-```
-
-`governance.py` 把這條光譜實作成一個 `StrEnum`，只有三個值：`AUTO`、`PROPOSE`、`ESCALATE`。判斷規則逐條讀是這樣的：不可逆的行動一律 `ESCALATE`，沒有例外；標了 `requires_approval` 的最高只能到 `PROPOSE`；信心低於 `governance_conf_low`（0.5）也是 `ESCALATE`；0.5 到 `governance_conf_high`（0.8）之間是 `PROPOSE`；只有信心 ≥ 0.8、可逆、沒有標核准、而且**校準被證明是好的**，才會拿到 `AUTO`。
-
-最後那個條件是這整段的關鍵。書裡把它寫成一句話：自主權是掙來的，而且是可以被收回的。高信心是必要條件但不是充分條件，agent 的歷史必須顯示它講的信心真的跟著現實走。`_calibration_verdict()` 那個函式就是這句話的程式碼版本，而它有兩道門：總標註數要夠（`governance_min_labeled_runs = 20`），其中非自我標註的數量也要夠（`governance_min_human_labeled_runs = 20`）。`_SELF_LABEL_SOURCES` 只排除 `remediation-verified` 跟 `remediation-failed` 這兩個來源，翻成白話就是**「自己說自己修好了」不能拿來解鎖自主權**。
-
-所以現在按下去會發生什麼？光譜上那兩格綠色就是答案：目前能走到的最遠是 `PROPOSE`。不是因為程式碼沒寫，是因為證據不夠。
-
-搭在授權光譜旁邊的是「人在哪裡」。ARE §4.7 開頭第一句是「human in the loop 不等於人工簽核」，然後把人拆成三種模式：
-
-- **迴圈之上**（above the loop）：人定義意圖。服務目標、可接受的風險、影響範圍容忍度、成本限制。節奏是週到月，在冷靜的時候做，由擁有這個服務的團隊做。書裡認為這是最有價值、也最被低估的一種參與。
-- **迴圈之中**（in the loop）：人參與特定的那一次決策，而且照設計應該是稀少的。當治理平面因為信心低、條件反常、或 policy 明講而把提案路由給人的時候，人拿到的是一份已經調查完、上下文已經整理好、假設已經命名、選項已經排序的提案。人的工作是對一個準備好的問題下判斷，不是從原料開始組裝那個問題。
-- **迴圈之上監看**（on the loop）：人看 SLO（Service Level Objective，服務水準目標）、抽樣審查自主決策、在校準漂移時調門檻。這是唯一會 scale 的模式，因為那個工程師不是在核准決策，是在看那個核准決策的系統。
-
-照這三個定義去對這個 repo：迴圈之上監看被 `eval/harness.py` 撐起來了一部分，迴圈之中的審查介面只做到一半（後端的核准 endpoint 有，前端那頁只列得出提案，按鈕還沒接上去），迴圈之上那層目前散在 `signal.yaml` 跟 policy 裡，還沒有一個地方讓人把「這個服務可以自動做到哪」寫下來。
-
-> 舉個現實案例，我看過一個團隊為了「安全」，把所有自動化都改成要人按確認。半年後那個確認變成值班的人閉著眼睛按，因為一天要按四十次。
-> 這種我只能說「很棒！」——防護網還在，只是變成一個橡皮圖章 XD
-
-## 一條它現在還跑不起來的時間軸
-
-ARE §4.8 用一個結帳延遲事件走了一次完整時間軸，從 t=15s 偵測、t=18s 提案、t=22s 核准、t=23s 執行，到 t=180s 驗證結果。我把它換成這座 demo 上那個真的發生過的事故（payment-service 在某個版本之後拒絕率上升），畫成同一種節奏：
-
-```mermaid
-sequenceDiagram
-    participant S as 訊號平面
-    participant R as 推理平面
-    participant G as 治理平面
-    participant E as 執行平面
-    participant H as 人
-
-    S->>R: t=0s 拒絕率越過門檻，帶契約與拓撲情境
-    R->>R: t=3s 假設樹、查三個 store、算信心 0.7
-    R->>G: t=20s 候選行動：rollout_undo(payment-service)
-    G->>G: t=20s 可逆？是。信心 0.7 < 0.8 → PROPOSE
-    G->>H: t=20s 提案送到面板，附影響範圍：2 pods、rev 25→24
-    H->>E: t=?? 人按下 Approve
-    E->>E: 乾跑 → 執行 → settle window
-    E->>S: t=+180s 結果訊號，失敗則自動 rollback
-    S->>G: 事後標註：這次判斷對不對
-```
-
-這張圖有一半是假的，我先講清楚是哪一半。從 t=0 到 t=20 那段是真的，前三十一天跑過很多次，信心 0.7 跟那個 2 pods、rev 25→24 都是實際輸出裡抄下來的數字。從 `H->>E` 那一箭頭開始往下全部是示範性重演：核准這件事目前只存在成一支 HTTP endpoint（`POST /actions/requests/{id}/approve`），plugin 那頁只把提案列出來，沒有那顆按鈕，而且就算按了，`actions_enabled` 是關的，也不會有 executor 接手；最後那條「事後標註」的箭頭同樣沒有東西在跑，而它正是讓第一格的門檻可以被回頭校正的那條線。
-
-換句話說，**這座系統目前是一條走到一半就停住的迴圈，而停住的位置剛好是「建議」跟「行動」的交界**。後面幾天要做的事，就是從那個箭頭往下，一段一段讓它第一次拿到真實輸入。
-
-## 階梯：現在卡在第幾級
-
-最後一張圖先畫出來放著，細節留給後面。ARE §4.9 給了一個五級成熟度模型，三個維度：可觀測性（系統能感知並賦予情境的能力）、推理（決策怎麼形成與驗證）、授權（agent 被允許做哪些行動）。治理不是第四個維度，因為治理是那個在 runtime 執行授權的機制，它的成熟度藏在授權維度裡。
-
-```mermaid
-flowchart TB
-    L1["L1 Reactive<br/>人主導，工具各自為政"] --> L2["L2 Augmented<br/>遙測標準化<br/>agent 只給建議"]
-    L2 -.->|"Trust Ceiling"| L3["L3 Bounded<br/>低風險行動可自主<br/>治理平面在 runtime 運作"]
-    L3 --> L4["L4 Adaptive<br/>自我批判、跨事故學習"]
-    L4 --> L5["L5 Systemic<br/>多 agent 協作<br/>不可否認的稽核帳本"]
-
-    classDef here fill:#d5f5e3,stroke:#27ae60,color:#145a32
-    class L2 here
-```
-
-書裡最值得記住的一句話是：整個模型最難的一段不是 L4 到 L5，是 **L2 到 L3**，它把那個位置命名為`信任天花板`（Trust Ceiling）。因為那是系統從「agent 是顧問」變成「agent 是執行者」的那一刻，而它需要四個機制同時到位：治理平面、行動契約、自動逆轉、被校準過的信心。多數團隊帶著其中三個就去嘗試，然後第一次自主失敗剛好就落在缺的那一個上面。
-
-書裡還特別點名了一種失敗方式：團隊想用「把 prompt 寫得更嚴格」來補治理平面投資的不足，而 prompt 層級的安全性在有負載的時候撐不住。這句我讀的時候有點刺，因為第一階段有一整天在講「規定寫在 prompt，執行才在圖上」，那時候我把它當成一個關於注入的觀察，現在看它其實就是這件事的另一個講法。
-
-照這三個維度粗略定位，這個 repo 大概在 L2：遙測標準化做過了、拓撲圖可查詢也有在對帳、agent 會給結構化的建議，但所有寫入動作都還要人按。而 L2 有一個專屬的量尺叫建議接受率（Suggestion Acceptance Rate，SAR），我現在量不出來，因為那顆按鈕沒有人按過，分母是 0。
+- **A/B 沒有跑。** 管線接上了，但要真的跑一輪 harness 才有資料，那需要整套 stack 加 LLM。
+- **沒有回填 `investigations`。** 六月那 35 筆的調查內容沒有留下來（當時就沒寫），所以補不回去，只能從下一輪開始有。
+- **那兩個 id 的命名沒有統一。** 今天只是在寫入的時候挑對了那一個，`thread_id` 跟 `run_id` 還是兩個不同的字串，下一個人一樣會踩。
+- **`draft_runbook` 沒有非 UI 的入口。** 它還是只在有人按的時候才會動。
+- **沒有任何東西在檢查這條路端到端是通的。** 今天的探測是我手動跑的，它沒有進 CI。
 
 ## 小結
 
-總結來說，今天沒有跑任何一行程式碼，做的事情只有一件：把接下來九天要填的格子先畫出來，並且把 repo 現況誠實地擺進那張圖裡。得到的結論比我動筆前預期的要窄，也要具體一些——執行跟治理這兩格不是白紙，是一組沒有人按過的開關，而它們的狀態不是「壞掉」也不是「好的」，是「不知道」。
+總結來說，今天原本是驗收的一天，結果變成修接縫的一天。過去事故庫沒有自己活過來，因為它是一個 JOIN，而那兩張表在唯一會產出標註的那條路上只有一半有人寫。修完之後它會在下一輪真的跑起來的時候有東西，而昨天那個欄位順便讓它撈不到不該撈的紀錄。
 
-一個從來沒有被觸發過的防護網，跟一個不存在的防護網，在證據等級上是一樣的。這句話會是接下來九天的判準，也是最後一天要回頭驗收的東西。至於那條光譜為什麼現在只走得到 `PROPOSE`，答案剛剛已經出現過一次了：不是程式碼不夠，是標註數還是 0，而標註這件事買不到，只能一筆一筆累積出來。
+比較有用的收穫是那個 A/B 的取捨。我原本很想生一個數字出來，畢竟四天下來還沒有一個「變好了」的結果。但用自己編的資料去驗證一個檢索機制，量到的只會是自己編得好不好。這種時候把管線接好、把規則釘成測試、然後誠實寫下「還沒跑」，比生一個數字有用。
 
-> 花三十一天做出一隻可以被檢查的 agent，結果第三十二天發現真正沒被檢查的是我自己寫的那道檢查 XD
-> 下一件要做的事很不浪漫：把那六支檔案的真實呼叫關係畫出來，因為大綱寫的跟 repo 裡的差很多。
+> 這三天我沒有讓 agent 變聰明一點點，做的全部是把它已經有的東西接起來。
+> 但至少現在那些綠燈，紅的時候是真的紅 :)

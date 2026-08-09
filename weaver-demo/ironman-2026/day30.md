@@ -1,234 +1,299 @@
 ---
-title: "【Day30】使用者到底拿到了什麼：入口、格式、帳單"
+title: "【Day30】准不准，跟准了之後誰在管：三道鎖，三個沒有人管的狀態"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
-tags: [OpenTelemetry, AIOps, Grafana, LLM, 鐵人賽]
+tags: [OpenTelemetry, AIOps, Governance, 鐵人賽]
 ---
 
-# Day30：從使用者那一側看回來，三個角度各量一次
+# Day30：一道從來沒被評估過的門，跟一個只有人按才會動的狀態機
 
-> 前面二十九天我一直在驗證那條沒有人在看的路徑
-> 而真正會被用的那一條
-> 缺假設樹、缺信心分數、缺一顆按鈕
-> 還缺一張帳單
+> 那兩支檔案的 docstring 都寫得很好
+> 一支講自主權要靠校準紀錄換
+> 一支講狀態轉移為什麼是原子的
+> 而我今天量出來的是，一段從來沒改變過任何結果，一段只有在有人敲門的時候才會動
 
-昨天把整條鏈從上線檢查跑到「這次考幾分」。今天換一個方向：**不看 agent 做了什麼，看使用者最後拿到了什麼。**
+昨天畫出真實的呼叫關係，結論是提案那條路一直是活的，斷掉的是提案之後那一段。今天把那一段的前兩格一起讀完：`governance.py` 決定一個行動准不准自己做，`action_requests.py` 把那個判斷變成一列可以被人按的紀錄。它們是同一條路上前後相鄰的兩格，分開讀會看不出來今天最後那個結論。
 
-這件事量下去分成三段，剛好是同一個回答的三個層次：它從哪個門進來的（入口）、它輸出的東西能不能被操作（格式）、以及這一次回答花了多少（帳單）。三段各自都踩到東西，而且踩的形狀很像。
+程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day30/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day30)。兩支探測腳本都不需要叢集、不需要 LLM（Large Language Model，大型語言模型），暫存 SQLite 檔加真的模組，沒有 mock。
 
-程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day30/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day30)。
+## 為什麼「信心 0.9」不足以決定任何事
 
-## 一、入口：同一隻 agent，兩個門進來拿到不一樣的東西
+先講上游那個模組想解決的問題。agent 跑完一次調查，findings 上面帶一個 `confidence`，比方說 0.9。這個數字是它自己寫的。前面有一次實測裡它在自己的推論裡寫著「沒有找到反證」，然後給了 1.0，我當時看到那份報告的反應是想笑又笑不太出來。
 
-先講一件很尷尬的事：**從 Day23 到昨天，每一次驗證都是從告警那頭進去的。** `/webhook/alert`、`run_headless()`、eval harness，全部都是。
+所以問題不是「它有多有信心」，是**它過去說 0.9 的時候，實際上對了幾成**。這個東西在 ARE（Agentic Reliability Engineering，代理式可靠性工程）裡叫 `校準`（calibration，白話點講就是「這隻 agent 的嘴巴跟它的手對不對得上」），而 [ARE 這本書](https://learning.oreilly.com/library/view/agentic-reliability-engineering/0642572294809/) §6.2 的第一條約束講得很硬：自主權是掙來的、而且是可以被收回的，而掙的憑據不能是它自己給自己打的分數。
 
-但這整套東西最後要用的樣子，是一個人在 Grafana 的輸入框打一句「payment 的拒絕率為什麼變高了」。那條路我一次都沒有量過。
+`governance.py` 的 docstring 把這件事翻成三個層級：
 
-先講清楚那條路的形狀，因為它跟告警那條差很多：
+- `AUTO`：政策允許自己執行（後面還有一道總開關）
+- `PROPOSE`：算出來給人看，人按了才算數
+- `ESCALATE`：連按鈕都不要生，直接交回給人
+
+聽起來很清楚。今天要確認的是這三個層級在目前這個 repo 裡實際上怎麼分佈。
+
+## 逐條讀那個判斷
+
+`decide()` 整個函式的判斷順序是這樣，順序本身就是設計：
 
 ```mermaid
 flowchart TB
-    U["使用者打一句話"] --> I["意圖閘門<br/>in_scope? lookup 還是 investigate?"]
-    I -->|out of scope| R["拒絕，不花任何工具呼叫"]
-    I --> S["服務解析<br/>字面比對 → LLM 比對"]
-    S -->|模稜兩可| C["clarify 選單<br/>『你是指哪一個服務』"]
-    S --> INJ["注入能力快照 / Signal context / 依賴健康"]
-    INJ --> M{"mode"}
-    M -->|lookup| F["快速路徑：一次 LLM 呼叫吐出查詢<br/>面板自己渲染"]
-    M -->|investigate| G["完整的圖：工具迴圈"]
+    S["decide(action, confidence, calib, dq)"] --> R{"action.reversible?"}
+    R -->|"不可逆"| E1["ESCALATE<br/>never autonomous"]
+    R -->|"可逆"| C1{"confidence < low (0.5)?"}
+    C1 -->|"是"| E2["ESCALATE"]
+    C1 -->|"否"| C2{"confidence < high (0.8)?"}
+    C2 -->|"是"| P1["PROPOSE<br/>信心落在提案帶"]
+    C2 -->|"否"| A1{"action.requires_approval?"}
+    A1 -->|"是"| P2["PROPOSE<br/>這個行動本來就要人核准"]
+    A1 -->|"否"| A2{"校準 proven-good?"}
+    A2 -->|"否"| P3["PROPOSE<br/>降級"]
+    A2 -->|"是"| A3{"DQ proven-good?"}
+    A3 -->|"否"| P4["PROPOSE"]
+    A3 -->|"是"| AUTO["AUTO"]
 ```
 
-意圖閘門做兩件事。第一是**擋掉不相干的問題**，而且是 fail-closed：分類器自己壞掉的時候一律拒絕，因為「分類失敗就放行」等於給了一條繞過的路。第二是分模式：
+硬性安全規則排在最前面：不可逆的行動不管信心多高都是 ESCALATE，這條在 `confidence` 之前就決定了。之後才是信心分帶，最後那三格才是「掙來的自主權」那一段。
 
-```console
-$ uv run python chat_probe.py
-payment-service 的拒絕率為什麼變高了   in_scope=True  mode=investigate  services=['payment-service']
-order-service 的 p95 latency          in_scope=True  mode=lookup       services=['order-service']
-近10筆 payment 的錯誤 log              in_scope=True  mode=lookup       services=['payment-service']
-幫我寫一個 python 快排                 in_scope=False mode=investigate  services=[]
-哪個服務最近最不健康                    in_scope=True  mode=investigate  services=[]
+要注意的是圖裡 `action.requires_approval?` 那一格的位置。它在校準那兩格上面。這個排法本身沒有錯，一個標記成需要人核准的行動，本來就不該因為 agent 最近表現不錯就變成自動的。但它有一個副作用，等一下量出來會很直接。
+
+`test_governance.py` 有十幾條測試，涵蓋率上看每個分支都有人走過：不可逆會 ESCALATE、低信心會 ESCALATE、中信心 PROPOSE、高信心加好校準會 AUTO、校準過度自信會降回 PROPOSE。看起來很完整。但每一條測試用的都是這個東西：
+
+```python
+def _spec(reversible=True, requires_approval=False, name="k8s.test"):
+    return ActionSpec(
+        name=name, description="d", reversible=reversible, requires_approval=requires_approval
+    )
 ```
 
-`lookup` 那兩題不需要 ReAct 迴圈。使用者要的是**看到那張圖**，agent 的工作只是把中文翻成一句 PromQL/LogQL，剩下的交給面板去跑。一次 LLM 呼叫、零工具呼叫。這個分流不是為了省錢，是因為「顯示一個指標」跟「查出根因」在互動上根本是兩件事。
+`requires_approval` 預設是 `False`。而註冊表裡真的存在的行動，兩個都是 `True`。**這證明了意圖，沒有證明機制**，而這句話今天還會再用一次。
 
-然後我把兩條路的清單並排：
+> 這種「排在前面的檢查會讓後面的檢查失去意義」的形狀，其實跟前面那個 policy 只比對名字前綴是同一類東西：不是邏輯錯，是這條路上根本走不到後面那些判斷，而程式碼看起來仍然完整。
 
-| | 人打字（改之前） | 告警 webhook |
-| --- | --- | --- |
-| 意圖閘門 / 服務解析 / clarify 選單 | ✅ | — |
-| 能力快照、Signal context、依賴健康 | ✅ | ✅ |
-| **RCA playbook（假設樹＋五步＋信心規則）** | ❌ | ✅ |
-| **findings：結論／信心／suspected_version** | ❌ | ✅ |
-| 過去事故注入 | ❌ | ✅ |
-| **investigation 紀錄 ＋ `trace_id`** | ❌ | ✅ |
-| trace ID 幻覺守門 | ✅ | ✅ |
-| 面板、alert 提案卡 | ✅ | — |
+## 拿真的註冊表去掃一遍
 
-中間那四列就是這三十天的成果裡，**只長在告警那一側的部分**。
-
-白話講：你在 Grafana 問「payment 為什麼一直被拒」，拿到的是一段有面板的回答，但沒有假設樹、沒有信心分數、事後在 investigation 列表裡找不到這次對話，也沒有一條 trace 可以回頭看它怎麼想的。
-
-這不是設計取捨，是我沒發現。`_RCA_PLAYBOOK` 這個常數只被 `_alert_to_prompt()` 用到，而那個函式只有 webhook 會呼叫。**同一個圖、同一組工具、同一份 catalog，只有 kickoff 那段話不一樣，出來的東西就差這麼多。**
-
-補起來只有三件事：investigate 模式也注入同一份 playbook；回合結束後跑一次結構化抽取，把 findings 用一個新事件送到前端並存一列 investigation（`source: chat`，帶著 Day28 那個 `trace_id`）；過去事故的查詢原本要 service ＋ alertname 兩個條件，改成 alertname 可選，因為 chat 問句沒有 alertname，而「上次有人查這個服務，結論是什麼」本來就是一個同事會記得的事。
-
-```console
-$ uv run python chat_turn.py "payment-service 的拒絕率為什麼變高了"
-tool_start query_prometheus {'expr': 'sum by (git_version, reason) (rate(payment_charges_total{status="declined"}…
-findings   confidence=0.7 services=['payment-service'] version=v2.5.0
-           The decline rate for payment-service has increased due to a spike in declines with the
-           reason "new_validator"…
-
-stored row: fp=day30-demo source=chat confidence=0.7 trace_id=10d35edee3e4a743d43395ee6b55f5c8
+```bash
+# 從 o11y-bench 主 repo 的根目錄跑
+python3 ironman-2026/day30/probe_governance.py
 ```
 
-接的過程踩到兩個坑，而且是同一個形狀。**第一版我把 playbook 接在使用者訊息後面**，結果中文問題拿到一半英文的回答：一大塊英文指令黏在問句尾巴，模型就順著換語言了。改成獨立的 system message，並在最後一行重申「用使用者的語言回答」（放最後是因為近因效應，這條規則是模型最先忘的）。**第二版它把整棵假設樹印在回答裡**，告警那條路沒人看無所謂，chat 這條路使用者會先看到三段 H1/H2/H3 才看到答案。指令得明說：內部想，不要印，最後只留一行信心與還不能排除什麼。
+先看它認得哪些行動，以及一份乾淨到不能再乾淨的校準紀錄：
 
-兩個坑講的是同一件事：**同一段指令，對著沒人看的批次流程跟對著一個正在等答案的人，寫法是不一樣的。**
+```
+[0] registered actions (2)
+    k8s.rollout_undo   reversible=True requires_approval=True impl=wired
+    k8s.scale          reversible=True requires_approval=True impl=wired
 
-> 另外一個沒有解決的東西：那一輪它給的信心是 0.7，但同一個問題我跑過一次拿到 1.0，而那次它在答案裡自己寫「Contradictory evidence: None found」。它根本沒去找反證，卻給了滿分，而 playbook 裡明明寫了「沒做反證嘗試 → 信心 ≤ 0.5」。這個數字準不準，是下一個系列的第一個題目 :(
+[baseline] 25 grader labels, overconfidence -0.1 — every calibration gate satisfied
+```
 
-## 二、格式：一個內容完全正確、格式完全沒用的回答
+25 筆非自我標註、過度自信是負的（也就是它比實際表現還保守），這份紀錄過得了所有校準檢查。接著拿它去掃信心值：
 
-入口補好了，接著是答案的另一半：**它輸出的東西怎麼變成使用者真的能操作的介面。**
+```
+[1] the real registry
+    k8s.rollout_undo   0.3->escalate 0.6->propose  0.9->propose  1.0->propose
+    k8s.scale          0.3->escalate 0.6->propose  0.9->propose  1.0->propose
 
-在 Grafana 裡，agent 的回答不是純文字。回答裡的 fenced block 會被 plugin 換成活的面板，`alert` 提案會變成一張有「Create alert」按鈕的卡。這是一份契約，而契約有兩端：prompt 那邊負責寫對，parser 那邊負責認得出來。兩端都斷過一次。
+[2] the same actions with requires_approval flipped off
+    k8s.rollout_undo   0.3->escalate 0.6->propose  0.9->auto     1.0->auto
+    k8s.scale          0.3->escalate 0.6->propose  0.9->auto     1.0->auto
+```
+
+兩排的差別只有一個布林值。**在目前註冊的行動上，`AUTO` 這個層級是到不了的，而擋住它的不是校準，是那個旗標。** [2] 那排把旗標翻掉之後 AUTO 立刻出現，同一份校準資料、同一個信心值，證明後面那幾格程式碼是活的、會動的，只是現實中沒有任何一個行動走得到那裡。
+
+換句話說，這個模組最核心、docstring 花了半頁在講的那段校準判斷，在這個 repo 至今沒有改變過任何一次結果。它每次都會被算出來，算出來的字串也每次都被塞進 `Decision.calibration_note` 裡跟著提案跑，但決定去向的一直是上面那一格。
+
+## 唯一真的裝在門上的那把鎖
+
+前面講的是壞消息，這一段是好消息。校準那格內部其實有兩道門，`_calibration_verdict()` 依序檢查：
+
+```python
+labeled = calib.get("labeled") or 0
+if labeled < settings.governance_min_labeled_runs:      # 20
+    return False, f"calibration unproven ({labeled} labeled run(s) < 20); autonomy withheld"
+
+if human_labeled is not None and human_labeled < settings.governance_min_human_labeled_runs:  # 20
+    return False, (f"insufficient human/grader labels ({human_labeled} < 20); "
+                   "self-produced labels cannot unlock AUTO")
+```
+
+第一道問「總共有幾筆標註」，第二道問「其中有幾筆不是它自己標的」。第二道那個 `human_labeled` 來自 `store.cal_count_by_source(exclude_sources=_SELF_LABEL_SOURCES)`，而那個常數只排除兩個來源：
+
+```python
+_SELF_LABEL_SOURCES = ("remediation-verified", "remediation-failed")
+```
+
+這兩個來源是 `execution.py` 執行完之後自己回頭驗證的結果。也就是說，agent 修完之後自己去查一下說「嗯我修好了」，這筆紀錄進得了資料庫、算得進總數，但解不開自主權：
+
+```
+[3] self-produced labels vs grader labels, at confidence 0.9
+    after 25 x remediation-verified  labeled=25  non-self=0
+        -> propose  insufficient human/grader labels (0 < 20); self-produced labels cannot unlock AUTO
+    after 20 x grader                labeled=45  non-self=20
+        -> auto     calibration ok (overconfidence -0.1, 45 runs)
+```
+
+25 筆自我標註，第一道門過了（25 ≥ 20），第二道門把它擋下來。再灌 20 筆 grader 標註進去，同一個信心值、同一個行動，判斷才變成 AUTO。這是 ARE §6.2 第一條約束最字面的一行程式碼，而且它是今天所有探測裡唯一一個「機制真的裝好了、而且真的會擋」的東西。
+
+順帶一個小發現：過度自信那道檢查寫的是 `if overconf > settings.governance_max_overconfidence`，所以負的一路通行。一隻永遠說 0.3、實際上都對的 agent，會拿著滿分的校準成績單走到 AUTO 那格，而它的信心數字對值班的人來說一點資訊都沒有。
+
+> 我還是把它寫出來會比較誠實：那兩個門檻都是 20，而 20 是設定檔裡的一個地板數字，不是統計上「夠了」的數字。20 筆全部集中在信心 0.9 那一格，跟 20 筆散在各個信心區間，能講的話完全不一樣。
+
+## 那，現在按下去會發生什麼
+
+這是上游這半段最想回答的一句話。探測四直接讀真實的那個 store：
+
+```
+[4] the real store, right now
+    recorded=0 labeled=0 non-self=0 overconfidence=None
+    k8s.rollout_undo   -> propose  high confidence but action is approval-gated
+                          calibration unproven (0 labeled run(s) < 20); autonomy withheld
+    k8s.scale          -> propose  high confidence but action is approval-gated
+                          calibration unproven (0 labeled run(s) < 20); autonomy withheld
+```
+
+答案是 PROPOSE，而且是三道各自獨立的鎖同時鎖著：
 
 ```mermaid
 flowchart LR
-    A["agent 的回答<br/>散文 + fenced blocks"] --> P["splitQueryBlocks<br/>（plugin）"]
-    P --> M1["```promql<br/>活的時序圖"]
-    P --> M2["```logql 10<br/>活的 logs 面板"]
-    P --> M3["```traceql 3<br/>活的 traces 表"]
-    P --> M4["```alert<br/>提案卡 + Create alert 按鈕"]
-    P --> M5["其他<br/>純文字"]
+    D["高信心的提案"] --> L1["鎖一：requires_approval<br/>兩個行動都是 True"]
+    L1 --> L2["鎖二：校準<br/>0 筆標註"]
+    L2 --> L3["鎖三：actions_enabled<br/>總開關 False"]
+    L3 --> OUT["一列 proposed<br/>等人來按"]
 ```
 
-這個設計有一個好處值得講：**面板不是把 agent 查到的資料畫出來，是把它用的查詢再跑一次。** 所以使用者看到的數字跟 agent 引用的數字來自同一句查詢，但由 Grafana 自己去取，時間範圍還能自己拉。agent 的角色是「把中文翻成查詢」，不是「當一個資料中轉站」。Day25 那個把 72 KB 壓成 5 KB 的摘要，也是靠這件事才敢做：模型手上那份被壓過的數字只是拿來推理的，畫給人看的那份是面板自己去查的。
+這三道鎖沒有一道是多餘的，但它們疊在一起造成一個實際的問題：**現在這個系統告訴你「不行」的理由，跟你以為的理由不是同一個。** 看那兩行輸出，`reason` 說的是「approval-gated」，`calibration_note` 說的是「unproven」，同一列紀錄上兩句話、兩個原因。如果明天我把標註灌到 20 筆、校準也漂亮，第二句會變綠，第一句不會，結果一模一樣還是 PROPOSE。反過來說，如果有人為了「讓自動化跑起來」去把 `requires_approval` 改成 `False`，他會發現還是 PROPOSE，然後很可能繼續往下改。
 
-**斷點一，使用者不可能弄錯的東西。** 「幫我設一個告警」最後會打到 `/alerts/provision`。第一次真的按下去：
+## 那一列 proposed 之後呢
 
-```console
-$ curl -X POST localhost:8091/alerts/provision -d '{"title":"payment decline rate high", …}'
-{"detail":"grafana rejected the rule: {\"message\":\"invalid alert rule: folder does not exist\"}"}
+上面那條路最後產出的東西，是一列 `proposed`。從這裡開始換一支檔案。
+
+治理平面算出來的 `Decision` 是一個 pydantic 物件，活在記憶體裡，函式回傳完就沒了。但「這個行動被允許到什麼程度」這件事必須撐得比一次函式呼叫久，因為中間要插進去一個人：人要看得到它、要能按、按完要留下是誰按的、而且隔天有人問起的時候要查得到。所以它得變成一列有狀態的紀錄。
+
+`action_requests.py` 的 docstring 把職責切得很清楚：這支檔案管一個請求現在在哪個狀態、以及它可以合法地移動到哪裡；執行的時候發生什麼事是 `execution.py` 的；到底會不會真的動到叢集是 `actions.py` 那道 kill switch 的。狀態總共 13 個，其中 7 個標著 `(7b-4+)`，也就是執行管線之後才會用到、今天不碰的那一段：
+
+```mermaid
+stateDiagram-v2
+    [*] --> proposed
+    [*] --> approved: AUTO 且 kill switch 開著
+    proposed --> approved: 人按核准
+    proposed --> rejected: 人按拒絕
+    proposed --> expired: TTL 過了
+    approved --> executing: executor 認領
+    executing --> refused: kill switch 關著／沒有實作
+    executing --> aborted: 前置檢查擋下
+    executing --> succeeded
+    executing --> failed
+    executing --> verify_failed
 ```
 
-Grafana 講得沒錯，那個 folder 真的不存在。但**那個 folder 是 `AlertSpec` 的預設值 `aiops` 選的，使用者從頭到尾沒看過這個欄位。** 他做的事情只有按一顆按鈕，然後拿到一句「folder 不存在」。這跟 Day13 那條判準是同一件事：一個機制如果失敗之後還要人去補一個他根本沒參與的前置條件，那個成本就是設計者推給使用者的。改成送規則之前先確認 folder，沒有就建（409 也當成功，那代表別人剛好同時建了）：
+所有的狀態轉移都走同一個函式，`store.ar_transition()`，而它的核心只有一句 SQL：
 
-```console
-$ curl -X POST localhost:8091/alerts/provision -d '…'
-{"ok":true,"uid":"bfudlf17fvw8wb","title":"payment decline rate high"}
+```sql
+UPDATE action_requests SET status=? WHERE request_id=? AND status=?
 ```
 
-**斷點二，模型照著自己的習慣寫。** 接著我用正常的方式問一次「幫我對 payment-service 的拒絕率設一個告警，超過 5% 就通知」：
+最後那個 `AND status=?` 是重點。它不是「先讀出來看一下是不是 proposed，是的話再寫進去」，而是把讀跟寫壓成同一句原子操作，然後看 `cur.rowcount > 0`。這叫 compare-and-set（簡稱 CAS），兩個人同時按核准的時候，第二個人的 UPDATE 會匹配到 0 列，函式回 `False`，`approve()` 因此回 `None`。
 
-```console
-```yaml
-alert: PaymentDeclinedRateHigh
-expr: sum(rate(payment_charges_total{…,status="declined"}[5m])) / sum(rate(…)) > 0.05
-for: 5m
-labels:
-  severity: warning
-```
+這個設計是對的。要確認的是它在真的併發的時候也是對的，因為現有那三條相關的測試（double approve、approve after TTL、approve missing）都是單執行緒依序呼叫，只證明了「第二次呼叫看到狀態已經變了」。
+
+```bash
+python3 ironman-2026/day30/probe_lifecycle.py
 ```
 
-這是一份**完全正確的 Prometheus 告警規則**，也完全沒有用。plugin 認的是 ```` ```alert ```` 的 JSON，看到 `yaml` 就當純文字印出來，那顆按鈕不會出現。原因不難猜：訓練資料裡「告警規則」長得就是 Prometheus YAML 那個樣子，而我的契約寫在系統 prompt 中段的一個小節裡。**模型不是不聽話，是它有一個更強的先驗。**
-
-第一次修法是在 prompt 裡明寫禁止項，而不只是說明正確格式。再問一次，JSON 對了，**內容一字不差，fence 還是 ```` ```json ````**，卡片依然不會出現。所以第二步是改接收方：```` ```json ```` 只要驗得成 AlertSpec 就當成提案，驗不成照樣當程式碼區塊。
-
-> 這件事講起來像 Postel's law（送出要嚴謹、接收要寬容），但我想強調的是另一半：**只靠 prompt 的契約是機率性的。** 它會在你沒改任何東西的情況下，因為換一個問法、換一個模型版本就不成立。所以凡是「模型必須輸出某個特定格式」的地方，接收端都要有 plan B，而且要有測試。
-
-還有一個我改的時候才注意到的：這個解析在 repo 裡有兩份，一份在 plugin 的 TypeScript，一份在服務端的 Python，兩份的 regex 各寫各的。這就是 Day26 那個「同一個概念散成兩份」的形狀又出現一次，差別是這次跨語言，沒辦法用 import 收斂。能做的只有讓其中一份有測試，而且在另一份旁邊寫清楚它是誰的鏡像。
-
-## 三、帳單：一次「調查」其實是五次模型呼叫
-
-第三段是把同一次回答攤平來看。Day28 確認了 agent 的推理過程一直有被 trace，前面那一段又把「從結論走回那條 trace」的欄位補上，所以現在可以問一個以前只能猜的問題：**那七秒裡到底發生了什麼，以及它多少錢。**
-
-`/traces/{id}` 把 Tempo 的 OTLP-JSON 轉成一棵節點樹，`trace_tree.py` 把同一份東西印在終端機上：
-
-```console
-trace 10d35edee3e4a743d43395ee6b55f5c8
-  55 spans, 5 LLM call(s), 1 tool call(s), 18070 tokens, $0.001964
-  models: ['gemini-2.5-flash-lite']
-
-[http    ] POST /chat                                             7064ms
-  [business] AIOps_Intent_Gate                                      1400ms
-    [llm     ] ChatGoogleGenerativeAI.chat                            1397ms in=684 out=69 $9.6e-05
-    [business] invoke_agent LangGraph                                 3094ms
-      [business] LangGraph                                              3093ms
-        [business] agent                                                  1491ms
-          [llm     ] ChatGoogleGenerativeAI.chat                            1488ms in=10039 out=115 $0.00105
-        [business] tools                                                    39ms
-          [tool    ] query_prometheus                                        37ms
-        [business] agent                                                  1553ms
-          [llm     ] ChatGoogleGenerativeAI.chat                            1549ms in=4050 out=123 $0.000454
-        [business] rubric_trace                                             4ms
-    [business] AIOps_Findings_Extractor                               1445ms
-      [llm     ] ChatGoogleGenerativeAI.chat                            1442ms in=2408 out=156 $0.000303
-    [business] AIOps_FollowUp_Suggester                                904ms
-      [llm     ] ChatGoogleGenerativeAI.chat                             902ms in=366 out=60 $6.1e-05
+```
+[1] 8 threads approve the same request simultaneously
+    approve() returned a request 1 time(s) out of 8
+    after                  status=approved   actor=human-2 outcome=''
 ```
 
-這張圖回答了四個我以前只能用猜的問題。
+八個執行緒，恰好一個贏。連跑三次，贏的分別是 `human-2`、`human-1`、`human-1`、`human-0`，誰贏是隨機的，但**數量永遠是 1**。CAS 在真的併發下守住了，這一格是好的，也是今天下半段唯一的好消息。
 
-**一，「一次調查」其實是五次模型呼叫。** 只有中間兩次在推理，其他三次分別是意圖閘門、結論抽取（就是前面那段補的）、後續問題建議。使用者感覺是「問了一個問題」，帳單上是五筆。
+## 三個沒有人管的狀態
 
-**二，錢花在輸入，不是輸出。** 第一次推理輸入 10,039 個 token、輸出 115 個，而它就佔了整趟 53% 的成本。那一萬個 token 就是 Day23 量到的那七千多字元 context 加上系統 prompt。**這系列前面二十天做的所有 context 工程，成本都壓在這一格上。**
+剩下三個探測撞出來的東西骨架相同，先一個一個看。
 
-**三，慢的是想，不是查。** `tools` 那一層只花 39 毫秒，模型每次思考一秒半。我原本一直以為要優化的是查詢，看到這棵樹才知道優化查詢等於在七秒裡搶那 39 毫秒。
+**一、同樣過期的請求，approve 跟 reject 給出不同的故事。**
 
-**四，前面補的那個信心分數不是免費的。** `AIOps_Findings_Extractor` 是 $0.000303，大約 15%。我在第一段寫的時候只寫「多一次 LLM 呼叫」，現在它有數字了。
-
-> 順帶一提，這棵樹會這麼完整，是因為 `opentelemetry-instrumentation-langchain` 照著 gen_ai 語意慣例產 span，而我一行 instrumentation 都沒寫。這是這系列最直接的一次「遵守慣例的回報」：別人做的工具直接看懂你的東西。
-
-那個 `$0.001964` 是怎麼來的？一張寫死在 `traces.py` 裡的價格表，我手打的，從來沒有跟帳單對過。這個形狀在這系列出現過太多次了：Day21 那個過期的 `git_version` 宣告、Day15 那張沒人對過的拓撲圖、Day18 那個沒講清楚邊界的 100%。**一份沒有人對帳的宣告，會在沒有人發現的情況下慢慢變成謊話。** 而成本數字特別危險，因為它會被拿去做決策（「這個功能太貴，關掉」）。
-
-所以今天做的不是去把價格對準（我沒有那份帳單），是讓這個數字帶著它的來歷一起走：
-
-```console
-  55 spans, 5 LLM call(s), 1 tool call(s), 18070 tokens, $0.001964
-  cost basis: 2026-08-06, hand-entered from the public price list, never reconciled against billing
+```
+[2] the same stale request: approve() vs reject()
+    approve() -> None
+    approved path          status=expired    actor=None outcome='approval TTL elapsed before action'
+    reject()  -> a request
+    rejected path          status=rejected   actor=human outcome=''
 ```
 
-**我沒辦法讓它變準，但我可以讓它不假裝自己很準。**
+兩列一模一樣的請求，`expires_ts` 都被我改到 60 秒前。走 approve 那條路的結果是 `expired`，`outcome` 留下了原因；走 reject 那條路的結果是 `rejected`，`actor` 是那個人。原因很單純：`approve()` 開頭有一行 `_expire_if_stale()`，`reject()` 沒有。
 
-那條 trace 有 55 個 span，其中十幾個是 httpx 打 Prometheus/Loki/Tempo 的 client span。它們是真的，但如果全部印出來，「它怎麼想」會被埋在一堆 `GET` 裡面，所以預設濾掉，`--all` 才全印。這也是這系列反覆講的那條線：資料完整跟資料可讀是兩個目標，而報告要服務的是後者。
+從「會不會出事」的角度看，這不是 bug，兩邊都是終局狀態，沒有東西會被執行。但從稽核軌跡的角度看，這兩列紀錄講的是兩個不同的故事：一個說「它逾時了，沒人來得及處理」，另一個說「有人看過並且決定不做」。前者該問的是為什麼沒人看到，後者該問的是那個人為什麼判斷不做，而事後翻紀錄的人分不出來。
 
-## 三段的共通點
+**二、沒有人碰的過期請求，會一直待在待辦清單裡。**
 
-寫完才發現這三段的骨架一樣：**每一段都是「東西早就在那裡了，只是沒有人從使用者那一側看回來一次」。**
+```
+[3] a stale request nobody touches
+    listed under status=proposed: 1
+    stored                 status=proposed   actor=None outcome=''
+```
 
-playbook 一直都在，只是掛在一個只有 webhook 會呼叫的函式上。提案卡的渲染一直都在，只是模型有它自己的先驗，而接收端只認一個字串。那棵 trace 一直都在被產出來，只是沒有人把它讀出來排成一棵樹。
+`_expire_if_stale()` 全專案只有一個呼叫點，就是 `approve()` 裡面那一行。也就是說過期是被動觸發的：沒有人去按那顆核准，那列紀錄就會用 `proposed` 的身分一直躺在那裡，`list_requests(status="proposed")` 撈得到它，plugin 那頁也會把它畫出來。
 
-三件事沒有一件是「功能沒做」，全部是**接縫沒有人走過一遍**。
+TTL（Time To Live，存活時間）存在的理由寫在 `config.py` 的註解裡，講得很好：核准會走味，一個在時窗內沒被處理的請求要讓它過期，免得世界已經動了之後還有人拿著舊的前置條件去行動（那是典型的 TOCTOU）。設計意圖是對的，但目前那個時窗只有在有人來敲門的時候才會被檢查。
 
-## 對值班的人來說差在哪
+實務上會怎樣：凌晨兩點出了一次事故，agent 提了一個回滾建議，沒有人處理。早上九點有人打開面板，看到一列 `proposed`，上面寫著回滾 payment-service 到 rev 24。那個提案是七小時前的世界算出來的，而畫面上沒有任何東西告訴他這件事，除非他自己去看 `created_ts`。他按下去，`approve()` 才在那一刻發現它過期了，然後回 `None`。運氣好的話畫面會跳一個 409，運氣不好的話他會以為自己按了。
 
-三段各有各的時機，剛好對應事故的三個階段。
+**三、executor 認領到一半死掉。**
 
-**事故當下，價值在面板。** 一段文字說「拒絕率從 1% 跳到 15%」，你會想確認：是哪個時間點跳的、現在還在跳嗎、是不是只有某一版。這三個問題如果要回頭再問 agent 三次，那這個工具就只是一個比較會講話的查詢器。面板是活的，你可以直接把時間軸拉開、把 legend 點掉一半，**這些都不用再花一次 LLM 呼叫，也不用相信 agent 有沒有算對。** 而那顆「Create alert」按鈕守的是另一件事：agent 只能提案，寫進 Grafana 那一步永遠是人按的，跟 Day27 那個「乾跑算出範圍、但不執行」是同一個立場。
+```
+[4] the pod dies between claim and outcome
+    executor claimed it: True
+    after the crash        status=executing  actor=human outcome=''
+    a restarted executor re-claims it: False
+    approve() on it now: None
+```
 
-**事故之後，價值在那條 trace 跟那列紀錄。** 以前一段講得不錯的分析，關掉分頁就沒了，隔天有人問「昨天那個誰查的、結論是什麼」，答案是去翻 Slack。現在那次對話會出現在 investigation 列表裡，帶著信心分數、可以被標記正確或錯誤（那個標記會餵給校準），而且有一個連結可以打開它當時的推理過程。**可以被檢討的東西才會被改進，不能被檢討的東西只會被關掉。**
+`execution.py` 認領一個請求的方式是 `approved → executing` 的 CAS，這樣兩個 executor 不會搶到同一列。問題是認領成功之後如果那個 pod 被砍掉（重新部署、OOMKilled、節點被驅逐），那列紀錄就永遠停在 `executing`。重啟後的 executor 沒辦法重新認領，因為它找的是 `approved`；人也沒辦法做任何事，因為 `approve()` 找的是 `proposed`。這一列就卡在一個既不是終局、也沒有人會再看它一眼的狀態，而且全專案沒有任何地方在掃 `executing` 的殘留。
 
-**再之後，價值在那張帳單。** 當有人問「這個 agent 一個月要多少錢」，答案不再是「呃，我估算一下」，而是一條可以按服務、按告警名稱切開的 trace 資料。而且它跟延遲、跟工具呼叫次數長在同一條 trace 上，所以「省錢」跟「變笨」之間的取捨是看得見的。
+> 我在別的地方踩過同一個坑，那次是一個訂單狀態卡在「處理中」三個月，沒有人發現，因為報表只看成功跟失敗兩種。
+> 卡住的東西最可怕的地方不是它壞了，是它不會叫 QQ
 
-至於 `lookup` 那條路刻意什麼都不留，因為「給我看 p95」本來就不是一次調查，硬要記錄只會把列表洗掉。
+這三件事的骨架是同一個：**這個狀態機的推進完全依賴有人來敲門。** 核准要人按、過期要靠有人試著按、卡在執行中的那列要靠有人發現。沒有任何一個角色在背景把時間的流逝變成狀態的變化。
+
+```mermaid
+flowchart LR
+    H["人／HTTP endpoint"] -->|"approve"| P["proposed"]
+    P --> A["approved"]
+    A -->|"executor 認領"| E["executing"]
+    E -.->|"pod 死掉"| STUCK["卡住，沒有人在看"]
+    P -.->|"沒有人來按"| STALE["過期了，但還顯示成 proposed"]
+
+    classDef bad fill:#fadbd8,stroke:#c0392b,color:#78281f
+    class STUCK,STALE bad
+```
+
+這在目前的狀態下沒有造成任何傷害，因為 kill switch 是關的，卡住的那列本來也不會動到叢集。但這幾天的目標是把那個開關打開，而開關打開之後，這兩個虛線框就從「一列難看的紀錄」變成「一個沒有人知道的、進行中的變更」。
+
+## 兩個缺口，都在同一個地方
+
+平台工程的角度今天有兩個很具體的形狀，而它們指向同一個缺口。
+
+第一個在上游：`requires_approval` 是掛在行動上的，不是掛在（行動、目標）這一對上的。`k8s.rollout_undo` 用在 demo namespace 裡一個三副本的無狀態服務上，跟用在 payment 上，在註冊表裡是同一格、同一個布林值。真正跟目標有關的風險判斷不在這裡，它在 `blast_radius.py`（namespace 白名單、影響 pod 數上限、單副本拒絕），那是另一個平面、另一個時間點的檢查。所以現在的分工是：行動的性質歸平台團隊（誰能改註冊表誰就決定），爆炸半徑歸執行前的政策，而「payment 這個服務願意讓 agent 自動做到哪一級」這件事，repo 裡仍然沒有地方可以寫。這個缺口的代價是可以預期的：一旦哪天真的要讓某一個低風險的場景自動跑，唯一的做法是把註冊表裡那個旗標翻掉，而那一翻是全域的。paved road 的重點從來不是只有一條路，是預設那條最好走、要走別條得自己說明理由，現在這裡連別條路的入口都沒有，只有一個總開關。
+
+第二個在下游：一個提案卡在畫面上，成本是誰的？如果過期只在按下去的那一刻才算，成本就落在**值班的人**身上，而他手上的資訊是最少的，因為他不知道 TTL 是 900 秒（那寫在服務端的設定檔裡）。反過來，如果清單本身就把過了時窗的提案標出來，或者乾脆讓它們自己走到 `expired`，成本就落在平台團隊身上，代價是多一支背景工作。這是這系列反覆問的同一個問題：一道 gate 擋下來之後，對方能不能自己修好。目前這道門擋下來的訊息是 HTTP 409 加一句 `request not approvable (missing, expired, or already decided)`，三種原因擠在同一句話裡，而它們對值班的人來說是三件完全不同的事。
+
+兩個缺口的共同點是：**這條路上每一個「誰可以決定什麼」的問題，目前的答案都是平台團隊，因為那是唯一有地方可以寫的角色。**
 
 ## 今天沒做的事
 
-- **chat 不會產生 remediation 提案。** 提案來自 runbook 的 remediation 區塊，而 runbook 的 trigger 是告警形狀的（要 alertname）。一句問話要怎麼比對到 runbook，我還沒想清楚，硬比會在「payment 的延遲如何」這種問題上比到 decline 的 runbook。
-- **信心分數還是模型自己講的。** 上面那個 1.0 就是證據。
-- **沒有量 chat 這條路的分數。** eval fixture 現在全部是告警形狀的。
-- **面板的 datasource uid 是寫死的**（`prometheus` / `loki` / `tempo`），換一座 Grafana 就會全部畫不出來，而且錯誤訊息只會說找不到資料源。
-- **提案卡沒有預覽。** 按下去之前看不到這條規則在過去 24 小時會不會一直在燒，而那是最該先看的東西。
-- **兩份 parser 還是兩份。**
-- **價格表沒有對帳，成本也沒有進指標。** 它現在只存在於個別 trace 裡，沒有一條「每天花多少」的 metric，也就沒辦法設告警。
-- **span 取樣是全開的。** 每個模型 span 都帶著完整 prompt，高頻使用下 Tempo 的量會很可觀，而 Day23 那個一小時保留期同時也代表「昨天的推理過程今天已經沒了」。
+- **三道鎖一道都沒開，三個洞一個都沒補。** 今天的目的是把「按下去會發生什麼」講清楚，不是讓它變成 AUTO。開哪一道、補哪一個，得先有標註數字跟開關打開之後的實際影響。
+- **兩支腳本都不是測試。** `probe_governance.py` 跟 `probe_lifecycle.py` 都是印東西給人看，沒有斷言，也沒有進 `tests/`。真正該補的是一條「拿註冊表裡真的存在的行動去走 AUTO 那條路」的測試，那條測試現在會告訴你到不了。
+- **兩處訊息打架都只講不改。** `reason` 跟 `calibration_note` 兩句話、409 那句把三種原因擠成一句，改它們要動到 plugin 跟現有測試。
+- **`requires_approval` 的每服務分級沒有設計。** 今天只寫出缺口的形狀，那牽涉到誰擁有那份設定。
+- **沒有撞 `execution.py` 那一側。** 今天只到「認領」那一格為止，認領之後的乾跑、rubric 檢查、settle window 都沒碰。
+- **併發只測到 8 個執行緒、同一個 process。** 兩個 replica 同時打同一個 SQLite 檔是另一回事，那牽涉到 SQLite 的鎖行為。
+- **DQ（data quality）那格完全沒碰。** 它排在校準後面，而校準那格現在都走不到。
 
 ## 小結
 
-總結來說，今天做的事情都不難，難的是發現要做。前面二十九天我一直在驗證那條沒有人看的路徑，而真正會被用的那一條，缺了假設樹、缺了一顆按鈕、也沒有人知道它多少錢。這三個缺口沒有一個是設計上的取捨，全部是「兩條路徑看起來都是同一隻 agent」造成的錯覺。
+總結來說，今天沒有改任何一行產品程式碼，做的事情是把兩支檔案的 docstring 跟它們的實際效果各對一次帳。上游那段最重要的校準邏輯是活的、正確的、有測試的，但在真實的註冊表上從來沒有被評估到，唯一真的在擋人的是「自己說自己修好了不算數」那一條，它擋得乾淨俐落。下游那個狀態機的 CAS 在八個執行緒下守住了，而它之外的三條路都指向同一件事：只有在有人按的時候它才會動，時間本身不會讓任何一列紀錄前進。
 
-比較實際的收穫是那三個數字：一次調查是五次模型呼叫、錢有一半花在第一次推理的輸入、查詢只佔七秒裡的 39 毫秒。這三件事我在前面二十幾天裡，每一件都猜錯過。而那個成本數字最後沒有變準，只是變得誠實，這在決策場合裡比一個看起來很精確的數字有用。
+把兩半放在一起看，接下來要做的事情就收斂成一件很具體的東西：那個 `non-self=0` 得變成一個大於 20 的數字，而且不是靠 agent 自己標的。在那之前，校準曲線、過度自信、自主權階梯，講起來都還是設計稿。
 
-> 這系列到現在，我大概有一半的發現都來自「把兩個東西並排列成一張表」。
-> 不是什麼高明的方法，但它逼你把「我以為一樣」寫成兩欄 XD
+> 寫這篇的時候我原本準備了一段「來看看校準門怎麼把它擋下來」的示範，跑完第一個探測才發現根本輪不到那道門上場。
+> 而寫那兩支探測腳本花的時間，比我讀完那十幾條測試的時間還短。早知道每次看到「這裡有測試」就先花十分鐘撞一下，前面三十幾天可以少寫幾篇認錯的文章 XD
