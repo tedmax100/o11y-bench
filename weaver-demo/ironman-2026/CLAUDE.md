@@ -252,17 +252,18 @@ grep -nE "[0-9]+\s*(個|%|次|行)" dayNN.md | grep -v "http"
 
 ## 對應的程式碼放另一個 repo
 
-可執行的範例、policy、registry 放 `otel-aiops-agent/dayNN/`，文章只貼重點片段跟真實輸出，並在開頭連過去，該 repo 的 `dayNN/README.md` 寫完整重現步驟。
+可執行的範例、policy、registry 放 `otel-aiops-agent/ironman-2026/dayNN/`，文章只貼重點片段跟真實輸出，並在開頭連過去，該 repo 的 `dayNN/README.md` 寫完整重現步驟。
 
-**文章裡不要出現「submodule」這個詞**——那是我這邊的工作方式，讀者只會看到 GitHub 上的一個 repo。開頭的連結一律寫成「程式碼在範例 repo [`OTel_AIOps_Agent`](網址) 的 [`dayNN/`](網址)」，指令的前提寫「從 repo 根目錄跑」。
+**文章裡不要出現「submodule」這個詞**——那是我這邊的工作方式，讀者只會看到 GitHub 上的一個 repo。開頭的連結一律寫成「程式碼在範例 repo [`OTel_AIOps_Agent`](網址) 的 [`ironman-2026/dayNN/`](網址)」，指令的前提寫「從 repo 根目錄跑」。
 
-**資料夾日號跟文章一致。** 文章 DayN 就對應 `dayNN/`：現在是 `day01`、`day03`–`day17`、`day21`–`day27`、`day29`–`day34`。純概念日沒有資料夾（`day02`、`day18`–`day20`、`day28`），那幾天開頭不用寫程式碼連結。也沒有 `testability/`，Day12 的東西在 `day12/`。
+**資料夾日號跟文章一致。** 文章 DayN 就對應 `ironman-2026/dayNN/`：現在是 `day01`、`day03`–`day17`、`day21`–`day27`、`day29`–`day35`。純概念日沒有資料夾（`day02`、`day18`–`day20`、`day28`），那幾天開頭不用寫程式碼連結。
 
 **改號的時候記得三個地方一起改**（v10 把 43 天壓成 40 天、v11 把 40 天壓成 34 天時各走過一次）：文章的 `title:`／`# ` 標題／內文的 repo 連結、`dayNN/README.md` 的第一行標題、以及腳本 docstring 裡那行執行指令的路徑。最後跑一次「檔名 vs 標題」「文章連到的資料夾存不存在」的對照，比人眼掃可靠。
 
 **那個 repo 的佈局要寫對**（曾經寫錯過）：
 
-- 那個 repo 裡**沒有** `demo-services/` 這個目錄。它存的是每一天當下那組 stack 的**完整快照**，一天一個資料夾：`dayNN/services/{api-gateway,order,payment,user,webapp}`、`dayNN/shared/`、`dayNN/k8s/`、`dayNN/weaver/`。
+- **這一季的東西全部在 `ironman-2026/` 底下。** 那個 repo 的根目錄還留著 `day01`、`day04`–`day17` 跟 `testability/`，那是上一輪編號的殘留，跟現在的文章沒有對應關係，不要連過去、也不要拿它的內容當事實來源。
+- 那個 repo 裡**沒有** `demo-services/` 這個目錄。整組 stack 的**完整快照**（`services/{api-gateway,order,payment,user,webapp}`、`shared/`、`k8s/`、`weaver/`）只存在 `ironman-2026/day03/` 跟 `ironman-2026/day04/`，不是每天一份；其他天的資料夾只放那天真的用到的東西，通常是一兩個腳本加一份 `README.md`。
 - `demo-services/` 是**主 repo** `o11y-bench/` 底下的目錄，是這組服務持續演進的地方。文章裡用 `demo-services` 稱呼這組服務沒問題（Day1 就是這樣介紹的），但**不要說它在範例 repo 裡**，也不要寫成那個 repo 的路徑。
-- 文章裡的指令一律假設在範例 repo 的根目錄下跑，路徑從 `dayNN/` 開始寫（`-r day06/weaver/registry`），不要寫裸的 `weaver/registry`——那在根目錄下不存在。
+- 文章裡的指令一律假設在範例 repo 的根目錄下跑，路徑從 `ironman-2026/dayNN/` 開始寫（`-r ironman-2026/day06/registry`），不要寫裸的 `registry`——那在根目錄下不存在。
 - 貼路徑之前先 `ls` 確認一次。這類錯誤讀者一照做就會撞到。

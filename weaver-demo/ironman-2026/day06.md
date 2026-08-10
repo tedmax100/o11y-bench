@@ -19,7 +19,7 @@ Rego 是這整套治理機制裡最陡的一段，所以中間會有一節專門
 
 程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day06/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day06)，一份刻意留著漂移的 registry 加一份 [`naming.rego`](https://github.com/tedmax100/OTel_AIOps_Agent/blob/main/ironman-2026/day06/policies/naming.rego)。
 
-> 驗證環境：weaver 0.24.1。下面所有輸出都是實際跑出來貼上的，離開碼也是真的 `echo $?` 出來的。
+> 驗證環境：weaver 0.25.1。下面所有輸出都是實際跑出來貼上的，離開碼也是真的 `echo $?` 出來的。
 
 ## 命名漂移為什麼靠 code review 擋不住
 
