@@ -189,6 +189,58 @@ def _connect(path: str | Path | None = None) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+_COUNTED_TABLES = (
+    "calibration",
+    "investigations",
+    "action_requests",
+    "executions",
+    "audit",
+    "runbook_feedback",
+)
+
+
+def describe(path: str | Path | None = None) -> dict[str, Any]:
+    """Which physical store is this, and what is in it.
+
+    Exists because the most expensive class of bug in this system was never a
+    wrong query — it was a right query against the wrong file. Two deployments
+    of the same code, same schema, same filename, different mount: one had 35
+    calibration rows and 0 investigations, the other 15 and 15, and nothing on
+    any screen said which one you were reading. An absolute path plus row counts
+    costs one cheap query and makes that answerable without kubectl.
+    """
+    p = _resolve(path)
+    out: dict[str, Any] = {"path": str(p.resolve()) if p.exists() else str(p.absolute())}
+    out["exists"] = p.exists()
+    tables: dict[str, int | None] = {}
+    # This function must not go anywhere near `_connect`. `_connect` creates the
+    # file and runs the schema + migrations on open, which is right for every
+    # writer and wrong for the one caller whose entire job is asking "which file
+    # am I looking at". Both halves of that bit us: describing a missing path
+    # manufactured another empty store, and describing an *older* store silently
+    # migrated it — which is how a read-only probe added a column to the very
+    # snapshot that was being kept as evidence that the column was absent.
+    if not out["exists"]:
+        out["tables"] = dict.fromkeys(_COUNTED_TABLES, None)
+        return out
+    try:
+        # mode=ro is enforced by SQLite itself, so this cannot create, migrate,
+        # or write no matter what the rest of this module does later.
+        conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+        try:
+            for t in _COUNTED_TABLES:
+                try:
+                    tables[t] = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                except sqlite3.Error:
+                    tables[t] = None  # table absent on this store — say so, don't guess 0
+        finally:
+            conn.close()
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    out["tables"] = tables
+    return out
+
+
 # ---- calibration ----------------------------------------------------------
 
 

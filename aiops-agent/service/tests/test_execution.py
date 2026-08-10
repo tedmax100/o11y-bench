@@ -256,6 +256,10 @@ def _setup_verify_test(monkeypatch, tmp_path, *, verify_pass: bool, rollback_ok:
     p = _db(monkeypatch, tmp_path)
     monkeypatch.setattr(arq.settings, "actions_enabled", True)
     monkeypatch.setattr(arq.settings, "verify_delay_seconds", 0)
+    # These tests are about verify/rollback, and the actuation preflight needs a
+    # real cluster to answer. Turned off explicitly rather than left to fail
+    # open — see test_actuation_not_ready_aborts for the other half.
+    monkeypatch.setattr(arq.settings, "actuation_check_enabled", False)
     _wire_ok_dry_run(monkeypatch)
 
     # fake impl (always succeeds at the execute step)
@@ -384,3 +388,50 @@ async def test_verify_fail_rollback_fail(tmp_path, monkeypatch):
     res = await run(req.request_id, path=p)
     assert res["status"] == Status.ROLLBACK_FAILED.value
     assert get(req.request_id, p).status == Status.ROLLBACK_FAILED.value
+
+
+async def test_actuation_not_ready_aborts_before_anything_runs(tmp_path, monkeypatch):
+    """A dead write credential must stop the executor at a gate, not at the write.
+
+    This is the only execution this system ever really attempted, and it died on
+    a 401 after clearing every policy check. Failing here costs one API call;
+    failing at the write costs a half-applied change nobody planned for."""
+    import app.signals.actuation as act_mod
+
+    p = _setup_verify_test(monkeypatch, tmp_path, verify_pass=True)
+    monkeypatch.setattr(arq.settings, "actuation_check_enabled", True)
+
+    async def _dead(namespaces=None):
+        return act_mod.ActuationFit(
+            computed_ts=__import__("time").time(),
+            reachable=False,
+            in_cluster=True,
+            namespaces=namespaces or ["demo"],
+            error="ApiException: Unauthorized",
+        )
+
+    monkeypatch.setattr(act_mod, "check_actuation", _dead)
+    monkeypatch.setattr(
+        act_mod,
+        "actuation_verdict",
+        lambda: {
+            "proven_good": False,
+            "score": 0.0,
+            "note": "write credentials did not authenticate",
+        },
+    )
+
+    req = create_from_decision(
+        "fp1", _decision(), runbook_id="rb1", args={"deployment": "x", "namespace": "demo"}, path=p
+    )
+    approve(req.request_id, actor="alice", path=p)
+    res = await run(req.request_id, path=p)
+
+    assert res["status"] == Status.ABORTED.value
+    assert "did not authenticate" in res["outcome"]
+    # and it is on the record as its own phase, not buried in a generic failure
+    import app.audit as audit
+
+    assert [
+        e for e in audit.history(request_id=req.request_id, path=p) if e["phase"] == "actuation"
+    ]

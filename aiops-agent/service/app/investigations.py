@@ -131,12 +131,15 @@ def list_investigations(limit: int = 50, path: Path | None = None) -> list[dict[
         by_fp[r.fp] = r  # later lines win (file is append order = chronological)
     latest = sorted(by_fp.values(), key=lambda r: r.ts, reverse=True)[:limit]
 
-    # merge correctness from the CE harness (single source of truth)
+    # Merge correctness from the CE harness (single source of truth). `path` is
+    # threaded through deliberately: reading the rows from one store and the
+    # verdicts from another is the same seam that made the past-incident JOIN
+    # silently empty — the tables were fine, they just lived in different files.
     try:
         from .calibration import load_records
 
         verdict = {}
-        for cr in load_records():
+        for cr in load_records(path):
             if cr.correct is not None:
                 verdict[cr.run_id] = cr.correct
     except Exception:

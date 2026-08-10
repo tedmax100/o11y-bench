@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from . import action_requests, audit, breaker, execution
+from . import action_requests, audit, breaker, execution, store
 from .agent import lifespan, stream_chat
 from .alerts import AlertProvisioningDisabled, AlertSpec, build_alert_rule, provision_alert
 from .calibration import CULPRIT, label_run
@@ -37,7 +37,11 @@ class ChatRequest(BaseModel):
 
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True}
+    # `store` is here so "which database is this pod actually reading" is a curl
+    # away. Two same-named stores on different mounts disagreed for weeks and
+    # nothing surfaced it; identity you have to shell in to discover is identity
+    # nobody checks.
+    return {"ok": True, "store": store.describe()}
 
 
 @app.post("/chat")
@@ -84,7 +88,7 @@ async def webhook_alert(
 async def investigations_list(limit: int = 50):
     """Recent alert-driven RCA runs with their conclusion + governance decisions,
     most recent first. Read-only."""
-    return {"investigations": list_investigations(limit=limit)}
+    return {"investigations": list_investigations(limit=limit), "store": store.describe()}
 
 
 class LabelRequest(BaseModel):
@@ -232,6 +236,34 @@ async def actions_request_reject(request_id: str, body: ActorRequest):
             status_code=409, detail="request not rejectable (missing or already decided)"
         )
     return req.model_dump()
+
+
+@app.get("/actions/readiness")
+async def actions_readiness():
+    """Can the agent still act — as opposed to whether policy would let it.
+
+    Deliberately a live probe rather than a cached read: the whole point is that
+    a credential's health is only observable at the moment you use it, so an
+    endpoint that reports the last stored answer would reproduce the bug."""
+    from .signals.actuation import actuation_verdict, check_actuation
+
+    fit = await check_actuation()
+    return {
+        "verdict": actuation_verdict(),
+        "namespaces": fit.namespaces,
+        "in_cluster": fit.in_cluster,
+        "missing": fit.missing,
+        "excess": fit.excess,
+        "error": fit.error,
+    }
+
+
+@app.post("/actions/reconcile")
+async def actions_reconcile():
+    """Run the state-machine reconciliation pass now. It also runs on a timer;
+    this exists so a human can see what it would do without waiting for it, and
+    so the check can be asserted in CI."""
+    return await asyncio.to_thread(action_requests.reconcile)
 
 
 @app.get("/actions/audit")

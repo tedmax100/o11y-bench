@@ -433,6 +433,35 @@ async def run(request_id: str, path: Path | None = None) -> dict:
         )
         return {"status": Status.ABORTED.value, "outcome": f"circuit breaker: {reason}"}
 
+    # --- 3a. actuation readiness: can this credential still act ---------------
+    # Runs before the (expensive, LLM-backed) rubric gate because it is the
+    # cheapest possible way to discover the thing that actually stopped the only
+    # real execution this system ever attempted: a write token that had been
+    # dead for 46 days. Failing here costs one API call; failing at the write
+    # costs a half-applied change nobody planned for.
+    if settings.actions_enabled and settings.actuation_check_enabled:
+        from .signals.actuation import actuation_verdict, check_actuation
+
+        await check_actuation([ar.target_of(req.args).split("/")[0]])
+        act = actuation_verdict()
+        if not act["proven_good"]:
+            audit.record(
+                "actuation",
+                "abort",
+                request_id=req.request_id,
+                fp=req.fp,
+                detail={"note": act["note"], "score": act["score"]},
+                path=path,
+            )
+            ar_store_transition(
+                req.request_id,
+                Status.EXECUTING,
+                Status.ABORTED,
+                outcome=f"actuation readiness: {act['note']}",
+                path=path,
+            )
+            return {"status": Status.ABORTED.value, "outcome": f"actuation: {act['note']}"}
+
     # --- 3b. rubric gate: LLM safety check for k8s mutations ------------------
     # Only run when actions are live — no point blocking a kill-switched execute.
     try:

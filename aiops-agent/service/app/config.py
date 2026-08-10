@@ -91,6 +91,17 @@ class Settings(BaseSettings):
     # Approvals go stale: a request not acted on within this window is expired so
     # its preconditions can't be acted on after the world has moved (TOCTOU).
     approval_ttl_seconds: int = 900
+    # Background reconciliation: without it every transition needs a human to
+    # knock, so proposals expire only when someone tries to approve them and a
+    # request whose executor died stays `executing` forever. The reconciler only
+    # ever makes the record honest — it never retries or rolls back.
+    reconcile_enabled: bool = True
+    reconcile_interval_seconds: int = 60
+    # How long a claimed request may sit in `executing` before it is written off
+    # as abandoned. Must comfortably exceed the whole execute→settle→verify→
+    # rollback path (verify_delay_seconds plus rollout time), or the reconciler
+    # will declare live work dead.
+    executing_timeout_seconds: int = 600
 
     # --- Dry-run + blast-radius policy (step 7 後半 7b-2) -------------------
     # Read-only gates that run before any (kill-switched) execution: re-verify the
@@ -114,6 +125,14 @@ class Settings(BaseSettings):
     breaker_window_seconds: int = 3600
     breaker_fail_threshold: int = 2  # consecutive failures on a target → trip open
 
+    # --- Actuation readiness preflight ---------------------------------------
+    # "May we act" was gated; "can we still act" was assumed. A write-SA token
+    # outlived the cluster it was minted against and nothing reported it for 46
+    # days, because a credential is only observed at the instant it is used.
+    # SelfSubjectAccessReview turns permission into a signal that expires.
+    actuation_check_enabled: bool = True
+    actuation_max_age_seconds: int = 900  # older than this → readiness stale
+
     # --- Verify + rollback (step 7 後半 7b-4) ---------------------------------
     verify_delay_seconds: int = 60  # settle window between execute and verify query
     require_rollback_contract: bool = True  # no rollback contract → executor refuses
@@ -127,7 +146,21 @@ class Settings(BaseSettings):
     # needs grafana_url + grafana_token, else the endpoint refuses.
     governance_conf_low: float = 0.5
     # If measured overconfidence exceeds this, AUTO is downgraded to PROPOSE.
+    # NOTE: this is a *signed mean*, so on its own it is not a gate — two
+    # opposite errors cancel into a passing number. The three settings below
+    # read the reliability bins, where cancellation is impossible.
     governance_max_overconfidence: float = 0.1
+    # Worst single bin: max |accuracy - confidence| over bins with enough rows.
+    # A max over absolute values cannot be averaged away.
+    governance_max_bin_gap: float = 0.25
+    # Bins thinner than this are dropped rather than trusted — one labeled run in
+    # a bin yields an accuracy of exactly 0.0 or 1.0, which is not evidence. Also
+    # the floor for how many labeled runs the decision band must contain.
+    governance_min_bin_count: int = 3
+    # Accuracy required in the confidence band at/above governance_conf_high —
+    # the region where AUTO is actually granted. Being calibrated on questions
+    # that never reach the gate says nothing about the ones that do.
+    governance_min_band_accuracy: float = 0.7
     # AUTO requires at least this many labeled runs — autonomy must be earned.
     governance_min_labeled_runs: int = 20
     # Of those, at least this many must be human/grader labels (source not

@@ -31,41 +31,94 @@ _WRITE_TOKEN_PATH = "/var/run/secrets/k8s-write/token"
 _CLUSTER_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
 _write_api = None
+_write_authz_api = None
 _write_error: str | None = None
+_write_token_fp: tuple[int, int] | None = None
+
+
+def in_cluster_write_creds() -> bool:
+    """True when the projected write-SA token is mounted — i.e. we are holding
+    the restricted credential and not a developer's full-permission kubeconfig.
+    The distinction matters to any check that asks "what am I allowed to do":
+    on a dev kubeconfig the answer is "everything", which proves nothing about
+    what the deployed agent can do."""
+    return Path(_WRITE_TOKEN_PATH).exists()
+
+
+def _token_fingerprint() -> tuple[int, int] | None:
+    try:
+        st = Path(_WRITE_TOKEN_PATH).stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _invalidate_on_rotation() -> None:
+    """Drop the cached clients when the projected token has been rewritten.
+
+    kubelet refreshes bound ServiceAccount tokens *in place*, and a cached
+    ApiClient keeps presenting the bearer string it read at startup. That is how
+    a credential stays dead for weeks while every client object in the process
+    still looks perfectly healthy: nothing re-reads the file, and the only code
+    path that would notice is the one that runs once a quarter."""
+    global _write_api, _write_authz_api, _write_error, _write_token_fp
+    fp = _token_fingerprint()
+    if fp != _write_token_fp:
+        if _write_api is not None or _write_error is not None:
+            logger.info("write token changed on disk; rebuilding client")
+        _write_api = _write_authz_api = None
+        _write_error = None
+        _write_token_fp = fp
+
+
+def _build_write_clients() -> tuple[Any, Any]:
+    """(AppsV1Api, AuthorizationV1Api) on the same credentials. The authz client
+    is built from the identical Configuration on purpose — a readiness check that
+    asks a different client is answering about a different identity."""
+    from kubernetes import client, config
+    from kubernetes.config.config_exception import ConfigException
+
+    if in_cluster_write_creds():
+        cfg = client.Configuration()
+        cfg.host = "https://kubernetes.default.svc"
+        cfg.ssl_ca_cert = _CLUSTER_CA_PATH
+        cfg.api_key["authorization"] = Path(_WRITE_TOKEN_PATH).read_text().strip()
+        cfg.api_key_prefix["authorization"] = "Bearer"
+        api_client = client.ApiClient(configuration=cfg)
+    else:
+        try:
+            config.load_incluster_config()
+        except ConfigException:
+            config.load_kube_config()
+        api_client = client.ApiClient()
+    return client.AppsV1Api(api_client), client.AuthorizationV1Api(api_client)
 
 
 def _load_write_api() -> Any:
-    """Return AppsV1Api bound to the write SA credentials. Cached.
+    """Return AppsV1Api bound to the write SA credentials. Cached, but the cache
+    is dropped when the token file changes (see `_invalidate_on_rotation`).
     In-cluster: uses the projected write SA token. Host-side dev: falls back
     to the local kubeconfig (which has full perms — dev only)."""
-    global _write_api, _write_error
+    global _write_api, _write_authz_api, _write_error
+    _invalidate_on_rotation()
     if _write_api is not None:
         return _write_api
     if _write_error is not None:
         raise RuntimeError(_write_error)
 
     try:
-        from kubernetes import client, config
-        from kubernetes.config.config_exception import ConfigException
-
-        if Path(_WRITE_TOKEN_PATH).exists():
-            cfg = client.Configuration()
-            cfg.host = "https://kubernetes.default.svc"
-            cfg.ssl_ca_cert = _CLUSTER_CA_PATH
-            cfg.api_key["authorization"] = Path(_WRITE_TOKEN_PATH).read_text().strip()
-            cfg.api_key_prefix["authorization"] = "Bearer"
-            _write_api = client.AppsV1Api(client.ApiClient(configuration=cfg))
-        else:
-            try:
-                config.load_incluster_config()
-            except ConfigException:
-                config.load_kube_config()
-            _write_api = client.AppsV1Api()
-
+        _write_api, _write_authz_api = _build_write_clients()
         return _write_api
     except Exception as e:
         _write_error = f"k8s write client unavailable ({type(e).__name__}: {e})"
         raise RuntimeError(_write_error) from e
+
+
+def load_write_authz_api() -> Any:
+    """AuthorizationV1Api on the write credentials — for SelfSubjectAccessReview
+    preflights. Same cache and same rotation handling as the write client."""
+    _load_write_api()
+    return _write_authz_api
 
 
 def _ns(args: dict) -> str:

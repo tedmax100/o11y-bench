@@ -16,10 +16,15 @@ harness) and **narrows autonomy when calibration is poor or unproven**:
         is proven-good                → AUTO
         calibration unproven/poor     → downgraded to PROPOSE
 
-"Calibration proven-good" = enough labeled runs exist AND measured
-overconfidence is within tolerance. With no calibration evidence the gate refuses
-AUTO by default — in uncertainty it degrades to a human, which ARE names the
-highest sign of maturity.
+"Calibration proven-good" = enough labeled runs exist AND the reliability curve
+holds up under four separate readings: mean overconfidence within tolerance, the
+worst adequately-populated bin within tolerance, enough labeled runs in the
+confidence band where AUTO is actually granted, and enough accuracy in that band.
+The mean alone is deliberately not sufficient — it is a signed average, and an
+underconfident half plus an overconfident half sum to a number that looks
+perfect while the agent is wrong in both directions. With no calibration
+evidence the gate refuses AUTO by default — in uncertainty it degrades to a
+human, which ARE names the highest sign of maturity.
 
 This module returns a *decision*; it never executes. Execution is the registry's
 job and is separately kill-switched (actions.py). The two gates are independent
@@ -33,6 +38,7 @@ from enum import StrEnum
 from pydantic import BaseModel
 
 from .actions import ActionSpec, registry
+from .calibration import bin_evidence
 from .config import settings
 
 
@@ -50,6 +56,7 @@ class Decision(BaseModel):
     reason: str
     calibration_note: str
     dq_note: str = ""
+    act_note: str = ""
     reversible: bool
     requires_approval: bool
 
@@ -89,16 +96,72 @@ def _calibration_verdict(calib: dict, *, human_labeled: int | None = None) -> tu
             f"overconfident by {overconf:+} > "
             f"{settings.governance_max_overconfidence}; autonomy narrowed"
         )
-    return True, f"calibration ok (overconfidence {overconf:+}, {labeled} runs)"
+
+    # The mean cleared. That is necessary and nowhere near sufficient: it is a
+    # signed average, so an underconfident half and an overconfident half sum to
+    # a passing number while the agent is wrong in both directions. The bins
+    # were always computed and never read — read them.
+    ev = bin_evidence(
+        calib,
+        min_bin_count=settings.governance_min_bin_count,
+        band_lo=settings.governance_conf_high,
+    )
+    if not ev["available"]:
+        return False, "no reliability curve to read; autonomy withheld"
+
+    skipped = (
+        f", {ev['thin_bins']} bin(s)/{ev['thin_runs']} run(s) too thin to count"
+        if ev["thin_bins"]
+        else ""
+    )
+
+    # The band check comes first: it asks about the exact region where AUTO is
+    # granted, so failing it makes the rest of the curve irrelevant.
+    if ev["band_n"] < settings.governance_min_bin_count:
+        return False, (
+            f"only {ev['band_n']} labeled run(s) at confidence ≥ "
+            f"{settings.governance_conf_high} (need "
+            f"{settings.governance_min_bin_count}); no evidence in the band where "
+            f"AUTO is granted{skipped}"
+        )
+    if ev["band_accuracy"] < settings.governance_min_band_accuracy:
+        return False, (
+            f"accuracy {ev['band_accuracy']} at confidence ≥ "
+            f"{settings.governance_conf_high} (n={ev['band_n']}) < "
+            f"{settings.governance_min_band_accuracy}; autonomy withheld in the "
+            f"band it would be exercised in{skipped}"
+        )
+    if ev["max_gap"] is not None and ev["max_gap"] > settings.governance_max_bin_gap:
+        return False, (
+            f"worst bin {ev['max_gap_bin']} is off by {ev['max_gap']} > "
+            f"{settings.governance_max_bin_gap} (mean overconfidence {overconf:+} "
+            f"hid it); autonomy narrowed{skipped}"
+        )
+    return True, (
+        f"calibration ok (overconfidence {overconf:+}, worst bin {ev['max_gap']}, "
+        f"accuracy {ev['band_accuracy']} on {ev['band_n']} run(s) in the decision "
+        f"band, {labeled} labeled){skipped}"
+    )
 
 
 def decide(
-    action: ActionSpec, confidence: float, calib: dict, dq: dict | None = None, *, path=None
+    action: ActionSpec,
+    confidence: float,
+    calib: dict,
+    dq: dict | None = None,
+    act: dict | None = None,
+    *,
+    path=None,
 ) -> Decision:
     """Policy verdict for one proposed action given the run confidence, the
-    current calibration state, and (optionally) the data-quality verdict. When a
-    DQ verdict is supplied, AUTO additionally requires it to be proven-good —
-    autonomy is withheld on a signal model that has drifted or gone stale."""
+    current calibration state, and (optionally) the data-quality and actuation
+    verdicts. When supplied, AUTO additionally requires each to be proven-good —
+    autonomy is withheld on a signal model that has drifted or gone stale, and on
+    a write credential that can no longer be shown to work.
+
+    The three gates answer three different questions and none substitutes for
+    another: *should we* (calibration), *is the map real* (DQ), *can we still
+    act* (actuation)."""
     # For AUTO evaluation enforce the human-label minimum (§6.2 constraint 1).
     # Fetch lazily — only when confidence is high enough to reach the AUTO gate.
     # `path=None` means use settings.store_path; tests that don't wire a store
@@ -119,6 +182,7 @@ def decide(
         )
     good, cal_note = _calibration_verdict(calib, human_labeled=human_labeled)
     dq_note = dq.get("note", "") if dq else "DQ not evaluated"
+    act_note = act.get("note", "") if act else "actuation readiness not evaluated"
 
     def mk(level: Autonomy, reason: str) -> Decision:
         return Decision(
@@ -129,6 +193,7 @@ def decide(
             reason=reason,
             calibration_note=cal_note,
             dq_note=dq_note,
+            act_note=act_note,
             reversible=action.reversible,
             requires_approval=action.requires_approval,
         )
@@ -152,11 +217,20 @@ def decide(
         return mk(Autonomy.PROPOSE, "high confidence but calibration not proven-good")
     if dq is not None and not dq.get("proven_good"):
         return mk(Autonomy.PROPOSE, "high confidence but data-quality (DQ) not proven-good")
-    return mk(Autonomy.AUTO, "high confidence, reversible, calibration + data-quality proven-good")
+    if act is not None and not act.get("proven_good"):
+        return mk(Autonomy.PROPOSE, "high confidence but actuation readiness not proven-good")
+    return mk(
+        Autonomy.AUTO,
+        "high confidence, reversible, calibration + data-quality + actuation proven-good",
+    )
 
 
 def propose_remediations(
-    remediation_actions: list[str], confidence: float, calib: dict, dq: dict | None = None
+    remediation_actions: list[str],
+    confidence: float,
+    calib: dict,
+    dq: dict | None = None,
+    act: dict | None = None,
 ) -> list[Decision]:
     """Map a runbook's remediation step action names to registered actions and run
     each through the gate. Unregistered names are skipped (only the typed,
@@ -166,7 +240,7 @@ def propose_remediations(
         spec = registry.get(name)
         if spec is None:
             continue
-        out.append(decide(spec, confidence, calib, dq))
+        out.append(decide(spec, confidence, calib, dq, act))
     return out
 
 
@@ -183,5 +257,5 @@ def format_decisions(decisions: list[Decision]) -> str:
             Autonomy.ESCALATE: "ESCALATE (hand to human)",
         }[d.autonomy]
         lines.append(f"- `{d.action}` → {verb}")
-        lines.append(f"  - {d.reason}; {d.calibration_note}; DQ: {d.dq_note}")
+        lines.append(f"  - {d.reason}; {d.calibration_note}; DQ: {d.dq_note}; act: {d.act_note}")
     return "\n".join(lines)

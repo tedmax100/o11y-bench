@@ -218,9 +218,110 @@ def approve(request_id: str, actor: str, path: Path | None = None) -> ActionRequ
     return get(request_id, path)
 
 
+def reconcile(path: Path | None = None) -> dict[str, Any]:
+    """Let time move the state machine, instead of only people.
+
+    Every transition in this module used to require somebody to knock: a
+    proposal expired only when a human tried to approve it, and a request that
+    reached `executing` had no way back if the process running it died. Neither
+    is harmless once the kill switch is on. The first means the on-call sees a
+    seven-hour-old suggestion presented as current, and they are the one person
+    without the context to know better. The second means a change is recorded as
+    in-flight forever, which is the one status that makes the idempotency key
+    refuse every retry.
+
+    Two rules, and the second one is deliberately conservative:
+
+      - `proposed` past its TTL → `expired`. Safe: nothing has run.
+      - `executing` past `executing_timeout_seconds` → `failed`. **No rollback
+        is attempted.** We do not know whether the write landed before the
+        executor vanished, and a background job that guesses in that situation
+        can turn a maybe-nothing-happened into a definitely-something-happened.
+        Reconciliation may only make the record honest; deciding what to do
+        about a half-known change stays with a human.
+
+    Everything it does is written to the audit log under actor `reconciler`, so
+    a status that changed with nobody watching is still attributable — otherwise
+    this becomes the second invisible actor in a system built to not have one.
+    """
+    now = _now()
+    changed: dict[str, Any] = {"expired": [], "abandoned": [], "checked": 0}
+
+    for row in store.ar_list(status=Status.PROPOSED.value, limit=1000, path=path):
+        changed["checked"] += 1
+        try:
+            if now <= _parse(row["expires_ts"]):
+                continue
+        except Exception:
+            continue  # unparseable timestamp: leave it alone rather than guess
+        if store.ar_transition(
+            row["request_id"],
+            Status.PROPOSED.value,
+            Status.EXPIRED.value,
+            outcome="approval TTL elapsed before action (reconciler)",
+            path=path,
+        ):
+            changed["expired"].append(row["request_id"])
+            audit.record(
+                "expired",
+                "ok",
+                request_id=row["request_id"],
+                fp=row.get("fp", ""),
+                actor="reconciler",
+                detail={"expires_ts": row["expires_ts"]},
+                path=path,
+            )
+
+    cutoff = now - timedelta(seconds=settings.executing_timeout_seconds)
+    for row in store.ar_list(status=Status.EXECUTING.value, limit=1000, path=path):
+        changed["checked"] += 1
+        try:
+            # created_ts is the honest lower bound we have for "how long has this
+            # been running" — a claim timestamp would be better, and its absence
+            # is why the timeout has to be generous.
+            if _parse(row["created_ts"]) > cutoff:
+                continue
+        except Exception:
+            continue
+        if store.ar_transition(
+            row["request_id"],
+            Status.EXECUTING.value,
+            Status.FAILED.value,
+            outcome=(
+                "executor never reported back (process restart?); "
+                "whether the change landed is unknown — no rollback attempted"
+            ),
+            path=path,
+        ):
+            changed["abandoned"].append(row["request_id"])
+            audit.record(
+                "abandoned",
+                "abort",
+                request_id=row["request_id"],
+                fp=row.get("fp", ""),
+                actor="reconciler",
+                detail={"created_ts": row["created_ts"], "rollback_attempted": False},
+                path=path,
+            )
+
+    if changed["expired"] or changed["abandoned"]:
+        logger.warning(
+            "reconciler: expired=%d abandoned=%d",
+            len(changed["expired"]),
+            len(changed["abandoned"]),
+        )
+    return changed
+
+
 def reject(request_id: str, actor: str, path: Path | None = None) -> ActionRequest | None:
     req = get(request_id, path)
     if req is None:
+        return None
+    # Same TTL check as approve(): without it, two equally stale proposals end up
+    # telling different stories — one becomes `expired` with a reason, the other
+    # `rejected` with a person's name on it, and the audit log now says a human
+    # declined something that had already lapsed.
+    if _expire_if_stale(req, path):
         return None
     if not store.ar_transition(
         request_id, Status.PROPOSED.value, Status.REJECTED.value, actor=actor, path=path

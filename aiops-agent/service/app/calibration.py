@@ -282,6 +282,66 @@ def compute_calibration(
     }
 
 
+def bin_evidence(calib: dict[str, Any], *, min_bin_count: int, band_lo: float) -> dict[str, Any]:
+    """Reduce a reliability curve to the facts an autonomy gate needs, which the
+    mean cannot carry.
+
+    `overconfidence` is a *signed mean*, so two opposite errors cancel: a run
+    that underestimates itself by 0.28 on the questions it can do and
+    overestimates by 0.37 on the ones it can't averages out to ~0 and lights the
+    gate green. The bins were always computed; nothing read them. This returns
+    the three things that survive averaging:
+
+      - `max_gap` — the worst |accuracy − confidence| over bins with enough rows
+        to be evidence (MCE, but restricted to eligible bins). Cancellation is
+        impossible here: it is a max over absolute values.
+      - `band_accuracy` — accuracy over the bins at/above `band_lo`, i.e. the
+        confidence region where AUTO is actually granted. Being well calibrated
+        on questions that never reach the gate is not evidence about the ones
+        that do.
+      - `thin_bins` / `thin_runs` — what was excluded for being too thin, so the
+        caller can say so rather than silently narrowing its own evidence.
+
+    Bins under `min_bin_count` are dropped rather than trusted: a single labeled
+    run in a bin gives an accuracy of exactly 0.0 or 1.0, which is a coin toss
+    wearing a decimal point. `available=False` means there is no curve to read
+    at all (an old-shaped calib dict) — callers should treat that as unproven,
+    not as passing.
+    """
+    bins = calib.get("bins")
+    if not isinstance(bins, list):
+        return {"available": False}
+
+    eligible = [b for b in bins if (b.get("count") or 0) >= min_bin_count]
+    thin = [b for b in bins if 0 < (b.get("count") or 0) < min_bin_count]
+
+    max_gap = max_gap_bin = None
+    for b in eligible:
+        if b.get("gap") is None:
+            continue
+        if max_gap is None or b["gap"] > max_gap:
+            max_gap, max_gap_bin = b["gap"], f"[{b['lo']:.1f},{b['hi']:.1f})"
+
+    # A bin counts as "in the decision band" when its whole range sits at or
+    # above the AUTO threshold — a bin straddling it would mix runs the gate
+    # would have let through with runs it would not.
+    band = [b for b in bins if b["lo"] >= band_lo - 1e-9 and (b.get("count") or 0) > 0]
+    band_n = sum(b["count"] for b in band)
+    band_acc = round(sum(b["accuracy"] * b["count"] for b in band) / band_n, 4) if band_n else None
+
+    return {
+        "available": True,
+        "max_gap": max_gap,
+        "max_gap_bin": max_gap_bin,
+        "eligible_bins": len(eligible),
+        "thin_bins": len(thin),
+        "thin_runs": sum(b["count"] for b in thin),
+        "band_lo": band_lo,
+        "band_n": band_n,
+        "band_accuracy": band_acc,
+    }
+
+
 def format_report(calib: dict[str, Any]) -> str:
     if not calib.get("labeled"):
         return (

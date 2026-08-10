@@ -4,6 +4,7 @@ connection (= pod restart), label is a targeted UPDATE on the latest row, and th
 one-time legacy migration is idempotent."""
 
 import json
+import sqlite3
 
 import app.store as store
 
@@ -182,3 +183,94 @@ def test_inv_query_similar_needs_both_tables(tmp_path):
     )
     store.cal_label("lonely", True, score=1.0, source="eval-harness", path=path)
     assert not store.inv_query_similar("payment-service", path=path)
+
+
+# ---- store identity ---------------------------------------------------------
+
+
+def _insert(path, run_id, confidence):
+    store.cal_insert(
+        run_id=run_id,
+        ts="2026-01-01T00:00:00Z",
+        confidence=confidence,
+        summary="",
+        hypothesis="",
+        suspected_version=None,
+        services=[],
+        path=path,
+    )
+
+
+def test_describe_names_the_physical_store(tmp_path, monkeypatch):
+    """The most expensive bug class here was never a wrong query — it was a right
+    query against the wrong file. Two stores, same code, same schema, same
+    filename, different mount, and nothing on any screen said which one you were
+    reading. `describe` makes that answerable without shelling into the pod."""
+    p = _cfg(monkeypatch, tmp_path)
+    _insert(p, "r1", 0.9)
+
+    d = store.describe(p)
+
+    assert d["path"].endswith(str(p.name)) and d["exists"]
+    assert d["tables"]["calibration"] == 1
+    assert d["tables"]["investigations"] == 0
+
+
+def test_describe_distinguishes_two_same_named_stores(tmp_path, monkeypatch):
+    """The actual production shape: `aiops.db` on a dev box and `aiops.db` on a
+    pod's volume, disagreeing for weeks."""
+    _cfg(monkeypatch, tmp_path)
+    dev = tmp_path / "dev" / "aiops.db"
+    cluster = tmp_path / "cluster" / "aiops.db"
+    _insert(dev, "r1", 0.9)
+    for i in range(3):
+        _insert(cluster, f"c{i}", 0.5)
+
+    a, b = store.describe(dev), store.describe(cluster)
+
+    assert a["path"] != b["path"]
+    assert (a["tables"]["calibration"], b["tables"]["calibration"]) == (1, 3)
+
+
+def test_describe_on_a_fresh_path_is_not_an_error(tmp_path, monkeypatch):
+    """A path with no store reports unknown, not zero. "There is no file here"
+    and "there is a file here and it is empty" are different answers, and the
+    whole point of this function is telling stores apart."""
+    _cfg(monkeypatch, tmp_path)
+    d = store.describe(tmp_path / "nope" / "aiops.db")
+    assert d["exists"] is False and d["tables"]["calibration"] is None
+    assert "error" not in d
+
+
+def test_describe_does_not_create_the_store_it_describes(tmp_path, monkeypatch):
+    """The probe built to count these files must not add to them. `_connect`
+    creates + migrates on open, which is right for every writer and wrong for
+    the one caller whose whole job is asking which file it is looking at."""
+    _cfg(monkeypatch, tmp_path)
+    missing = tmp_path / "ghost" / "aiops.db"
+
+    d = store.describe(missing)
+
+    assert d["exists"] is False
+    assert not missing.exists()
+    assert d["tables"]["calibration"] is None  # unknown, not 0
+
+
+def test_describe_never_writes_to_the_store_it_reads(tmp_path, monkeypatch):
+    """`_connect` migrates on open. A probe that migrates the file it is only
+    supposed to identify will silently alter older stores — which is exactly how
+    a read-only run added a column to a snapshot being kept as evidence that the
+    column was missing."""
+    _cfg(monkeypatch, tmp_path)
+    old = tmp_path / "old.db"
+    conn = sqlite3.connect(str(old))
+    conn.execute("CREATE TABLE calibration (id INTEGER PRIMARY KEY, confidence REAL)")
+    conn.commit()
+    conn.close()
+    before = old.read_bytes()
+
+    d = store.describe(old)
+
+    assert d["tables"]["calibration"] == 0
+    assert d["tables"]["audit"] is None  # table genuinely absent here
+    assert old.read_bytes() == before  # byte-identical: nothing was migrated

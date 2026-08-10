@@ -52,12 +52,26 @@ def _req(fp: str):
 
 
 def _calib(labeled=50, overconfidence=0.0):
+    # A well-behaved reliability curve: `labeled` runs, all stated at 0.9 with
+    # 90% actually correct, so every bin gate passes and these tests isolate the
+    # human-label rule they are about. `bins` is populated because the gate reads
+    # it — an empty bin list is now (correctly) treated as no evidence at all.
+    n_correct = round(labeled * 0.9)
     return {
         "labeled": labeled,
         "overconfidence": overconfidence,
         "ece": overconfidence,
         "brier": 0.1,
-        "bins": [],
+        "bins": [
+            {
+                "lo": 0.9,
+                "hi": 1.0,
+                "count": labeled,
+                "avg_confidence": 0.9,
+                "accuracy": round(n_correct / labeled, 4) if labeled else None,
+                "gap": 0.0,
+            }
+        ],
     }
 
 

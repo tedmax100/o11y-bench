@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -1255,7 +1256,13 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
             from .calibration import compute_calibration, load_records
             from .governance import propose_remediations
             from .runbook import _subst, incident_params
+            from .signals.actuation import actuation_verdict, refresh_actuation
             from .signals.dq import dq_verdict
+
+            # Ask the cluster whether the write credential still works before
+            # proposing anything that would use it. Read-only, off the agent
+            # budget, cached — same treatment as the env-fit refresh.
+            await refresh_actuation()
 
             # Only the grading modes whose `correct` means what the calibration
             # math assumes — see settings.governance_calibration_modes.
@@ -1267,6 +1274,7 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
                 findings.confidence,
                 calib,
                 dq_verdict(),
+                actuation_verdict(),
             )
 
             # Materialize each AUTO/PROPOSE decision as a tracked ActionRequest the
@@ -1354,13 +1362,37 @@ async def suggest_followups(user_message: str, answer: str) -> list[str]:
     return [s.strip() for s in res.suggestions if s.strip()][:3]
 
 
+async def _reconcile_loop() -> None:
+    """Periodically let time advance the action-request state machine. Runs for
+    the life of the process; every iteration is guarded because a reconciler that
+    dies on one bad row stops reconciling everything else, and it would do so
+    silently — which is the exact failure class it exists to prevent."""
+    from . import action_requests
+
+    while True:
+        try:
+            await asyncio.sleep(settings.reconcile_interval_seconds)
+            await asyncio.to_thread(action_requests.reconcile)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("reconcile loop iteration failed: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app):
     from . import store
 
     store.init()  # schema + one-time legacy JSONL migration (7b-0)
     await _build_agent()
-    yield
+    task = None
+    if settings.reconcile_enabled:
+        task = asyncio.create_task(_reconcile_loop())
+    try:
+        yield
+    finally:
+        if task is not None:
+            task.cancel()
 
 
 CLARIFY_PROMPT = "你是指哪一個服務？(Which service do you mean?)"
