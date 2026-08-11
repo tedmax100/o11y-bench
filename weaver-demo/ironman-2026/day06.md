@@ -19,7 +19,7 @@ Rego 是這整套治理機制裡最陡的一段，所以中間會有一節專門
 
 程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day06/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day06)，一份刻意留著漂移的 registry 加一份 [`naming.rego`](https://github.com/tedmax100/OTel_AIOps_Agent/blob/main/ironman-2026/day06/policies/naming.rego)。
 
-> 驗證環境：weaver 0.25.1。下面所有輸出都是實際跑出來貼上的，離開碼也是真的 `echo $?` 出來的。
+> 驗證環境：weaver 0.25.1。下面所有輸出都是實際跑出來貼上的，exit code 也是真的 `echo $?` 出來的。
 
 ## 命名漂移為什麼靠 code review 擋不住
 
@@ -30,6 +30,8 @@ Rego 是這整套治理機制裡最陡的一段，所以中間會有一節專門
 這是命名漂移跟一般 bug 最大的差別。一般 bug 有失敗訊號，測試紅了、服務掛了、使用者抱怨了。命名漂移的訊號是零：兩個名字都合法、都能跑、都送得出去、Grafana 都查得到。它唯一的症狀要等到很久以後才出現，某天有人要做一個跨服務的查詢，才發現要嘛全部改名重新部署，要嘛在查詢語法裡手動兼容五種寫法。
 
 那為什麼不靠 review 就好？因為 review 這件事有一個結構性的限制：**review 的人看得到這個 PR 改了什麼，看不到整個系統目前已經有什麼。** 一個 reviewer 要抓到「這個新的 `userId` 跟三個月前另一個服務的 `user_id` 撞了」，他得先記得那個 `user_id` 存在。服務數量一多，這件事就從「認真一點就做得到」變成不可能。
+
+單靠嘴上掛著標準化這種紙上約束（精神上的口號），是沒辦法作到一致的，因為有可能漏掉沒 review 抓出來，也可能大家忘記了，又或是換了一批新人。只有加入自動化流程（準確說 CI 階段靠程式掃描抓出來）才有可能無一例外。
 
 Day2 講`缺語意`的三種長相時，第一種就是這個，同一個概念兩個名字。當時的結論是「語意是一份共同的約定，不是任何一個欄位、任何一個服務單獨能決定的東西」。今天要做的，就是把這份約定從「大家心裡都知道」變成一份機器每次 PR 都會核對的規格。關鍵不在於規則多聰明，而在於它有整份 registry 的視野，而人沒有。
 
@@ -49,9 +51,11 @@ OTel（OpenTelemetry）本身就有一份[命名規範](https://opentelemetry.io
 
 ## 結構：一條 policy 從輸入到輸出
 
-在寫規則之前，先把 `weaver registry check -p policies` 這條路徑上的資料流搞清楚。`-p` 是 `--policies` 的簡寫，指向放 `.rego` 檔的目錄；`-r` 則是 `--registry`，昨天那個 `-r .` 假綠燈就是它。
+在寫規則之前，先把 `weaver registry check -p policies` 這條路徑上的資料流搞清楚。`-p` 是 `--policy` 的簡寫（單數，參數值那個 `<POLICIES>` 才是複數），指向放 `.rego` 檔的目錄；`-r` 則是 `--registry`，昨天那個 `-r .` 假綠燈就是它。
 
 昨天弄壞 registry 的示範一裡，`ref` 指到不存在的屬性，那個錯誤在 `weaver_resolver` 階段就爆了，管線根本走不到 policy。今天要看的是走得到的那一段：
+
+![image](https://hackmd.io/_uploads/BJm8whdLMe.png)
 
 ```mermaid
 flowchart TB
@@ -85,9 +89,20 @@ flowchart TB
 }
 ```
 
-注意 attribute 的鍵是 `name` 不是 `id`，group 才是 `id`。這是寫第一條規則時最容易卡住的地方。昨天那條值域規則的支點 `is_object(attr.type)` 也是同一個原因：在這裡 enum 的 `type` 是物件、字串欄位的 `type` 是字串 `"string"`。
+注意 attribute 的鍵是 `name` 不是 `id`，group 才是 `id`。這是寫第一條規則時最容易卡住的地方。昨天那條「metric label 值域必須有界」的規則沒貼出規則本體，它的支點就是這個結構差異：在 resolved schema 裡，enum 的 `type` 是一個帶 `members` 的**物件**，普通字串欄位的 `type` 就是字串 `"string"`。所以那條規則只要問一句 `is_object(attr.type)`，就等於問了「這個欄位的值域有沒有寫進 schema」。
 
 第二，`package after_resolution` 這行決定規則什麼時候跑。還有一個 `before_resolution`，在 `ref` 展開之前跑，看得到原始的 YAML 結構。今天所有規則都用 `after_resolution`，因為命名檢查要看的是最終每個 group 上實際掛了哪些 attribute。
+
+換句話說，package 名字就是「這條規則歸哪個指令、在哪個時間點跑」的開關。而 weaver 認得的名字其實有四個，`registry check` 只會執行前兩個：
+
+| package | 誰會執行它 |
+|---|---|
+| `before_resolution` | `registry check`，展開 `ref` 之前 |
+| `after_resolution` | `registry check`，展開之後（今天三條都在這） |
+| `comparison_after_resolution` | `registry diff`，拿新舊兩份 registry 比對的時候 |
+| `live_check_advice` | `live-check`，拿真實流量對照的時候 |
+
+`comparison_after_resolution` 跟 `live_check_advice` 這兩個今天完全用不到，先知道有這回事就好，免得之後看到別人的 `.rego` 開頭不是 `after_resolution` 會愣住。
 
 第三，只有 `deny` 這個名字會被收集。這點下面會用實測說明，因為它推翻了我原本的一個假設。
 
@@ -125,7 +140,7 @@ my_finding(group_id, attr_id) := violation if {
 
 | | 元素 | 規矩 |
 |---|---|---|
-| ① | `package` | 只有 `before_resolution` / `after_resolution` 有效。打錯不會報錯，會給你綠燈（下面詳述） |
+| ① | `package` | `registry check` 只認 `before_resolution` / `after_resolution`。打錯不會報錯，會給你綠燈（下面詳述） |
 | ② | `import rego.v1` | 選用。引擎本來就是 v1，但舊語法會被拒絕 |
 | ③ | `deny` | 唯一會被收集的規則名。叫 `violation`、`warn`、`allow` 都不會有任何效果 |
 | ④ | `[_]` | 「對每一個都試一次」，不是「取第 0 個」 |
@@ -135,6 +150,8 @@ my_finding(group_id, attr_id) := violation if {
 ### 兩個 package，看到的東西完全不一樣
 
 這是寫 weaver policy 最需要先搞清楚的一件事，也是決定「這條規則要寫在哪」的依據。我把 `input` 整包印出來對照過：
+
+![image](https://hackmd.io/_uploads/S17BdndLGg.png)
 
 ```mermaid
 flowchart TB
@@ -192,7 +209,8 @@ Rego 語言本身很大，但寫 weaver policy 反覆用到的其實就這幾個
 | `not <表達式>` | 「這個表達式無法成立」 | `not contains(name, ".")` |
 | `every g in xs { … }` | 全稱：每一個都要滿足 | 「所有 metric 都必須有 unit」 |
 | `x in xs` | 成員判斷 | 白名單比對 |
-| `[e \| some g in xs]` | comprehension，把巢狀結構攤平成集合 | 全域撞名檢查的關鍵 |
+| `X contains e if { … }` | 定義一個集合規則，把巢狀結構攤平 | 全域撞名檢查的關鍵，下面規則二就靠它 |
+| `[e \| some g in xs]` | comprehension，另一種攤平寫法 | 一次性、不想另外命名一條規則時 |
 | `default x := false` | 給規則一個預設值，避免 undefined | 布林旗標 |
 | 同名規則寫兩次 | OR | 「是 enum 或是 boolean 都算安全」 |
 
@@ -200,7 +218,7 @@ Rego 語言本身很大，但寫 weaver policy 反覆用到的其實就這幾個
 
 **`not` 不是布林取反，是「無法成立」。** 在有迭代的情境下差很多：`not group.attributes[_].name == "x"` 的意思是「不存在任何一個叫 x 的 attribute」，不是「每個都不叫 x」。單一布林值的情況（像 `contains()` 的回傳）才跟直覺一致。
 
-要 OR 就寫兩條同名規則。Rego 沒有 `||`，昨天那條「enum 或 boolean 都算有界」就是這樣寫的：
+要 OR 就寫兩條同名規則。Rego 沒有 `||`，昨天那條值域規則裡的「enum 或 boolean 都算有界」就是這樣寫的：
 
 ```rego
 bounded_label(attr) if is_object(attr.type)      # enum
@@ -263,7 +281,7 @@ $ echo $?
 0
 ```
 
-綠燈、離開碼 0、沒有任何警告。weaver 不會說「你這個 package 我不認得」，它只是安靜地不去執行它。
+綠燈、Exit code 0、沒有任何警告。weaver 不會說「你這個 package 我不認得」，它只是安靜地不去執行它。
 
 更麻煩的是連 `--display-policy-coverage` 都什麼都不印：
 
@@ -284,7 +302,7 @@ ironman-2026/day06/policies/naming.rego has full coverage
 
 ## 三條規則，一條比一條難
 
-拿一份刻意保留漂移的最小 registry 當靶子（[`ironman-2026/day06/registry/model/drift.yaml`](https://github.com/tedmax100/OTel_AIOps_Agent/blob/main/ironman-2026/day06/registry/model/drift.yaml)），裡面同時放了 `userId`、`user_id`、`status`、`biz.order.id` 四個 attribute：
+拿一份刻意保留漂移的最小 registry 當靶子（[`ironman-2026/day06/registry/model/drift.yaml`](https://github.com/tedmax100/OTel_AIOps_Agent/blob/main/ironman-2026/day06/registry/model/drift.yaml)），裡面是兩個 group：`registry.order` 是屬性池，放了 `userId`、`user_id`、`status`、`biz.order.id` 四個 attribute；`span.order.create` 是一個 span，把這四個都 `ref` 進來：
 
 ```yaml
 groups:
@@ -313,6 +331,17 @@ groups:
         stability: development
         brief: "訂單識別碼"
         examples: ["ord-1001"]
+
+  - id: span.order.create          # 把四個都 ref 進來，等一下報兩次就是它害的
+    type: span
+    span_kind: server
+    stability: development
+    brief: "建立訂單的 Span"
+    attributes:
+      - ref: userId
+      - ref: user_id
+      - ref: status
+      - ref: biz.order.id
 ```
 
 先跑一次不帶 policy 的 check，確認基準：
@@ -366,7 +395,35 @@ $ echo $?
 1
 ```
 
-抓到了，但同一個 `userId` 被報了兩次，一次在定義它的 `registry.order`，一次在 `ref` 它的 `span.order.create`。這不是 bug，是前面講的「Rego 看到的是 resolved schema」的直接後果，`ref` 已經被展開，那個 attribute 現在真的同時存在於兩個 group 裡。實務上這反而有用，因為它告訴你這個壞名字的影響範圍有多大，改名要動幾個地方，數字就在那裡。
+抓到了，但同一個 `userId` 被報了兩次，一次在定義它的 `registry.order`，一次在 `ref` 它的 `span.order.create`。
+
+為什麼會兩次，把那兩層 `[_]` 攤開來看最清楚。它們合起來的意思是「所有 group 配上所有 attribute」，這份 registry 有 2 個 group、每個 group 各 4 個 attribute，所以 Rego 實際上是拿 8 組配對去一組一組試：
+
+```
+(registry.order,    userId)       regex 成立 ✅
+(registry.order,    user_id)      不成立
+(registry.order,    status)       不成立
+(registry.order,    biz.order.id) 不成立
+(span.order.create, userId)       regex 成立 ✅   ← ref 展開後它真的掛在這裡
+(span.order.create, user_id)      不成立
+(span.order.create, status)       不成立
+(span.order.create, biz.order.id) 不成立
+```
+
+兩組成立，就是兩個 violation。所以 `userId` 被檢查了兩次，不是因為規則跑了兩遍，是因為它同時掛在兩個 group 上。這也是前面講的「Rego 看到的是 resolved schema」的直接後果：`ref` 已經被展開，那個 attribute 現在真的同時存在於兩個地方。
+
+還有一個藏在後面的細節，要先講清楚 `deny` 到底是什麼。它是規則的名字，同時也是**存放結果的那個袋子**。`deny contains X if { 條件 }` 這行拆開念就是：每次條件成立，就把 `X` 丟進一個叫 `deny` 的袋子裡。weaver 跑完只做一件事，把袋子倒出來，裡面有幾個東西就印幾個 Finding，袋子空的就是綠燈。前面說「`deny` 是唯一會被收集的規則名」講的就是這件事，你丟進叫 `warn` 的袋子，它連看都不看。
+
+而這個袋子是**集合**，不是清單，差別只有一個：一模一樣的東西丟兩次，袋子裡還是只有一個。上面那兩組成立的配對，各丟了一個東西進去：
+
+```
+{… "group": "registry.order",    "attr": "userId"}
+{… "group": "span.order.create", "attr": "userId"}
+```
+
+`group` 那格不一樣，所以是兩個不同的東西，兩個都留下來。但假設我當初沒把 `group_id` 放進去，只寫了 `{"attr": "userId"}`，那兩次丟的就是完全相同的東西，袋子只留一個，最後只有一個 Finding，你也就看不出這個壞名字其實影響到兩個地方。
+
+而看得出影響幾個地方，實務上比只報一次有用：改名要動幾處，數字就在那裡。
 
 ### 規則二：抓「同一個概念，兩個名字」
 
@@ -391,6 +448,8 @@ deny contains duplicate_concept(a, b) if {
 ```
 
 `all_attr_names` 那三行是 Rego 裡很常用的一個模式：先用一條規則把散落在巢狀結構裡的東西收集成一個集合，後面的規則就可以在這個扁平集合上做兩兩比對。沒有這一步，你會發現很難在一條規則裡同時拿到「兩個不同 group 裡的兩個 attribute」。
+
+這裡的 `contains` 跟規則三那個 `not contains(attr.name, ".")` **是兩個完全不同的東西**，同一個字在 Rego 裡有兩種身分。後者是字串內建函式；前者是宣告「這條規則產出的是一個集合，每次成立就往裡面丟一個元素」。其實 `deny contains ...` 從頭到尾都是同一種寫法，`deny` 也只是一個集合，只是那個集合的名字被 weaver 認得而已。看懂這件事，`all_attr_names` 就不神祕了，它就是一個我自己取名、weaver 不認得、純粹拿來給後面規則用的 `deny`。
 
 `a < b` 這行也值得說一句。少了它，同一組會被報兩次（`userId` 對 `user_id`、`user_id` 對 `userId`），而且 `a` 跟自己比也會成立。字串比大小在這裡不是為了排序，純粹是拿來去掉對稱重複的一個慣用手法。
 
@@ -506,9 +565,9 @@ $ weaver registry live-check --help
           Advice policies directory. Set this to override the default policies
 ```
 
-`registry check` 跟 `registry live-check` 用的是兩套不同的 policy 機制。前者只有 `deny`、只有 `violation` 一級；三級嚴重度屬於後者的 advice 系統，那也是 `signal_type` 跟 `signal_name` 這兩個欄位會被填上的地方（check 階段永遠是 `null`，因為靜態定義沒有「哪一筆遙測」這個概念）。這條線明天會走一次。
+`registry check` 跟 `registry live-check` 用的是兩套不同的 policy 機制。前者只有 `deny`、只有 `violation` 一級；三級嚴重度屬於後者的 advice 系統，那也是 `signal_type` 跟 `signal_name` 這兩個欄位會被填上的地方（check 階段永遠是 `null`，因為靜態定義沒有「哪一筆遙測」這個概念）。這條線等後面真的接上流量再走。
 
-實務上的結論：在 `registry check` 這一階段，policy 是一個二元的閘門，違規就是違規，沒有「建議」這種中間狀態。想要分級，只能靠拆成兩個資料夾、跑兩次 check，一次的離開碼進 CI 當硬性擋，另一次只印出來給人看。
+實務上的結論：在 `registry check` 這一階段，policy 是一個二元的閘門，違規就是違規，沒有「建議」這種中間狀態。想要分級，只能靠拆成兩個資料夾、跑兩次 check，一次的 exit code 進 CI 當硬性擋，另一次只印出來給人看。
 
 這個限制其實有平台工程上的後果。**沒有中間狀態，就代表每加一條新規則都是一次「要嘛擋所有人、要嘛完全沒作用」的決定**，沒辦法先用「建議」模式讓大家適應一季再轉硬性。拆兩個資料夾跑兩次是目前唯一的解，而那是你自己搭的，不是工具給的。
 
@@ -574,9 +633,11 @@ Day1 那隻 agent 已經示範過 LLM 犯錯的方式有多隱蔽。它不會說
 
 今天那條 `duplicate_concept` 規則的價值就在這裡。它不只是幫團隊維持整潔，它是在把一個 agent 必然會踩、而且踩了不會報錯的坑，提前在 PR 階段清掉。Day1 說每個決定在當下都是局部最優解，時間拉長才變成全域的爛攤子；policy 做的事，就是把「全域」這個視野，在每一次局部決定發生的當下就補上去。
 
+> 對我來說要做好 AI agent 這種充滿`不確定性`的服務，那我們就必須在設計時，盡量提高確定性。讓遙測資料具備`語意一致性`，是我這系列前半段的主要思想。
+
 ## 今天沒做的事
 
-沒有把這三條規則接進 CI。離開碼已經是 1 了，但真正變成「PR 上的紅字」還需要 GitHub Actions 的 workflow 跟 `--diagnostic-format gh_workflow_command`，那是明天整天的事。
+沒有把這三條規則接進 CI。Exit code 已經是 1 了，但真正變成「PR 上的紅字」還需要 GitHub Actions 的 workflow 跟 `--diagnostic-format gh_workflow_command`，那是明天整天的事。
 
 也沒有真的去修那份 registry。今天產出的是一張遷移清單，不是遷移本身。把 `userId` 收斂掉會動到 `o11y_shared` 跟五個服務，還會動到 Loki 和 Prometheus 的 label 跟既有的 dashboard，留給後面。
 

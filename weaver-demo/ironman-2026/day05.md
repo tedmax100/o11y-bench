@@ -137,7 +137,7 @@ exit=1
 
 **attribute 的 id 是整份 registry 全域唯一的**，不是每個 group 各自一個命名空間。所以 `ref` 不可能有歧義，撞名的東西根本進不了 registry。
 
-> 這個輸出有個容易看走眼的地方：它上面還印了一行 `✔ No after_resolution policy violation`。那只代表 policy 那一關沒事，錯誤是在更早的 resolver 階段爆的。**看到 ✔ 不等於過了，要看 exit code。** 這個「同一次輸出裡綠燈跟紅字並存」的情況，後面拆管線三個階段時會再遇到。
+> 這個輸出有個容易看走眼的地方：它上面還印了一行 `✔ No after_resolution policy violation`。那只代表 policy 那一關沒事，而這個錯誤是在更早的地方爆的：weaver 要先把所有 `ref` 展開成一份完整的 schema（下面 `resolve` 那節會看到），才輪得到 policy 去檢查那份結果。撞名在展開的時候就死了，所以那行綠燈其實沒有對任何東西背書。**看到 ✔ 不等於過了，要看 exit code。**
 
 先看整份東西是怎麼疊起來的。從最外層到最裡層總共四層，每一層各回答一個問題：
 
@@ -280,7 +280,7 @@ flowchart TB
 
 `attribute_group` 就是那個屬性池：定義一次，其他 group 用 `ref` 指過來。慣例上這種 group 的 `id` 用 `registry.` 開頭（`registry.app`、`registry.biz`、`registry.gen_ai`），一眼看得出「這裡是定義處，不是訊號」。
 
-這也是為什麼等一下 `stats` 那個 `deduplicated attributes: 55 (53%)` 是設計指標而不只是統計：53% 代表超過一半的屬性是被共用的。這個數字低，代表大家各寫各的，那份 registry 遲早會自相矛盾。
+這也是為什麼等一下 `stats` 那個 `deduplicated attributes: 55 (53%)` 是設計指標而不只是統計。那個百分比是「去重之後還剩多少」：34 個 group 上總共出現了 102 次 attribute，壓成 55 個相異的，剩 53%，等於有將近一半的使用是靠 `ref` 共用同一份定義來的。**所以這個數字要往低了看，越接近 100% 越代表大家各寫各的**，那份 registry 遲早會自相矛盾。
 
 ### `ref` 展開之後是什麼
 
@@ -427,6 +427,8 @@ $ weaver registry check -r ironman-2026/day05/registry -p ironman-2026/day05/pol
 ✔ No `after_resolution` policy violation
 ```
 
+（`-p` 是 `--policy` 的簡寫，告訴 weaver 去哪裡讀 Rego 規則，後半那條擋 metric label 的規則就住在那個目錄。）
+
 兩次都乾淨。第一次跑就綠燈會讓人懷疑「是不是根本沒認真檢查」，但這符合預期：這份 registry 是照**目標命名**新寫的，不是拿舊的 flat key 硬塞進來。它跟現在程式碼裡的欄位是這樣對應的：
 
 | 現在程式碼裡的 flat key | registry 裡的目標 attribute | 訊號 |
@@ -471,11 +473,13 @@ Shared Catalog (after resolution and deduplication):
 
 | 數字 | 讀出來的意思 | 該問的問題 |
 |---|---|---|
-| `deduplicated attributes: 55 (53%)` | 重用率 53% | 太低代表大家各自重寫定義；一半以上被 `ref` 共用是健康的 |
+| `deduplicated attributes: 55 (53%)` | 102 次使用壓成 55 個相異定義，剩 53% | 越接近 100% 代表大家各自重寫定義；壓掉將近一半算健康 |
 | 18 個 `enum`（把 `card:` 那幾行加總） | 18 個欄位把合法值寫進 schema | 剩下 23 個 `string` 裡，有沒有其實該是 enum 的？ |
 | `enum(card:015): 1` | 有一個 enum 有 15 個成員 | 拿去當 metric label 就是 15 條時間序列起跳 |
 | `required: 17`／`recommended: 30` | 必填佔三成 | 必填太多會讓 live-check 噴一堆違規；太少等於沒有承諾 |
 | `development: 100%` | 沒有任何 attribute 是 `stable` | 符合現況——這份 registry 沒對任何人承諾「不會再改」。之後講 breaking change 時這個 100% 會開始鬆動 |
+
+（那個 102 不是我估的，是把 `stats` 上半段每一種 group 的 `Total number of attributes` 加起來：AttributeGroups 30、Entitys 2、Events 28、Metrics 14、Spans 28。上面的輸出為了短，只留了 `Shared Catalog` 那一段。）
 
 **`enum(card:NNN)` 這個格式是這份輸出裡最被低估的東西**，因為它是**唯一一個直接把成本攤在你面前的數字**。`card` 就是 cardinality。那個 `enum(card:015)` 是 `app.event`，15 個業務事件名。它單獨當 label 是 15 條時間序列，跟一個 `card:005` 的 label 組合就是 75 條，再乘上 `service.name` 就是幾百條。
 
@@ -775,7 +779,14 @@ span.http.server                       server.address = recommended
 
 ## 三個示範：管線上三個不同的位置各踩一次
 
-拿一份丟棄式的複製亂改，看錯誤長什麼樣。
+下面三個示範都是拿一份丟棄式的複製去亂改，別動到 repo 裡那份：
+
+```console
+$ mkdir -p /tmp/weaver-demo
+$ cp -r ironman-2026/day05/registry ironman-2026/day05/policies /tmp/weaver-demo/
+```
+
+之後的指令就一律指到 `/tmp/weaver-demo/registry` 跟 `/tmp/weaver-demo/policies`。
 
 示範一：`ref` 指到不存在的屬性。 在 metric group 裡塞一行 `- ref: app.nonexistent_attr`。這是 `weaver_resolver` 階段的錯誤，管線根本走不到 policy，輸出是純文字診斷、exit 1。
 
@@ -853,7 +864,7 @@ flowchart TD
 $ weaver registry infer --otlp-grpc-port 14317 --registry-path /tmp/inferred
 ```
 
-（port 不用預設的 4317，理由後面會講。那個坑很值得單獨講。）
+（port 我刻意不用預設的 4317。那個 port 上常常已經有別的東西在送 OTLP，`infer` 會照單全收學進來，我就這樣把不相干的遙測收進過草稿一次 XD）
 
 三個指令的分工這樣看最清楚：
 
