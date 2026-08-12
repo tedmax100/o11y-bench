@@ -127,6 +127,7 @@ Day5 那個 `-r .` 的假綠燈，在 CI 裡會變成更難發現的形狀，因
 ```console
 $ weaver registry stats -r ironman-2026/day07/registry | grep -oE '[0-9]+ groups'
 2 groups
+# -r 是 --registry 的短寫，後面每一個 weaver 子指令都會用到
 
 $ weaver registry stats -r . | grep -oE '[0-9]+ groups'
 0 groups
@@ -153,7 +154,7 @@ $ weaver registry stats -r . | grep -oE '[0-9]+ groups'
 
 ### 讓違規變成 PR 上的紅字
 
-`--diagnostic-format gh_workflow_command` 會把 Finding 轉成 GitHub 的 [workflow command](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands)，也就是那些 `::error` 開頭的行。拿昨天那份沒收斂的 registry 當靶子：
+`--diagnostic-format gh_workflow_command` 會把 Finding 轉成 GitHub 的 [workflow command](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands)，也就是那些 `::error` 開頭的行。拿昨天那份沒收斂的 registry 當靶子（`-p` 是 `--policy`，吃檔案或整個目錄）：
 
 ```console
 $ weaver registry check -r ironman-2026/day06/registry -p ironman-2026/day07/policies \
@@ -259,7 +260,7 @@ Day6 已經測過，`registry check` 這一階段沒有「建議」這種中間�
 
 到這裡，PR 那道門守住的是「寫進 registry 的定義是好的」。但 Day1 那隻 agent 撞到的問題，沒有一個是定義寫壞造成的。`job` 對 `service_name`、`WARN` 對 `warn`，那些都是**程式碼實際送出去的東西**跟規範對不上，而 registry 裡的定義可能一直都是對的。
 
-`weaver registry live-check` 守的就是這個時間點。它接真實的 OTLP 訊息，一筆一筆跟 registry 比對。
+`weaver registry live-check` 守的就是這個時間點。它接真實的 OTLP（OpenTelemetry Protocol）訊息，一筆一筆跟 registry 比對。
 
 ### 樣本從哪來
 
@@ -348,7 +349,7 @@ $ weaver registry live-check ... --fail-on none ; echo $?
 
 ### 三筆值得單獨看的 advice
 
-**`app.outcome = OK` 那個 `information`。** registry 裡 `app.outcome` 是個 enum，成員是 `authorized`／`declined`／`gateway_error`，而樣本送的是 `OK`。這條 advice 抓到的東西，正是 Day1 那隻 agent 猜 `WARN` 猜錯的鏡像版本：一邊是 agent 不知道值域，另一邊是服務自己送了值域外的值，兩邊加起來就是那個「查得到 0 筆」的完美條件。而它只被判成 `information`，預設不會擋，這個嚴重度我覺得偏低。
+**`app.outcome = OK` 那個 `information`。** registry 裡 `app.outcome` 是個 enum，成員是 `authorized`／`declined`／`gateway_error`，而樣本送的是 `OK`。這條 advice 抓到的東西，正是 Day1 那隻 agent 猜 `WARN` 猜錯的鏡像版本：一邊是 agent 不知道值域，另一邊是服務自己送了值域外的值，兩邊加起來就是那個「查得到 0 筆」的完美條件。而它只被判成 `information`，預設不會擋，這個嚴重度我覺得偏低。要擋的話 `--fail-on information` 就做得到，只是那等於連所有「這個欄位還不穩定」也一起變成紅燈，所以真要用大概得先把下面那串 `not_stable` 處理掉。
 
 **`not_stable` 那一串 `improvement`。** 這份 registry 每個 attribute 都是 `development`，所以每一筆合規的資料也會拿到一條「這個欄位還不穩定」。它不是在罵你，是一份即時的技術債清單：你的服務現在正踩在幾個隨時可能改名的欄位上，這個數字就是答案。
 
@@ -368,13 +369,23 @@ Span totally.made.up.span `server`
   - by highest advice level:
     - no advice: 1
 
+Advisories given
+  - total: 0
+
+Registry coverage
+  - total seen: 0.0%
+
 $ echo $?
 0
 ```
 
-metric 名字不在 registry 裡會噴 `Metric does not exist in the registry`，log 的 event name 也會噴 `Event ... does not exist`，唯獨 span 名字不會。綠燈、離開碼 0。
+metric 名字不在 registry 裡會噴 `Metric does not exist in the registry`，log 的 event name 也會噴 `Event ... does not exist`，唯獨 span 名字不會。綠燈、離開碼 0，advice 一條都沒有。整份輸出裡唯一還在喊的是最後那行 `total seen: 0.0%`，等一下會回來講它。
 
 第二，缺了必填欄位它也不會說。registry 裡 `span.order.create` 把 `biz.user.id`、`biz.order.id`、`app.outcome` 三個都標成 `required`，但我送一個只帶其中兩個的 span 過去，它一句話都沒有。
+
+span 名字跟 `required` 這兩件，其實是同一個性質：**live-check 只能對它看到的東西發表意見，看不到的東西不在它的視野裡。** 它回答的問題是「你送的這些有沒有不合規的」，不是「規範要求的你有沒有都送到」。這是一個很容易誤讀的邊界，而誤讀的後果是你以為 `required` 這個承諾有人在守，實際上沒有。
+
+`requirement_level` 那個承諾，到這一步還是沒有任何機制去兌現。Day5 寫下 17 個 `required` 的時候我以為那是在替未來的自己制定規則，現在看起來，那個未來還要自己動手做。
 
 把兩道門看得到什麼放在一起畫，邊界就很清楚了：
 
@@ -397,9 +408,7 @@ flowchart LR
     end
 ```
 
-這兩件事其實是同一個性質：**live-check 只能對它看到的東西發表意見，看不到的東西不在它的視野裡。** 它回答的問題是「你送的這些有沒有不合規的」，不是「規範要求的你有沒有都送到」。這是一個很容易誤讀的邊界，而誤讀的後果是你以為 `required` 這個承諾有人在守，實際上沒有。
-
-`requirement_level` 那個承諾，到這一步還是沒有任何機制去兌現。Day5 寫下 17 個 `required` 的時候我以為那是在替未來的自己制定規則，現在看起來，那個未來還要自己動手做。
+圖裡「兩邊都沒人守」那格多列了一項「這個值是不是真的」。前面那個 `app.outcome = OK` 頂多是值域對不上，還抓得到；但一個服務把 `biz.order.id` 填成上一筆訂單的編號，兩道門都會說沒問題，因為形狀完全合規。這一項今天不會有答案，先擺在這裡，因為它正是 agent 拿著資料下結論時真正要賭的東西。
 
 ### registry coverage：規範跟現實的距離
 
@@ -412,7 +421,9 @@ Registry coverage
 
 意思是這份 registry 定義的東西裡，有 75% 在這批樣本裡真的出現過。這個數字**不是合規率**，它跟「有幾筆資料違規」是兩件事。它量的是另一個方向：你寫下來的規範，有多少比例是活的。
 
-一個長期偏低的 coverage 通常代表兩種情況之一，而兩種都值得處理：規範裡有一堆沒人在用的定義（該刪，或者該問為什麼沒人用），或者你的樣本根本沒涵蓋到主要流量（那這次 live-check 的結論就不能當真）。
+先講清楚這個 75% 怎麼來的，不然它看起來會比實際上有份量。這份 registry 一共只有四個 attribute（`biz.user.id`、`biz.order.id`、`app.outcome`、`app.fail_reason`），樣本涵蓋了前三個，3/4 就是 75%。沒被涵蓋的 `app.fail_reason` 是 `conditionally_required`，只在 `app.outcome` 不是 `authorized` 時才出現，而我那六筆樣本裡沒有失敗的案例。所以這個 75% 其實是「樣本沒涵蓋到失敗路徑」，不是「規範有四分之一是死的」。
+
+正因為分母這麼小，這個數字在 day07 這種玩具 registry 上意義不大，要等 registry 長到幾十個 group 才會開始有用。到那個時候，一個長期偏低的 coverage 通常代表兩種情況之一，而兩種都值得處理：規範裡有一堆沒人在用的定義（該刪，或者該問為什麼沒人用），或者你的樣本根本沒涵蓋到主要流量（那這次 live-check 的結論就不能當真）。前面那個亂編 span 名字的例子就是後者的極端版本，advice 全綠，只有 coverage 誠實地印了 `0.0%`。
 
 > 我會把這個數字跟前面那個探針放在一起看，它們回答的是同一種問題：這次檢查到底有沒有在看真的東西。一個是輸入端（registry 讀到了嗎），一個是輸出端（樣本涵蓋了嗎）。
 
@@ -433,9 +444,9 @@ biz.user.id = u-5
     - [improvement] Attribute 'biz.user.id' is not stable; stability = development.
 ```
 
-自訂規則生效了。但把這份輸出跟前面那份對照會發現，`missing_namespace` 跟 `invalid_format` 這兩條內建 advice **不見了**。`--advice-policies` 的語意是「覆蓋預設的 advice 目錄」，不是「再加一組」。
+自訂規則生效了。但把這份輸出跟前面那份對照會發現，`missing_namespace` 跟 `invalid_format` 這兩條內建 advice **不見了**。
 
-有趣的是 `not_stable` 跟「不在 registry 裡」這兩條還在，因為它們是 weaver 用 Rust 實作的，不是 Rego 寫的。所以被覆蓋掉的只有 Rego 那一半。這個切分沒有寫在文件裡，是我把兩次輸出擺在一起 diff 才看出來的。
+這件事其實 `--help` 有講，是我自己沒讀仔細：`Advice policies directory. Set this to override the default policies`——`override`，不是 add。真正沒寫在任何地方的是下一層：被 override 掉的到底是哪些。`not_stable` 跟「不在 registry 裡」這兩條還在，因為它們是 weaver 用 Rust 實作的，不是 Rego 寫的，所以那個 `override` 只吃得到 Rego 那一半。這個切分我是把兩次輸出擺在一起 diff 才看出來的。
 
 實務上的意思是：你想加一條規則，就得把內建那幾條一起帶進你的目錄，否則等於用一條新規則換掉兩條舊規則。我是從 weaver 二進位檔裡把預設的 `otel.rego` 撈出來當範本的（`strings $(which weaver) | grep -A30 'package live_check_advice'`），那也是我知道 advice 物件確切形狀的方式：
 
@@ -448,9 +459,17 @@ deny contains make_advice("pii_on_telemetry", "violation", input.sample.attribut
 	endswith(input.sample.attribute.name, suffix)
 	message := sprintf("Attribute '%s' looks like PII; ...", [input.sample.attribute.name])
 }
+
+make_advice(advice_type, advice_level, advice_context, message) := {
+	"type": "advice",
+	"advice_type": advice_type,
+	"advice_level": advice_level,
+	"advice_context": advice_context,
+	"message": message,
+}
 ```
 
-兩個地方跟 Day6 那個 `after_resolution` 的 policy 不一樣，而且寫錯了都是安靜失敗：輸入是 `input.sample.<訊號型別>` 而不是 `input.groups[_]`；產出的物件要有 `type`／`advice_type`／`advice_level`／`advice_context`／`message` 五個欄位，少一個整條規則就不生效。跟昨天那個「`type` 只能是 `semconv_attribute`」是同一類的東西，**一份沒有寫進文件的欄位合約，而違反它的代價是沉默。**
+兩個地方跟 Day6 那個 `after_resolution` 的 policy 不一樣，而且寫錯了都是安靜失敗：輸入是 `input.sample.<訊號型別>` 而不是 `input.groups[_]`；產出的物件要有 `type`／`advice_type`／`advice_level`／`advice_context`／`message` 五個欄位（就是上面 `make_advice` 那個 helper 在做的事，我特地把它拆出來就是為了讓這五個欄位擺在眼前），少一個整條規則就不生效。跟昨天那個「`type` 只能是 `semconv_attribute`」是同一類的東西，**一份沒有寫進文件的欄位合約，而違反它的代價是沉默。**
 
 ## 回到 AIOps：兩道門對 agent 的判斷有什麼影響
 

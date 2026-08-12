@@ -30,7 +30,7 @@ ironman-2026/day08/
 
 先講為什麼需要分層，因為兩個極端我都待過。
 
-一種是**全公司一份 registry**，誰要加欄位都去改那個中央檔案。前三個月很好，第四個月開始，那份檔案變成一個沒有人敢動的東西：你要加一個只有自己團隊在用的 `biz.order.channel`，得先搞懂另外十二個團隊的命名慣例，還要等一個不熟悉你領域的人來 review。**這個設計把成本推給了使用者，而且推得很不平均**，愈邊緣的團隊付愈多。
+一種是**全公司一份 registry**，誰要加欄位都去改那個中央檔案。前三個月很好，第四個月開始，那份檔案變成一個沒有人敢動的東西：你要加一個只有自己團隊在用的 `biz.order.channel`，得先搞懂另外十二個團隊的命名慣例，還要等一個不熟悉你領域的人來 review。這個設計把成本推給了使用者，而且推得很不平均，愈邊緣的團隊付愈多。
 
 另一種是**每個團隊各自一份**，互不相干。這個一開始更快，但它就是 Day1 那個現場：`userId` 跟 `user_id` 並存，不是因為誰不願意統一，而是根本沒有一個東西在盯著。
 
@@ -54,7 +54,7 @@ flowchart TB
 
 判準其實只有一句話：**一個定義如果需要跨團隊對齊才有意義，它就該在下面那層；如果只有自己在用，就該在自己那層。** `biz.user.id` 是前者，因為 agent 要跨服務串一個使用者的行為；`biz.order.channel` 是後者，只有訂單團隊在分 web 跟 mobile。
 
-> 這條線我畫錯過。第一版把整個 `biz.*` 收進 base，理由聽起來很正當（業務識別碼要統一）。結果三週內收到四個「我可以加一個 `biz.xxx` 嗎」的 PR，全部要我 review，全部都是只有那個團隊在用的東西。**我不是在治理，我是在當一個人肉的 merge queue。**
+> 這條線我畫錯過。第一版把整個 `biz.*` 收進 base，理由聽起來很正當（業務識別碼要統一）。結果三週內收到四個「我可以加一個 `biz.xxx` 嗎」的 PR（Pull Request），全部要我 review，全部都是只有那個團隊在用的東西。**我不是在治理，我是在當一個人肉的 merge queue。**
 
 ## 兩層各自長什麼樣
 
@@ -69,7 +69,7 @@ dependencies:
     registry_path: https://github.com/open-telemetry/semantic-conventions@v1.43.0[model]
 ```
 
-`registry_path` 是「檔案在哪」，`schema_url` 是「這是誰的哪一版」。官方文件把這個區分寫得很清楚：`schema_url` 不需要真的下載得到，它是身分識別，provenance 跟版本衝突都靠它來判斷。這裡順手做了昨天講過的那件事，**把版本釘在 `@v1.43.0`**，不要用 `main`，理由跟釘 weaver 版本一模一樣。
+`registry_path` 是「檔案在哪」，`schema_url` 是「這是誰的哪一版」。官方那份 [registry 文件](https://github.com/open-telemetry/weaver/blob/main/docs/registry.md)把這個區分寫得很清楚：`schema_url` 不需要真的下載得到，它是身分識別，provenance 跟版本衝突都靠它來判斷。這裡順手做了昨天講過的那件事，**把版本釘在 `@v1.43.0`**，不要用 `main`，理由跟釘 weaver 版本一模一樣。
 
 產品團隊那層，就是再往上疊一次：
 
@@ -100,12 +100,15 @@ dependencies:
       - ref: biz.order.channel  # 自己的
 ```
 
-`ref` 的時候可以就地改 `requirement_level`，這是分層裡很重要的一個彈性：**base 決定這個欄位叫什麼、代表什麼，團隊決定在自己這個 span 上它必不必填。** 語意統一，嚴格度放手。
+`ref` 的時候可以就地改 `requirement_level`，這是分層裡很重要的一個彈性：base 決定這個欄位叫什麼、代表什麼，團隊決定在自己這個 span 上它必不必填。語意統一，嚴格度放手。
 
 兩層都是綠的：
 
 ```console
 $ weaver registry check -r ironman-2026/day08/base
+# -r 是 --registry 的短寫
+ℹ Found registry manifest: ironman-2026/day08/base/manifest.yaml
+ℹ Found registry manifest: /home/nathan/.weaver/vdir_cache/repoYqHwXF/model/manifest.yaml
 ✔ No `after_resolution` policy violation
 
 $ weaver registry check -r ironman-2026/day08/team-orders
@@ -117,7 +120,7 @@ $ weaver registry check -r ironman-2026/day08/team-orders
 Total execution time: 2.201078414s
 ```
 
-那三行 `Found registry manifest` 就是分層在跑的證據，一層一層往下讀。第三行那個 `vdir_cache` 是 weaver 把官方 semconv clone 下來的快取，第一次會慢一點。
+那幾行 `Found registry manifest` 就是分層在跑的證據，一層一層往下讀：base 兩行（自己＋官方 semconv），team-orders 三行（自己＋base＋官方）。最後那個 `vdir_cache` 是 weaver 把官方 semconv clone 下來的快取，第一次會慢一點，後面所有的秒數都是快取熱的情況下量的。
 
 ## 四個安靜的坑
 
@@ -133,7 +136,7 @@ $ weaver registry check -r team-orders
   │ directory (os error 2)
 ```
 
-**那個路徑是相對於 `cwd` 解析的，不是相對於 manifest 檔案自己的位置。** 這件事的後果比看起來大：manifest 進了版控，但它能不能用，取決於執行的人站在哪個目錄。CI 上跑得好好的，同事在自己的子目錄跑就壞掉，而錯誤訊息只說「找不到檔案」，不會說「你可能站錯地方了」。
+那個路徑是相對於 `cwd` 解析的，不是相對於 manifest 檔案自己的位置。這件事的後果比看起來大：manifest 進了版控，但它能不能用，取決於執行的人站在哪個目錄。CI（Continuous Integration，持續整合）上跑得好好的，同事在自己的子目錄跑就壞掉，而錯誤訊息只說「找不到檔案」，不會說「你可能站錯地方了」。
 
 這個坑至少是會噴錯的，比後面三個仁慈。實務上的解法是在 README 裡寫死「所有指令從 repo 根目錄跑」，然後在 CI 裡永遠 `cd` 到根目錄。
 
@@ -148,7 +151,9 @@ $ weaver registry check -r ironman-2026/day08/team-orders
   │ Attribute reference: service.name
 ```
 
-**不行。dependency 只往下看一層。** 你依賴 base，就只拿得到 base 自己定義的東西，拿不到 base 依賴的東西。
+**不行。attribute 的 `ref` 只往下看一層。** 你依賴 base，就只 ref 得到 base 自己定義的東西，ref 不到 base 依賴的東西。
+
+範圍我先講清楚，因為我只驗證了 attribute。`metric`、`event`、`entity` 那三種另有一條路叫 `imports`，可以把上游的東西明確拉進來（等一下第三個坑會用到它），**而 attribute 沒有 `imports`，只有 `ref`**。所以要重列一次整條依賴路徑的，就只有 attribute 這一種。
 
 要用就得自己也列一次：
 
@@ -160,7 +165,7 @@ dependencies:
     registry_path: https://github.com/open-telemetry/semantic-conventions@v1.43.0[model]
 ```
 
-這樣在 0.25.1 上是可以跑的，`check` 綠燈。但要付兩個代價。近的一個是時間：官方那份 semconv 被載入兩次，執行時間從 2.2 秒變成 4.8 秒，一份不到 40 行的 team registry 花四秒鐘檢查完。
+這樣在 0.25.1 上是可以跑的，`check` 綠燈。但要付兩個代價。近的一個是時間：官方那份 semconv 被載入兩次，執行時間從 2.3 秒變成 4.6 秒，一份不到 40 行的 team registry 花四秒半檢查完。（兩個數字都是 `vdir_cache` 已經有 semconv 的情況下各跑三次取的，冷快取還要再多算 clone 的時間。）
 
 遠的一個更麻煩：**版本號現在被寫在兩個地方了。** 哪天平台團隊把 base 升到 semconv v1.44.0，team-orders 那份 manifest 不會自動跟上，也不會有人提醒你。你的 team registry 會拿著 v1.43.0 的定義去 ref 一個 base 認為是 v1.44.0 的世界，而兩邊都是綠燈。
 
@@ -244,7 +249,7 @@ $ weaver registry check -r ironman-2026/day08/team-orders
   │ - Object contains unexpected properties: attributes.
 ```
 
-`imports` 只吃 `metrics`、`events`、`entities` 三種，attribute 沒有這條路，只能靠 `ref`。所以這個檢查目前是走在一條要被拆掉的橋上，而橋的另一頭還沒蓋。這也是為什麼後面那條 policy 得自己寫。
+`imports` 只吃 `metrics`、`events`、`entities` 三種，attribute 沒有這條路，只能靠 `ref`，就是第二個坑裡那件事的另一面。所以這個檢查目前是走在一條要被拆掉的橋上，而橋的另一頭對 attribute 來說還沒蓋。這也是為什麼後面那條 policy 得自己寫。
 
 ### 四、摘要那行綠字，不代表沒有違規
 
@@ -267,6 +272,15 @@ $ echo $?
 
 **那句 `✔ No after_resolution policy violation` 只講 `after_resolution` 那一個階段**，`before_resolution` 的違規不會被算進去，但它們照樣印在下面、照樣讓離開碼變成 1。第一次看到的時候我以為是自己 policy 寫錯了，因為畫面上最顯眼的是一個綠色勾勾。
 
+認出來的方法其實就在那句話本身，只是要看過兩種才會發現。weaver 在這裡會印兩種不同的句子：
+
+| 看到的那行 | 真正的意思 |
+| --- | --- |
+| `✔ No after_resolution policy violation` | 這個階段**一條規則都沒跑到**，綠不綠跟你的 policy 無關 |
+| `✔ All after_resolution policies checked (1 violations found)` | 這個階段真的跑了，而且抓到 1 個 |
+
+第二句是等一下那條正式規則會印的。差別在括號——有括號才代表有東西被檢查過。
+
 這個坑本身不嚴重（訊息都在，離開碼也對），但它跟昨天那三個 CI 陷阱是同一個家族：**摘要跟細節講的不是同一件事，而人只看摘要。**
 
 ## 那條 policy 我第一次寫錯了
@@ -287,7 +301,7 @@ deny contains reserved_namespace(group.id, attr.id) if {
 }
 ```
 
-`before_resolution` 這個 package 到今天才第一次有真正的用武之地。它跑在解析之前，看到的是 YAML 原本的樣子，所以 `id:` 跟 `ref:` 還分得出來，這正是這條規則需要的視野。跑起來：
+`before_resolution` 這個 package 到今天才第一次有真正的用武之地。它跑在解析之前，看到的是 YAML 原本的樣子，所以 `id:` 跟 `ref:` 還分得出來，這正是這條規則需要的視野。跑起來（`-p` 是 `--policy`，吃檔案或整個目錄）：
 
 ```console
 $ weaver registry check -r ironman-2026/day08/team-orders -p ironman-2026/day08/policies-prefix-ban
@@ -317,9 +331,19 @@ deny contains conflicting_definition(name) if {
 	briefs := definitions[name]
 	count(briefs) > 1        # 同一個名字，兩份不一樣的 brief
 }
+
+conflicting_definition(name) := {
+	"id": "conflicting_definition",
+	"type": "semconv_attribute",
+	"category": "layering",
+	"group": "(registry-wide)",
+	"attr": name,
+}
 ```
 
 用 `brief` 當比較的依據，是因為它就是那個「這個欄位代表什麼」的欄位。同名而 `brief` 不同，意思就是有兩個人對同一個名字有不同的理解，而這正是要抓的東西。
+
+這裡有一個換了 package 就會靜悄悄失效的東西，我卡了一陣子才發現：**上面那條 `before_resolution` 用的是 `attr.id`，這條 `after_resolution` 用的是 `attr.name`。** 解析之後 `ref:` 已經被攤平成一個完整的 attribute 了，`id` 這個欄位不存在，全部都叫 `name`。寫錯不會噴錯，Rego 只是永遠匹配不到，然後你會拿到一句「沒有違規」。跟 Day7 那個 advice 物件少一個欄位一樣，**一份沒有寫進文件的欄位合約，違反它的代價是沉默**，這已經是這系列第三次撞到同一種東西了。
 
 ```console
 $ weaver registry check -r ironman-2026/day08/team-orders -p ironman-2026/day08/policies
@@ -332,13 +356,17 @@ $ weaver registry check -r ironman-2026/day08/team-orders -p ironman-2026/day08/
 
 ```mermaid
 flowchart TD
-    A["團隊要定義一個新 attribute"] --> Q1{"名字開頭是<br/>biz. / app. ？"}
-    Q1 -->|"是"| V1["❌ 申請制<br/>擋下來，來找平台團隊談"]
-    Q1 -->|"否"| OK1["✅ 通過"]
+    subgraph P1["第一版：申請制（寫錯的那條）"]
+        Q1{"名字開頭是<br/>biz. / app. ？"}
+        Q1 -->|"是"| V1["❌ 擋下來<br/>來找平台團隊談"]
+        Q1 -->|"否"| OK1["✅ 通過"]
+    end
 
-    A2["團隊要定義一個新 attribute"] --> Q2{"解析後有沒有<br/>同名而不同 brief 的定義？"}
-    Q2 -->|"有"| V2["❌ 衝突制<br/>擋下來，指出跟誰衝突"]
-    Q2 -->|"沒有"| OK2["✅ 通過，不用問任何人"]
+    subgraph P2["改對的版本：衝突制"]
+        Q2{"解析後有沒有<br/>同名而不同 brief 的定義？"}
+        Q2 -->|"有"| V2["❌ 擋下來<br/>指出跟誰衝突"]
+        Q2 -->|"沒有"| OK2["✅ 通過，不用問任何人"]
+    end
 ```
 
 兩條規則的差別，用 platform 的語言講是這樣：前者是**申請制**（這個 namespace 是我的，你要用先問我），後者是**衝突制**（你自己開，撞到別人的時候我才出面）。第二種的維護成本不會隨團隊數成長，因為平台團隊只在真的有衝突時才需要介入。
