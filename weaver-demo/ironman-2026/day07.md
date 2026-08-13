@@ -172,6 +172,8 @@ $ echo $?
 
 完整輸出是 9 行 `::error`，跟昨天那 9 個違規一一對應，這裡只留三行代表三種規則。
 
+> 今天貼的這份 workflow 是為了逐段拆解寫的教學快照，一份 registry、一個 job。範例 repo 自己實際在跑的是另一份 `.github/workflows/telemetry-schema.yml`，差別在那個 repo 裡有一半的 registry 是故意寫壞的教材，所以它不能問「check 有沒有過」，得問「結果跟預期一不一樣」。那份的完整說明寫在 `day07/README.md`，等到後面把這些檢查收成回歸測試的時候會再回來講它。
+
 ## 三個實測出來的坑，共通點是都不會讓你看到錯誤訊息
 
 ### 一、預設走 stderr，而 workflow command 要在 stdout

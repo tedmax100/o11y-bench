@@ -68,6 +68,8 @@ expect_exit 0 "registry diff 對型別／值域／語意改變靜音" \
 
 ## 跑起來長什麼樣
 
+底下是節錄，`== 該綠的還是綠的`、`== 已知的缺口`、`== 生成物跟 registry 有沒有走散` 三段拿掉了，留下最能說明今天這件事的兩段：
+
 ```console
 $ bash ironman-2026/day12/regress.sh
 
@@ -87,17 +89,19 @@ $ bash ironman-2026/day12/regress.sh
   ✓ day07 live-check 抓得到還在送的舊欄位     exit=1
 
 == 訊息本身也要能讓人自己修好
-  ✓ day06 講得出是哪一條規則        找到「duplicate_concept」
-  ✓ day08 講得出跟誰衝突            找到「registry.acme.biz」
-  ✓ day11 講得出合法值有哪些        找到「合法的是：authorized, declined, g」
-  ✓ day07 產得出 GitHub annotation       找到「::error file=」
+  ✓ day06 講得出是哪一條規則        找到 「duplicate_concept」
+  ✓ day08 講得出跟誰衝突            找到 「registry.acme.biz」
+  ✓ day11 講得出合法值有哪些        找到 「合法的是：authorized, declined, g」
+  ✓ day07 產得出 GitHub annotation       找到 「::error file=」
 
 ────────────────────────────────────────────────────────────
 29 條斷言：29 通過，0 失敗
 其中預期離開碼非 0 的有 8 條，預期 0 的有 10 條
 ```
 
-29 條斷言，跑一次 36 秒，零次 LLM 呼叫。那 36 秒裡有大半是分層的那幾份 registry 要去解析官方 semconv，純本地的那些是毫秒級的。
+29 條斷言，跑一次不到一分鐘，零次 LLM 呼叫。（我機器上連跑三次是 38 / 39 / 44 秒，`vdir_cache` 都是熱的。）那幾十秒裡有大半是分層的那幾份 registry 要去解析官方 semconv，純本地的那些是毫秒級的。
+
+最後那兩行的數字加起來不是 29，這是對的：離開碼只是其中一種斷言，剩下十一條驗的是 `stats` 讀到幾個 group、以及輸出裡有沒有出現某個關鍵字。
 
 那段「訊息本身也要能讓人自己修好」是我後來才加的。前面講過，一道 gate 說不清楚，維護成本會隨團隊數線性成長。既然這件事這麼重要，那它就該被測試，而不是靠我每次改 policy 的時候記得順手看一眼輸出。**「錯誤訊息夠不夠好」是一個可以被斷言的東西，只要你願意把那個關鍵字寫進測試裡。**
 
@@ -124,6 +128,30 @@ flowchart LR
     B --> R["regress.sh：3 條斷言變紅"]
     R --> F["人：知道那條規則死了"]
 ```
+
+## 一支要靠人記得跑的回歸測試，就是今天在講的那個問題
+
+寫完這支腳本之後我發現一件很好笑的事：它本身就犯了整篇文章在罵的那個錯。一份會擋人的東西如果要靠人記得執行，它跟不存在的差別只在於你以為它存在，而 `regress.sh` 當時正是那個樣子，我手動跑，跑得很開心。
+
+所以它現在真的進 CI 了，範例 repo 的 `.github/workflows/telemetry-schema.yml` 會在每個動到治理資產的 PR 上跑它：
+
+```yaml
+- uses: ./.github/actions/setup-weaver
+  with:
+    version: ${{ env.WEAVER_VERSION }}   # v0.25.1，釘死
+- uses: actions/cache@v4                  # ~/.weaver/vdir_cache
+- run: bash ironman-2026/day12/regress.sh
+```
+
+三個決定值得單獨講。
+
+**一、CI 跑的是這支腳本，不是 `weaver registry check`。** 這個 repo 裡有一半的 registry 是故意寫壞的教材，直接對它們跑 check，gate 會永遠紅燈，然後大家學會忽略它。斷言寫死預期離開碼，「該紅的」跟「該綠的」才有辦法在同一個 job 裡共存。這其實就是今天那句話在 CI 上的形狀：問的不是有沒有通過，是結果跟預期一不一樣。
+
+**二、安裝 weaver 那段抽成一個 composite action。** 前面講釘版本的時候只說了下載加驗 sha256，實際寫下去才發現少一步：裝完之後要再比對一次 `weaver --version`。runner 的 image 自己帶了 weaver、或者 `PATH` 上先找到別的版本的時候，前面每一步都會成功，只有最後這一句抓得到。**釘版本的意義在於「跑的真的是釘的那個」，而那件事需要另外一句去確認。**
+
+**三、快取 `~/.weaver/vdir_cache`，key 掛在 `manifest.yaml` 上。** 分層的那幾份 registry 依賴官方 semantic-conventions，沒有快取每跑一次都要 clone 一份。而這不只是省時間：GitHub 那邊抽風的時候，那次 clone 會失敗，於是這道 gate 會給出一個跟你的改動完全無關的紅燈。假紅燈跟假綠燈一樣傷，它消耗的是大家對這道門的信任。
+
+> path filter 我刻意沒有做得太精細。動到第二季的資產也會把第一季那個 job 一起帶起來，因為升 weaver 版本正是那種會同時打到兩套資產的改動，而「只跑被改到的那一套」會讓跨系列的破壞沒有人看得到。兩支腳本加起來一分鐘出頭，這個錢我付得起。
 
 ## 那這一整套，新服務怎麼接
 
@@ -168,7 +196,7 @@ $ python3 ironman-2026/day12/verify_onboarding.py ironman-2026/day12/shipping-v0
   ✓ 8. 狀態類欄位都把值域寫進 schema  enum：（沒有）
   ✗ 9. 每個 metric 都有語意單位
       問題：單位是空的或 1：shipping.dispatched
-      下一步：用 UCUM（Unified Code for Units of Measure）的計數單位，例如 {shipment}，agent 才知道這個數字在數什麼
+      下一步：用 UCUM 的計數單位，例如 {shipment}，agent 才知道這個數字在數什麼
   ✗ 10. 每個 metric 都標了 owner
       問題：沒有 annotations.intent.owner：shipping.dispatched
       下一步：在 metric group 上加 annotations.intent.owner，告警才知道要找誰
@@ -187,6 +215,8 @@ $ python3 ironman-2026/day12/verify_onboarding.py ironman-2026/day12/shipping-v0
 ```
 
 先看第 3 項：**`registry check` 是綠的。** 這個服務在 weaver 眼裡完全合法，YAML 結構正確、該有的欄位都有。但它有六項沒過，而那六項全部落在「合法，但對 agent 沒有用」這個區間。前面講過內建檢查的邊界：少了 `brief` 是硬錯誤，少了 `examples` 完全不吭聲。這份 checklist 補的就是那條邊界之外的東西：工具管的是這份 YAML 合不合法，checklist 管的是這份 schema 好不好用。
+
+（第 9 項那個 UCUM 是 Unified Code for Units of Measure，OTel 的 metric `unit` 就是用它。）
 
 每一項失敗都有「下一步」，這是我花最多力氣的部分。所以第 4 項不只說 `shippingStatus` 違規，還說改成 `shipping.status`；第 11 項不只說沒有意圖，還說去哪抄一份。補完之後 `shipping-v1` 拿到 13/13，而它做的事只有四件：`shippingStatus` 改成有 `members` 的 `shipping.status`、接上 base 並把 `biz.user.id` 改成 `ref`、metric 補上 `{shipment}` 跟 `owner`、寫一份意圖，加起來大概三十行 YAML。
 
@@ -255,7 +285,7 @@ flowchart TB
 
 ## 今天沒做的事
 
-- **兩支腳本都沒進 CI。** `regress.sh` 現在是我手動跑的，而一個要靠人記得跑的回歸測試，跟今天整篇在講的問題是同一個；checklist 的前六項其實應該變成 PR 上的 required check。難的是決定它們該多久跑一次，以及「已知的缺口」那幾條變紅的時候該通知誰。
+- **`verify_onboarding.py` 還沒進 CI。** 它前六項是機械的、可以直接當 required check，但後面那幾項不適合用擋的，所以要先決定是拆成兩個 job 還是只跑前半段。另外「已知的缺口」那幾條哪天變紅的時候該通知誰，也還沒想。
 - **checklist 自己沒有被加進回歸腳本。** `shipping-v0` 要跑出 exit 1、`shipping-v1` 要跑出 exit 0，這兩條斷言應該進去，不然哪天有人改壞了第 4 項的判斷邏輯，沒有任何東西會發現。
 - **那兩個洞沒有修。** 第 8 項要改成「先確認命名合規，再檢查值域」，或者乾脆改成看 `examples` 裡有幾個相異值；第 6 項在 `--include-unreferenced` 的雜訊被解決之前，只能先誠實記著。修它們需要先想清楚規則該問什麼問題，而那正是分層那條規則教過的事：問「這個名字歸誰管」跟問「這個定義跟別人衝不衝突」，是兩條完全不同的規則。
 - **斷言的粒度還很粗。** 目前大部分只驗離開碼，只有四條驗到訊息內容。理想上每一條 policy 都該驗「它抓到的是不是我以為的那一條」。

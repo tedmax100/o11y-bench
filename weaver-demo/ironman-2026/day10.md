@@ -16,13 +16,13 @@ Day1 那隻 agent 從來沒讀過它。它知道的所有 schema 都寫在 promp
 
 今天要把這條路接起來。`weaver registry mcp` 會把 registry 開成一個 MCP（Model Context Protocol）server，讓 LLM 自己去問「這個欄位叫什麼、有哪些值」。
 
-程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day10/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day10)，只有一支 [`mcp_probe.py`](https://github.com/tedmax100/OTel_AIOps_Agent/blob/main/ironman-2026/day10/mcp_probe.py)。用的 registry 是昨天那兩份。指令一律假設從 repo 根目錄跑，驗證環境是 weaver 0.25.1。
+程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day10/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day10)，核心只有一支 [`mcp_probe.py`](https://github.com/tedmax100/OTel_AIOps_Agent/blob/main/ironman-2026/day10/mcp_probe.py)。用的 registry 是昨天那兩份。指令一律假設從 repo 根目錄跑，驗證環境是 weaver 0.25.1。
 
 ## 先講一件跟 LLM 無關的事
 
 今天最有用的東西可能是這個：**驗證這件事完全不需要接 LLM。**
 
-MCP 說穿了就是一套跑在 stdio 上的 JSON-RPC 協定。`weaver registry mcp` 起來之後，你往它的標準輸入丟 JSON，它從標準輸出回 JSON，中間沒有任何模型參與。所以一支七十行的 Python 就能把整個 server 打過一輪：
+MCP 說穿了就是一套跑在 stdio 上的 JSON-RPC 協定。`weaver registry mcp` 起來之後，你往它的標準輸入丟 JSON，它從標準輸出回 JSON，中間沒有任何模型參與。所以一支不到兩百行的 Python 就能把整個 server 打過一輪：
 
 ```python
 self._proc = subprocess.Popen(
@@ -40,7 +40,7 @@ tools = self._request("tools/list")
 
 ## 八個 tool，三種職責
 
-文件那段介紹講的是三個 tool，實際跑 `tools/list` 回來的是八個：
+當初的 release note 講的是三個 tool，實際跑 `tools/list` 回來的是八個：
 
 ```console
 $ python3 ironman-2026/day10/mcp_probe.py
@@ -54,6 +54,8 @@ $ python3 ironman-2026/day10/mcp_probe.py
   - live_check
   - search
 ```
+
+三跟八的差別不是文件寫錯，是它拆開了。[CHANGELOG](https://github.com/open-telemetry/weaver/blob/main/CHANGELOG.md) 裡 0.21.0 那筆寫的是「MCP server for a registry with search, get and live_check tools」，那個 `get` 實際上是 `get_attribute`、`get_metric`、`get_span`、`get_event`、`get_entity` 五個；後來 0.23.0 又加了 `browse_namespace`。三類、八個，講的是同一件事。
 
 按用途分成三組，剛好對應一個 agent 排查時的三個階段：
 
@@ -132,9 +134,9 @@ flowchart LR
   content: Attribute 'biz.does.not.exist' not found in registry
 ```
 
-MCP 協定裡的 `isError` 是給模型看的訊號，用來區分「這次呼叫失敗了」跟「這次呼叫成功，結果是這樣」。weaver 選擇後者：查不到不是錯誤，是一個成功的查詢加上一句散文答案。
+MCP 協定裡的 `isError` 是給模型看的訊號，用來區分「這次呼叫失敗了」跟「這次呼叫成功，結果是這樣」。weaver 選擇後者：查不到不是錯誤，是一個成功的查詢加上一句自然語言的答案。
 
-這個選擇是對的，但它有一個後果值得知道：**那句「not found」是一段自然語言，不是一個結構化的欄位。** 模型會不會正確理解它、會不會因此改用別的查法，取決於它讀不讀得懂那句話，而不是取決於某個布林值。這跟 Day1 那個空陣列是同一類問題的溫和版本，只是這次至少有一句話而不是一個空結果。
+這個選擇是對的，但它有一個後果值得知道：**那句「not found」是一句自然語言，不是一個結構化的欄位。** 模型會不會正確理解它、會不會因此改用別的查法，取決於它讀不讀得懂那句話，而不是取決於某個布林值。這跟 Day1 那個空陣列是同一類問題的溫和版本，只是這次至少有一句話而不是一個空結果。
 
 ## 分層 registry 預設只看得見自己那層
 
@@ -143,7 +145,7 @@ MCP 協定裡的 `isError` 是給模型看的訊號，用來區分「這次呼�
 把 MCP 指向昨天那份 `team-orders`，先問它那個 span：
 
 ```console
-## get_span 拿得到 base 的屬性（注意 type 不帶 span. 前綴）
+## get_span 拿得到 base 的屬性（type 不帶 span. 前綴，下面解釋）
   app.outcome          required         {"source": "https://example.com/schemas/acme-base/0.2.0"}
   biz.order.channel    recommended      {"path": "ironman-2026/day09/team-orders/model/orders.yaml"}
   biz.order.id         required         {"source": "https://example.com/schemas/acme-base/0.2.0"}
@@ -152,23 +154,34 @@ MCP 協定裡的 `isError` 是給模型看的訊號，用來區分「這次呼�
 
 完美。四個屬性都在，必填標得清清楚楚，而且 `provenance` 直接回答了昨天那個問題：**這三個是 base 的東西，而且是 `acme-base/0.2.0` 這一版。** agent 現在知道自己讀的是哪一版的規範，這在昨天那個「升版沒人通知」的場景裡很重要。
 
+先解釋上面那個括號：`get_span` 要的是 span type，不是 group id。
+
+```console
+  span.orders.create -> Span 'span.orders.create' not found in registry
+  orders.create      -> （正常回傳）
+```
+
+YAML 裡寫的是 `id: span.orders.create`，照抄進去就是 not found，要把 `span.` 拿掉。這種「照著你看到的東西輸入卻拿到 not found」的介面，對 agent 特別不友善，因為它拿到的訊號跟「這個東西不存在」一模一樣。
+
 然後同樣那幾個屬性，換個入口問：
 
 ```console
 ## 但同樣那幾個屬性，直接查就是不存在
   biz.user.id          -> Attribute 'biz.user.id' not found in registry
   app.outcome          -> Attribute 'app.outcome' not found in registry
+
+## 同一個 browse_namespace，這次只數到 1 個
   {"total_attribute_count": 1}
 ```
 
-**同一個 server、同一份 registry、同一個屬性，從 span 進去看得到，直接查就是不存在。** 而 `browse_namespace` 說整份 registry 只有一個屬性，那個唯一被承認的，是團隊自己定義的 `biz.order.channel`。
+**同一個 server、同一份 registry、同一個屬性，從 span 進去看得到，直接查就是不存在。** 而 `browse_namespace`（前面在 base 那份上數到 5 個的同一個 tool）說整份 registry 只有一個屬性，那個唯一被承認的，是團隊自己定義的 `biz.order.channel`。
 
 ```mermaid
 flowchart TB
     B["base 定義的屬性<br/>biz.user.id / biz.order.id / app.outcome"] --> Q{"有沒有被<br/>team 的某個 span<br/>ref 到？"}
     Q -->|"有"| Y["get_span 看得到<br/>還附 provenance.source"]
     Q -->|"沒有"| N["get_attribute 回 not found<br/>browse_namespace 也數不到"]
-    N --> F["--include-unreferenced<br/>整份 semconv 一起進來，940 個"]
+    N --> F["--include-unreferenced<br/>連整份官方 semconv 都進來，940 個"]
     F --> D["但這個 flag 已標為 deprecated"]
 ```
 
@@ -183,18 +196,11 @@ flowchart TB
    "provenance": {"source": "https://example.com/schemas/acme-base/0.2.0"}}
 ```
 
-940 個，因為官方 semconv 整份都進來了。而這正是分層那個兩難的另一面：這個 flag 已經被標為 deprecated，官方建議改用 `imports`，但 `imports` 不吃 attribute。所以現在要讓 agent 查得到 base 的屬性，你只有兩條路：用一個正在被淘汰的 flag，或者確保每一個屬性都真的被某個 span 或 metric 引用到。
+940 個，因為連整份官方 semconv 都進來了。而這正是分層那個兩難的另一面：這個 flag 已經被標為 deprecated，官方建議改用 `imports`，但 `imports` 不吃 attribute。
+
+這裡有個小落差值得記一下：那句 deprecated 的警告是 `registry check` 印的，`weaver registry mcp --include-unreferenced` 我跑起來 stderr 一個字都沒說，`usage.md` 的 mcp 那節也沒標它。所以你在這條路上不會收到任何提醒，只會在某次升級之後發現 agent 突然查不到東西了。所以現在要讓 agent 查得到 base 的屬性，你只有兩條路：用一個正在被淘汰的 flag，或者確保每一個屬性都真的被某個 span 或 metric 引用到。
 
 > 第二條路其實不算壞。「沒有任何訊號在用的定義，agent 也不需要知道」聽起來滿合理的。但它有個副作用：team registry 就此無法回答「這個公司有哪些共用欄位」這種問題，只能回答「我這一層用到了哪些」。
-
-順帶一提，`get_span` 要的是 span type，不是 group id：
-
-```console
-  span.orders.create -> Span 'span.orders.create' not found in registry
-  orders.create      -> （正常回傳）
-```
-
-YAML 裡寫的是 `id: span.orders.create`，照抄進去就是 not found，要把 `span.` 拿掉。這種「照著你看到的東西輸入卻拿到 not found」的介面，對 agent 特別不友善，因為它拿到的訊號跟「這個東西不存在」一模一樣。
 
 ## 閉環：`live_check` 也在同一個 server 上
 
@@ -233,7 +239,7 @@ YAML 裡寫的是 `id: span.orders.create`，照抄進去就是 not found，要�
 | --- | --- |
 | `search` 是 AND 關鍵字 | 下一個自然語言式的長查詢，回 0 筆，然後以為沒有這個欄位 |
 | `browse_namespace` 不標 deprecated | 挑到已經被更名的舊欄位，查歷史資料還真的查得到，更難發現 |
-| not found 是一句散文 | 讀得懂就改查法，讀不懂就當作「這個系統沒有這個概念」 |
+| not found 是一句自然語言 | 讀得懂就改查法，讀不懂就當作「這個系統沒有這個概念」 |
 | 分層預設只看自己那層 | 問一個 base 定義的必填欄位，得到「不存在」 |
 
 把一次排查畫成呼叫序列，會看到那些坑都長在什麼位置：
@@ -276,7 +282,7 @@ sequenceDiagram
 
 ## 小結
 
-總結來說，今天寫的程式碼只有一支七十行的探針，沒有做出任何新的治理能力。但它把「這個 server 到底會告訴 agent 什麼」變成一件可以重複跑、跑完就有答案的事，之後每次改 registry 我都會順手打一次。比較意外的是那個 `total_attribute_count: 1`，分層是前面花一整天做對的事，結果它在 agent 這一側的預設行為，是讓大部分共用定義變成查不到，而這兩件事之間沒有任何自動的保證。這也讓我對後面的東西多了一個習慣：做完一層治理，要記得換到 agent 那一側再看一次。
+總結來說，今天寫的程式碼只有一支一百多行的探針，沒有新增任何一條規則。但它把「這個 server 到底會告訴 agent 什麼」變成一件可以重複跑、跑完就有答案的事，之後每次改 registry 我都會順手打一次。比較意外的是那個 `total_attribute_count: 1`，分層是前面花一整天做對的事，結果它在 agent 這一側的預設行為，是讓大部分共用定義變成查不到，而這兩件事之間沒有任何自動的保證。這也讓我對後面的東西多了一個習慣：做完一層治理，要記得換到 agent 那一側再看一次。
 
 > `search` 是關鍵字 AND、不是語意搜尋這件事，我一開始問了三輪都以為是自己問法不對。
 > tool description 就是 agent 的介面契約，寫得含糊，agent 就會很有禮貌地一直查錯 :)

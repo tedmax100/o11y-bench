@@ -33,7 +33,7 @@ ironman-2026/day09/
 先設定情境。平台團隊要出 base 的 0.2.0，這一版做了五件事，每一件單獨看都很合理：
 
 1. 新增 `biz.tenant.id`，因為公司開始做多租戶。
-2. `biz.cart.id` 更名成 `biz.basket.id`，統一用詞。
+2. `biz.cart.id` 更名成 `biz.basket.id`，跟公司內部一直在講的「購物籃」對齊。
 3. `biz.order.id` 的型別從 `string` 改成 `int`，因為資料庫那邊本來就是整數。
 4. `app.outcome` 移除 `gateway_error` 這個 enum member，因為那個狀態已經被拆到別的欄位。
 5. `biz.user.id` 的 `brief` 從「使用者識別碼」改成「使用者的 email，登入用」，把語意寫精確。
@@ -85,7 +85,7 @@ $ echo $?
 
 `reason: renamed` 加 `renamed_to` 不只是給人看的註解，它是 diff 能把「刪掉一個舊的、加一個新的」認成「這是同一個東西改了名字」的唯一依據。少了它，讀 diff 的人會看到一個消失、一個冒出來，然後自己去猜兩者是不是同一件事。
 
-離開碼是 0。**`diff` 從來不會因為發現變更而失敗**，它是一個報告工具，不是一道門。這個設計本身沒錯，但如果你以為在 CI 裡跑一下 `diff` 就有防護，那就誤會了。
+exit code 是 0。**`diff` 從來不會因為發現變更而失敗**，它是一個報告工具，不是一道門。這個設計本身沒錯，但如果你以為在 CI 裡跑一下 `diff` 就有防護，那就誤會了。
 
 ## 三種它不出聲的變更
 
@@ -94,14 +94,20 @@ $ echo $?
 先排除「是不是渲染沒印出來」這個可能，直接看資料：
 
 ```console
-$ weaver registry diff ... --format json
+$ weaver registry diff ... --format json | jq '.changes'
 
-"registry_attributes": [
-    { "type": "renamed", "old_name": "biz.cart.id", "new_name": "biz.basket.id", ... },
+{
+  "registry_attributes": [
+    { "type": "renamed", "old_name": "biz.cart.id", "new_name": "biz.basket.id",
+      "note": "Replaced by `biz.basket.id`." },
     { "type": "added", "name": "biz.tenant.id" },
     { "type": "added", "name": "biz.basket.id" }
-]
+  ],
+  "spans": [], "metrics": [], "events": [], "entities": []
+}
 ```
+
+（那五個陣列都在 `changes` 底下，外面還有 `head` 跟 `baseline` 兩個只放版本號的欄位。直接 `jq .registry_attributes` 會拿到 `null`，我第一次就是這樣以為自己撈錯東西。）
 
 三筆，就這樣。**不是沒印出來，是資料模型裡根本沒有這幾種變更。**
 
@@ -124,7 +130,7 @@ flowchart LR
     C3["型別改變"] --> X["（沒有任何輸出）"]
     C4["enum member 移除"] --> X
     C5["brief 改語意"] --> X
-    D --> R["報告 ＋ 離開碼 0"]
+    D --> R["報告 ＋ exit code 0"]
     X --> N["下游第一次知道<br/>是在東西壞掉的時候"]
 ```
 
@@ -176,7 +182,7 @@ $ echo $?
 1
 ```
 
-一模一樣的句子，`⚠` 變成 `×`，離開碼 0 變成 1。那份 registry 裡寫的是舊式的 `deprecated: "use demo.new_field instead"`，一句話而不是結構化物件，也就是前面說的那種讓 diff 認不出更名的寫法。
+一模一樣的句子，`⚠` 變成 `×`，exit code 0 變成 1。那份 registry 裡寫的是舊式的 `deprecated: "use demo.new_field instead"`，一句話而不是結構化物件，也就是前面說的那種讓 diff 認不出更名的寫法。
 
 這個 flag 的價值不在技術，在於**它把「什麼時候開始變嚴」這個決定交給了平台團隊**。上游先讓規則以警告的形式存在一段時間，平台團隊挑一個自己的時間點，在 CI 裡加上 `--future`，讓所有團隊同時進入下一版的嚴格度。這是一個排程決定，不是技術決定，而工具給了你決定它的空間。
 
@@ -184,18 +190,22 @@ $ echo $?
 
 ## 第三層：把 diff 的三個洞補起來
 
-`comparison_after_resolution` 這個 package，是 weaver 三個 policy 階段裡最後一個還沒用到的。它只有在 `registry check` 帶上 `--baseline-registry` 的時候才會跑，而且它的輸入跟前面兩個階段都不一樣：
+`comparison_after_resolution` 這個 package，是 weaver 三個 policy 階段裡最後一個還沒用到的（另外兩個是看 YAML 原貌的 `before_resolution`，跟看攤平結果的 `after_resolution`，前面幾天都用過了）。它只有在 `registry check` 帶上 `--baseline-registry` 的時候才會跑，而且它的輸入跟前面兩個階段都不一樣：
 
 ```rego
 # input.groups = 新版（-r 指的那份）
 # data.groups  = baseline（--baseline-registry 指的那份）
 ```
 
-這件事沒寫在文件裡，我是寫了一條只做一件事的探針規則測出來的：讓它印出 `count(input.groups)` 跟 `count(data.groups)`，兩邊都回 1，而 `data.baseline.groups` 這種猜測的路徑則完全不成立。**遇到沒有文件的輸入結構，寫一條會失敗的規則去問它，比猜快得多。**
+這件事我在官方的 [`docs/validate.md`](https://github.com/open-telemetry/weaver/blob/main/docs/validate.md) 沒找到，是寫了一條只做一件事的探針規則測出來的：讓它印出 `count(input.groups)` 跟 `count(data.groups)`，兩邊都回 1，而 `data.baseline.groups` 這種猜測的路徑則完全不成立。**遇到沒有文件的輸入結構，寫一條會失敗的規則去問它，比猜快得多。**
 
 先把兩邊攤平成「名字對定義」的索引，後面三條規則都靠它：
 
 ```rego
+package comparison_after_resolution
+
+import rego.v1
+
 new_attr[attr.name] := attr if {
 	group := input.groups[_]
 	attr := group.attributes[_]
@@ -206,6 +216,8 @@ old_attr[attr.name] := attr if {
 	attr := group.attributes[_]
 }
 ```
+
+（下面三條規則都省略了組 Finding 物件的 `finding(id, attr)` helper，跟前面兩天那個 `type` 要填 `semconv_attribute` 的合約是同一件事，完整檔案在 repo 的 `policies/breaking_changes.rego`。）
 
 **規則一，型別改變。**
 
@@ -227,6 +239,11 @@ deny contains finding("attribute_type_changed", name) if {
 old_members[name] contains member.value if {
 	old := old_attr[name]
 	member := old.type.members[_]
+}
+
+new_members[name] contains member.value if {
+	new := new_attr[name]
+	member := new.type.members[_]
 }
 
 deny contains finding("enum_member_removed", sprintf("%s: %s", [name, value])) if {
@@ -290,7 +307,7 @@ $ echo $?
 
 ## 最後一道防線也只是輕輕地提了一下
 
-那如果沒有人去敲門呢？服務照舊跑著，資料照舊送著，前面那三道門（PR 的 check、CI gate、升級時的 diff）全部沒擋住，最後一道是 live-check。
+那如果沒有人去敲門呢？服務照舊跑著，資料照舊送著，前面那三道門（平台團隊自己的 check、`registry diff`、下游升級之後的 check）全部沒擋住，最後一道是 live-check。
 
 我拿一筆「服務還在送舊值」的樣本去打新的 registry：
 
@@ -299,28 +316,41 @@ $ weaver registry live-check -r ironman-2026/day09/team-orders \
     --input-source ironman-2026/day09/live-check/samples.json
 
 Span order.create `server`
+    biz.user.id = u-5
+        - [improvement] Attribute 'biz.user.id' is not stable; stability = development.
     biz.order.id = ord-1001
+        - [improvement] Attribute 'biz.order.id' is not stable; stability = development.
         - [violation] Attribute 'biz.order.id' has type 'string'. Type should be 'int'.
     app.outcome = gateway_error
+        - [improvement] Attribute 'app.outcome' is not stable; stability = development.
         - [information] Enum attribute 'app.outcome' has value 'gateway_error' which is not documented.
 ```
 
-型別那個抓得很漂亮，`violation` 級，離開碼 1。這條路走得通：base 改了型別、沒有人通知、服務照舊送 `string`，live-check 在部署後把它抓出來。
+（那三條 `not_stable` 是因為這份 registry 每個 attribute 都還是 `development`，前面講 live-check 的時候提過，今天不是重點但沒有刪掉，免得你照跑對不上。）
+
+型別那個抓得很漂亮，`violation` 級，exit code 1。這條路走得通：base 改了型別、沒有人通知、服務照舊送 `string`，live-check 在部署後把它抓出來。
 
 但 enum 那個只有 `information`。把樣本縮到只剩那一筆：
 
 ```console
 $ weaver registry live-check -r ironman-2026/day09/team-orders --input-source <只留 enum 那一筆>
-    - [information] Enum attribute 'app.outcome' has value 'gateway_error' which is not documented.
+
+Span order.create `server`
+    app.outcome = gateway_error
+        - [improvement] Attribute 'app.outcome' is not stable; stability = development.
+        - [information] Enum attribute 'app.outcome' has value 'gateway_error' which is not documented.
 
   - by highest advice level:
-    - information: 1
+    - no advice: 1
+    - improvement: 1
 
 $ echo $?
 0
 ```
 
-**綠燈。** 一個 breaking change 從 registry 一路走到 runtime，經過三道門，最後只換來一條資訊級的提示跟一個 0。
+**綠燈。** 一個 breaking change 從 registry 一路走到 runtime，經過四道門，最後只換來一條資訊級的提示跟一個 0。
+
+這裡要講清楚 exit code 為什麼是 0，因為它不是「最高只到 `information`」的意思，最高其實是 `improvement`，就是那條 `not_stable`。真正的原因是 `--fail-on` 預設只擋 `violation`，`improvement` 跟 `information` 都照樣放行。所以那個未記載的 enum 值，在預設設定下不管被判成哪一級，都不會讓任何一道門變紅。
 
 把 `gateway_error` 這個值一路走完，經過的四道門是這樣：
 
@@ -339,9 +369,11 @@ sequenceDiagram
     T->>T: 把 dependency 指到 v0.2.0
     T-->>T: check 綠燈（ref 都指得到）
     S->>L: app.outcome = gateway_error
-    L-->>S: information，離開碼 0
+    L-->>S: information，exit code 0
     Note over S,L: 四道門，沒有一道變紅
 ```
+
+### 同一條訊息，兩種完全不同的成因
 
 那個 `information` 我在前面講 live-check 的時候就說過覺得偏低，現在有了一個具體的場景可以說明為什麼：`undefined_enum_variant` 這條 advice 的意思其實是「你送了一個規範沒有寫過的值」，而它有兩種完全不同的成因。一種是服務亂送，那確實不嚴重；另一種是規範把這個值刪掉了而服務還在送，那是一次沒有被通知到的 breaking change。**兩種成因，同一條訊息，同一個嚴重度。**
 
@@ -367,15 +399,15 @@ agent 讀 registry，是為了知道「這個欄位叫什麼、代表什麼、�
 
 `brief_changed` 那條沒有辦法區分「改錯字」跟「改語意」。目前是全部報出來讓人判斷，比較好的做法可能是比對語意上的變化，但那要嘛需要人工標記，要嘛需要另一個模型，兩條路都還沒試。
 
-也沒有處理 metric 跟 span 的變更。今天三條規則都只看 attribute，而 `diff` 的 JSON 裡 `metrics`、`spans`、`events`、`entities` 四個陣列今天全部是空的，它們各自會有什麼靜音的變更，我還沒測。
+也沒有處理 metric 跟 span 的變更。今天三條規則都只看 attribute，而 `diff` 的 JSON 裡 `changes.metrics`、`changes.spans`、`changes.events`、`changes.entities` 四個陣列今天全部是空的，它們各自會有什麼靜音的變更，我還沒測。
 
 `--future` 只示範了一條規則。它到底涵蓋哪些檢查、上游打算什麼時候把它變成預設，這些我沒有查證，只知道它現在是什麼行為。
 
 ## 小結
 
-總結來說，今天最有用的一句話大概是：`diff` 看得到名字的變化，看不到名字底下內容物的變化。知道這條界線在哪，就知道自己還要補什麼。比較值得記的是那個 `information`，一個 breaking change 走完全程只換來一條資訊級提示，這件事本身其實不是工具的錯，工具沒辦法知道那個未記載的值是「服務亂送」還是「規範刪掉了」。**能分辨這兩件事的資訊，只存在於版本之間的差異裡，而那正是今天寫的那三條規則手上有、live-check 手上沒有的東西。** 兩個階段各自看到一半。
+總結來說，今天最有用的一句話大概是：`diff` 看得到名字的變化，看不到名字底下內容物的變化。知道這條界線在哪，就知道自己還要補什麼。比較值得記的是那個 `information`，一個 breaking change 走完全程只換來一條資訊級提示，這件事本身其實不是工具的錯，工具沒辦法知道那個未記載的值是「服務亂送」還是「規範刪掉了」。**能分辨這兩件事的資訊，只存在於版本之間的差異裡，而那正是今天寫的那三條規則手上有、live-check 手上沒有的東西。** 兩個階段各自看到一半。真要說今天替自己定下什麼標準，大概就是 `brief_changed` 那條的算法：誤報三十秒，漏報是半年後 agent 拿著錯的語意去推理，那就讓它誤報。
 
-> 昨天那個「把所有祖先都列出來」的解法，在 0.23.0 上直接 panic、exit 134。
+> 昨天那個「兩邊都列一次 dependency」的解法，我更早在 0.23.0 上試過，那時候直接 panic、exit 134。
 > 工具升版也是 breaking change 的來源，這句話我是被 exit code 教會的 :(
 >
 > 明天換個方向，把 registry 交到 agent 手上，讓它自己去查。

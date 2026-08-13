@@ -16,7 +16,9 @@ tags: [OpenTelemetry, AIOps, Signal Plane, 鐵人賽]
 
 而我手上其實已經有一個寫到一半的東西在處理這件事。agent 服務底下有一個叫 `signals` 的模組，寫的時候是照著一份設計稿走的，但那是好幾個月前的事了。所以第二階段的第一天不做新東西，先搞清楚它現在真正長什麼樣。
 
-程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day13/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day13)，只有一支 `importgraph.py`。今天被讀的那個模組是 agent 服務自己的原始碼，不在範例 repo 裡，重現步驟寫在那個資料夾的 `README.md`。
+程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day13/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day13)，核心只有一支 `importgraph.py`。今天被讀的那個模組是 agent 服務自己的原始碼，不在範例 repo 裡，重現步驟寫在那個資料夾的 `README.md`。
+
+要先講一件事：**今天所有的輸出都是 2026-08-09 那天讀出來的快照**，包括底下那張八個模組的表、那段注入給 agent 的文字、還有幾個模組的回傳值。這一整篇的重點就是「現在到底長什麼樣」，而那個「現在」會動，後面幾天做的事有一部分就是在補今天讀出來的洞，所以你今天照著跑，數字跟我貼的不會一樣。這是預期中的，不是你跑錯了。
 
 ## 設計文件會過期，import 關係不會
 
@@ -164,7 +166,7 @@ $ uv run python -c "from app.signals.context import build_signal_context; \
 
 `缺情境`那一塊是 `upstream` 跟 `downstream` 那兩行。這是第一階段完全沒有碰過的東西，registry 再完整也不會告訴你 order-service 的下游是 payment-service。而最後那句 caveat 更直接，它等於預先告訴 agent「你等一下會看到一堆 cancelled，那不是故障」。
 
-> 我以前覺得這種東西寫在 prompt 裡就好，反正都是給模型看的字串。後來發現差別很大：寫在 prompt 裡的是一份對所有服務都一樣的通則，寫在契約裡的是「這個服務的這條 SLI」，而且它可以被程式檢查、可以在服務改版的時候一起改。第一天那段害慘我的 schema 散文，就是前者。
+> 我以前覺得這種東西寫在 prompt 裡就好，反正都是給模型看的字串。後來發現差別很大：寫在 prompt 裡的是一份對所有服務都一樣的通則，寫在契約裡的是「這個服務的這條 SLI」，而且它可以被程式檢查、可以在服務改版的時候一起改。第一天那段害慘我的 schema 說明文字，就是前者。
 
 不過這裡也有個不太舒服的細節。那段 SLI 的 PromQL 是寫死在契約裡的，包括 `clamp_min` 那個防除零、包括 histogram 要用 `_bucket` 加 `sum by (le)`。會寫死是因為讓模型每次自己推導，它就會每次都踩同一批坑。**這等於承認一件事：在「讓 agent 自己算對」跟「把算好的答案交給它」之間，我選了後者。** 它換到的是穩定，付出的是那條查詢從此得有人維護。
 

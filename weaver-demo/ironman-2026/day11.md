@@ -52,7 +52,7 @@ flowchart LR
 
 ## registry 這一端：`annotations`
 
-weaver 的 group 跟 attribute 都吃一個 `annotations` 欄位，內容是自由的 key-value，它不參與任何驗證，但**會被完整帶進 resolved schema**。這就是掛意圖用的地方：
+weaver 的 group 跟 attribute 都吃一個 `annotations` 欄位（[`semconv.schema.v2.json`](https://github.com/open-telemetry/weaver/blob/main/schemas/semconv.schema.v2.json) 裡 `AttributeDef`、`Metric`、`Span`、`Event`、`Entity` 這些定義底下都有它），內容是自由的 key-value，它不參與任何驗證，但**會被完整帶進 resolved schema**。這就是掛意圖用的地方：
 
 ```yaml
       - id: app.outcome
@@ -78,12 +78,20 @@ weaver 的 group 跟 attribute 都吃一個 `annotations` 欄位，內容是自�
               stability: development
 ```
 
-跑 `weaver registry resolve --format json` 撈出來確認它真的還在：
+解析一次撈出來，確認它真的還在：
 
 ```console
-metric.orders.attempts | annotations: {"intent": {"owner": "orders-team", "slo": "checkout-success"}}
-   attr app.outcome {"intent": {"role": "outcome_dimension", "good_values": ["authorized"]}}
+$ weaver registry resolve -r ironman-2026/day11/registry --format json \
+    | jq -r '.groups[] | "\(.id) | annotations: \(.annotations // {})",
+             (.attributes[]? | select(.annotations != null) | "   attr \(.name) \(.annotations)")'
+
+metric.orders.attempts | annotations: {"intent":{"owner":"orders-team","slo":"checkout-success"}}
+   attr app.outcome {"intent":{"role":"outcome_dimension","good_values":["authorized"]}}
+metric.orders.duration | annotations: {}
+   attr app.outcome {"intent":{"role":"outcome_dimension","good_values":["authorized"]}}
 ```
+
+順帶注意 `orders.duration` 那行是空的，我只在 `orders.attempts` 上掛了 annotation，等一下編譯出來的東西會把這個缺漏直接印在臉上。
 
 **這是 registry 第一次記錄「這個欄位在業務上扮演什麼角色」**，而不只是它叫什麼、是什麼型別。`role: outcome_dimension` 這種東西 weaver 完全不認得，它只負責原封不動地送過去，認得它的是下一段那支腳本。
 
@@ -190,7 +198,7 @@ groups:
 expr: histogram_quantile(0.99, sum by (le) (rate(orders_duration_bucket[30m]))) > 2
 ```
 
-那個 `owner` 欄位在這條變成 `unknown`，因為我只在 `orders.attempts` 上掛了 annotation，沒有在 `orders.duration` 上掛。這種缺漏會直接顯示在產物上，比藏在腦子裡好。
+那個 `owner` 欄位在這條變成 `unknown`，就是前面 resolve 出來看到 `orders.duration` 那行是空的造成的。這種缺漏會直接顯示在產物上，比藏在腦子裡好。
 
 ## 兩個故意寫壞的意圖
 
@@ -213,7 +221,9 @@ $ echo $?
 
 第一個錯是大小寫。這就是 Day1 那隻 agent 把 `warn` 猜成 `WARN`、讓 60 筆 log 變成 0 筆的同一個錯誤，只是這次犯錯的是人，而且是在 PR 階段被抓到，不是在凌晨三點。
 
-第二個錯更值得看：`orders.errors` 跟 `app.error_type` 這兩個名字聽起來都很合理，合理到 code review 的時候不會有人停下來問「我們真的有這個 metric 嗎」。**這正是 LLM 產生幻覺欄位時的長相，它們從來不會編一個離譜的名字。**
+第二個錯更值得看。那份 YAML 裡寫的是 `metric: orders.errors` 加 `dimension: app.error_type`，兩個名字聽起來都很合理，合理到 code review 的時候不會有人停下來問「我們真的有這個 metric 嗎」。**這正是 LLM 產生幻覺欄位時的長相，它們從來不會編一個離譜的名字。**
+
+（訊息裡只出現 `orders.errors`，因為編譯器在 metric 那一關就停了，沒有再往下去查 dimension。一次報一層，修完再跑一次會再看到下一個。）
 
 兩條錯誤訊息都做到同一件事：不只說哪裡錯，還說合法的有哪些。這是前面做 CI gate 時那條判準的具體實踐，被擋下來的人不用來問你就能自己修好。
 
@@ -277,19 +287,25 @@ class AppOutcome(StrEnum):
 ValueError: 'AUTHORIZED' is not a valid AppOutcome
 ```
 
+（`StrEnum` 要 Python 3.11 以上，更早的版本得改成 `class AppOutcome(str, Enum)`，行為一樣。）
+
 **錯誤從「可以被檢查」變成「說不出來」。** 前面幾天做的事都是「寫錯了會被抓到」，這一步是「根本寫不出錯的東西」，這兩者在工程上差很多：前者需要有人記得跑檢查，後者不需要。
 
 ## 意外收穫：生成物的 diff 補上了 `registry diff` 那三個洞
 
 前面講 breaking change 的時候量過一件很不舒服的事：`registry diff` 對型別改變、enum member 移除、`brief` 改寫這三種變更完全靜音，而那三種正好是最會痛的。
 
-今天做完 codegen 之後，我拿前面那兩份 `base-v1`／`base-v2` registry 各生成一次，然後 diff 生成物：
+今天做完 codegen 之後，我拿今天這份樣板去餵前面那兩份 `base-v1`／`base-v2` registry，各生成一次，然後 diff 生成物：
 
 ```console
-$ weaver registry generate -r ironman-2026/day09/base-v1 --templates ... python /tmp/g1
-$ weaver registry generate -r ironman-2026/day09/base-v2 --templates ... python /tmp/g2
+$ weaver registry generate -r ironman-2026/day09/base-v1 \
+    --templates ironman-2026/day11/templates python /tmp/g1
+$ weaver registry generate -r ironman-2026/day09/base-v2 \
+    --templates ironman-2026/day11/templates python /tmp/g2
 $ diff -u /tmp/g1/semconv_attrs.py /tmp/g2/semconv_attrs.py
 ```
+
+底下是節錄，新增 `biz.basket.id` 跟 `biz.tenant.id` 那幾行拿掉了，因為那兩種變更 `registry diff` 本來就報得出來，這裡只留它報不出來的：
 
 ```diff
 -# 使用者識別碼
@@ -339,7 +355,7 @@ flowchart TB
 
 **誰維護？** 意圖一定是產品團隊的，不能是平台團隊。「結帳成功率低於 99.5% 要叫醒人」這種判斷只有懂那個業務的人能下，平台團隊來寫就會變成一堆抄來抄去的 99.9%。平台團隊提供的是格式、編譯器，跟那條「你寫的東西必須指得到 registry 裡真的存在的欄位」的檢查。
 
-**成本落在誰身上？** 我算過這份 `steady-state.yaml`，一條 objective 大概八行，其中有實質內容的是 `statement`、`why`、`first_check` 三段散文，而那三段本來就寫在值班手冊裡。要學的新概念是「意圖要指向 registry 裡的欄位」這一件事。
+**成本落在誰身上？** 我算過這份 `steady-state.yaml`，一條 objective 大概八行，其中有實質內容的是 `statement`、`why`、`first_check` 三段自然語言，而那三段本來就寫在值班手冊裡。要學的新概念是「意圖要指向 registry 裡的欄位」這一件事。
 
 **擋下來的時候修得動嘛？** 前面那兩條錯誤訊息都附了合法值清單，這是我刻意花力氣做的部分。一條只說「validation failed」的訊息，會把每一次驗證失敗都變成一張給平台團隊的工單。
 
