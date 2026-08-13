@@ -19,7 +19,7 @@ $ uv run python -c "from app.signals.dq import dq_verdict; print(dq_verdict())"
 
 DQ 是 Data Quality（資料品質）。這句 `DQ unproven` 的意思不是圖畫錯了，是從來沒有人去驗過。今天就是去驗那一次，而驗完會發現要問的其實是兩個問題：那些邊對不對，以及**那張圖上該有誰**。
 
-程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day14/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day14)。要跑的 `reconcile.py` 是 agent 服務自己的原始碼，我一個字都沒改，這個資料夾裡放的是「跑之前該先確認什麼」的兩支工具。驗證環境是 Tempo 2.6.0、Loki 3.x、Prometheus，都跑在同一座 k3d 叢集裡。
+程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day14/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day14)。要跑的 `reconcile.py` 是 agent 服務自己的原始碼，我一個字都沒改，這個資料夾裡放的是「跑之前該先確認什麼」的兩支工具。驗證環境是 k3d 叢集 `demo` namespace 裡的 Tempo 2.6.0、Loki 3.2.0 跟 Prometheus。
 
 ## 一張沒人對過的圖，比沒有圖更危險
 
@@ -105,8 +105,16 @@ topology v1.0.0 reconciled against 50 traces
 先去翻原始碼，api-gateway 確實有這條路（`POST /api/payments` 直接代理到 payment 的 `/charge`），只是 `load.sh` 的端點組合裡沒有直接打它，付款都是經由 order-service 進去的。手動打了十二次之後再跑，結果沒變，還是 `unobserved`。於是我去 Tempo 裡撈一筆真的走過那條路的 trace，把同一個函式套上去：
 
 ```console
-$ uv run python -c "... edges_from_trace(raw) ..."
-edges in that one payment trace: {('api-gateway', 'payment-service')}
+$ uv run python -c "
+import asyncio, httpx
+from app.signals.reconcile import edges_from_trace
+async def m():
+    async with httpx.AsyncClient() as c:
+        r = await c.get('http://localhost:3210/api/traces/<那筆 trace id>')
+        print('edges in that one payment trace:', sorted(edges_from_trace(r.json())))
+asyncio.run(m())
+"
+edges in that one payment trace: [('api-gateway', 'payment-service')]
 ```
 
 **那條邊看得見，是對帳沒有看到它。** 問題出在取樣：`reconcile` 預設抓 50 筆 trace，而那段時間 Tempo 裡的 trace 由結帳流量主導，我那十二筆付款請求根本沒被抽中。同一份程式碼、同一個視窗、同一座 stack，只把取樣數往上調：
@@ -118,6 +126,8 @@ max_traces=300  sampled=300  observed=6  dq=1.0  unobserved=[]
 ```
 
 50 跟 100 說這條邊死了，300 說一切正常。而預設值是 50。
+
+這三個數字別當成常數看。我後來在另一個時間點重跑，那個視窗裡結帳流量更密，連 300 都還是報 `unobserved`，得再往上調才看得到。**會變的不是那條邊，是它在那個視窗裡佔多少比例**，而那正是這件事最麻煩的地方：同一份程式碼、同一張圖，答案取決於你什麼時候問。
 
 ```mermaid
 flowchart TB
@@ -205,9 +215,14 @@ $ python3 ironman-2026/day14/topology_watch.py \
 前面抱怨過對帳報告把三種原因塞進同一個畫面，這支腳本至少把最後一種拆出來了：
 
 ```console
-$ python3 ironman-2026/day14/topology_watch.py --topology ... --loki http://localhost:9999
-  ! loki did not answer (Connection refused) — treating it as no evidence
+$ python3 ironman-2026/day14/topology_watch.py \
+    --topology aiops-agent/service/app/signals/topology.yaml \
+    --loki http://localhost:9999 --lookback 6h
+
+  ! loki did not answer (<urlopen error [Errno 111] Connection refused>) — treating it as no evidence
+# topology watch — declared 5, lookback 6h
   no source answered; cannot tell alignment from silence
+
 $ echo $?
 2
 ```
