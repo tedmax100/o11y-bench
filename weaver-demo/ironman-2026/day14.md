@@ -13,13 +13,13 @@ tags: [OpenTelemetry, AIOps, Tempo, Loki, Signal Plane, 鐵人賽]
 昨天那張九宮格，中間「對帳」那一欄三格全是空的，而其中一格的具體長相是這樣：
 
 ```console
-$ uv run python -c "from app.signals.dq import dq_verdict; print(dq_verdict())"
-{'proven_good': False, 'score': None, 'note': 'topology not reconciled against live traces; DQ unproven'}
+$ uv run python -c "from app.signals.reconcile import get_last_drift; print(get_last_drift())"
+None
 ```
 
-DQ 是 Data Quality（資料品質）。這句 `DQ unproven` 的意思不是圖畫錯了，是從來沒有人去驗過。今天就是去驗那一次，而驗完會發現要問的其實是兩個問題：那些邊對不對，以及**那張圖上該有誰**。
+那個 `None` 是對帳結果的快取。沒有人跑過對帳，它就一直是 `None`，而負責算 DQ（Data Quality，資料品質）的那支 `dq.py` 拿不到它的時候，只會回一句 `topology not reconciled against live traces; DQ unproven`。這句話的意思不是圖畫錯了，是從來沒有人去驗過。今天就是去驗那一次，而驗完會發現要問的其實是兩個問題：那些邊對不對，以及**那張圖上該有誰**。
 
-程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day14/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day14)。要跑的 `reconcile.py` 是 agent 服務自己的原始碼，我一個字都沒改，這個資料夾裡放的是「跑之前該先確認什麼」的兩支工具。驗證環境是 k3d 叢集 `demo` namespace 裡的 Tempo 2.6.0、Loki 3.2.0 跟 Prometheus。
+程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day14/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day14)。要跑的 `reconcile.py` 是 agent 服務自己的原始碼，我一個字都沒改，這個資料夾裡放的是「跑之前該先確認什麼」的兩支工具。驗證環境是 k3d 叢集 `demo` namespace 裡的 Tempo 2.6.0、Loki 3.2.0 跟 Prometheus v2.55.0，底下的輸出都是對著這座 stack 真的跑出來的，最近一次重跑是 2026-08-16。
 
 ## 一張沒人對過的圖，比沒有圖更危險
 
@@ -74,14 +74,14 @@ topology v1.0.0 reconciled against 0 traces
 ```console
 $ python3 ironman-2026/day14/tempo_probe.py http://localhost:3210 120
 http://localhost:3210 → Tempo 2.6.0 (rev e85bbc57d)
-  last 120s: 214 traces
-    slowest seen           : 1ms
+  last 120s: 31 traces
+    slowest seen           : 0ms
     survives the >5ms filter: 0
     ⚠ reconcile would sample 0 traces here and report every declared
       edge as unobserved. That is 'no traffic', not 'the graph is wrong'.
 ```
 
-214 筆 trace，最長 1 毫秒，全部是 kubelet 打的 `GET /health` 跟 `GET /healthz`。健康檢查會把 Tempo 灌滿，而且它們不跨服務，一條邊都貢獻不了。不濾掉它們，那個取樣上限會被探針吃光。**但同一個過濾器，在沒有應用流量的時候會把畫面清成全空，而全空跟「圖全錯」在報告上長得一模一樣。**
+兩分鐘裡 31 筆 trace，最長連 1 毫秒都不到，全部是 kubelet 打的 `GET /health` 跟 `GET /healthz`。沒有應用流量的時候，Tempo 裡就只剩下健康檢查，而且它們不跨服務，一條邊都貢獻不了。不濾掉它們，那個取樣上限會被探針吃光。**但同一個過濾器，在沒有應用流量的時候會把畫面清成全空，而全空跟「圖全錯」在報告上長得一模一樣。**
 
 在拿到這個結論之前我先繞了一大圈：`kubectl port-forward` 把 Tempo 轉到本機 3200，curl 得到回應、reconcile 拿到 0 筆、collector 說它送出了四萬多個 span 而且零失敗、Tempo 的 log 說它正在寫 block，每一個元件都說自己沒事，資料卻不在。真相是那句 port-forward 根本沒成功（`bind: address already in use`），本機 3200 早就被另一座 k3d 叢集的 load balancer 佔著，那座叢集裡也有一個 Tempo，版本 2.10.3，資料本來就停在兩小時前。兩個東西共用一個埠號，失敗的那個安靜地退場，而活著的那個照常回答問題。我後來把「這個位址上的 Tempo 到底是哪一版」加進那支探針工具的第一行輸出，就是因為這件事：**一個對帳工具在報告差異之前，得先能證明它在跟正確的對象講話。**
 
@@ -127,7 +127,7 @@ max_traces=300  sampled=300  observed=6  dq=1.0  unobserved=[]
 
 50 跟 100 說這條邊死了，300 說一切正常。而預設值是 50。
 
-這三個數字別當成常數看。我後來在另一個時間點重跑，那個視窗裡結帳流量更密，連 300 都還是報 `unobserved`，得再往上調才看得到。**會變的不是那條邊，是它在那個視窗裡佔多少比例**，而那正是這件事最麻煩的地方：同一份程式碼、同一張圖，答案取決於你什麼時候問。
+這三個數字別當成常數看。今天重跑一次，一樣先打十五筆付款進去，50、100、300 全部都說沒看到，一路調到 600（那個十分鐘的視窗裡其實只撈得到 474 筆）才觀察到六條邊。**會變的不是那條邊，是它在那個視窗裡佔多少比例**，而那正是這件事最麻煩的地方：同一份程式碼、同一張圖，答案取決於你什麼時候問。
 
 ```mermaid
 flowchart TB
@@ -140,7 +140,9 @@ flowchart TB
     C --> S
 ```
 
-三種原因，一種呈現。而它們的處置完全相反：第一種要去改宣告，第二種要去改對帳的參數，第三種什麼都不該做。這件事讓我對這個模組的評價往下修了一格。它不是壞掉，它做的事情是對的，但它**把一個統計取樣的結果，用一個斷言的語氣印出來**。`observed` 是一個下界，不是一個事實；`unobserved` 是「我沒看到」，不是「它不存在」。這兩個詞現在讀起來的份量是一樣的。
+三種原因，一種呈現。而它們的處置完全相反：第一種要去改宣告，第二種要去改對帳的參數，第三種什麼都不該做。而那份 `-m app.signals.reconcile` 印出來的報告，**把一個統計取樣的結果用一個斷言的語氣印出來**：`observed` 的意思是「這個視窗裡至少有這幾條」，不是「總共就這幾條」；`unobserved` 的意思是「我沒看到」，不是「它不存在」。但這兩個詞印在同一張畫面上，讀起來的份量是一樣的。
+
+公道話得講，這個模組本身其實留了東西給後面用。`TopologyDrift` 裡有一個 `caller_samples`，記的是每個服務出現在幾筆取樣的 trace 裡，所以「api-gateway 跑了 40 次都沒走這條邊」跟「api-gateway 根本沒被抽到」在資料上是分得開的。分不開的是那份 CLI 的輸出，它把這個欄位整個略過了。
 
 > 稀有路徑本來就是最難用取樣看到、也最值得知道的東西。錯誤處理的分支、降級的備援路徑、只有月底才會走的結算流程，全部都是低流量高風險。而一個照流量比例取樣的對帳，剛好對它們最盲。
 
@@ -264,16 +266,18 @@ flowchart TB
 
 把這件事放回凌晨三點。agent 說「order-service 在噴錯，但它的下游 payment-service 是健康的，所以問題應該在 order-service 自己」。
 
-如果那張圖裡 `order-service → payment-service` 這條邊因為取樣不足被判定成不存在，agent 就不會去看 payment，也不會把它列進候選。你拿到的是一段推理完整、語氣肯定、而且少了一整個分支的結論。**它不會告訴你它少看了哪裡，因為它自己也不知道。**
+先說清楚沒有那麼糟的部分：這條邊不會因為對帳沒看到就從圖上消失。`context.py` 注給 agent 的還是那張宣告的圖，只是在那條邊後面掛一個標記，而且它掛得比我預期的細。caller 有被抽到夠多次，才會寫 `(⚠ not seen in 40 sampled traces of order-service)`，抽到的次數太少就只寫 `(not exercised in this sample)`，因為一個「通常是錯的」警告會連帶讓真的那幾個一起被略過。
 
-反過來，如果 `dq_score` 跟那份 `unobserved` 清單有跟著送到值班的人面前，至少你會知道「這個判斷是建立在一張有兩條邊沒被驗證的圖上」。這個資訊現在算得出來，`context.py` 也真的會把漂移標記注進去，但前提是有人跑過對帳。而今天之前，沒有人跑過。
+問題在那個標記進到 prompt 之後會被讀成什麼。一個 LLM 看到「這條依賴在四十筆 trace 裡都沒出現」，很容易就把它當成「這條路現在沒在走」，然後在排序候選根因的時候把 payment 往後放。它不會憑空刪掉一個分支，但它會照著一份被取樣扭曲過的權重去推理，而那段推理讀起來一樣完整、一樣肯定。
+
+真正該補的是把 `dq_score` 跟那份 `unobserved` 清單也送到值班的人面前，至少你會知道「這個判斷是建立在一張有一條邊沒被驗證的圖上」。這個資訊現在算得出來，`context.py` 也真的會把它寫進注入的標頭，但前提是有人跑過對帳。而今天之前，沒有人跑過，所以那段標頭是空的，整張圖看起來就跟驗過一樣。
 
 ## 今天沒做的事
 
 - **對帳跟那支 watch 都沒有排程。** 今天全部是手動敲的，而一個要靠人記得跑的資料品質檢查，跟前面那些「寫好了但沒有在跑」的東西是同一個問題。要真的排上去，得先決定 exit 2 的時候通知誰、以及連續幾次 exit 1 才值得吵人。
 - **沒有處理取樣。** 最直接的做法是把取樣數調高，但那只是把界線往後推。比較對的方向大概是讓對帳留下歷史，用「這條邊連續幾天沒被看到」取代「這一次沒看到」。
 - **`unobserved` 沒有帶上時間。** 一條邊上次被觀察到是十分鐘前還是三個月前，是決定要不要動手刪它的關鍵，而現在這兩者在報告上完全一樣。
-- **沒有量「取樣涵蓋率」。** 要判斷 50 筆夠不夠，得先知道那個視窗裡總共有多少筆，而那個數字現在只有我手動用探針工具問出來。
+- **沒有量「取樣涵蓋率」。** 要判斷 50 筆夠不夠，得先知道那個視窗裡總共有多少筆，而那個數字現在只有我手動用探針工具問出來。`caller_samples` 那個欄位已經有一半的答案（每個服務被抽到幾次），但沒有分母。
 - **沒有把 `list_service_names()` 改掉。** 今天做的是一支獨立的腳本，agent 服務裡那個只讀 Loki 的函式一個字都沒動，所以 `topology validate` 那條路現在依然會給出那個假綠燈。要決定的是「多一個資料源」還是「換一個資料源」，兩者對其他呼叫端影響不同。
 - **沒有處理服務改名。** 一個服務從 `user-service` 改叫 `identity-service`，這支腳本會報成一個死掉加一個新增，而不是一次更名。
 - **`--lookback` 沒有下放到各服務自己宣告。**

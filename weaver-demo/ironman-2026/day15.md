@@ -11,11 +11,13 @@ tags: [OpenTelemetry, Weaver, AIOps, Signal Plane, 鐵人賽]
 > 也可能是在說「我根本沒讀到」
 > 而這兩句話印出來一模一樣
 
-前面讀那個 `signals` 模組的時候，挖出一件挺尷尬的事：`weaver.py` 這支負責把治理成果接進來的模組，**沒有任何東西呼叫它**。手動敲會綠燈，CI 一次都沒跑過。
+昨天把那張宣告的拓撲跟 Tempo 裡真的看得到的呼叫關係對了一次，`dq_verdict()` 那個判定總算有一個維度有證據了。但它旁邊那一格還是空的：agent 手上那些 SLI 查詢，用的 metric 名字到底有沒有人在管。
+
+而前面讀那個 `signals` 模組的時候，挖出一件挺尷尬的事：`weaver.py` 這支負責把治理成果接進來的模組，**沒有任何東西呼叫它**。手動敲會綠燈，CI 一次都沒跑過。
 
 今天把它接起來。這是這個系列第一次讓兩個階段的程式碼互相呼叫，而接的過程比我想的難，因為第一版接法會把一個「檔案不見了」變成六筆假的違規。
 
-改的是 agent 服務自己的原始碼，重現步驟在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day15/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day15)。
+改的是 agent 服務自己的原始碼，重現步驟在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day15/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day15)。底下的輸出都是真的跑出來的，最近一次重跑是 2026-08-16。
 
 ## 中間斷掉的是哪一段
 
@@ -43,7 +45,7 @@ flowchart LR
 
 > DEV/CI-time guard, NOT a runtime dependency: the registry is not shipped in the agent image.
 
-registry 是 repo 裡的東西，agent 的映像檔裡沒有它。所以在 runtime 讀，讀到的永遠是「檔案不存在」。而那個函式是 fail-open 的，讀不到就回一個空集合：
+registry 是 repo 裡的東西，agent 的映像檔裡沒有它。所以在 runtime 讀，讀到的永遠是「檔案不存在」。而那個函式是 fail-open 的，白話講就是「讀不到就當作沒事，不要擋路」，它讀不到就回一個空集合：
 
 ```python
 except Exception as e:
@@ -127,6 +129,9 @@ flowchart TB
              SLIs match the schema registry (6 metrics)'}
 ```
 
+> 這個判定後面還會再長。它現在只回答兩個問題，而再往後幾天會發現還有一個問題得排在這兩個前面問，所以你之後照著跑，看到的第一個 `False` 理由不一定是上面這一句。
+> 我把這件事寫在這裡，是因為這篇的重點就是「一個判定裡有幾個維度」，而答案顯然還沒到齊。
+
 第二行那個 `proven_good: True` 是這個系列到目前為止第一次出現。前面每一次跑 `dq_verdict()` 拿到的都是 `False`，而且理由都是同一個：沒有人驗過。現在兩個維度都有證據了，一個是 50 筆 trace 對出來的拓撲一致性，一個是 5 份契約對 6 個 registry metric 的名字對齊。
 
 DQ 是 Data Quality。這個判定會被治理層拿去決定要不要放行自動執行，所以它從 `False` 變成 `True` 這件事，實際的意思是**這套系統第一次有資格談自動化**。在那之前它不是不安全，是連「安不安全」這個問題都答不出來。
@@ -154,7 +159,7 @@ def test_schema_is_checked_before_topology(monkeypatch):
 
 重生一次產物，然後比對它跟 commit 進去的那份有沒有差。有差就是紅的。
 
-這一招能成立，是因為那份產物是**決定性**的。我原本在裡面放了一個 `computed_ts`，寫完才發現那樣 `git diff` 每次都會有差異，這道檢查會永遠是紅的，然後三天之內就會有人把它拿掉。所以時間戳拿掉了，什麼時候變的 git 本來就知道。
+這一招能成立，是因為那份產物是**決定性**的：同一份 registry 加同一份契約，不管跑幾次、誰跑、什麼時候跑，生出來的位元組都一樣，所以 `git diff` 有東西就一定是輸入變了。我原本在裡面放了一個 `computed_ts`，寫完才發現那樣 `git diff` 每次都會有差異，這道檢查會永遠是紅的，然後三天之內就會有人把它拿掉。所以時間戳拿掉了，什麼時候變的 git 本來就知道。
 
 > 這件事我在前面講 codegen 的時候得出過一模一樣的結論：生成物要 commit 進版控，因為 diff 才是那個會說話的東西。差別是那次的產物給人讀，這次的產物給 `dq_verdict()` 讀。同一個模式用第二次的時候，我才注意到它有一個前提，產物必須是決定性的，不然 diff 這件事整個不成立。
 
@@ -166,7 +171,7 @@ def test_unreadable_registry_is_unproven_not_degraded(monkeypatch):
     make every SLI look undeclared. It must land as 'no evidence' instead."""
 ```
 
-整包跑起來 322 條通過。
+整包跑起來 322 條通過（這是寫這篇那天的數字，後面幾天還會一直往上加，你現在照著跑只會更多）。
 
 ## 值班的時候差在哪
 
@@ -196,7 +201,7 @@ registry 是平台團隊維護的，契約是產品團隊寫的，而這道新�
 
 `weaver.py` 從 registry 撈名字的方式還是靠正規表示式去讀 `note` 裡那句 `Current code metric:`。這是一個慣例，不是一個欄位，有人 `note` 寫得不一樣就撈不到，而且撈不到會安靜地少一個名字。這件事該用 `annotations` 做，前面講機器可讀的意圖時用過那個欄位。
 
-也沒有把產物接進那支回歸腳本。`schema_alignment.json` 被人手動改成一份假的綠燈，現在沒有任何東西會發現。
+runtime 完全信任那份產物。有人把 `schema_alignment.json` 手動改成一份假的綠燈再 commit 上去，CI 那道重生加 `git diff` 會擋下來（我試著改成 `declared_metrics: 99` 再跑一次，產物被蓋回去、diff 就出來了）；但如果它是在打包映像檔的時候才被換掉，跑起來的 agent 沒有任何辦法發現，因為它手上根本沒有 registry 可以重算。要補這個洞得往簽章那個方向走，今天不做。
 
 ## 小結
 
