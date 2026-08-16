@@ -11,7 +11,7 @@ tags: [OpenTelemetry, AIOps, LangGraph, Agent, 鐵人賽]
 > 是有一天要跟別人解釋的時候
 > 講得出來
 
-前面七天都在處理同一件事：讓資料本身帶著足夠的上下文。昨天把帳算清楚，四項職責做到一項半。從今天開始換一邊看，讀這些資料的那個東西到底怎麼運作。
+前面七天都在處理同一件事：讓資料本身帶著足夠的上下文。昨天把 CEL（Context Enrichment Layer，情境豐富層）那四項職責逐項打勾，結論是只做到一項半。從今天開始換一邊看，讀這些資料的那個東西到底怎麼運作。
 
 這是概念日。今天講的東西跟 OTel（OpenTelemetry）沒有關係，講的是 agent 這個詞在這個 repo 裡具體指什麼。因為接下來幾天要拆的 `agent.py`，如果不先講清楚它的骨架，會變成逐行讀一份看不懂的程式碼。
 
@@ -86,13 +86,15 @@ LangGraph 做的事情就是把上面那三件事變成一個明確的結構。�
 ```python
 class RcaState(TypedDict):
     messages: Annotated[list, add_messages]
-    tool_calls_used: int
-    budget: int
+    tool_calls_used: int          # 這一輪已經用掉幾次工具呼叫
+    budget: int                   # 這一輪的上限
     rubric_feedback: str          # 檢查沒過時要餵回去的修正提示
     rubric_revision_count: int    # 這一輪已經重寫幾次
 ```
 
 `messages` 那個 `Annotated[list, add_messages]` 是 LangGraph 的 reducer 語法，意思是「這個欄位每次更新是**追加**而不是覆蓋」。其他欄位沒有標記，預設就是覆蓋。這個小地方解掉了前面那個「狀態散在各處」的問題：跨圈要傳的東西全部有名字、有型別、有明確的合併規則。
+
+順帶一提，這兩種合併規則剛好對應到兩種生命週期：`messages` 會跨輪累積，同一條對話問第二次時前面的東西都還在；`tool_calls_used` 每輪的輸入都被覆蓋回 0，所以預算是「每一輪」的上限，不是「這條對話一輩子」的上限。
 
 `node` 是一個步驟。它是一個函式，吃當前狀態，回傳要更新的欄位。它可以是一次 LLM 呼叫，也可以是純粹的程式邏輯，兩者在圖裡沒有差別。
 
@@ -131,18 +133,22 @@ flowchart TB
     START(["START"]) --> AG["agent<br/>LLM 決定下一步"]
     AG -->|"有工具要呼叫<br/>且預算還夠"| TL["tools<br/>真的去執行查詢"]
     TL --> AG
-    AG -->|"預算用完"| FA["force_answer<br/>拿掉工具，逼它作答"]
+    AG -->|"還想呼叫工具<br/>但預算用完了"| FA["force_answer<br/>拿掉工具，逼它作答"]
     AG -->|"沒有工具要呼叫<br/>它答完了"| RB["rubric_trace<br/>檢查答案裡的 trace ID<br/>是不是真的存在"]
     FA --> RB
     RB -->|"檢查沒過<br/>且重寫次數還夠"| AG
     RB -->|"通過，或重寫超過上限"| E(["END"])
 ```
 
+（這張圖不是我照著程式碼畫的，是把編譯完的 graph 直接吐出來的：`graph.get_graph().draw_mermaid()`，四個 node 跟七條邊都對得起來，只是我把 LangGraph 產的標籤換成中文說明。）
+
+`agent` 那個框往外分三條，判斷的順序是先看「這一次模型有沒有要呼叫工具」，沒有就直接去 `rubric_trace`；有的話才去比預算。所以 `force_answer` 只會發生在「它還想查，但額度沒了」的情況，而不是預算一到就被打斷。
+
 `agent` 跟 `tools` 兩個 node 加上它們中間那條來回，就是前面那個 ReAct 迴圈。另外兩個 node 是為了前面講的那些「其他路徑」而存在的。
 
 `force_answer` 處理預算用完的情況。它做的事情很直接：同一個模型，但**不綁任何工具**，於是它想呼叫也呼叫不了，只能作答。這比在 `while` 裡 `break` 掉好，因為 `break` 會讓你拿到一個沒有結論的空回應。
 
-`rubric_trace` 是答完之後的檢查。它去驗證答案裡引用的 trace ID 是不是真的存在，沒過就把修正提示寫進 `rubric_feedback`，路由回 `agent` 讓它重寫。除了 ReAct 那條來回之外，這是圖裡唯一一條往回走的邊，而且它有次數上限（`_max_rubric_revisions = 1`，也就是只讓它重寫一次）。
+`rubric_trace` 是答完之後的檢查。它去驗證答案裡引用的 trace ID 是不是真的存在，沒過就把修正提示寫進 `rubric_feedback`，路由回 `agent` 讓它重寫。除了 ReAct 那條來回之外，這是圖裡唯一一條往回走的邊，而且它有次數上限（`_max_rubric_revisions = 1`）：第一次抓到就放它回去重寫，重寫完的答案如果又被抓到一次，就不再給機會，直接結束。也就是這條回頭路一輪最多走一次。
 
 而建圖那段函式的說明寫得很白：
 
