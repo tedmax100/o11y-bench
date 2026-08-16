@@ -31,7 +31,7 @@ $ curl -sG localhost:9090/api/v1/query --data-urlencode \
 
 ```console
 $ curl -sG localhost:9090/api/v1/query --data-urlencode 'query=payment_charges_total'
-series count: 2
+series count: 2          # 只有 status / reason 的組合，跟 replica 數無關
 labels: [__name__, deployment_environment, git_repo, git_version, job,
          reason, service_name, service_namespace, service_version, status,
          telemetry_auto_version, telemetry_sdk_language, telemetry_sdk_name,
@@ -45,11 +45,22 @@ $ kubectl -n demo get deploy payment-service -o jsonpath='{.spec.replicas}'
 
 Prometheus 看到的就是一條上上下下跳的線，因為它一下拿到 A pod 的值、一下拿到 B pod 的值。`rate()` 的職責是處理 counter reset，於是每一次交錯它都當成「重啟了」，然後補上它以為漏掉的量。四十筆從來沒發生過的付款就是這樣長出來的。
 
+這句話不用相信我，把那條 counter 的原始樣本點拉出來看就好，一條「只增不減」的 counter 會這樣：
+
+```console
+$ curl -sG localhost:9090/api/v1/query_range \
+    --data-urlencode 'query=payment_charges_total{status="authorized"}' ...
+104  104  119  100  212  304  42  704  1400  2079  2741
+               ↑ 掉了        ↑ 掉了
+```
+
+一條 counter 不該往下走。每一個往下走的點，`rate()` 都會讀成「這中間重啟過，所以前面累積的量要補回來」，然後在完全沒有流量的情況下憑空生出每秒幾十筆。
+
 這件事重要的不是它是一個 bug。它當然是，而且是遙測管線設定的問題，不是應用程式的問題。重要的是：**那份 JSON 裡沒有任何一個欄位有機會告訴你這件事。**
 
 ## 訊號跟情境
 
-ARE（Agentic Reliability Engineering，代理式可靠性工程）那本書把這個落差講得很清楚。它區分兩個詞：
+[《代理式可靠性工程》（Agentic Reliability Engineering，簡稱 ARE）](https://learning.oreilly.com/library/view/agentic-reliability-engineering/0642572294809/) 這本書的第十章把這個落差講得很清楚。它區分兩個詞：
 
 > *Signals* are facts about the system. *Context* is facts about the system *and the situation*.
 
@@ -87,7 +98,7 @@ flowchart TB
 
 `enrichment`（豐富化）回答「這個值算不算異常」。一個訊號進來，補上它的基準線（這個服務在這個時段的正常長什麼樣）、它的趨勢（正在往哪個方向跑、多快）、它的拓撲位置（誰依賴它）、以及它的變更情境（這附近最近部署過什麼）。昨天那個 `impact` 判斷，也就是「呼叫方的歸因失敗量跟三十分鐘前比有沒有漲」，就是最小版本的 enrichment，它做的正是「補上基準線」這件事。
 
-`correlation`（關聯）回答「這些東西是不是同一件事」。分開抵達的訊號被聚成一組，推理平面讀到的是一幅完整的畫面而不是一堆散落的事件。Day17 那個平鋪掃描給出的二十二個候選，裡面有十一條在講同一批 402 回應，那就是一份**沒有做 correlation** 的輸出長什麼樣子。
+`correlation`（關聯）回答「這些東西是不是同一件事」。分開抵達的訊號被聚成一組，推理平面讀到的是一幅完整的畫面而不是一堆散落的事件。昨天那個平鋪掃描給出的二十二個候選，裡面有十一條在講同一批 402 回應，那就是一份**沒有做 correlation** 的輸出長什麼樣子。
 
 `projection`（推估）回答「接下來會怎樣」。在底下的訊號支撐得起的時候，給出短期的推估值跟信心區間。這是三個裡面最有野心的一個，也是這個系列不會做到的一個。
 
@@ -131,7 +142,7 @@ flowchart TB
 
 它沒有回答、而且結構上也沒有地方可以回答的東西：這個值正不正常（沒有基準線）、這個服務該多少才算合格（沒有目標值）、它從哪裡來（沒有發射源的身分，所以那兩個 replica 的問題無處可藏）、後面那兩個十倍的跳動是事故還是假象（沒有可信度）、以及誰會被它影響（沒有拓撲）。
 
-決策級遙測要換的就是這個形狀。同一個事實，寫成一個帶著自己上下文的物件：
+`決策級遙測`（decision-grade telemetry，前面借 ARE 這本書的說法介紹過：為了讓 agent 據以行動而打造的遙測資料，不是為了讓人類盯著看而打造的）要換的就是這個形狀。同一個事實，寫成一個帶著自己上下文的物件：
 
 ```json
 {

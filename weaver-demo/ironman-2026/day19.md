@@ -17,7 +17,7 @@ tags: [OpenTelemetry, AIOps, CEL, Signal Plane, 鐵人賽]
 
 ## 先看蓋了什麼
 
-第二階段的程式碼在 `app/signals/`，八個模組（加一個 `__init__.py`）1545 行，六份對應的測試檔 69 條。設計稿把它切成四個階段，代號 s1 到 s4：
+第二階段的程式碼在 `app/signals/`，八個模組（加一個 `__init__.py`）1545 行，六份對應的測試檔 69 條（這是寫這篇那天數的，後面幾天還會再長）。設計稿把它切成四個階段，代號 s1 到 s4：
 
 ```mermaid
 flowchart TB
@@ -29,6 +29,8 @@ flowchart TB
     S4 --> OUT["注入 RCA 的三段文字"]
     S1 --> OUT
 ```
+
+（圖裡那個 SLI 是 Service Level Indicator，服務水準指標，也就是「用哪一句查詢判斷這個服務好不好」；RCA 是 root cause analysis，根因分析，agent 被叫去做的那件事。）
 
 四個階段全部唯讀，這是設計稿一開始就定下的鐵律：整個第二階段不能有任何副作用。這個限制回頭看是對的，它讓每一段都可以單獨上線、單獨驗證，而且錯了也只是 context 難看，不會壞掉任何東西。
 
@@ -44,7 +46,7 @@ flowchart TB
 | projection | 沒有，一行都沒有 | 缺 |
 | grounding | 權威查詢可以重跑、log 帶著 trace ID；但注入的那段話本身沒有任何識別碼 | 半 |
 
-四項裡一項完整、一項半、兩項空白。下面把每一項的證據攤開。
+四項裡沒有一項是完整的：enrichment 四格只有拓撲那一格做滿，grounding 一半，correlation 跟 projection 整格空白。加起來大概一項半。下面把每一項的證據攤開。
 
 ### enrichment：只有一條邊有 baseline
 
@@ -79,26 +81,28 @@ change context 那格是最尷尬的一格，因為它看起來像有做。`topo
 
 好的那半是契約帶來的。注入給 agent 的每一條 SLI 都附上權威的 PromQL，log 也附上權威的 LogQL。這代表 agent 講出來的任何結論，都可以有人把那句查詢複製出來重跑一次，看看數字對不對。這是很實用的一種溯源，而且成本幾乎是零。
 
-Loki 那邊更完整。隨手撈一筆 `payment.declined`，它自己就帶著 `trace_id`：
+Loki 那邊更完整。隨手撈一筆 `payment.declined`，它自己就帶著 trace 的識別碼。這裡要注意它在 Loki 裡的形狀跟服務 stdout 印出來的那份 JSON 不一樣：走 OTLP 進來之後，log 的本體只剩一句話，其他全部變成 structured metadata：
 
-```json
-{
-  "event": "payment.declined",
-  "reason": "new_validator_odd_cents",
-  "order_id": "o-odd-9903",
-  "git_version": "v2.5.0",
-  "trace_id": "47c189ff6a548f1b9910ef14f685fefc",
-  "service_name": "payment-service"
-}
+```console
+$ curl -sG localhost:3100/loki/api/v1/query_range --data-urlencode \
+    'query={service_name="payment-service"} | event="payment.declined"' ...
+
+body: "declined by new validator"
+  event:        payment.declined
+  reason:       new_validator_odd_cents
+  order_id:     o-25779
+  git_version:  v2.5.0
+  otelTraceID:  e18757726d5af93fe9fabd3d9d82adee
+  span_id:      6a6aeadc9c010352
 ```
 
-從這一行可以直接跳到那一條 trace。這是三種訊號裡唯一一種本來就走得回去的。
+（那個欄位叫 `otelTraceID` 不叫 `trace_id`，是 OTLP 進 Loki 之後被改名的，寫查詢的時候會踩到。）從這一行可以直接跳到那一條 trace。這是三種訊號裡唯一一種本來就走得回去的。
 
 缺的那半是：**注入的那段話本身沒有身分。** 它是一段散文，裡面的每一個數字都沒有標記它是什麼時候、用哪一句查詢、在哪個視窗算出來的。agent 讀完之後如果說「payment 拒絕率 55%」，沒有任何機制可以從那句話走回產生它的那次查詢。前面那個兩個 replica 疊成一條 series 的坑會沒有人發現，根本原因就在這裡。
 
 ## 一個現行的 silent decay
 
-書裡列了五種「從 dashboard 上看不見」的失效模式，第一種叫 `silent decay`：宣告當初是對的，然後系統變了，宣告沒跟上，而且沒有任何東西會叫。
+[《代理式可靠性工程》（Agentic Reliability Engineering，簡稱 ARE）](https://learning.oreilly.com/library/view/agentic-reliability-engineering/0642572294809/) 第三章列了五種「從 dashboard 上看不見」的失效模式，第一種叫 `silent decay`：宣告當初是對的，然後系統變了，宣告沒跟上，而且沒有任何東西會叫。
 
 寫這篇的時候我順手對了一下宣告的版本跟實際跑的版本：
 
@@ -117,9 +121,10 @@ $ curl -sG localhost:9090/api/v1/query --data-urlencode \
   payment-service  v2.5.0     ← 宣告寫 v2.4.1
   user-service     v1.3.0
   webapp           v5.2.0
+  aiops-agent      v0.0.1     ← 它自己也在噴指標，而拓撲裡沒有它
 ```
 
-四個對得上，payment 對不上。而它是這整個階段所有實測都繞著跑的那個服務。
+五個宣告的服務裡四個對得上，payment 對不上。而它是這整個階段所有實測都繞著跑的那個服務。（多出來的 `aiops-agent` 就是前面提過那個「沒被宣告卻活著」的服務，agent 自己。）
 
 問題不在那個數字錯了，在於**這一階段有三條對帳路徑，沒有一條覆蓋這個欄位**：
 
@@ -133,7 +138,17 @@ flowchart LR
 
 這裡順帶要補一句：那三條路徑裡只有兩條真的住在 agent 裡（`reconcile.py` 跟 `weaver.py`），對服務名單那一條是隨文附的獨立腳本，agent 執行時完全不會碰到它。所以「三條」這個說法其實已經有點寬容了。
 
-我去 grep 過整包程式碼，`git_version` 在 `signals/` 底下只出現在兩個地方：`compile.py` 把它從各服務的宣告搬到編譯產物、`topology.py` 定義這個欄位存在。沒有第三個地方讀它。
+我去 grep 過整包程式碼，`git_version` 在 `signals/` 底下出現在三個地方，但沒有一個是在讀它：
+
+```console
+$ grep -rn "git_version" app/signals/*.py
+app/signals/topology.py:45:    git_version: str = ""          # 定義這個欄位存在
+app/signals/compile.py:56:    git_version: str = ""           # 從各服務的宣告搬進來
+app/signals/compile.py:123:            git_version=f.git_version,
+app/signals/health.py:328: "correlate with git_version (sum by git_version,reason) ..."
+```
+
+前三筆是定義跟搬運，第四筆是一句寫給 agent 看的文案。**沒有任何一行程式碼把這個宣告的值拿去跟任何東西比對。**
 
 而諷刺的地方在這裡。`health.py` 判定一個服務是根因的時候，結論那句話是這樣寫的：
 

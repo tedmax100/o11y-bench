@@ -14,7 +14,9 @@ tags: [OpenTelemetry, AIOps, Signal Plane, 鐵人賽]
 
 這是 `health.py` 的職責，Signal Plane 這一段最後一塊、也是唯一一塊會真的去打 API 的。前面幾天做的東西，拓撲、契約、對帳，到這裡才第一次被花掉。
 
-程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day17/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day17)。
+（前面把 Signal Plane 切成四步在做，編號沿用到今天：s1 拓撲、s2 拿真的 trace 對帳、s3 每個服務的權威 SLI 契約，而 s4 就是今天這塊，順著圖走的依賴健康分析。）
+
+程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day17/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day17)。底下的輸出都是真的跑出來的，環境是那座 k3d 上的 demo stack。要提醒一件事：這一篇的每一個數字都跟當下的流量綁死，你照著跑一定會拿到不一樣的數值，該對得上的是形狀（誤報有幾十個、五個節點只有兩個判得動），不是小數點。
 
 ## 平鋪掃全部指標，為什麼行不通
 
@@ -22,9 +24,9 @@ tags: [OpenTelemetry, AIOps, Signal Plane, 鐵人賽]
 
 最直覺的異常偵測是這樣：把所有指標拉出來，每一條跟一段時間之前比，變化超過某個幅度就標成異常候選。這個做法的好處是不用維護任何東西：不用宣告拓撲、不用寫契約，新服務上線自動就被涵蓋。它也確實是很多「AI 維運」產品的第一版。
 
-我把這個做法寫成一支八十行的 `flat_scan.py`，而且刻意寫成講道理的版本：只看現在真的有資料的 series、跟一段時間前的自己比而不是跟一個寫死的門檻比、累積型的 counter 一律先過 `rate()`（不然每一條都會「上升」）、`_bucket` 跳過（它跟 `_count`/`_sum` 是同一件事攤在 `le` 上）。
+我把這個做法寫成一支 130 行的 `flat_scan.py`，而且刻意寫成講道理的版本：只看現在真的有資料的 series、跟一段時間前的自己比而不是跟一個寫死的門檻比、累積型的 counter 一律先過 `rate()`（不然每一條都會「上升」）、`_bucket` 跳過（它跟 `_count`/`_sum` 是同一件事攤在 `le` 上）。
 
-先在**完全沒有事故**的穩定流量下跑一次，baseline 取十分鐘前：
+先在**完全沒有事故**的穩定流量下跑一次，baseline 取十分鐘前。這裡有個重現的前提，我自己重跑的時候踩到過：流量要先穩定跑滿一個 baseline 視窗再掃。stack 才剛起來就掃，十分鐘前是零流量，於是幾乎每一條 series 都是 `inf%`，候選數會變成兩百多個。那不是這個做法比較爛的證據，是量測還沒站穩：
 
 ```console
 $ python3 flat_scan.py --baseline 10m --min-rel 0.5
@@ -52,7 +54,7 @@ min-rel 5.0 -> anomaly candidates (rel change >= 500%): 8
 
 **門檻拉十倍，誤報只從二十個掉到八個。** 這座 stack 從頭到尾沒有任何事故，所以這八個也全部是誤報。它們留下來是因為它們的 baseline 是零，相對變化算出來是 `inf%`，多高的門檻都擋不住。而這中間被濾掉的十二個，跟留下來的八個，在這個做法眼裡沒有任何本質差別。
 
-問題不在門檻設在哪裡，在**排序的依據**。這一輪排在最前面的是 user-service `/authcheck` 的 503 跟 SDK 那幾條佇列長度，前者是 demo 裡本來就有的少量認證失敗，後者是那個東西的日常起伏。**這個做法從頭到尾不知道哪一條指標代表「這個服務還活著」，所以它沒有辦法把重要的排前面，只能把變化大的排前面。**
+問題不在門檻設在哪裡，在**排序的依據**。這一輪排在最前面的（含被上面那個 `...` 折掉的部分）是 SDK 那幾條佇列長度，跟 user-service `/authcheck` 的 401，後者是 demo 裡本來就有的少量認證失敗，前者是那個東西的日常起伏。**這個做法從頭到尾不知道哪一條指標代表「這個服務還活著」，所以它沒有辦法把重要的排前面，只能把變化大的排前面。**
 
 ## 換成順著圖走
 
@@ -189,11 +191,11 @@ flowchart LR
     S["downstream 不健康"] --> Q{"這條邊有<br/>attribution 嗎？"}
     Q -->|沒有| C["請 agent 自己確認<br/>不下判斷"]
     Q -->|有| D{"呼叫方的歸因失敗量<br/>比 baseline 漲了嗎？"}
-    D -->|漲了| E["genuine SYMPTOM<br/>修下游就會好"]
-    D -->|沒漲| F["only topologically adjacent<br/>不要當成症狀報上去"]
+    D -->|漲了| E["verdict=rising<br/>genuine SYMPTOM<br/>修下游就會好"]
+    D -->|沒漲| F["verdict=flat<br/>only topologically adjacent<br/>不要當成症狀報上去"]
 ```
 
-`flat` 那一支之所以重要，是因為它是**唯一一條會主動阻止 agent 把一個健康的服務寫進事故報告的路徑**。拓撲圖天生鼓勵過度歸因，圖上連著就看起來有關係，而這條邊上的那一句 PromQL 是唯一能反駁它的證據。
+圖裡 `verdict=flat` 那一支之所以重要，是因為它是**唯一一條會主動阻止 agent 把一個健康的服務寫進事故報告的路徑**。拓撲圖天生鼓勵過度歸因，圖上連著就看起來有關係，而這條邊上的那一句 PromQL 是唯一能反駁它的證據。
 
 ## 然後 api-gateway 出事了
 
@@ -208,7 +210,7 @@ flowchart LR
   under investigation show HEALTHY SLIs themselves. ...
 ```
 
-**api-gateway 沒有 SLI。** 它的契約裡一條都沒有。那是它自己宣告的，`exclusions` 寫得清清楚楚「No custom application metrics」，錯誤要從 Loki 的 `event=http.request_failed` 看。
+**api-gateway 沒有 SLI。** 它的契約裡一條都沒有。回頭看前面 payment-service 那段輸出，`upstream` 那兩行只列了 order-service，api-gateway 也是在那裡被同一個方式吃掉的，只是那一段在講別的事，我當下沒注意到。那是它自己宣告的，`exclusions` 寫得清清楚楚「No custom application metrics」，錯誤要從 Loki 的 `event=http.request_failed` 看。
 
 所以上面那段輸出裡，`this service api-gateway` 那一行從頭到尾沒有出現過，因為 `_health_sli()` 回 `None`，而 `_evaluate()` 看到 `None` 就直接把這個服務丟掉：
 
@@ -311,7 +313,7 @@ async def test_root_cause_verdict_does_not_clear_unjudgeable_deps(monkeypatch):
     order the root cause is fine; claiming its dependencies are healthy is not."""
 ```
 
-另外三條既有測試的斷言被改掉了，因為它們原本釘的就是舊的錯誤行為（`assert "HEALTHY SLIs themselves" in block`）。整包 327 條通過。
+另外三條既有測試的斷言被改掉了，因為它們原本釘的就是舊的錯誤行為（`assert "HEALTHY SLIs themselves" in block`）。整包 327 條通過（這是寫這篇那天的數字，後面幾天還會一直往上加）。
 
 ## 值班的時候差在哪
 

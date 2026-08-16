@@ -26,7 +26,7 @@ Topology data-quality (last reconcile, 30 traces): declared/observed agreement 1
 
 **標題那行說一致性 100%，往下兩行就有兩個 ⚠。** 而那兩個 ⚠ 講的是同一條邊。
 
-今天處理的就是這件事。程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day16/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day16)，改的是 agent 服務自己的 `reconcile.py` 跟 `context.py`。
+今天處理的就是這件事。程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day16/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day16)，改的是 agent 服務自己的 `reconcile.py` 跟 `context.py`。底下的輸出都是真的跑出來的，最近一次重跑是 2026-08-16，環境是那座 k3d 上的 demo stack，取樣 30 筆 trace。
 
 ## 為什麼一份「正確」的報告會是壞的
 
@@ -36,7 +36,7 @@ Topology data-quality (last reconcile, 30 traces): declared/observed agreement 1
 
 這是可觀測性裡那個老問題換了一個位置。告警疲勞不是因為告警錯了，是因為**大部分告警是對的但不重要，於是值班的人學會了全部略過**，然後真的那一次也跟著被略過。同一件事發生在注入給 agent 的 context 裡，代價一模一樣：一個大部分時候是雜訊的 ⚠，會讓那個符號整個貶值。
 
-前面查過那條 `api-gateway → payment-service` 的來歷，它是活的，只是那批取樣沒抽到。所以現在這個 ⚠ 有很高的機率根本不是漂移，是取樣的產物。
+前面查過那條 `api-gateway → payment-service` 的來歷，它是活的，前面撈到過一筆真的走過那條邊的 trace，只是它太稀有，這批取樣沒抽到。所以現在這個 ⚠ 有很高的機率根本不是漂移，是取樣的產物。
 
 ## 三個問題，各自的成因
 
@@ -66,14 +66,20 @@ flowchart TB
 def services_from_trace(raw: dict) -> set[str]:
     """Every service that appears anywhere in one trace. Used to tell 'this
     caller ran and never made the call' apart from 'this caller never ran'."""
+    seen: set[str] = set()
+    for batch in raw.get("batches", []):
+        service = _otlp_service(batch.get("resource", {}))
+        if service and any(ss.get("spans") for ss in batch.get("scopeSpans", [])):
+            seen.add(service)
+    return seen
 ```
 
-這個東西是免費的，同一批 trace 已經抓回來了，只是原本只從裡面挑邊。跑起來長這樣：
+原本掃 trace 的那個迴圈只做 `observed |= edges_from_trace(raw)`，現在多一行把這個集合裡的每個服務各加一次計數。這個東西是免費的，同一批 trace 已經抓回來了，只是原本只從裡面挑邊。跑起來長這樣：
 
 ```console
 unobserved: [('api-gateway', 'payment-service')]
-caller_samples: {'webapp': 30, 'api-gateway': 30, 'order-service': 25,
-                 'user-service': 17, 'payment-service': 10}
+caller_samples: {'webapp': 30, 'api-gateway': 30, 'order-service': 19,
+                 'user-service': 17, 'payment-service': 5}
 ```
 
 api-gateway 出現在三十筆 trace 裡，一次都沒呼叫 payment-service。**這是一句有份量的話，而原本的報告只會說「沒看到」。**
@@ -81,10 +87,14 @@ api-gateway 出現在三十筆 trace 裡，一次都沒呼叫 payment-service。
 於是 `context.py` 那個標記函式就有東西可以判斷了：
 
 ```python
-seen = drift.evidence_for(edge[0])
-if seen >= _MIN_CALLER_EVIDENCE:
-    return f" (⚠ not seen in {seen} sampled traces of {edge[0]})"
-return " (not exercised in this sample)"
+def _annotate(edge: tuple[str, str], drift: TopologyDrift | None) -> str:
+    if not drift or not any((e.caller, e.callee) == edge for e in drift.unobserved_edges):
+        return ""                       # 這條邊有被走到，什麼都不用標
+    caller = edge[0]
+    seen = drift.evidence_for(caller)   # caller 出現在幾筆取樣的 trace 裡
+    if seen >= _MIN_CALLER_EVIDENCE:
+        return f" (⚠ not seen in {seen} sampled traces of {caller})"
+    return " (not exercised in this sample)"
 ```
 
 呼叫方被跑過夠多次，才給 ⚠，而且把次數寫進去；不夠的時候退成一句沒有警示符號的描述。門檻現在是 5，這個數字沒有什麼理論根據，就是一個「至少要多看幾眼才算數」的下限。
@@ -117,7 +127,7 @@ if up:
 
 ## 讓分數承認自己漏了什麼
 
-第三個改動是在 DQ 那行後面補一句，只在「分數滿分但有邊沒被走到」的時候出現：
+第三個改動是在 DQ（data quality，資料品質，就是前面那個 `dq_verdict()` 在判的東西）那行後面補一句，只在「分數滿分但有邊沒被走到」的時候出現：
 
 ```
 declared/observed agreement 100%. That score only grades edges seen in
@@ -148,7 +158,7 @@ exercised in this sample and are marked below.
 
 差別不在字數，在於**現在每一個符號都還有意義**。前面那版讀完之後，一個合理的反應是「這裡有兩個警告但分數是滿分，大概都可以不用理」；這一版讀完之後，那個 ⚠ 是一句具體的話：api-gateway 跑了三十次，沒有一次走過這條路。
 
-四條新測試釘住這幾個行為，其中兩條是專門盯著退化的：
+四條測試釘住這幾個行為：三條是新加的，另外一條是原本那條「有沒有標出來」的斷言被改嚴，現在連那句話的內容跟次數都一起釘。其中兩條是專門盯著退化的：
 
 ```python
 def test_context_withholds_warning_without_evidence(monkeypatch):
@@ -158,7 +168,7 @@ def test_context_does_not_repeat_the_edge_on_the_callee(monkeypatch):
     """The same missing edge must be stated once, on the caller's side."""
 ```
 
-整包 325 條通過。
+整包 325 條通過（這是寫這篇那天的數字，後面幾天還會一直往上加，你現在照著跑只會更多）。
 
 ## 值班的時候差在哪
 
@@ -184,7 +194,7 @@ def test_context_does_not_repeat_the_edge_on_the_callee(monkeypatch):
 
 沒有動 `undeclared_edges` 那一側的呈現。觀察到但沒宣告的邊現在還是每個沾到的服務各印一次，跟今天修掉的那個重複是同一個形狀，只是它比較少見所以還沒有咬到我。
 
-也沒有量這個改動對 agent 實際輸出的影響。今天全部是看那段注入的文字本身，沒有跑一次完整的 RCA 去比對改前改後的結論差在哪。
+也沒有量這個改動對 agent 實際輸出的影響。今天全部是看那段注入的文字本身，沒有跑一次完整的 RCA（root cause analysis，根因分析）去比對改前改後的結論差在哪。
 
 ## 小結
 
