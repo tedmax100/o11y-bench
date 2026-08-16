@@ -1379,19 +1379,43 @@ async def _reconcile_loop() -> None:
             logger.warning("reconcile loop iteration failed: %s", e)
 
 
+async def _actuation_loop() -> None:
+    """Probe write-credential readiness on a timer, for the life of the process.
+
+    Until now the preflight only ran on the RCA path and just before an execute,
+    which means readiness was computed exactly when it was already too late to be
+    useful. On a timer it becomes a standing signal with an age: the question
+    "can we still act" has an answer before an incident asks it, and a credential
+    that dies at 03:00 is visible at 03:05 instead of at the next execution
+    attempt — which, measured on this system, was 46 days later."""
+    from .signals.actuation import check_actuation
+
+    while True:
+        try:
+            await check_actuation(source="loop")
+            await asyncio.sleep(settings.actuation_probe_interval_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("actuation probe loop iteration failed: %s", e)
+            await asyncio.sleep(settings.actuation_probe_interval_seconds)
+
+
 @asynccontextmanager
 async def lifespan(app):
     from . import store
 
     store.init()  # schema + one-time legacy JSONL migration (7b-0)
     await _build_agent()
-    task = None
+    tasks = []
     if settings.reconcile_enabled:
-        task = asyncio.create_task(_reconcile_loop())
+        tasks.append(asyncio.create_task(_reconcile_loop()))
+    if settings.actuation_check_enabled:
+        tasks.append(asyncio.create_task(_actuation_loop()))
     try:
         yield
     finally:
-        if task is not None:
+        for task in tasks:
             task.cancel()
 
 

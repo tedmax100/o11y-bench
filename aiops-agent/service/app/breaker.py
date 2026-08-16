@@ -69,7 +69,14 @@ def check(action: str, target: str, path=None) -> tuple[bool, str]:
 
 
 def record_outcome(
-    action: str, target: str, *, fp: str = "", request_id: str = "", success: bool, path=None
+    action: str,
+    target: str,
+    *,
+    fp: str = "",
+    request_id: str = "",
+    success: bool,
+    drill: bool = False,
+    path=None,
 ) -> None:
     """Record an *actual* execution outcome (call this only after something ran —
     not for refusals/aborts). On enough consecutive failures for the scope, trips
@@ -83,6 +90,7 @@ def record_outcome(
         fp=fp,
         request_id=request_id,
         success=success,
+        drill=drill,
         path=path,
     )
     if success:

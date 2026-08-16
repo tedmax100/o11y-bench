@@ -306,7 +306,7 @@ def _setup_verify_test(monkeypatch, tmp_path, *, verify_pass: bool, rollback_ok:
                 detail={"error": "fake rollback error"},
                 path=path,
             )
-            return False
+            return False, "rollback failed: RuntimeError"
 
         monkeypatch.setattr(ex_mod, "_auto_rollback", _fail_rb)
 
@@ -435,3 +435,137 @@ async def test_actuation_not_ready_aborts_before_anything_runs(tmp_path, monkeyp
     assert [
         e for e in audit.history(request_id=req.request_id, path=p) if e["phase"] == "actuation"
     ]
+
+
+async def test_dead_credential_records_rollback_unavailable(tmp_path, monkeypatch):
+    """Verify fails, then the credential turns out to be dead: the request must
+    say we *couldn't* undo, not that undoing failed.
+
+    Same terminal status (there is still an un-undone change in the cluster), but
+    the outcome and the audit verdict separate the two, because a stuck rollout
+    and a dead token get fixed by different people."""
+    import app.audit as audit
+    import app.signals.actuation as act_mod
+
+    p = _setup_verify_test(monkeypatch, tmp_path, verify_pass=False, rollback_ok=True)
+
+    # Preflight passes (the credential was alive when we started) and dies in
+    # between — which is the whole point: readiness is a fact with a timestamp,
+    # not a property.
+    async def _ok_preflight(namespaces=None, *, source="rca", path=None):
+        return None
+
+    monkeypatch.setattr(act_mod, "check_actuation", _ok_preflight)
+    monkeypatch.setattr(act_mod, "actuation_verdict", lambda: {"proven_good": True, "note": "ok"})
+
+    async def _dead(namespaces=None, *, path=None):
+        return False, "write credentials no longer authenticate (401 Unauthorized)"
+
+    monkeypatch.setattr(act_mod, "can_still_write", _dead)
+    monkeypatch.setattr(ex.settings, "actuation_check_enabled", True)
+
+    req = create_from_decision(
+        "fp1",
+        _decision(),
+        runbook_id="rb1",
+        args={"deployment": "x", "namespace": "demo"},
+        rollback={"action": "k8s.rollout_undo", "args": {"deployment": "x", "namespace": "demo"}},
+        path=p,
+    )
+    approve(req.request_id, actor="alice", path=p)
+    res = await run(req.request_id, path=p)
+
+    assert res["status"] == Status.ROLLBACK_FAILED.value
+    assert "rollback unavailable" in get(req.request_id, p).outcome
+    verdicts = [
+        r["verdict"]
+        for r in audit.history(request_id=req.request_id, path=p)
+        if r["phase"] == "rollback"
+    ]
+    assert verdicts == ["unavailable"]
+
+
+async def test_idempotency_does_not_reach_back_past_the_window(tmp_path, monkeypatch):
+    """A run from a previous occurrence of the same alert must not block today's.
+
+    `fp` is stable across recurrences by design (it is the investigation thread
+    id), so an unbounded idempotency probe turns "don't act twice on this
+    incident" into "never act on this kind of incident again". A drill hit this:
+    the rollback was refused as a duplicate of an execution eight days earlier.
+    """
+    p = _db(monkeypatch, tmp_path)
+    monkeypatch.setattr(arq.settings, "actions_enabled", False)
+    monkeypatch.setattr(arq.settings, "idempotency_window_seconds", 3600)
+    _wire_ok_dry_run(monkeypatch)
+
+    old = create_from_decision("fp1", _decision(), args={"deployment": "x"}, path=p)
+    approve(old.request_id, actor="alice", path=p)
+    store.ar_transition(old.request_id, "approved", "executing", path=p)
+    # Backdate it to a previous occurrence of the same alert.
+    with store._connect(p) as conn:
+        conn.execute(
+            "UPDATE action_requests SET created_ts=? WHERE request_id=?",
+            ("2026-08-08T09:02:44Z", old.request_id),
+        )
+
+    fresh = create_from_decision("fp1", _decision(), args={"deployment": "x"}, path=p)
+    assert fresh.idem_key == old.idem_key  # same incident type, same target
+    approve(fresh.request_id, actor="alice", path=p)
+    res = await run(fresh.request_id, path=p)
+
+    # Reaches the kill switch instead of being refused as a duplicate.
+    assert res["status"] == Status.REFUSED.value
+
+
+async def test_idempotency_still_blocks_within_the_window(tmp_path, monkeypatch):
+    """The storm case it actually exists for still has to be caught."""
+    p = _db(monkeypatch, tmp_path)
+    monkeypatch.setattr(arq.settings, "idempotency_window_seconds", 3600)
+    _wire_ok_dry_run(monkeypatch)
+
+    first = create_from_decision("fp1", _decision(), args={"deployment": "x"}, path=p)
+    approve(first.request_id, actor="alice", path=p)
+    store.ar_transition(first.request_id, "approved", "executing", path=p)
+
+    second = create_from_decision("fp1", _decision(), args={"deployment": "x"}, path=p)
+    approve(second.request_id, actor="bob", path=p)
+    res = await run(second.request_id, path=p)
+    assert res["status"] == Status.ABORTED.value
+    assert "idempotent" in res["outcome"]
+
+
+def test_settle_window_covers_the_verify_query_lookback(monkeypatch):
+    """A `[2m]` verify query cannot be answered 60s after the fix.
+
+    This is the drill's finding, pinned: the first successful execution this
+    system ever performed was rolled back because its own check averaged over a
+    window that still contained the incident. A false-negative verify is worse
+    than no verify — it removes a fix that worked.
+    """
+    monkeypatch.setattr(ex.settings, "verify_delay_seconds", 60)
+    monkeypatch.setattr(ex.settings, "verify_rollout_margin_seconds", 45)
+    verify = {"args": {"expr": 'sum(rate(payment_charges_total{status="declined"}[2m]))'}}
+    settle, why = ex._settle_seconds(verify)
+    assert settle == 165  # 120s lookback + 45s roll margin, not the configured 60
+    assert "would have measured the incident" in why
+
+
+def test_configured_floor_wins_when_it_already_covers_the_lookback(monkeypatch):
+    monkeypatch.setattr(ex.settings, "verify_delay_seconds", 300)
+    monkeypatch.setattr(ex.settings, "verify_rollout_margin_seconds", 45)
+    settle, why = ex._settle_seconds({"args": {"expr": "sum(rate(x[1m]))"}})
+    assert settle == 300 and "covers the query" in why
+
+
+def test_query_without_a_range_selector_falls_back_to_the_floor(monkeypatch):
+    monkeypatch.setattr(ex.settings, "verify_delay_seconds", 60)
+    settle, why = ex._settle_seconds({"args": {"expr": "up{job='payment'}"}})
+    assert settle == 60 and "no range selector" in why
+
+
+def test_zero_delay_is_an_explicit_opt_out(monkeypatch):
+    """0 must mean "check now" — a knob that silently ignores 0 is a knob nobody
+    trusts (and it makes every verify test take three minutes)."""
+    monkeypatch.setattr(ex.settings, "verify_delay_seconds", 0)
+    settle, why = ex._settle_seconds({"args": {"expr": "sum(rate(x[2m]))"}})
+    assert settle == 0 and "disabled" in why

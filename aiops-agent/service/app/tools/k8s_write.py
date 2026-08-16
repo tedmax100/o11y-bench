@@ -82,7 +82,21 @@ def _build_write_clients() -> tuple[Any, Any]:
         cfg = client.Configuration()
         cfg.host = "https://kubernetes.default.svc"
         cfg.ssl_ca_cert = _CLUSTER_CA_PATH
-        cfg.api_key["authorization"] = Path(_WRITE_TOKEN_PATH).read_text().strip()
+        # Both entries are keyed by the *scheme name* the generated client looks
+        # up, not by the header name. `get_api_key_with_prefix("BearerToken",
+        # alias="authorization")` finds the key under either name but only ever
+        # reads the prefix under "BearerToken" — so keying the prefix on
+        # "authorization" (which reads perfectly sensibly) silently sends the raw
+        # JWT with no `Bearer ` in front of it, the API server can't parse the
+        # header, and every call comes back 401 Unauthorized.
+        #
+        # That 401 is the one this system spent months believing was an expired
+        # token: the credential was always valid, the header was always malformed,
+        # and the two are indistinguishable from the outside. Keep both keys.
+        token = Path(_WRITE_TOKEN_PATH).read_text().strip()
+        cfg.api_key["BearerToken"] = token
+        cfg.api_key["authorization"] = token
+        cfg.api_key_prefix["BearerToken"] = "Bearer"
         cfg.api_key_prefix["authorization"] = "Bearer"
         api_client = client.ApiClient(configuration=cfg)
     else:

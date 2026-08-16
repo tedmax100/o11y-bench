@@ -119,3 +119,59 @@ def test_governance_withholds_auto_when_actuation_unproven(monkeypatch):
     assert d.autonomy is Autonomy.PROPOSE
     assert "actuation readiness not proven-good" in d.reason
     assert d.act_note == "readiness unproven"
+
+
+# ---- standing probe + rollback capability (Act closure, Stage 0) ------------
+
+
+def test_probe_is_persisted_so_readiness_has_a_history(monkeypatch, tmp_path):
+    """A verdict that only lives in memory can't answer "how long has this been
+    broken" — the question nobody could answer for 46 days."""
+    import asyncio
+
+    from app import store
+
+    db = tmp_path / "s.db"
+    monkeypatch.setattr(act, "_probe", lambda ns: _fit(reachable=False, error="401 Unauthorized"))
+    asyncio.run(act.check_actuation(["demo"], source="loop", path=db))
+
+    rows = store.actuation_probe_recent(path=db)
+    assert len(rows) == 1
+    assert rows[0]["reachable"] == 0
+    assert rows[0]["source"] == "loop"
+    assert "401" in rows[0]["error"]
+
+
+def test_storage_failure_does_not_swallow_the_probe(monkeypatch, tmp_path):
+    """Recording is best-effort by contract: losing the row must not lose the
+    answer the caller is about to act on."""
+    import asyncio
+
+    from app import store
+
+    def _boom(**kw):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(store, "actuation_probe_insert", _boom)
+    monkeypatch.setattr(act, "_probe", lambda ns: _fit())
+    fit = asyncio.run(act.check_actuation(["demo"], path=tmp_path / "s.db"))
+    assert fit.ok
+
+
+def test_dead_credential_makes_rollback_unavailable_not_failed(monkeypatch, tmp_path):
+    """The distinction the only real execution got wrong: we didn't fail to undo,
+    we never had the ability to."""
+    import asyncio
+
+    monkeypatch.setattr(act, "_probe", lambda ns: _fit(reachable=False, error="401 Unauthorized"))
+    ok, why = asyncio.run(act.can_still_write(["demo"], path=tmp_path / "s.db"))
+    assert not ok
+    assert "no longer authenticate" in why
+
+
+def test_live_credential_allows_rollback(monkeypatch, tmp_path):
+    import asyncio
+
+    monkeypatch.setattr(act, "_probe", lambda ns: _fit())
+    ok, why = asyncio.run(act.can_still_write(["demo"], path=tmp_path / "s.db"))
+    assert ok and "still valid" in why

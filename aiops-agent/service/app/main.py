@@ -41,7 +41,12 @@ async def healthz():
     # away. Two same-named stores on different mounts disagreed for weeks and
     # nothing surfaced it; identity you have to shell in to discover is identity
     # nobody checks.
-    return {"ok": True, "store": store.describe()}
+    # Readiness is the *cached* verdict on purpose — /actions/readiness is the
+    # live probe. What belongs on a health endpoint is "is the standing signal
+    # fresh and green", which is exactly what a stale age tells you.
+    from .signals.actuation import actuation_verdict
+
+    return {"ok": True, "store": store.describe(), "actuation": actuation_verdict()}
 
 
 @app.post("/chat")
@@ -188,6 +193,20 @@ async def alerts_provision(spec: AlertSpec):
 # Strong refs to in-flight executor tasks so the loop doesn't GC them mid-run.
 _executor_tasks: set[asyncio.Task] = set()
 
+# Terminal states in which something actually touched the cluster, so there is a
+# real outcome for a person to grade. REFUSED / ABORTED / REJECTED / EXPIRED are
+# excluded on purpose: nothing ran, so "did the fix work" has no referent, and
+# counting them would quietly pad the AE-SLO denominator with non-events.
+_GRADABLE_STATUSES = frozenset(
+    {
+        "succeeded",
+        "failed",
+        "verify_failed",
+        "rolled_back",
+        "rollback_failed",
+    }
+)
+
 
 def _spawn_executor(request_id: str) -> None:
     task = asyncio.create_task(execution.run(request_id))
@@ -290,6 +309,84 @@ async def actions_breaker_reset(body: BreakerResetRequest):
     return {"ok": True, "cleared": cleared, "scope": body.scope or "all"}
 
 
+class ActionOutcomeRequest(BaseModel):
+    """The on-call's verdict on an action that ran."""
+
+    resolved: bool  # did the incident actually end
+    actor: str = "unknown"
+    side_effect: bool = False  # did it break something else
+    note: str = ""
+
+
+@app.post("/actions/requests/{request_id}/outcome")
+async def actions_grade_outcome(request_id: str, body: ActionOutcomeRequest):
+    """Grade one executed action: did it actually resolve the incident.
+
+    This is the authoritative AE-SLO numerator, and it is a *person*, on purpose.
+    The pipeline already produces its own opinion — the verify step re-runs a
+    query the runbook author wrote and checks one number against a threshold —
+    but "the decline rate came back under 0.01" and "the incident is over" are
+    different claims, and only the second one is what the SLO says it measures.
+    Letting the machine grade its own remediation is also how a system starts
+    issuing itself the evidence it needs to be trusted with more autonomy, which
+    is why governance counts these labels as human and the verify-derived ones as
+    self-produced.
+
+    Only actions that really ran can be graded — grading a refusal would put a
+    row in the ledger for something that never touched the cluster.
+    """
+    from . import store as _store
+
+    req = action_requests.get(request_id)
+    if req is None:
+        raise HTTPException(status_code=404, detail="no such request")
+    if req.status not in _GRADABLE_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"request is {req.status}; only an action that actually ran can be graded "
+                f"({', '.join(sorted(_GRADABLE_STATUSES))})"
+            ),
+        )
+
+    # What the machine concluded, so agreement can be computed instead of assumed.
+    verify_said: bool | None = None
+    for row in audit.history(request_id=request_id):
+        if row["phase"] == "verify" and row["verdict"] in ("pass", "fail"):
+            verify_said = row["verdict"] == "pass"
+
+    drill = str((req.params or {}).get("drill", "")).lower() in ("true", "1", "yes")
+    _store.action_outcome_put(
+        request_id=request_id,
+        resolved=body.resolved,
+        side_effect=body.side_effect,
+        actor=body.actor,
+        fp=req.fp,
+        action=req.action,
+        verify_said=verify_said,
+        drill=drill,
+        note=body.note,
+    )
+    audit.record(
+        "outcome",
+        "resolved" if body.resolved else "not_resolved",
+        request_id=request_id,
+        fp=req.fp,
+        actor=body.actor,
+        detail={"side_effect": body.side_effect, "verify_said": verify_said, "note": body.note},
+    )
+    return {"ok": True, "request_id": request_id, "verify_said": verify_said, "drill": drill}
+
+
+@app.get("/actions/ae-slo")
+async def actions_ae_slo():
+    """Action Effectiveness SLO, drills reported separately from incidents and no
+    percentage below the reporting floor."""
+    from . import store as _store
+
+    return _store.ae_slo()
+
+
 @app.get("/actions/fix-efficacy")
 async def actions_fix_efficacy():
     """Per-action fix-efficacy summary (7b-5 Learn). Reads the executions ledger
@@ -325,6 +422,7 @@ async def actions_fix_efficacy():
 
     return {
         "per_action": by_action,
+        "ae_slo": _store.ae_slo(),
         "remediation_ce_labels": {
             "verified": verified_count,
             "failed": failed_count,

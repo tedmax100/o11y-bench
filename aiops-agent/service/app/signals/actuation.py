@@ -6,11 +6,19 @@ It never proved the third: **can we still act at all.**
 
 The cost of that gap was measured. A rollback cleared every policy gate, the
 executor claimed the request, ran the dry-run, passed the blast-radius check —
-and Kubernetes answered 401. The write ServiceAccount token had been minted 46
-days earlier against a cluster that was rebuilt in between, so its signing key
-was long gone. Nothing anywhere reported it. A credential is only observed at
-the instant it is used, and this one was used once every few weeks, so its
-death was invisible for as long as the interval between attempts.
+and Kubernetes answered 401. Nothing anywhere reported it, for eight days.
+
+The diagnosis written here originally was that the write ServiceAccount token had
+expired. It had not. The token was always valid; `tools/k8s_write.py` keyed the
+auth *prefix* under the header name while the generated client reads it under the
+scheme name, so the raw JWT went out with no `Bearer ` in front of it and the API
+server rejected it before authorization was ever evaluated. An unparseable header
+and a dead credential are the same 401 from the outside, which is exactly why the
+wrong story survived for months: it was plausible, and nothing was probing.
+
+That makes the case for this module stronger, not weaker. Whatever the cause, a
+credential is only observed at the instant it is used, and this one was used once
+every few weeks.
 
 The fix is to stop treating permission as a static fact and start treating it as
 a signal that expires — the same move this system already made for topology
@@ -129,13 +137,38 @@ def _probe(namespaces: list[str]) -> ActuationFit:
     return fit
 
 
-async def check_actuation(namespaces: list[str] | None = None) -> ActuationFit:
-    """Run the preflight and cache it. Read-only; never raises."""
+async def check_actuation(
+    namespaces: list[str] | None = None, *, source: str = "rca", path=None
+) -> ActuationFit:
+    """Run the preflight, cache it, and persist it. Read-only; never raises.
+
+    Persisting matters as much as probing: a verdict that only exists in memory
+    is gone on the next restart, and a readiness signal you can't look backwards
+    at can't answer "how long has this been broken" — which is the exact question
+    nobody could answer for 46 days."""
     global _last
     ns = namespaces or list(settings.execution_namespace_allowlist)
     fit = await asyncio.to_thread(_probe, ns)
     fit.namespaces = ns
     _last = fit
+    try:
+        from .. import store
+
+        total = max(1, len(ns) * len(REQUIRED))
+        store.actuation_probe_insert(
+            ok=fit.ok,
+            reachable=fit.reachable,
+            in_cluster=fit.in_cluster,
+            score=round((total - len(fit.missing)) / total, 4) if fit.reachable else 0.0,
+            namespaces=ns,
+            missing=fit.missing,
+            excess=fit.excess,
+            error=fit.error or "",
+            source=source,
+            path=path,
+        )
+    except Exception as e:  # a storage failure must not turn a good probe into no probe
+        logger.warning("actuation probe not recorded: %s", e)
     if not fit.ok:
         logger.warning(
             "actuation preflight not ready: error=%s missing=%s excess=%s",
@@ -144,6 +177,27 @@ async def check_actuation(namespaces: list[str] | None = None) -> ActuationFit:
             fit.excess,
         )
     return fit
+
+
+async def can_still_write(namespaces: list[str] | None = None, *, path=None) -> tuple[bool, str]:
+    """Fresh (uncached) answer to "does this credential still work right now",
+    for the rollback path.
+
+    Rollback runs with the *same* credential the failed execute used, so when the
+    failure was the credential itself, rollback cannot possibly succeed — it will
+    fail for the same reason and the request lands in `rollback_failed`. That
+    status then says "we tried to undo and couldn't", which is a different and
+    much less alarming claim than the truth: **we never had the ability to undo.**
+    An on-call reading the first one goes looking for a stuck rollout; reading the
+    second one they go fix a token.
+
+    Cached deliberately not used: the point is the state *after* the failure."""
+    fit = await check_actuation(namespaces, source="rollback", path=path)
+    if not fit.reachable:
+        return False, f"write credentials no longer authenticate ({fit.error})"
+    if fit.missing:
+        return False, f"write credentials lost required permission: {fit.missing[0]}"
+    return True, "write credentials still valid"
 
 
 async def refresh_actuation() -> None:
@@ -156,7 +210,7 @@ async def refresh_actuation() -> None:
         last = get_last_actuation()
         age = time.time() - last.computed_ts if last else None
         if last is None or age is None or age > settings.actuation_max_age_seconds:
-            await check_actuation()
+            await check_actuation(source="loop")
     except Exception as e:
         logger.warning("actuation refresh failed: %s", e)
 

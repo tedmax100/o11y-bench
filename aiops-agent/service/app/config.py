@@ -124,6 +124,13 @@ class Settings(BaseSettings):
     breaker_max_actions_per_window: int = 3
     breaker_window_seconds: int = 3600
     breaker_fail_threshold: int = 2  # consecutive failures on a target → trip open
+    # How far back the idempotency probe looks. `idem_key` is action|target|fp and
+    # `fp` is stable across recurrences of the same alert, so without a bound this
+    # gate silently means "this remediation may run once, ever" — a drill was
+    # refused as a duplicate of an execution eight days old. Idempotency is
+    # defending against an alert storm, which happens in minutes; a recurrence
+    # tomorrow is a new incident that deserves the same fix again.
+    idempotency_window_seconds: int = 3600
 
     # --- Actuation readiness preflight ---------------------------------------
     # "May we act" was gated; "can we still act" was assumed. A write-SA token
@@ -132,9 +139,18 @@ class Settings(BaseSettings):
     # SelfSubjectAccessReview turns permission into a signal that expires.
     actuation_check_enabled: bool = True
     actuation_max_age_seconds: int = 900  # older than this → readiness stale
+    # Standing probe interval. Comfortably under actuation_max_age_seconds so a
+    # single missed probe doesn't make readiness stale — a signal that reports
+    # itself broken every time one scrape is late gets ignored like any other
+    # flapping alert.
+    actuation_probe_interval_seconds: int = 300
 
     # --- Verify + rollback (step 7 後半 7b-4) ---------------------------------
-    verify_delay_seconds: int = 60  # settle window between execute and verify query
+    verify_delay_seconds: int = 60  # floor for the settle window; the query can raise it
+    # Added on top of a verify query's own lookback window before checking it, to
+    # cover the time pods actually take to roll. Without this a rollback is graded
+    # while the old ReplicaSet is still serving traffic.
+    verify_rollout_margin_seconds: int = 45
     require_rollback_contract: bool = True  # no rollback contract → executor refuses
 
     # --- Design-alert capability (ARE gap-analysis §4.2 step 6 / v3 §6) -----

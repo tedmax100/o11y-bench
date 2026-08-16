@@ -28,6 +28,7 @@ import sqlite3
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -150,12 +151,57 @@ CREATE TABLE IF NOT EXISTS runbook_feedback (
 );
 CREATE INDEX IF NOT EXISTS idx_rb_feedback_runbook ON runbook_feedback(runbook_id);
 CREATE INDEX IF NOT EXISTS idx_rb_feedback_ts ON runbook_feedback(ts);
+
+-- Actuation readiness probe history. The whole point of the preflight is that a
+-- credential's health is only observable at the moment you use it; a verdict
+-- that is only computed on the execution path is therefore observable only when
+-- it is already too late. Persisting every probe turns "can we still act" into a
+-- series with an age, so the answer exists before an incident asks for it.
+CREATE TABLE IF NOT EXISTS actuation_probes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         TEXT NOT NULL,
+    ok         INTEGER NOT NULL,             -- 1 = reachable, nothing missing/excess
+    reachable  INTEGER NOT NULL,             -- 0 = did not authenticate (the 401 case)
+    in_cluster INTEGER NOT NULL DEFAULT 0,
+    score      REAL,
+    namespaces TEXT NOT NULL DEFAULT '',     -- comma-separated
+    missing    TEXT NOT NULL DEFAULT '[]',   -- json list
+    excess     TEXT NOT NULL DEFAULT '[]',   -- json list
+    error      TEXT NOT NULL DEFAULT '',
+    source     TEXT NOT NULL DEFAULT 'loop'  -- loop / rca / preflight / rollback / api
+);
+CREATE INDEX IF NOT EXISTS idx_actuation_ts ON actuation_probes(ts);
+
+-- Human verdict on one executed action: did it actually resolve the incident.
+-- This is the authoritative AE-SLO numerator and it is deliberately NOT the
+-- verify step's opinion. `verify` asks a query the runbook author wrote months
+-- ago whether one number came back under a threshold; a person asks whether the
+-- incident is over. When those two disagree, the disagreement is the finding —
+-- so both are stored, and `agreed` is computed rather than assumed.
+CREATE TABLE IF NOT EXISTS action_outcomes (
+    request_id  TEXT PRIMARY KEY,             -- one verdict per execution; re-grading overwrites
+    ts          TEXT NOT NULL,
+    fp          TEXT NOT NULL DEFAULT '',
+    action      TEXT NOT NULL DEFAULT '',
+    resolved    INTEGER NOT NULL,             -- 1 = the incident actually ended
+    side_effect INTEGER NOT NULL DEFAULT 0,   -- 1 = it broke something else
+    verify_said INTEGER,                      -- what the machine concluded (NULL = never ran)
+    drill       INTEGER NOT NULL DEFAULT 0,
+    actor       TEXT NOT NULL,
+    note        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_action_outcomes_fp ON action_outcomes(fp);
 """
 
 # Additive migrations for columns added after initial schema creation.
 # Each ALTER is wrapped in a no-op try so re-running on an up-to-date db is safe.
 _MIGRATIONS = [
     "ALTER TABLE calibration ADD COLUMN error_dimension TEXT",
+    # Drill executions are real executions — they mutate the cluster and they
+    # belong in the ledger — but a rehearsal and an incident must not be averaged
+    # into one ratio. That mistake already cost this system a latency SLO whose
+    # samples were mostly one replayed alert.
+    "ALTER TABLE executions ADD COLUMN drill INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE calibration ADD COLUMN correction_note TEXT",
     "ALTER TABLE calibration ADD COLUMN grading_mode TEXT",
 ]
@@ -509,20 +555,41 @@ def ar_update(
 
 
 def ar_find_ran(
-    idem_key: str, exclude_request_id: str, path: str | Path | None = None
+    idem_key: str,
+    exclude_request_id: str,
+    path: str | Path | None = None,
+    window_seconds: int | None = None,
 ) -> str | None:
     """Idempotency probe: the request_id of *another* request with the same
-    idem_key that already ran or is running, else None. Empty idem_key never
-    matches (no target to dedup on)."""
+    idem_key that already ran or is running **within the window**, else None.
+    Empty idem_key never matches (no target to dedup on).
+
+    The window is the whole point. `idem_key` is `action|target|fp`, and `fp` is
+    deliberately stable across recurrences (it is also the investigation's
+    thread_id), so an unbounded lookup does not mean "don't act twice on this
+    incident" — it means "never act on this kind of incident again, for the life
+    of the database". A drill hit exactly that: a rollback was refused as a
+    duplicate of an execution eight days earlier, on an alert that had long since
+    resolved and re-fired.
+
+    What idempotency is actually defending against is an alert storm double-acting
+    on one target, and that happens in minutes. Anything older than the window is
+    a different occurrence of the same recurring problem, which is precisely what
+    the runbook exists to fix again.
+    """
     if not idem_key:
         return None
+    if window_seconds is None:
+        window_seconds = settings.idempotency_window_seconds
     placeholders = ",".join("?" for _ in _RAN_STATUSES)
+    since = (datetime.now(UTC) - timedelta(seconds=window_seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
     with _connect(path) as conn:
         r = conn.execute(
             f"SELECT request_id FROM action_requests "
-            f"WHERE idem_key=? AND request_id<>? AND status IN ({placeholders}) "
+            f"WHERE idem_key=? AND request_id<>? AND created_ts>=? "
+            f"AND status IN ({placeholders}) "
             f"ORDER BY created_ts LIMIT 1",
-            (idem_key, exclude_request_id, *_RAN_STATUSES),
+            (idem_key, exclude_request_id, since, *_RAN_STATUSES),
         ).fetchone()
     return r["request_id"] if r else None
 
@@ -539,13 +606,15 @@ def exec_record(
     fp: str,
     request_id: str,
     success: bool,
+    drill: bool = False,
     path: str | Path | None = None,
 ) -> None:
     with _write_lock, _connect(path) as conn:
         conn.execute(
-            "INSERT INTO executions (ts, scope_key, action, target, fp, request_id, success) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (ts, scope_key, action, target, fp, request_id, 1 if success else 0),
+            "INSERT INTO executions "
+            "(ts, scope_key, action, target, fp, request_id, success, drill) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (ts, scope_key, action, target, fp, request_id, 1 if success else 0, int(drill)),
         )
 
 
@@ -878,4 +947,146 @@ def rb_feedback_health_report(
     # rollback_failed first (critical), then by verify_failed_rate desc
     results.sort(key=lambda x: (-x["rollback_failed"], -x["verify_failed_rate"]))
     return results
-    migrate_legacy_jsonl(path)
+
+
+# ---- actuation readiness probe history ------------------------------------
+
+
+def actuation_probe_insert(
+    *,
+    ok: bool,
+    reachable: bool,
+    in_cluster: bool,
+    score: float | None,
+    namespaces: list[str],
+    missing: list[str],
+    excess: list[str],
+    error: str = "",
+    source: str = "loop",
+    path: str | Path | None = None,
+) -> None:
+    """Append one readiness probe. Best-effort by contract: the caller must never
+    lose a probe result to a storage failure, so this swallows nothing but is
+    always called inside a try by the prober."""
+    from datetime import UTC, datetime
+
+    ts = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _write_lock, _connect(path) as conn:
+        conn.execute(
+            "INSERT INTO actuation_probes "
+            "(ts, ok, reachable, in_cluster, score, namespaces, missing, excess, error, source) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                ts,
+                int(ok),
+                int(reachable),
+                int(in_cluster),
+                score,
+                ",".join(namespaces),
+                json.dumps(missing),
+                json.dumps(excess),
+                error,
+                source,
+            ),
+        )
+
+
+def actuation_probe_recent(limit: int = 50, path: str | Path | None = None) -> list[dict]:
+    """Most recent probes, newest first."""
+    with _connect(path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM actuation_probes ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---- action outcome grading (AE-SLO numerator) -----------------------------
+
+
+def action_outcome_put(
+    *,
+    request_id: str,
+    resolved: bool,
+    actor: str,
+    fp: str = "",
+    action: str = "",
+    side_effect: bool = False,
+    verify_said: bool | None = None,
+    drill: bool = False,
+    note: str = "",
+    path: str | Path | None = None,
+) -> None:
+    """Record (or correct) the human verdict on one executed action."""
+    ts = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _write_lock, _connect(path) as conn:
+        conn.execute(
+            "INSERT INTO action_outcomes "
+            "(request_id, ts, fp, action, resolved, side_effect, verify_said, drill, actor, note) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(request_id) DO UPDATE SET "
+            "ts=excluded.ts, resolved=excluded.resolved, side_effect=excluded.side_effect, "
+            "verify_said=excluded.verify_said, actor=excluded.actor, note=excluded.note",
+            (
+                request_id,
+                ts,
+                fp,
+                action,
+                int(resolved),
+                int(side_effect),
+                None if verify_said is None else int(verify_said),
+                int(drill),
+                actor,
+                note,
+            ),
+        )
+
+
+def action_outcomes(path: str | Path | None = None) -> list[dict]:
+    with _connect(path) as conn:
+        rows = conn.execute("SELECT * FROM action_outcomes ORDER BY ts DESC").fetchall()
+    return [dict(r) for r in rows]
+
+
+def ae_slo(min_n: int = 5, path: str | Path | None = None) -> dict:
+    """Action Effectiveness: of the actions we executed, how many actually ended
+    the incident — graded by a person, counted separately for drills.
+
+    Two rules this function exists to enforce, because both were broken by hand
+    before:
+
+    1. **No percentage under `min_n`.** `0/1` printed as `0.0%` reads like a
+       measured failure rate; it is one anecdote. Below the floor the ratio is
+       omitted entirely rather than rendered small.
+    2. **Drills never join the incident ratio.** They are reported beside it, so
+       a rehearsal cannot flatter (or ruin) the number that describes production.
+    """
+    rows = action_outcomes(path)
+
+    def summarize(subset: list[dict]) -> dict:
+        n = len(subset)
+        effective = sum(1 for r in subset if r["resolved"] and not r["side_effect"])
+        out = {"n": n, "effective": effective, "raw": f"{effective}/{n}"}
+        out["rate"] = round(effective / n, 3) if n >= min_n else None
+        if n < min_n:
+            out["note"] = f"n={n} below the reporting floor of {min_n}; ratio withheld"
+        return out
+
+    graded = [r for r in rows if r["verify_said"] is not None]
+    disagreements = [r for r in graded if bool(r["verify_said"]) != bool(r["resolved"])]
+    return {
+        "incidents": summarize([r for r in rows if not r["drill"]]),
+        "drills": summarize([r for r in rows if r["drill"]]),
+        "verify_agreement": {
+            "graded": len(graded),
+            "disagreed": len(disagreements),
+            "note": (
+                "no executed action has been graded yet, so the machine check has "
+                "nothing to be compared against"
+                if not graded
+                else "verify and the on-call reached the same verdict every time"
+                if not disagreements
+                else "the machine check and the person disagreed at least once — "
+                "read those rows before trusting either signal alone"
+            ),
+        },
+    }

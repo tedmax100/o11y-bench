@@ -197,3 +197,24 @@ def test_load_write_api_error_is_cached(tmp_path):
     # Cleanup
     kw._write_api = None
     kw._write_error = None
+
+
+def test_write_client_sends_a_bearer_prefixed_header(monkeypatch, tmp_path):
+    """The header the client actually puts on the wire must say `Bearer <jwt>`.
+
+    Regression for the failure this whole execution plane was blocked on: the
+    prefix was keyed on "authorization" while the generated client only reads it
+    under "BearerToken", so a perfectly valid token went out bare and came back
+    401 — indistinguishable, from the outside, from an expired credential.
+    """
+    import app.tools.k8s_write as kw
+
+    token_file = tmp_path / "token"
+    token_file.write_text("fake.jwt.value\n")
+    monkeypatch.setattr(kw, "_WRITE_TOKEN_PATH", str(token_file))
+    monkeypatch.setattr(kw, "_CLUSTER_CA_PATH", str(tmp_path / "ca.crt"))
+    monkeypatch.setattr(kw, "in_cluster_write_creds", lambda: True)
+
+    _apps, authz = kw._build_write_clients()
+    cfg = authz.api_client.configuration
+    assert cfg.auth_settings()["BearerToken"]["value"] == "Bearer fake.jwt.value"
