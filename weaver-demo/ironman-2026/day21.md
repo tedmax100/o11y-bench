@@ -44,20 +44,27 @@ agent_mod._build_agent = lambda: asyncio.sleep(0, result=_StubGraph())
 
 ```console
 $ uv run python probe_turn.py
+runbook payment-bad-deploy matched alertname 'PaymentDeclineRateHigh' only after
+normalization (trigger says 'payment-decline-rate-high') — align the alert rule
+or the runbook trigger
 budget: 6 tool calls
-messages handed to the graph: 4
+messages handed to the graph: 6
 
-0. [system   ]    806 chars  ## Live capability snapshot
-1. [system   ]   2264 chars  ## Signal context (topology v1.0.0)
-2. [system   ]    788 chars  ## Dependency health (live) — payment-service
-3. [user     ]   3444 chars  An alert just fired. Investigate the root cause and conclude with the sin…
+0. [system   ]    517 chars  ## Live capability snapshot
+1. [system   ]   2212 chars  ## Signal context (topology v1.0.0)
+2. [system   ]    785 chars  ## Runbook: payment-bad-deploy — payment-service decline-rate spike after…
+3. [system   ]   1305 chars  ## Runbook diagnostics auto-run: payment-bad-deploy
+4. [system   ]    572 chars  ## Dependency health (live) — payment-service
+5. [user     ]   3444 chars  An alert just fired. Investigate the root cause and conclude with the sin…
 
-total: 7302 chars before the first token of reasoning
+total: 8835 chars before the first token of reasoning
 ```
 
-四則訊息，七千三百個字元，而模型連第一個字都還沒吐。**其中前三則全部是第二階段的產出，第四則才是那個告警本身。**
+六則訊息，八千八百個字元，而模型連第一個字都還沒吐。**其中前五則全部是平台這一側先備好的東西（第二階段那幾天的產出加上 runbook），最後一則才是那個告警本身。**
 
-順序是有意義的。`0` 是能力快照，回答「這個服務有哪些指標真的存在」；`1` 是拓撲跟契約，回答「它在哪裡、該用哪一句查詢判斷它」；`2` 是依賴健康，回答「它的鄰居現在誰好誰壞」。等到 `3` 那則使用者訊息說「有個告警燒起來了，去查」的時候，模型手上已經有一張地圖。
+順序是有意義的。`0` 是能力快照，回答「這個服務有哪些指標真的存在」；`1` 是拓撲跟契約，回答「它在哪裡、該用哪一句查詢判斷它」；`2` 跟 `3` 是比對到的 runbook 跟它自動跑完的唯讀診斷，回答「這種告警以前是怎麼查的、那幾項檢查現在過不過」；`4` 是依賴健康，回答「它的鄰居現在誰好誰壞」。等到 `5` 那則使用者訊息說「有個告警燒起來了，去查」的時候，模型手上已經有一張地圖。
+
+第一行那個 `only after normalization` 值得順手記一筆。runbook 的 trigger 寫的是 `payment-decline-rate-high`，我隨手編的告警名字是 `PaymentDeclineRateHigh`，兩邊靠正規化才接上，而程式碼選擇「接上，但大聲講出來」。這句話是寫給平台團隊看的：現在能動，但兩邊的命名沒有對齊，哪天多一個 `payment_decline_rate_high` 就會開始靠運氣。
 
 ## 入口點在圖的外面
 
@@ -76,7 +83,7 @@ flowchart TB
 
 **六個注入全部在 `ainvoke` 之前跑完，圖裡的四個 node 沒有任何一個會回頭呼叫 `signals/`。** 這代表決策級 context 的入口點是「組裝那一輪」這個階段，不是圖的某一步。
 
-這個設計有個直接的後果：那些 context 是**一次性**的。圖跑了幾圈、模型查了什麼、發現了什麼，都不會讓那三個區塊重算。s4 的依賴健康是在調查開始前讀的一個快照，如果調查跑了三分鐘，那三分鐘內鄰居的狀態變了，模型不會知道。
+這個設計有個直接的後果：那些 context 是**一次性**的。圖跑了幾圈、模型查了什麼、發現了什麼，都不會讓那幾個區塊重算。s4 的依賴健康是在調查開始前讀的一個快照，如果調查跑了三分鐘，那三分鐘內鄰居的狀態變了，模型不會知道。
 
 這是刻意的取捨，理由在 `health.py` 的說明裡：
 
@@ -84,27 +91,28 @@ flowchart TB
 
 **它不佔預算。** 六次工具呼叫的上限是留給模型自己決定要查什麼的，如果依賴健康也從那裡扣，等於平台團隊先花掉了使用者的額度。放在迴圈外面就不用跟模型搶。
 
-## 兩則沒有出現的訊息
+## 那則沒有出現的訊息
 
-上面那份輸出只有四則，但注入有六個。`_inject_past_incidents` 跟 `_inject_runbook` 各自產出了空的東西：
+上面那份輸出是六則，但注入有六個，而其中 runbook 那一個自己就產了兩則。少掉的那則是過去事故：
 
 ```console
-$ uv run python -c "from app.runbook import match_runbook; \
-    print(match_runbook({'alertname':'PaymentDeclineRateHigh'}, {}))"
-None
-
 $ uv run python -c "from app.agent import _past_incident_context; \
     print(repr(_past_incident_context('payment-service','PaymentDeclineRateHigh')))"
 ''
 ```
 
-runbook 沒有比對到（我這個告警名字是隨手編的，沒有對應的 runbook），過去事故庫是空的（這台環境從來沒有存過一次成功的調查）。
+空的，因為這台環境從來沒有存過一次成功的調查。
 
-兩個都是 fail-open：拿不到東西就不注入，不會炸掉整輪。這個行為本身是對的，但它讓那份輸出有一點誤導性：**看到四則訊息，你不會知道本來可以有六則。** 這跟前面幾天一直在修的形狀是同一個：沒東西的時候，「沒有」跟「有但是空的」在輸出上長得一樣。差別只在這次咬到的是我自己在讀 debug 輸出，不是模型。
+它是 fail-open：拿不到東西就不注入，不會炸掉整輪。這個行為本身是對的，但它讓那份輸出有一點誤導性：**看到六則訊息，你不會知道本來可以有七則。** 這跟前面幾天一直在修的形狀是同一個：沒東西的時候，「沒有」跟「有但是空的」在輸出上長得一樣。差別只在這次咬到的是我自己在讀 debug 輸出，不是模型。
+
+> 順帶一提，同樣一個 `match_runbook()`，只丟 `alertname` 進去是比對不到的，
+> 要連 `service_name`、`severity` 一起丟才會中。
+> 我第一次拿一行 `python -c` 去驗，看到 `None` 就以為它沒比對到，
+> 結果是我自己少餵了 label，跟程式沒關係 QQ
 
 ## 然後真的跑一次
 
-輸入那一側看完了，接下來把模型接回去，看它實際怎麼走。同一個告警、同一個釘住的時鐘，`run_rca.py` 用的是真的圖，只是把每一則訊息側錄下來。
+輸入那一側看完了，接下來把模型接回去，看它實際做一次 RCA（root cause analysis，根因分析）怎麼走。同一個告警、同一個釘住的時鐘，`run_rca.py` 用的是真的圖，只是把每一則訊息側錄下來。
 
 十三秒、四次工具呼叫（上限是六次），結論是對的：
 
@@ -188,7 +196,6 @@ compactor:
 
 而它接不上的原因，正好是前面那份決策級遙測 JSON 裡沒有的東西。契約有宣告 `freshness`（樣本多舊算過期），但**沒有任何欄位宣告「這個 store 記得多久以前的事」**。這兩個是不同的問題：前者講的是資料新不新，後者講的是資料還在不在。
 
-
 ## 這場考試是開書的
 
 回頭看那份逐字稿，有一句話我怎麼想都不對勁。第一次查詢之後它寫：
@@ -238,9 +245,9 @@ reason 是 `new_validator_odd_cents`。看起來跟新部署的 validator 有關
 
 `discover → query → hypothesize → verify` 這條鏈，在程式碼裡其實分成兩半。
 
-`圖`負責的是**執行**：agent 想查東西就去 tools、查完回 agent、預算用完轉 force_answer、答完進 rubric_trace。它完全不知道「discover」跟「query」有什麼差別，對它來說都只是一次工具呼叫。
+圖負責的是**執行**：agent 想查東西就去 tools、查完回 agent、預算用完轉 force_answer、答完進 rubric_trace。它完全不知道「discover」跟「query」有什麼差別，對它來說都只是一次工具呼叫。
 
-`prompt` 負責的是**順序**。那份 `_RCA_PLAYBOOK` 把方法寫死在裡面，開頭第一段是這樣：
+順序則是 prompt 負責的。那份 `_RCA_PLAYBOOK` 把方法寫死在裡面，開頭第一段是這樣：
 
 ```
 ## Step 0 — Hypothesis tree (do this BEFORE any tool call)
@@ -309,7 +316,7 @@ flowchart TB
     PV --> IN
 ```
 
-所以嚴格講有三層迴圈：圖裡面的 ReAct、`rubric_trace` 那條檢查後重寫的回頭邊、以及最外面這個換假設的。三層各自解決不同的問題：查不夠、講錯了、想錯了。
+所以嚴格講有三層迴圈：圖裡面那個 ReAct（reason + act，想一下、呼叫一次工具、再想一下的來回）、`rubric_trace` 那條檢查後重寫的回頭邊、以及最外面這個換假設的。三層各自解決不同的問題：查不夠、講錯了、想錯了。
 
 ## 順手修掉一個矛盾
 
@@ -361,11 +368,11 @@ right node:
 
 沒有補那個 trace 保留期。目前沒有任何地方宣告「這個 store 記得多久」，所以 agent 會在一個結構上不可能成功的步驟上花預算。要修的話那個資訊該長在契約裡，跟 `freshness` 放在一起。
 
-沒有量那 7302 個字元的效益。注入越多不見得越好，前面講過 signal flood 的問題，而我現在沒有任何數據可以說這三個區塊各自貢獻了多少。要回答得跑對照組，那是評測那一塊的事。
+沒有量那 8835 個字元的效益。注入越多不見得越好，前面講過 signal flood 的問題，而我現在沒有任何數據可以說這幾個區塊各自貢獻了多少。要回答得跑對照組，那是評測那一塊的事。
 
 沒有處理那個「快照是一次性」的問題。調查跑到一半鄰居狀態變了，模型不會知道，而目前也沒有任何機制讓它重新讀。
 
-那兩則空的注入也沒有補。過去事故庫是空的這件事，其實是這套機制最有價值的部分還沒有被啟動。
+那則空的注入也沒有補。過去事故庫是空的這件事，其實是這套機制最有價值的部分還沒有被啟動。順便也沒去對齊 runbook trigger 跟告警規則的命名，現在是靠正規化接上的。
 
 ## 小結
 

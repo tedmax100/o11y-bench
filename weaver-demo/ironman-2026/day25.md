@@ -72,7 +72,7 @@ spans in Tempo for that trace: 46
    1 execute_tool query_prometheus
 ```
 
-`opentelemetry-instrumentation-langchain` 把 LangGraph 的每一個 node、每一次工具呼叫、每一次模型呼叫都變成了 span。三十個 span 裡有 `execute_task agent`（模型在想）、`execute_task route_after_agent`（前面畫過的那個條件分支真的走了哪一邊）、`execute_tool ...`（每一次查詢）。前面畫的那張四個 node 的圖，在這裡是一條可以逐格播放的實際錄影。
+`opentelemetry-instrumentation-langchain` 把 LangGraph 的每一個 node、每一次工具呼叫、每一次模型呼叫都變成了 span。三十個 span 裡有 `execute_task agent`（模型在想）、`execute_task route_after_agent`（前面畫過的那個條件分支真的走了哪一邊）、`execute_tool ...`（每一次查詢）。前面介紹 agent 迴圈時畫的那張四個 node 的圖，在這裡變成一條可以逐格播放的實際錄影。
 
 打開一個工具 span 看屬性：
 
@@ -94,12 +94,12 @@ execute_tool query_prometheus
 
 缺的東西很小，小到有點好笑：沒有任何欄位把「這個結論」連到「那條 trace」。
 
-investigation 那張表記了 fp、時間、結論、信心、governance 決策，但沒有 trace id。audit log 記了誰在什麼時候提了什麼動作，也沒有 trace id。所以要從一份結論走到它的推理過程，唯一的路是去日誌裡用時間或 fp 撈，撈到那行 `trace_id=...`，再貼進 Grafana。
+investigation 那張表記了 `fp`（fingerprint，Grafana 給同一個告警的識別碼）、時間、結論、信心、governance 決策，但沒有 trace id。audit log 記了誰在什麼時候提了什麼動作，也沒有 trace id。所以要從一份結論走到它的推理過程，唯一的路是去日誌裡用時間或 fp 撈，撈到那行 `trace_id=...`，再貼進 Grafana。
 
 ```mermaid
 flowchart LR
     C["結論<br/>investigation row"] -.->|"以前：要去 log 裡撈"| L["應用日誌"]
-    L -.-> T["trace<br/>36-46 個 span"]
+    L -.-> T["trace<br/>一次調查 36–46 個 span"]
     C -->|"現在：一個欄位"| T
     A["audit：誰批准了什麼"] --> T
 ```
@@ -147,7 +147,7 @@ flowchart TB
     S5 --> S6["5 評測<br/>固定資料上打分"]
 ```
 
-前四段跑在活的 k3d 叢集上，最後一段會啟動預先建好的 stack image。這兩件事不能同時發生，因為那個 image 自己要佔 9090／3100／3200，正好是前面幾段 port-forward 用的埠。所以 `e2e.sh` 的最後一段做的第一件事是把 port-forward 關掉。這不是設計，是現實逼出來的順序，而它剛好也是對的順序：先在真的環境裡看它會不會動，再到固定資料上量它有多準。
+前四段跑在活的 k3d 叢集上，最後一段（評測）會啟動一份預先建好的 stack image，裡面是一組不會再變的資料。這兩件事不能同時發生：那個 image 自己要佔 9090／3100／3200，而前面幾段的 port-forward 佔的正好也是這三個埠。所以 `e2e.sh` 的最後一段做的第一件事，是把前面的 port-forward 全部關掉。這不是設計，是現實逼出來的順序，而它剛好也是對的順序：先在真的環境裡看它會不會動，再到固定資料上量它有多準。
 
 ```console
 ── 1. governance: shipping-v1 onboarding checklist ──
@@ -188,7 +188,9 @@ policy    : within policy (affected 2 pod(s), ns demo)
 6 ok, 0 failed
 ```
 
-有幾行是這幾天的東西第一次在同一條鏈上一起出現。第三段那句 warning 是前幾天加的：告警名字跟 runbook 的 trigger 拼法不同，比對還是成功了，但它吵了一聲，而那正是這條鏈以前斷掉的地方。第四段的 `trace_id` 是今天上半段加的那個欄位，第 4b 段的 `footprint` 讓提案跟它的大小終於在同一行上。而第三段那句「no answer tokens」是洩題掃描：在打分之前先確認 prompt 裡沒有答案，**它排在評測前面，是因為在它綠掉之前，第五段那些數字沒有意義。**
+有幾行是這幾天的東西第一次在同一條鏈上一起出現。第三段那句 warning 是前幾天加的：告警名字跟 runbook 的 trigger 拼法不同，比對還是成功了，但它吵了一聲，而那正是這條鏈以前安靜斷掉的地方。第四段的 `trace_id` 是今天上半段補的那個欄位，第 4b 段的 `footprint` 則讓提案跟它的大小終於長在同一行上。
+
+還有第三段最後那句「no answer tokens」，那是洩題掃描的輸出，用來確認交給模型的東西裡沒有答案。**它排在評測前面，是因為在它綠掉之前，第五段那些數字沒有意義。**
 
 ## 三個紅燈，沒有一個是主功能壞掉
 
@@ -251,7 +253,7 @@ headless: capability snapshot failed for user-service: 2 validation errors for S
 
 把六段拼起來之後，這條鏈能替值班的人回答的問題是這樣一串：告警燒起來 → 三十秒後有一個結論跟一個信心分數 → 旁邊有一個「下一步做什麼」的提案，寫著它會換掉兩個 pod、從 revision 25 回到 24、在 policy 範圍內 → 而如果你不信，有一個 trace id 可以打開看它是怎麼想的 → 而如果你想知道它平常準不準，有一組 fixture 的分數可以看。沒有任何一段是「相信它」，每一段都給了一個可以自己去查的東西，這是這系列從第一天那個憑空生出 814 的 agent 走到今天，唯一真正想換到的東西。
 
-反過來說也有代價要誠實講：那條 trace 裡有完整的系統 prompt 跟每一則訊息。前面撞過一次類似的事（live-check 吃到自己 coding agent 的遙測，裡面有 PII）。推理過程可回放，等於推理過程可外洩，這件事在真的環境裡要先想清楚保存期限跟誰能看。
+反過來說也有代價要誠實講：那條 trace 裡有完整的系統 prompt 跟每一則訊息。前面撞過一次類似的事（weaver 的 live-check 吃到我自己那隻 coding agent 的遙測，裡面有 PII，personally identifiable information，個資）。推理過程可回放，等於推理過程可外洩，這件事在真的環境裡要先想清楚保存期限跟誰能看。
 
 ## 今天沒做的事
 

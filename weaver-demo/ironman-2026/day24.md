@@ -12,13 +12,13 @@ tags: [OpenTelemetry, AIOps, Kubernetes, Agent, 鐵人賽]
 
 這條線的終點在這系列裡是明確劃線的：**只做估算跟建議，不做自主執行。** 「能不能讓它自己動手」是下一個系列的題目。
 
-今天的主角是 `blast_radius.py`，218 行，一個從頭到尾沒有 import 任何寫入 API 的模組。
+今天的主角是 `blast_radius.py`，動手之前 218 行，一個從頭到尾沒有 import 任何寫入 API 的模組。
 
 程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day24/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day24)。
 
 ## 先看它算出什麼
 
-乾跑做的事很單純：讀現在的 Deployment 跟 ReplicaSet，推算「如果真的做下去，會換掉幾個 pod、從哪一版到哪一版、有沒有跨 namespace」。八個提案跑一輪：
+`乾跑`（dry-run）做的事很單純：讀現在的 Deployment 跟 ReplicaSet，推算「如果真的做下去，會換掉幾個 pod、從哪一版到哪一版、有沒有跨 namespace」。八個提案跑一輪：
 
 ```console
 roll back the suspect deploy
@@ -44,7 +44,7 @@ scale to zero    REFUSE — scaling to zero takes the service fully down
 
 注意每一列都有兩層：**上面那行是事實，下面那行是判斷。** 事實不帶立場（會換掉兩個 pod），判斷才吃 policy（兩個在允許範圍內）。這個分法很重要，因為 policy 是可以按團隊調的，而事實不行。
 
-三個「拒絕」的原因也不同性質。`typo-service` 那個是**讀不到叢集**，policy 直接 fail-closed，因為在看不見的情況下動手正是這道門要防的事。`kube-system` 那個是名單，`58 pods` 那個是量。
+三個「拒絕」的原因也不同性質。`typo-service` 那個是**讀不到叢集**，policy 直接 fail-closed（算不出範圍就一律拒絕，而不是當成沒問題放行），因為在看不見的情況下動手正是這道門要防的事。`kube-system` 那個是黑名單擋的，跟數字無關。`scale 2 -> 60` 那個則純粹是量的問題：58 個 pod 會被換掉，超過設定的上限 5。
 
 ## 它真的沒有動任何東西
 
@@ -84,7 +84,7 @@ scale to zero   REFUSE — scaling to zero takes the service fully down
 
 乾跑本身跑得好好的。問題是它在整條鏈的哪一段被呼叫。
 
-把「診斷 → 建議」整條線接起來跑一次真的 RCA，同一個事故，只有 alertname 的拼法不同：
+把「診斷 → 建議」整條線接起來跑一次真的 RCA（root cause analysis，根因分析），同一個事故，只有 alertname 的拼法不同：
 
 ```console
 as the alert rule names it: alertname='PaymentDeclineRateHigh'
@@ -163,7 +163,7 @@ action requests: 1
       'policy_reason': 'within policy (affected 2 pod(s), ns demo)'}
 ```
 
-執行前那次乾跑沒有拿掉，兩次都要跑。它們的職責不一樣：**提案那次是給人看的，執行那次是防 TOCTOU 的**——從人看到卡片到他按下同意，中間可能過了十分鐘，叢集會在這十分鐘裡繼續動。所以提案時的數字是「我建議的時候長這樣」，執行時的數字才是「真的要動之前長這樣」，兩個都需要。
+執行前那次乾跑沒有拿掉，兩次都要跑。它們的職責不一樣：**提案那次是給人看的，執行那次是防 TOCTOU 的**（time-of-check to time-of-use，檢查完到真的動手之間，狀態已經變了）。從人看到卡片到他按下同意，中間可能過了十分鐘，叢集會在這十分鐘裡繼續動。所以提案時的數字是「我建議的時候長這樣」，執行時的數字才是「真的要動之前長這樣」，兩個都需要。
 
 ## 對值班的人來說差在哪
 

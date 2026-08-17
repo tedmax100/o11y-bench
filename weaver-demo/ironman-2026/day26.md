@@ -37,7 +37,7 @@ flowchart TB
     M -->|investigate| G["完整的圖：工具迴圈"]
 ```
 
-意圖閘門做兩件事。第一是**擋掉不相干的問題**，而且是 fail-closed：分類器自己壞掉的時候一律拒絕，因為「分類失敗就放行」等於給了一條繞過的路。第二是分模式：
+意圖閘門做兩件事。第一是**擋掉不相干的問題**，而且是 fail-closed：分類器自己壞掉的時候一律拒絕，而不是當成沒問題放行，因為「分類失敗就放行」等於給了一條繞過這道門的路。第二是分模式：
 
 ```console
 $ uv run python chat_probe.py
@@ -48,7 +48,7 @@ order-service 的 p95 latency          in_scope=True  mode=lookup       services
 哪個服務最近最不健康                    in_scope=True  mode=investigate  services=[]
 ```
 
-`lookup` 那兩題不需要 ReAct 迴圈。使用者要的是**看到那張圖**，agent 的工作只是把中文翻成一句 PromQL/LogQL，剩下的交給面板去跑。一次 LLM 呼叫、零工具呼叫。這個分流不是為了省錢，是因為「顯示一個指標」跟「查出根因」在互動上根本是兩件事。
+`lookup` 那兩題不需要走完整的工具迴圈（想一下、查一次、看結果再想下一步的那種）。使用者要的是**看到那張圖**，agent 的工作只是把中文翻成一句 PromQL/LogQL，剩下的交給面板去跑。一次 LLM 呼叫、零工具呼叫。這個分流不是為了省錢，是因為「顯示一個指標」跟「查出根因」在互動上根本是兩件事。
 
 然後我把兩條路的清單並排：
 
@@ -56,7 +56,7 @@ order-service 的 p95 latency          in_scope=True  mode=lookup       services
 | --- | --- | --- |
 | 意圖閘門 / 服務解析 / clarify 選單 | ✅ | — |
 | 能力快照、Signal context、依賴健康 | ✅ | ✅ |
-| **RCA playbook（假設樹＋五步＋信心規則）** | ❌ | ✅ |
+| **RCA（root cause analysis，根因分析）playbook：假設樹＋五步＋信心規則** | ❌ | ✅ |
 | **findings：結論／信心／suspected_version** | ❌ | ✅ |
 | 過去事故注入 | ❌ | ✅ |
 | **investigation 紀錄 ＋ `trace_id`** | ❌ | ✅ |
@@ -69,7 +69,7 @@ order-service 的 p95 latency          in_scope=True  mode=lookup       services
 
 這不是設計取捨，是我沒發現。`_RCA_PLAYBOOK` 這個常數只被 `_alert_to_prompt()` 用到，而那個函式只有 webhook 會呼叫。**同一個圖、同一組工具、同一份 catalog，只有 kickoff 那段話不一樣，出來的東西就差這麼多。**
 
-補起來只有三件事：investigate 模式也注入同一份 playbook；回合結束後跑一次結構化抽取，把 findings 用一個新事件送到前端並存一列 investigation（`source: chat`，帶著 Day25 那個 `trace_id`）；過去事故的查詢原本要 service ＋ alertname 兩個條件，改成 alertname 可選，因為 chat 問句沒有 alertname，而「上次有人查這個服務，結論是什麼」本來就是一個同事會記得的事。
+補起來只有三件事。一是 investigate 模式也注入同一份 playbook。二是回合結束後跑一次結構化抽取，把 findings 用一個新事件送到前端，同時存一列 investigation（`source: chat`，帶著 Day25 那個 `trace_id`）。三是過去事故的查詢原本要 service ＋ alertname 兩個條件都給，現在 alertname 可以不給，因為聊天問句根本沒有 alertname，而「上次有人查這個服務，結論是什麼」本來就是一個同事會記得的事。
 
 ```console
 $ uv run python chat_turn.py "payment-service 的拒絕率為什麼變高了"
@@ -81,7 +81,11 @@ findings   confidence=0.7 services=['payment-service'] version=v2.5.0
 stored row: fp=day26-demo source=chat confidence=0.7 trace_id=10d35edee3e4a743d43395ee6b55f5c8
 ```
 
-接的過程踩到兩個坑，而且是同一個形狀。**第一版我把 playbook 接在使用者訊息後面**，結果中文問題拿到一半英文的回答：一大塊英文指令黏在問句尾巴，模型就順著換語言了。改成獨立的 system message，並在最後一行重申「用使用者的語言回答」（放最後是因為近因效應，這條規則是模型最先忘的）。**第二版它把整棵假設樹印在回答裡**，告警那條路沒人看無所謂，chat 這條路使用者會先看到三段 H1/H2/H3 才看到答案。指令得明說：內部想，不要印，最後只留一行信心與還不能排除什麼。
+接的過程踩到兩個坑，而且是同一個形狀。
+
+**第一版我把 playbook 直接接在使用者訊息後面**，結果中文問題拿回來一半英文的回答：一大塊英文指令黏在問句尾巴，模型就順著換語言了。改成獨立的 system message，並在最後一行重申「用使用者的語言回答」。放最後是因為近因效應（recency，越靠後的指令模型越容易照做），而這條規則正好是它最先忘的那條。
+
+**第二版它把整棵假設樹印在回答裡。** 告警那條路沒人看無所謂，聊天這條路使用者得先捲過三層標題才看得到答案。所以指令要明說：想歸想，不要印出來，最後只留一行信心分數跟「還不能排除什麼」。
 
 兩個坑講的是同一件事：**同一段指令，對著沒人看的批次流程跟對著一個正在等答案的人，寫法是不一樣的。**
 

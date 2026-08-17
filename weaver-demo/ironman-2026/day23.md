@@ -12,7 +12,7 @@ tags: [OpenTelemetry, AIOps, Prometheus, Loki, Tempo, LLM-as-a-judge, 鐵人賽]
 
 昨天新加的那個 fixture 兩次都失敗，兩次都是同一個動作：一句查詢回空的，然後它換一句查詢再問一次。當時我把這件事記在 agent 頭上，說它沒有先 discover。今天回頭看它下面那兩層，發現這個帳算得有點快。
 
-上半場看工具那一層（`app/tools/query.py`，agent 直接打 Prometheus / Loki / Tempo 原生 HTTP API 的那 539 行），下半場看守門那一層（`rubric.py`，152 行，兩個 LLM-as-a-judge）。兩層的問題形狀一樣，所以放在同一天。
+上半場看工具那一層，也就是 `app/tools/query.py`：agent 直接打 Prometheus / Loki / Tempo 原生 HTTP API 的地方，動手之前是 539 行。下半場看`守門`（guardrail，這系列裡指的是那種攔在流程上、答完或執行前先審一次的檢查）那一層，`rubric.py`，動手之前 152 行，裡面兩個都是 LLM-as-a-judge。兩層的問題形狀一樣，所以放在同一天。
 
 程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day23/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day23)。
 
@@ -70,7 +70,7 @@ Tempo 三種寫法全部大聲拒絕，連時間單位給錯都會回一個 `val
 
 治理那一段講過一句話：一道 gate 擋下來之後如果還要平台團隊親自去解釋，它的維護成本會隨團隊數線性成長。工具是同一個道理，只是對面那個「使用者」是模型。一個回空的工具如果不說明為什麼空，代價就是模型多花一次呼叫去猜，而預算只有六次。
 
-所以 `query.py` 這天多了兩個小函式，只在結果是空的時候才跑：Prometheus 那邊把 expression 裡用到的指標名字抓出來，跟 `/api/v1/label/__name__/values` 對一次；Loki 那邊把 selector 裡的鍵抓出來，跟 `/loki/api/v1/labels` 對一次，指名哪個鍵不是可索引標籤，並把可索引的那五個列出來。
+所以 `query.py` 這天多了兩個小函式，只在結果是空的時候才跑，去回答「為什麼空」。Prometheus 那邊把 expression 裡用到的指標名字抓出來，跟 `/api/v1/label/__name__/values` 的清單對一次，對不上就直接指名是哪個名字不存在。Loki 那邊同理，把 selector 裡的鍵抓出來跟 `/loki/api/v1/labels` 對一次，然後告訴它哪個鍵不是可索引標籤、可索引的是哪五個。
 
 ```console
 {'resultType': 'matrix_summary', 'result': [],
@@ -87,13 +87,13 @@ Tempo 三種寫法全部大聲拒絕，連時間單位給錯都會回一個 `val
 
 兩條都 fail-open。多打的那一次 metadata 查詢如果失敗，空結果就照原樣回去，不會因為補不到一句提示而讓整個工具呼叫炸掉。**提示是加值，不是前提。** 另外那句 `hint` 裡明講「rewording this query will return empty again」是刻意的，昨天那兩次失敗都是換句話再問，所以這句話直接對著那個行為講。
 
-寫測試的時候我把那個 Loki 空回應整包印出來，發現它有將近三千個字元。裡面沒有半行 log，全部是 `stats`：快取命中數、下載的 chunk bytes、各層的耗時，而且因為什麼都沒查到，數字全是 0。
+寫測試的時候我把那個 Loki 空回應整包印出來，發現它有將近 2.9 KB。裡面沒有半行 log，全部是 Loki 附在每個回應上的 `stats` 區塊：快取命中數、下載的 chunk bytes、各層的耗時，而且因為什麼都沒查到，數字全是 0。
 
 ```
 with stats: 2892 B   |   without: 39 B
 ```
 
-一則「我什麼都沒找到」的回答，用了 2,892 個字元。這包東西是給 Grafana 畫查詢統計用的，對 agent 來說是純雜訊，但它會照樣進到對話裡、照樣算 token、照樣稀釋掉旁邊那些真的有訊息的字。丟掉之後剩 39 B，補上 `note` 跟 `hint` 之後 404 B，而這 404 B 每個字都在講事情。這種東西不會有人抱怨，因為它不會壞，它只是讓每一輪對話都胖一點，然後在某一次長調查裡把有用的上下文擠掉。
+一則「我什麼都沒找到」的回答，用掉 2,892 B。這包東西是給 Grafana 畫查詢統計用的，對 agent 來說是純雜訊，但它會照樣進到對話裡、照樣算 token、照樣稀釋掉旁邊那些真的有訊息的字。丟掉之後剩 39 B，補上 `note` 跟 `hint` 之後 404 B，而這 404 B 每個字都在講事情。這種東西不會有人抱怨，因為它不會壞，它只是讓每一輪對話都胖一點，然後在某一次長調查裡把有用的上下文擠掉。
 
 Tempo 那一側的問題不是不吭聲，是它的訊息是寫給已經懂 TraceQL 的人看的。`unexpected IDENTIFIER` 沒有告訴你 `service_name` 在這裡該寫成 `resource.service.name`，`binary operations must operate on the same type` 沒有告訴你把 `error` 的引號拿掉。而這兩個錯都是昨天 A/B 那兩份逐字稿裡真的出現過的：模型腦袋裡「服務的標籤叫什麼」只有一份，跨三個 store 共用，所以它在 Tempo 裡寫了 Loki 的名字。所以今天把提示改成會讀查詢內容的東西：
 
@@ -170,7 +170,7 @@ a fabricated ID     a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4  seen by {32}: True   -> fl
 
 那個 `False` 是重點。**它不是「檢查過然後放行」，是「根本沒被檢查」**，而兩者在輸出上都是一句 `passes`。agent 如果引用了一個 31 個字的 ID，不管那個 ID 是真的、是它自己編的、還是它把兩個 ID 記混了，守門都不會有任何反應。
 
-這個比例我跑了三次，分別是 31%（1743 筆）、32%（1718 筆）、14%（1826 筆）。比例會跳是因為 Tempo search 每次回的集合不一樣，這件事本身也值得記一筆：**引用一個百分比的時候要一起講抽樣方式**，這裡是五個服務、每個 limit 500、過去一小時、去重。穩定的部分是每一次都有好幾百筆短 ID。
+這個比例我跑了三次，短 ID 佔比分別是 31%、32%、14%（三次撈回來的去重 ID 總數是 1743、1718、1826 筆）。比例會跳是因為 Tempo search 每次回的集合不一樣，這件事本身也值得記一筆：**引用一個百分比的時候要一起講抽樣方式**，這裡是五個服務、每個 limit 500、過去一小時、去重。穩定的部分是每一次都有好幾百筆短 ID。
 
 修法很短，`{32}` 改成 `{24,32}`，查 Tempo 之前把前導零補回去。24 這個下限是這樣選的：一個真的 128 bit ID 要短到 24 個字，得有 32 個 bit 的前導零，那個機率是四十億分之一；同時 24 個字又夠長，不會去誤抓文章裡其他長得像十六進位的東西。而 Tempo 兩種形式都認：
 

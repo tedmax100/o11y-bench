@@ -68,7 +68,7 @@ by source/correct:
 接下來的問題比寫程式難：那 35 筆到底該不該算數。讓治理平面直接去讀 `eval.db` 最省事，但等於把合成事故的成績直接當成營運歷史；把紀錄複製過去、順手把來源洗成 `manual` 之類的，這個我連想都不該想。我做的是第三種：複製過去，**但把 `source` 原封不動留著**，讓那 35 列在資料庫裡永遠標著 `eval-harness`，誰去查都看得出來這批是哪裡來的。
 
 ```bash
-# 從 o11y-bench 主 repo 的根目錄跑
+# 從範例 repo 的根目錄跑
 python3 ironman-2026/day31/promote_labels.py           # 先看會搬什麼
 python3 ironman-2026/day31/promote_labels.py --apply
 ```
@@ -135,13 +135,12 @@ python3 ironman-2026/day31/calibration_report.py
 ```
 
 ```
-[1] what the gate reads
+[1] the aggregate over every row, which is what the gate used to read
   labeled=35  overconfidence=-0.0029  tolerance=0.1
   ece=0.1743  mce=1.0  brier=0.2329
-  the whole store                        -> auto     calibration ok (overconfidence -0.0029, 35 runs)
 ```
 
-同一批資料，`overconfidence` 是 `-0.0029`，容忍值是 0.1，過得非常輕鬆。而 `ECE` 是 `0.1743`，如果關卡讀的是這個數字、門檻一樣是 0.1，它會直接被擋下來。
+同一批資料，`overconfidence` 是 `-0.0029`，容忍值是 0.1，過得非常輕鬆，剛剛那句 `calibration ok` 就是這樣來的。而 `ECE` 是 `0.1743`，如果關卡讀的是這個數字、門檻一樣是 0.1，它會直接被擋下來。同一批紀錄，換一個統計量就換一個結論。
 
 ```mermaid
 flowchart LR
@@ -236,14 +235,13 @@ flowchart TB
 
 ```
 [4] split by grading mode
-  culprit fixtures ('blame was right')   n=15  conf=0.72   acc=1.0    overconf=-0.28    ece=0.28
-  inconclusive fixtures ('it hedged')    n=20  conf=0.455  acc=0.25   overconf=+0.205   ece=0.405
+  culprit ('blame was right')            n=15  conf=0.72   acc=1.0    overconf=-0.28    ece=0.28
+  inconclusive ('it hedged')             n=20  conf=0.455  acc=0.25   overconf=+0.205   ece=0.405
 
-  culprit fixtures only                  -> propose  calibration unproven (15 labeled run(s) < 20); autonomy withheld
-  everything (what the gate does today)  -> auto     calibration ok (overconfidence -0.0029, 35 runs)
+  culprit only (what the gate does now)  -> propose  calibration unproven (15 labeled run(s) < 20); autonomy withheld
 ```
 
-最後兩行放在一起看有點刺眼。只算「指對兇手」那 15 筆，關卡的回答是標註不夠、自主權保留；把 20 筆量的是另一件事的紀錄混進去，同一個關卡的回答變成校準良好、可以放手。
+只算「指對兇手」那 15 筆，關卡的回答是標註不夠、自主權保留。而前面那個 `calibration ok`，靠的正是把 20 筆量著另一件事的紀錄一起算進去，才湊出 35 筆跟那個接近零的平均數。這兩個回答的差別不是統計上的細節，是它們根本在回答不同的問題。
 
 前面說那 35 筆只有三個 fixture、資訊量比數字看起來少。這句話還要再收緊一次：三個 fixture 裡，只有一個在量校準曲線假設的那件事，而它只有 15 筆。
 
@@ -263,7 +261,7 @@ WHERE ... AND c.correct = 1
 
 過去事故庫撈的是 `correct = 1`。照現在的標法，「在一個沒出事的告警上正確地保留」會被當成一次**成功解決的過去事故**撈出來餵給 agent。目前還沒發作，因為 eval 那批沒有寫進 `investigations` 表，但接下來要做的實驗正是要讓那張表有東西。
 
-做的事情很小，一個欄位：calibration 表加上 `grading_mode`，記下這一列的 `correct` 到底在回答哪個問題。誰知道就誰填 — harness 從 fixture 的 `expect` 拿、plugin 上人按對錯的那條路填 `culprit`，其他一律留 NULL。然後 `compute_calibration()` 多一個 `modes` 參數，`governance_calibration_modes` 預設 `["culprit"]`，NULL 不算數（不知道就不算，跟這系列一路的預設一樣）。
+做的事情很小，一個欄位：calibration 表加上 `grading_mode`，記下這一列的 `correct` 到底在回答哪個問題。誰知道就誰填，harness 從 fixture 的 `expect` 拿、plugin 上人按對錯的那條路填 `culprit`，其他一律留 NULL。然後 `compute_calibration()` 多一個 `modes` 參數，`governance_calibration_modes` 預設 `["culprit"]`，NULL 不算數（不知道就不算，跟這系列一路的預設一樣）。
 
 `inconclusive` 那 20 筆沒有被丟掉，它們改用一個不套校準數學的數字來報：
 
@@ -278,7 +276,9 @@ WHERE ... AND c.correct = 1
 culprit only (what the gate does now)  -> propose  calibration unproven (15 labeled run(s) < 20); autonomy withheld
 ```
 
-**綠燈變回紅燈，而且是「還沒量夠」那一種紅燈。** 今天上半段開的那道鎖，下半段又鎖回去了，理由是它本來就不該開。這兩句紅燈的差別值得記一下：`calibration unproven` 是還沒開始量，補標註就會變；`overconfident by +X` 是量完了而結論是不該信。它們在程式碼裡是兩個不同的回傳值，這個設計是對的。而今天實際拿到過的那個 `calibration ok`，沒有被跟第一種分開——它可能代表信心真的可信，也可能代表兩種毛病剛好抵銷，而這兩件事在畫面上、在資料庫裡、在那句 `calibration_note` 裡長得一模一樣。
+**綠燈變回紅燈，而且是「還沒量夠」那一種紅燈。** 今天上半段開的那道鎖，下半段又鎖回去了，理由是它本來就不該開。這兩句紅燈的差別值得記一下：`calibration unproven` 是還沒開始量，補標註就會變；`overconfident by +X` 是量完了而結論是不該信。它們在程式碼裡是兩個不同的回傳值，這個設計是對的。
+
+真正沒有被分開的是綠燈那一側。`calibration ok` 這句話可能代表信心真的可信，也可能代表兩種相反的毛病剛好抵銷，而這兩件事在畫面上、在資料庫裡、在那句 `calibration_note` 裡長得一模一樣。
 
 ## 誰有資格決定哪些紀錄算數
 
@@ -286,7 +286,14 @@ culprit only (what the gate does now)  -> propose  calibration unproven (15 labe
 
 一端是那條橋的維護成本。我做的是一次性的複製，而 eval harness 以後每跑一次還是會寫進 `eval.db`，也就是說這兩個數字從今天起就開始分岔，要它們對得上得有人記得再跑一次 `promote_labels.py`。一個要靠人記得的步驟，就是一個遲早會被忘記的步驟，而它被忘記的時候，症狀是治理平面用一份過時的校準紀錄在做授權判斷，畫面上沒有任何東西會說「這份紀錄停在兩個月前」。
 
-另一端是 `compute_calibration()` 吃的是 `load_records()` 的全部，除了今天補的 `modes` 之外沒有任何過濾參數。要算什麼、不算什麼，這個決定其實有好幾個維度：評分模式（今天講的）、新鮮度（三個月前的紀錄還算數嗎）、fixture 的多樣性（同一題跑十次算十筆還是一筆）、來源（`eval-harness` 該不該算「非自我」）。四個問題裡我今天只回答了第一個，其餘三個現在的答案都是「全部算」，因為沒有人被問過。
+另一端是 `compute_calibration()` 吃的是 `load_records()` 的全部，除了今天補的 `modes` 之外沒有任何過濾參數。要算什麼、不算什麼，這個決定其實有好幾個維度：
+
+- 評分模式：今天講的那個，`culprit` 跟 `inconclusive` 不是同一種對
+- 新鮮度：三個月前的紀錄還算數嗎
+- fixture 的多樣性：同一題跑十次，算十筆還是一筆
+- 來源：`eval-harness` 到底該不該算「非自我」
+
+四個問題裡我今天只回答了第一個，其餘三個現在的答案都是「全部算」，因為沒有人被問過。
 
 這是那種「不做決定也是一種決定」的地方，而它的代價要等到有人真的想放手的那天才會出現。到那天，做決定的人會發現他手上唯一的旋鈕是 `governance_max_overconfidence` 那個數字，而調它並不能解決上面任何一個問題。順帶一提，這也是「產品團隊要付多少成本」的一個例子：如果哪天有第二隻 agent、或別的團隊接進來，他們要做的第一件事不是接 API，是搞懂自己的 eval 結果要寫到哪個檔案才會被算進去，而這件事目前只寫在一行程式碼註解裡。
 

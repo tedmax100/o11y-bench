@@ -11,7 +11,7 @@ tags: [OpenTelemetry, AIOps, Governance, Kubernetes, 鐵人賽]
 > 而擋住真實變更的那個東西
 > 不是我蓋的任何一道門
 
-昨天把過去事故庫的接縫修好，那條路要等下一輪真的跑才有東西。今天做的是這七天真正的那件事：**讓它動一次**，然後在同一天把每一道門弄壞給它看。
+昨天把過去事故庫的接縫修好，那條路要等下一輪真的跑才有東西。今天做的是這八天真正的那件事：**讓它動一次**，然後在同一天把每一道門弄壞給它看。
 
 程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day33/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day33)。今天前半在真實叢集上跑，後半不需要叢集也不需要 LLM。
 
@@ -24,7 +24,7 @@ $ kubectl -n demo get deploy aiops-agent -o jsonpath='{range .spec.template.spec
 ACTIONS_ENABLED=true
 ```
 
-它是 true。而且旁邊那個 write RBAC 的 token secret 是 46 天前建的，也就是說**這顆開關從 6 月 22 號就開著**，而我這七天一直用「那是一組沒有人按過的開關」在講它。
+它是 true。而且旁邊那個 write RBAC 的 token secret 是 46 天前建的，也就是說**這顆開關從 6 月 22 號就開著**，而我這八天一直用「那是一組沒有人按過的開關」在講它。
 
 那 46 天裡它做了什麼？把 pod 裡那份資料庫撈出來看：
 
@@ -58,7 +58,7 @@ executions: 0
 
 **這條管線在它第一次遇到真實輸入的時候就紅了，而且紅得完全正確。** 前置條件重驗過了兩項，乾跑算出影響範圍，然後 `deny_singletons` 這條政策把它擋下來：payment-service 當時只有一個副本，回滾它等於整個服務中斷。
 
-我當時只是隨手做了一次 smoke test 就跑去做別的事，沒有把這條軌跡讀完。今天讀完才發現，這七天我一直在說的「防護網從來沒有紅過」，其實紅過一次，只是我沒去看。
+我當時只是隨手做了一次 smoke test 就跑去做別的事，沒有把這條軌跡讀完。今天讀完才發現，這八天我一直在說的「防護網從來沒有紅過」，其實紅過一次，只是我沒去看。
 
 而今天 payment-service 是兩個副本。也就是說，同一條路今天再走一次，那道門不會再擋。
 
@@ -120,7 +120,7 @@ flowchart TB
     class K,X notmine
 ```
 
-綠色那幾格是這七天在讀、在改、在寫測試的東西，它們今天全部放行，而且放行得有道理：影響範圍真的在政策內。紅色那格不是我蓋的，也不是任何人為了這個場景選的，它是一張因為叢集重建而失效的憑證。
+綠色那幾格是這八天在讀、在改、在寫測試的東西，它們今天全部放行，而且放行得有道理：影響範圍真的在政策內。紅色那格不是我蓋的，也不是任何人為了這個場景選的，它是一張因為叢集重建而失效的憑證。
 
 **我今天沒有讓一個真實變更發生，而讓它沒發生的是一個意外。** 這件事寫出來有點難看，但它正好是這系列一路在講的那句話最極端的版本：一個從來沒有紅過的防護網，跟一個不存在的防護網，證據等級是一樣的。今天我終於讓那張網接到球了，然後發現接住球的是網子後面那面牆。
 
@@ -180,9 +180,11 @@ outcome= idempotent: target already acted on for this incident (48e7df7697ac4034
 
 手動把 Secret 刪掉重建，這件事修的是這一次。下一次呢？
 
-授權那一關前面本來掛著兩道檢查，問的是**該不該做**（這隻 agent 的信心可不可信）跟**這張地圖是不是真的**（DQ，data quality）。今天證明了還缺第三道，而它問的是最基本的那件事：**我們現在還動得了嗎。**
+授權那一關前面本來掛著兩道檢查，問的是**該不該做**（這隻 agent 的信心可不可信）跟**這張地圖是不是真的**（DQ，data quality，資料品質）。今天證明了還缺第三道，而它問的是最基本的那件事：**我們現在還動得了嗎。**
 
-這件事之所以會被漏掉，是因為權限在直覺裡是一個靜態事實：RBAC 設好了就是設好了。但它其實跟這系列處理過的每一種訊號一樣會腐爛，只是腐爛的時候不會有人通知你。拓撲宣告會過期，所以拿真實 trace 去對帳；注入的知識會屬於別座環境，所以拿 live store 去解析。**一張 RBAC 授權也是一份宣告，而沒有對帳的宣告終究會變成謊言。** 差別只在憑證這種宣告只在被用到的那一瞬間才會被觀測，而這一張大概每幾個禮拜才被用一次，所以它的死亡可以隱形幾個禮拜。
+這件事之所以會被漏掉，是因為權限在直覺裡是一個靜態事實：RBAC 設好了就是設好了。但它其實跟這系列處理過的每一種訊號一樣會腐爛，只是腐爛的時候不會有人通知你。拓撲宣告會過期，所以拿真實 trace 去對帳；注入的知識會屬於別座環境，所以拿 live store 去解析。**一張 RBAC 授權也是一份宣告，而沒有對帳的宣告終究會變成謊言。**
+
+憑證這種宣告還有一個更麻煩的性質：它只在被用到的那一瞬間才會被觀測。而這一張大概每幾個禮拜才被用一次，所以它的死亡可以安靜地躺好幾個禮拜。
 
 用來對帳的東西 Kubernetes 本來就有，`SelfSubjectAccessReview`：拿寫入身分去問 API server「我可不可以在 demo 這個 namespace 上 patch deployments」。它不改任何東西，而且它是一個真的、需要認證的呼叫，所以一張死掉的 token 會在授權判斷之前就先撞 401。一次請求同時回答了兩個問題：這個身分還是真的嗎，以及它還被允許做那件事嗎。
 
@@ -243,7 +245,7 @@ flowchart TB
 上面那些是被動撞到的。真正該做的是主動去撞，而且要能重複跑。所以寫了一支 `regress_guards.py`，形狀跟 Day12 那支 `regress.sh` 一樣：每一條寫死「餵什麼進去」跟「預期它拒絕，理由要包含哪個字串」，全綠 exit 0，任何一道門放行 exit 1。
 
 ```bash
-# 從 o11y-bench 主 repo 的根目錄跑
+# 從範例 repo 的根目錄跑
 python3 ironman-2026/day33/regress_guards.py -v
 ```
 
@@ -257,14 +259,16 @@ governance
   PASS  50 self-produced labels do not unlock AUTO
         propose: insufficient human/grader labels (0 < 20); self-produced labels cannot unlock AUTO
   PASS  50 inconclusive-graded labels do not unlock AUTO
-        propose: curve saw 0 eligible row(s); calibration unproven
+        propose: curve saw 0 eligible row(s); calibration unproven (0 labeled run(s) < 20); autonomy withheld
   PASS  labels with no recorded grading mode do not unlock AUTO
   PASS  [control] 50 culprit-graded grader labels DO reach AUTO
 calibration curve
   PASS  offsetting errors do not unlock AUTO, even though the mean passes
-        propose: mean -0.0182 is inside tolerance; accuracy 0.5 at confidence >= 0.8 (n=10) < 0.7
+        propose: mean -0.0182 is inside tolerance; accuracy 0.5 at confidence ≥ 0.8 (n=10) < 0.7;
+                 autonomy withheld in the band it would be exercised in
   PASS  labels that never reach the decision band do not unlock AUTO
-        propose: only 0 labeled run(s) at confidence >= 0.8 (need 3)
+        propose: only 0 labeled run(s) at confidence ≥ 0.8 (need 3); no evidence in the band
+                 where AUTO is granted
   PASS  [control] a thin bin is skipped, said so, and does not block AUTO
         auto: calibration ok (...), 1 bin(s)/1 run(s) too thin to count
 actuation readiness
@@ -316,17 +320,17 @@ breaker
 
 而「調和不會去回滾」那條，是今天新加的六條裡唯一一條斷言**某件事不該發生**的。它去翻稽核帳本，確認那一列被寫成 `failed` 的請求底下沒有出現任何 `rollback` 事件。這種寫法比較囉唆，但一個背景工作最危險的行為是它多做了一步，而多做的那一步不會讓任何測試變紅，除非有人專門去問。
 
-## 這七天的門，誰在按
+## 這八天的門，誰在按
 
 平台工程的角度今天很好講，因為證據齊了。
 
-這七天做出來的四道門，今天全部通過測試，也全部在真實輸入上放行了。**它們是對的，而且是必要的，但它們沒有一道是最後那道。** 最後那道是 RBAC，一個 Kubernetes 自己提供的、跟這整套治理設計完全無關的東西。
+這八天做出來的四道門，今天全部通過測試，也全部在真實輸入上放行了。**它們是對的，而且是必要的，但它們沒有一道是最後那道。** 最後那道是 RBAC，一個 Kubernetes 自己提供的、跟這整套治理設計完全無關的東西。
 
 我覺得這不是壞消息，是分工。應用層的治理負責回答「這件事該不該做、範圍多大、憑什麼相信這隻 agent」，那些問題 RBAC 答不了。而「這個身分現在有沒有權限」是基礎設施的事，那件事應用層也不該自己重做一遍。問題出在中間：**沒有任何一個地方在檢查那張憑證還有沒有效**，於是一個安全機制在無聲失效的狀態下，替一個沒有人打算依賴它的地方擋了 46 天的班。
 
 這條線在這系列出現過太多次了：Day2 那個空陣列、Day31 那段從來沒被評估到的校準邏輯、Day32 那個沒人寫的表。今天是它最貴的一種形狀：**一個沒有人在看的成功狀態**。
 
-而今天補上去的兩支東西，講白了都只是在同一個位置放一個會問問題的人。憑證那支每十五分鐘問一次「我還動得了嗎」，調和那支每六十秒問一次「有沒有哪一列的狀態已經跟時間對不上了」。兩支都不聰明，也都沒有讓 agent 變強一點點。它們只是把「要靠人記得去看」換成「有東西會定期去看」，而這座系統這七天欠的幾乎每一筆帳，形狀都是前者。
+而今天補上去的兩支東西，講白了都只是在同一個位置放一個會問問題的人。憑證那支負責問「我還動得了嗎」，而且那個答案有保鮮期：超過 900 秒沒問過就算過期，被當成沒有證據，不是當成沒問題。調和那支每六十秒問一次「有沒有哪一列的狀態已經跟時間對不上了」。兩支都不聰明，也都沒有讓 agent 變強一點點。它們只是把「要靠人記得去看」換成「有東西會定期去看」，而這座系統這八天欠的幾乎每一筆帳，形狀都是前者。
 
 ## 今天沒做的事
 
@@ -343,7 +347,7 @@ breaker
 
 後半補的兩支東西都不大。憑證那支是一個 `SelfSubjectAccessReview`，調和那支是一個六十秒的迴圈，兩支加起來沒有讓任何分數變好，也沒有讓那次執行成功。它們換到的是這兩件事以後會自己說話：憑證死掉的時候治理平面會收手，提案過期的時候不用等人來按。
 
-比較有用的還是那 39 條。前半是運氣，一次真實的按下去只能證明「這一次發生了什麼」；後半是可以重複跑的，而且裡面那六條 `[control]` 讓它不會退化成一份「全部拒絕就算過」的清單。這七天講了很多次防護網，今天它終於有一份自己的回歸測試。
+比較有用的還是那 39 條。前半是運氣，一次真實的按下去只能證明「這一次發生了什麼」；後半是可以重複跑的，而且裡面那六條 `[control]` 讓它不會退化成一份「全部拒絕就算過」的清單。這八天講了很多次防護網，今天它終於有一份自己的回歸測試。
 
 > 我花了半小時在想要不要把 401 那段寫進去，因為它讓整篇的高潮變成一個運維事故。
 > 後來想想，這系列從第一天開始就是在寫我以為的跟實際量到的差在哪，今天只是差得比較大 XD

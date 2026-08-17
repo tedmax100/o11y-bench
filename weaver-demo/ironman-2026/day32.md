@@ -40,7 +40,7 @@ WHERE ... AND c.correct = 1
 
 ## 兩張表，兩個寫入者
 
-追下去的結果是這樣：`calibration` 跟 `investigations` 這兩張表，在正式的告警路徑上是同一個函式接連寫的，`webhook.py` 裡的 `_investigate_and_sink()` 先 `record_run()` 再 `record_investigation()`，兩個都用同一個 `fp`，所以 JOIN 對得起來。
+追下去的結果是這樣。`calibration` 跟 `investigations` 這兩張表，在正式的告警路徑上是同一個函式接連寫的：`webhook.py` 裡的 `_investigate_and_sink()` 先 `record_run()` 再 `record_investigation()`，兩邊用的是同一個 `fp`，所以 JOIN 對得起來。
 
 而 eval harness 走的是另一條路。它的 docstring 寫得很清楚，受測單元是 `run_headless`，也就是**繞過 webhook 直接叫 agent**。這個設計是對的，eval 要測的是 agent，不是 webhook 的收件邏輯。但副作用是：`record_investigation()` 那一行在 webhook 裡，harness 沒有它。
 
@@ -83,12 +83,12 @@ WHERE ... AND c.correct = 1 AND c.grading_mode = 'culprit'
 
 為什麼要加這個，昨天算過一次：在 `inconclusive` 那批紀錄上，`correct = 1` 的意思是「它正確地誰都沒有怪」。把那種紀錄當成一次成功解決的過去事故餵給 agent，等於在告訴它「上次這個服務出事，結論是沒出事」，這跟這段 context 想做的事情正好相反。
 
-`NULL` 也一起排除掉。這段輸出是要進 prompt 的，來源不明的東西不進 prompt，這個預設值我覺得沒什麼好猶豫。
+`grading_mode` 是 `NULL` 的那些也一起排除掉，也就是「有人標了對錯，但沒有人說那個對錯在回答什麼問題」的紀錄。這段輸出是要進 prompt 的，來源不明的東西不進 prompt，這個預設值我覺得沒什麼好猶豫。
 
 ## 四個探測
 
 ```bash
-# 從 o11y-bench 主 repo 的根目錄跑
+# 從範例 repo 的根目錄跑
 python3 ironman-2026/day32/probe_past_incidents.py
 ```
 
@@ -110,7 +110,9 @@ python3 ironman-2026/day32/probe_past_incidents.py
      retrieved: ['both']  -> excluded
 ```
 
-第三格是修好之後該有的樣子。第四格那四列每一列都寫進兩張表、都對得上 JOIN 的 id，只差在標註的內容，而四個都沒有被撈出來。其中 `hedged-non-incident` 那一列，在昨天改之前是會被撈出來的。
+先解釋一下那個 `both`：它是第三格塞進去的那一列的 id，兩張表都有寫，是唯一一列合格的過去事故。所以後面每加一列髒資料，只要撈回來的還是只有 `both`，就代表那一列被擋掉了。
+
+第三格是修好之後該有的樣子。第四格那四列每一列都寫進兩張表、id 也都對得上 JOIN，只差在標註的內容，而四列全部沒有被撈出來。其中 `hedged-non-incident` 那一列，在昨天改之前是會被撈出來的。
 
 這四條也補成了單元測試，因為它們是那種「壞掉不會有人發現」的規則。
 
