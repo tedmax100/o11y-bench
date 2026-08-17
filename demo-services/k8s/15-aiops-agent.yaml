@@ -151,6 +151,17 @@ spec:
             # 7b-0). Survives the rollout restarts the execution plane triggers.
             - name: STORE_PATH
               value: /data/aiops.db
+            # Chat-path tool budget (the alert path keeps its own, lower one).
+            # Raised from the code default of 4 because a question like "RED for
+            # every service" is 5 services x 3 dimensions: the budget ran out
+            # during discovery, so the turn ended at `force_answer` with the
+            # model writing queries it had not verified. Deliberately in the
+            # manifest and not a `kubectl set env`: an autonomy-adjacent knob
+            # that can be changed without a diff is a knob nobody can audit.
+            # Cost: each extra call is an LLM round trip, so this trades latency
+            # for the model getting to finish discovering before it answers.
+            - name: TOOL_CALL_BUDGET
+              value: "10"
             # ---- Self-observability (zero-code OTel) -----------------------
             # The agent runs under `opentelemetry-instrument`; these env vars
             # configure the SDK + exporters the same way the demo services do,

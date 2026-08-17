@@ -230,11 +230,21 @@ discover_metrics("payment-service")
 
 `service_name` 不在裡面。原因是 `_COMMON_LABELS` 這份清單，當初的用意是「每個 metric 都有的標籤不用重複列，省 token」，而它剛好把身分那一個濾掉了。**模型問了「這個服務有哪些標籤可以用」，回答把最該用的那個刪掉了。** 一個回答了錯誤問題的 discovery，比沒有 discovery 更糟，因為它讓模型覺得自己已經查過了。
 
+省 token 那個理由到今天還是成立的，錯的是「省」的方式：不該重複的是每個 metric 都列一遍，不是整組不講。所以改成整份回應報一次：
+
+```console
+discover_metrics("payment-service")
+→ identity_labels: [deployment_environment, git_repo, git_version, job,
+                    service_name, service_namespace, service_version]
+   metrics: [{"name": "payment_charges_total", "type": "counter",
+              "labels": ["reason", "status"]}, …]
+```
+
 **第二層，prompt 裡其實寫了，但只寫在 Loki 那一節。** catalog 上白紙黑字寫著 `service_name (NOT service)`，也附了一句 `sum by (service_name, le)` 的範例。所以它不是不知道，是那句否定句的作用域寫在 Loki 底下，而它在 PromQL 上翻車。**先驗打贏了一份它讀過的文件**，而 `service` 是 Prometheus 世界最常見的寫法。
 
-**第三層，registry 那份詞彙表沒有人送進來。** 前面編出來的 `label_vocabulary.yaml` 一直躺在那裡，而它正好是能回答這個問題的東西。
+**第三層，registry 那份詞彙表沒有人送進來。** 前面編出來的 `label_vocabulary.yaml` 一直躺在那裡，而它正好是能回答這個問題的東西。這一層跟上一層修的不是同一件事：工具講的是「這座 store 現在真的有什麼」，詞彙表講的是「這些名字當初是誰宣告的、為什麼長這樣」。前者會跟著環境跑掉，後者是治理那一側的意圖，兩個都要在桌上。
 
-於是這一段的修法只有一行的份量：把那份詞彙表算進這一輪的注入，而且是無條件注入。Signal context 那些要先解析出服務才會進來，但「每個服務的 RED」這種問題剛好解析不到單一服務，**最需要標籤名字的那一句，正好是拿到最少上下文的那一句**。
+所以第三層的修法是：把那份詞彙表算進這一輪的注入，而且是無條件注入。Signal context 那些要先解析出服務才會進來，但「每個服務的 RED」這種問題剛好解析不到單一服務，**最需要標籤名字的那一句，正好是拿到最少上下文的那一句**。
 
 ```
 ## Label vocabulary (compiled from the Weaver registry)
@@ -287,7 +297,7 @@ playbook 一直都在，只是掛在一個只有 webhook 會呼叫的函式上�
 - **面板的 datasource uid 是寫死的**（`prometheus` / `loki` / `tempo`），換一座 Grafana 就會全部畫不出來，而且錯誤訊息只會說找不到資料源。
 - **提案卡沒有預覽。** 按下去之前看不到這條規則在過去 24 小時會不會一直在燒，而那是最該先看的東西。
 - **兩份 parser 還是兩份。**
-- **`discover_metrics` 濾掉身分標籤那件事沒改。** 今天是繞過去的（把詞彙表放到桌上），那支工具的回傳仍然少了 `service_name`，下一個依賴它的人還是會拿到一份缺一格的答案。
+- **聊天那條路的工具預算從 4 調到 10。** 「每個服務的 RED」是五個服務乘三個維度，四次不夠它把 discovery 做完，於是回合在 `force_answer` 結束、模型寫出沒驗證過的查詢。調大是對的，但它同時也讓每一輪更慢更貴，而我沒有量過「幾次才夠」，只是把它調到不會卡住。
 - **詞彙表沒有對帳。** 它是從 registry 編出來的，而 registry 說的名字跟三個 store 裡真的存在的名字對不對得上，今天沒有量，這跟前面那個拓撲宣告是同一種帳。
 - **價格表沒有對帳，成本也沒有進指標。** 它現在只存在於個別 trace 裡，沒有一條「每天花多少」的 metric，也就沒辦法設告警。
 - **span 取樣是全開的。** 每個模型 span 都帶著完整 prompt，高頻使用下 Tempo 的量會很可觀，而 Day21 那個一小時保留期同時也代表「昨天的推理過程今天已經沒了」。
