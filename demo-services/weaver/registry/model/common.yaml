@@ -291,6 +291,31 @@ groups:
     display_name: Deploy provenance
     brief: Resource attributes identifying which build emitted the telemetry.
     attributes:
+      - id: service.name
+        type: string
+        stability: development
+        brief: >-
+          The service that emitted the telemetry. This is the label everything
+          is grouped and filtered by, on all three stores.
+        note: >-
+          Flat key in current code: `service_name` (resource attr). NOT
+          `service` — `sum by (service)` is valid PromQL that silently collapses
+          every service into one unlabelled series, and `{service="x"}` matches
+          no Loki stream at all. In Tempo the same identity is
+          `resource.service.name`.
+        examples: ["payment-service", "order-service"]
+      - id: service.namespace
+        type: string
+        stability: development
+        brief: The Kubernetes namespace the service runs in.
+        note: "Flat key in current code: `service_namespace` (resource attr)."
+        examples: ["demo"]
+      - id: deployment.environment
+        type: string
+        stability: development
+        brief: The deployment environment the telemetry came from.
+        note: "Flat key in current code: `deployment_environment` (resource attr)."
+        examples: ["demo"]
       - id: vcs.repository.url.full
         type: string
         stability: development
@@ -311,6 +336,12 @@ groups:
     stability: development
     brief: Resource conventions for every demo-service process.
     attributes:
+      - ref: service.name
+        requirement_level: required
+      - ref: service.namespace
+        requirement_level: required
+      - ref: deployment.environment
+        requirement_level: required
       - ref: vcs.repository.url.full
         requirement_level: required
       - ref: service.version

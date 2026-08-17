@@ -231,11 +231,13 @@ flowchart LR
 
 |  | 宣告 | 對帳 | 消費 |
 | --- | --- | --- | --- |
-| **缺語意** | registry、`contract.py` 的 SLI 與 log selector | `weaver.py`（寫好了，沒人跑）、live-check | MCP、注入的那段 `service_name (NOT service)` |
+| **缺語意** | registry、`contract.py` 的 SLI 與 log selector | `weaver.py`（寫好了，沒人跑）、live-check | 注入的 catalog（Loki 那一節有寫 `service_name (NOT service)`） |
 | **缺情境** | `topology.yaml`、`compile.py` 編出來的圖 | `reconcile.py`（寫好了，沒跑過） | `context.py` 的 upstream／downstream、`health.py` |
 | **缺信任度** | 意圖：什麼叫正常、門檻是多少 | `dq.py`（`proven_good: False`） | 空的 |
 
 排完之後那個形狀很清楚：**第一欄幾乎滿的，第三欄大致有東西，中間那一欄三格全是「寫好了但沒有在跑」。**
+
+`缺語意` 那一列的消費格我要特別講一下，因為我第一版填的是「MCP、注入的那段 `service_name (NOT service)`」，而 MCP 那半格是虛的。前面那天示範 `weaver registry mcp` 用的是一支獨立的探測腳本，**registry 從來沒有接進這隻 agent**——它手上那十一個工具沒有任何一個碰得到 registry。所以這一格真正有東西的只有後半句，而那句話還只寫在 catalog 的 Loki 那一節裡。一格填得太滿的表格，跟一個沒填的表格比起來，後者至少不會讓人停止找。
 
 而中間那欄正好是唯一會說「你手上這份東西已經不準了」的一欄。宣告那欄只會告訴你當初打算長怎樣，消費那欄只會把它照實端到 agent 面前，兩邊都沒有能力發現中間差了多少。所以這三格空著的代價不是少了一個功能，是這個系統目前沒有任何一條路徑會主動告訴你資料已經漂掉了，跟第一階段那個「檢查通過但其實是錯的」是同一個形狀，只是換到了另一層。
 

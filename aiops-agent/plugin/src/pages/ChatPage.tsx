@@ -14,8 +14,8 @@ type ChatEvent =
   | { type: 'thread'; thread_id: string }
   | { type: 'token'; text: string }
   | { type: 'final'; text: string }
-  | { type: 'tool_start'; tool: string; input: unknown }
-  | { type: 'tool_end'; tool: string; output_preview: string }
+  | { type: 'tool_start'; id?: string; tool: string; input: unknown }
+  | { type: 'tool_end'; id?: string; tool: string; output_preview: string }
   | { type: 'status'; phase: string; label: string }
   | { type: 'suggestions'; items: string[] }
   | { type: 'clarify'; prompt: string; options: string[] }
@@ -30,6 +30,10 @@ type ChatEvent =
   | { type: 'done' };
 
 type ToolCall = {
+  // The agent's run id for this invocation. Tool calls fan out in parallel
+  // (one `discover_metrics` per service, all in the same millisecond), so the
+  // tool name cannot identify which result belongs to which call.
+  id?: string;
   tool: string;
   input: unknown;
   outputPreview?: string;
@@ -438,15 +442,24 @@ function applyEvent(messages: Message[], evt: ChatEvent): Message[] {
       updated.status = undefined;
       break;
     case 'tool_start':
-      updated.toolCalls.push({ tool: evt.tool, input: evt.input, open: false });
+      updated.toolCalls.push({ id: evt.id, tool: evt.tool, input: evt.input, open: false });
       updated.status = undefined; // the tool call view conveys the activity now
       break;
     case 'tool_end': {
-      for (let i = updated.toolCalls.length - 1; i >= 0; i--) {
-        if (updated.toolCalls[i].tool === evt.tool && !updated.toolCalls[i].outputPreview) {
-          updated.toolCalls[i] = { ...updated.toolCalls[i], outputPreview: evt.output_preview };
-          break;
+      // Match on the run id. Falling back to the name is only correct for a
+      // single in-flight call of that tool; with a parallel fan-out it pairs an
+      // input with somebody else's output, which makes the transcript lie.
+      const byId = evt.id ? updated.toolCalls.findIndex((tc) => tc.id === evt.id) : -1;
+      let i = byId;
+      if (i < 0) {
+        for (i = updated.toolCalls.length - 1; i >= 0; i--) {
+          if (updated.toolCalls[i].tool === evt.tool && !updated.toolCalls[i].outputPreview) {
+            break;
+          }
         }
+      }
+      if (i >= 0) {
+        updated.toolCalls[i] = { ...updated.toolCalls[i], outputPreview: evt.output_preview };
       }
       break;
     }

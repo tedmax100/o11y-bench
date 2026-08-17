@@ -115,6 +115,49 @@ flowchart TB
     end
 ```
 
+## 同一份 registry，其實可以讀出第二種東西
+
+產物寫完之後我又回頭看了一次 registry，因為總覺得拿它只換到一個 `checked: 5` 有點虧。
+
+`weaver.py` 從 registry 撈的是 metric 名字，而 registry 裡其實還記著另一件事。每個 attribute 除了自己的點分 id，`note` 上都寫著程式碼今天實際送出去的扁平鍵：
+
+```yaml
+- id: app.outcome
+  note: "Flat key in current code: `status` (on metrics)."
+- id: app.fail_reason
+  note: "Flat key in current code: `reason`."
+```
+
+也就是說，「這個 label 到底叫什麼」這個問題，registry 一直答得出來。而它現在被 `alignment_report()` 壓縮成一個布林式的判定，那些名字讀完就丟了。**同一份宣告可以拿來判對錯，也可以拿來回答問題，而我只做了第一種。**
+
+所以照同一個模式再編一份產物出來，這次編的是 label 詞彙表：
+
+```console
+$ uv run python -m app.signals.vocabulary
+compiled 6 metric(s) + 5 identity label(s) → label_vocabulary.yaml
+  identity: deployment_environment   (deployment.environment)
+  identity: git_repo                 (vcs.repository.url.full)
+  identity: git_version              (service.version)
+  identity: service_name             (service.name)
+  identity: service_namespace        (service.namespace)
+```
+
+寫這支的時候撞到一件我完全沒預期的事：**`service.name` 本來不在 registry 裡。** `registry.deploy_provenance` 那組只宣告了 `git_repo` 跟 `service.version`，而 `service.name` 大概是因為它太理所當然（OTel SDK 自己會蓋上去），從來沒有人把它寫進來。
+
+這件事的意思是，那份號稱是 schema 單一真相來源的東西，**缺的正好是所有查詢都要拿來分組跟過濾的那一個 label**。任何人（或任何 agent）拿著 registry 問「這座環境的服務標籤叫什麼」，得到的會是 not found。所以我先補了宣告，順手把那句代價寫進 `note` 裡：
+
+```yaml
+- id: service.name
+  note: >-
+    Flat key in current code: `service_name` (resource attr). NOT `service` —
+    `sum by (service)` is valid PromQL that silently collapses every service
+    into one unlabelled series, and `{service="x"}` matches no Loki stream.
+```
+
+> 這句 note 我寫得比其他幾條都長，因為它要防的東西不是打錯字。`sum by (service)` 是一句完全合法的 PromQL，Prometheus 不會抱怨，它只會把六個服務加總成一條沒有 label 的線——一個錯的 label 在畫面上不長得像錯的 label，它長得像一個總計。
+
+有一格我刻意留白：這份產物同時帶著 enum 的值域（`app.fail_reason` 有十幾個 member），但那批東西**還沒有人送到 agent 面前**。名字跟值域是兩種不同性質的東西，前者是環境的形狀，後者常常就是結論本身。這件事等有 agent 要消費它的時候再來煩惱。
+
 ## 第一次拿到 proven_good
 
 `dq_verdict()` 現在讀那份產物，跟原本的拓撲漂移一起判。跑起來是這樣：
@@ -200,6 +243,8 @@ registry 是平台團隊維護的，契約是產品團隊寫的，而這道新�
 沒有反過來檢查。現在只問「契約引用的 metric 有沒有被宣告」，沒有問「registry 宣告的 metric 有沒有人在用」。後者是找出死掉的宣告用的，跟前面那個拓撲對帳的另一個方向是同一種東西。
 
 `weaver.py` 從 registry 撈名字的方式還是靠正規表示式去讀 `note` 裡那句 `Current code metric:`。這是一個慣例，不是一個欄位，有人 `note` 寫得不一樣就撈不到，而且撈不到會安靜地少一個名字。這件事該用 `annotations` 做，前面講機器可讀的意圖時用過那個欄位。
+
+那份 label 詞彙表編出來了，但沒有任何東西在讀它。今天只證明了 registry 答得出「這個 label 叫什麼」，而 agent 那一側要不要拿、怎麼拿、拿了會不會真的改變它寫出來的查詢，一個都沒有驗過。編一份沒有人消費的產物，跟今天開場那個沒有人呼叫的 `weaver.py`，形狀其實一模一樣，只是這次我一開始就知道。
 
 runtime 完全信任那份產物。有人把 `schema_alignment.json` 手動改成一份假的綠燈再 commit 上去，CI 那道重生加 `git diff` 會擋下來（我試著改成 `declared_metrics: 99` 再跑一次，產物被蓋回去、diff 就出來了）；但如果它是在打包映像檔的時候才被換掉，跑起來的 agent 沒有任何辦法發現，因為它手上根本沒有 registry 可以重算。要補這個洞得往簽章那個方向走，今天不做。
 

@@ -5,7 +5,7 @@
   "id": "tedmax100-aiops-app",
   "info": {
     "keywords": ["app", "aiops", "rca", "observability"],
-    "description": "Chat-based RCA assistant powered by LangGraph + Gemini, talks to Grafana stack via MCP.",
+    "description": "Chat-based RCA assistant powered by LangGraph + Gemini, querying Prometheus/Loki/Tempo directly.",
     "author": {
       "name": "Tedmax100"
     },

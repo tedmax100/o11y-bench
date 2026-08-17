@@ -30,6 +30,7 @@ from .runbook import (
 from .signals.context import build_signal_context
 from .signals.envfit import compute_env_fit, get_last_fit
 from .signals.health import evaluate_dependency_health
+from .signals.vocabulary import render_vocabulary
 from .tools import (
     discover_log_fields_tool,
     discover_metrics_tool,
@@ -1012,6 +1013,24 @@ def _inject_past_incidents(turn_messages: list, service: str | None, alertname: 
         logger.warning("past incident injection failed: %s", e)
 
 
+def _inject_label_vocabulary(turn_messages: list) -> None:
+    """Append the Weaver registry's label names for this environment.
+
+    Unconditional, unlike the rest of the Signal Plane injections: those are
+    keyed on a resolved service, and the question that most needs the right
+    label ("RED for every service") is exactly the one that resolves to no
+    single service — so gating this on `services` would withhold it precisely
+    when it matters. It is also small (a few hundred tokens) and static.
+
+    Fail-open: no compiled vocabulary means no block, never a broken turn."""
+    try:
+        block = render_vocabulary()
+        if block:
+            turn_messages.append(SystemMessage(content=block))
+    except Exception as e:
+        logger.warning("label vocabulary injection failed: %s", e)
+
+
 def _inject_signal_context(turn_messages: list, services: list[str]) -> None:
     """Append the decision-grade Signal context (topology / criticality /
     dependency neighbourhood) for the RCA's service(s). Fail-open enrichment:
@@ -1127,6 +1146,7 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
         except Exception as e:
             logger.warning("headless: capability snapshot failed for %s: %s", service, e)
         _inject_signal_context(turn_messages, [service])
+    _inject_label_vocabulary(turn_messages)
 
     # Runbook (v3 §5): if this alert matches a runbook, inject its rendered steps
     # (Tier 0) and auto-run its read-only diagnostics (Tier 1) so the agent
@@ -1558,6 +1578,7 @@ async def stream_chat(
     if snapshot:
         turn_messages.append(SystemMessage(content=snapshot))
     await _refresh_env_fit()
+    _inject_label_vocabulary(turn_messages)
     if resolved:
         _inject_signal_context(turn_messages, resolved)
         await _inject_dependency_health(turn_messages, resolved)
@@ -1630,10 +1651,19 @@ async def stream_chat(
                 answer_parts.append(text)
                 yield {"type": "token", "text": text}
 
+        # `id` is the run id LangChain assigns to this tool invocation, and it is
+        # the only thing that ties a result back to its call. The agent fans out
+        # (five `discover_metrics`, one per service, in the same millisecond), so
+        # a UI matching on the tool *name* pairs whichever result lands first
+        # with whichever call is still open — and then shows an input and an
+        # output that never belonged together. A transcript that mismatches
+        # argument and result is worse than no transcript: the whole point of it
+        # is that a human can check the agent's work against it.
         elif kind == "on_tool_start":
             tool_ran = True
             yield {
                 "type": "tool_start",
+                "id": event.get("run_id"),
                 "tool": name,
                 "input": data.get("input"),
             }
@@ -1643,6 +1673,7 @@ async def stream_chat(
             preview = str(output)[:500] if output is not None else ""
             yield {
                 "type": "tool_end",
+                "id": event.get("run_id"),
                 "tool": name,
                 "output_preview": preview,
             }

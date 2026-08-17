@@ -77,7 +77,12 @@ spec:
     spec:
       containers:
         - name: grafana
-          image: grafana/grafana:11.3.0
+          # Pinned, not `latest`: the AIOps app plugin is built against the
+          # @grafana/* 12.4 SDK and declares `grafanaDependency: >=12.3.0`. On
+          # 11.3.0 every panel it renders failed with "Error loading: timeseries"
+          # — the plugin loaded, the queries were correct, and only the viz
+          # failed, which reads like a broken query rather than a version skew.
+          image: grafana/grafana:13.1.3
           env:
             - name: GF_AUTH_ANONYMOUS_ENABLED
               value: "true"
