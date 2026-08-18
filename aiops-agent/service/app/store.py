@@ -22,10 +22,12 @@ action_requests / audit (7b-1) live here too once those land.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
 import threading
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -191,6 +193,75 @@ CREATE TABLE IF NOT EXISTS action_outcomes (
     note        TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_action_outcomes_fp ON action_outcomes(fp);
+
+-- ---- case memory --------------------------------------------------------
+-- One row per *incident*, not per run and not per alert instance. The
+-- distinction is the whole point: `fp` = sha256(alertname|service|git_version)
+-- is right for dedup and for the LangGraph thread_id, and wrong as a memory
+-- key, because a redeploy mints a new git_version and therefore a new fp. On
+-- the day36 drill snapshot that split one recurring payment incident across six
+-- fingerprints — precisely the case where last time's conclusion should have
+-- been on the table.
+--
+-- `case_key` drops the version on purpose. See `case_key()` for the derivation.
+CREATE TABLE IF NOT EXISTS cases (
+    case_key    TEXT PRIMARY KEY,
+    first_ts    TEXT NOT NULL,
+    last_ts     TEXT NOT NULL,
+    -- The signature, kept human-readable so this table can be grepped. The
+    -- authority is still case_key; these are what it was derived from.
+    alertname   TEXT,
+    service     TEXT,
+    symptom     TEXT NOT NULL DEFAULT '',
+    occurrences INTEGER NOT NULL DEFAULT 1,
+
+    -- The conclusion. NULL until something that is not the agent itself says so.
+    root_cause        TEXT,
+    -- human / grader / self / NULL. This column replaces the old
+    -- `JOIN calibration WHERE correct=1` as the gate on what may be recalled:
+    -- the question is no longer "was this run scored correct" but "who says so".
+    -- `self` never qualifies, for the same reason
+    -- `governance._SELF_LABEL_SOURCES` exists — saying you were right about
+    -- your own work unlocks nothing.
+    root_cause_source TEXT,
+    confirmed_run_id  TEXT,   -- which run's conclusion was believed (replayable)
+    confirmed_ts      TEXT,
+
+    resolution  TEXT,         -- json {"action":..., "args":{...}, "outcome":...}
+
+    -- open / resolved / recurring / false_positive. A false positive is a case
+    -- worth remembering ("the last three of these were noise") but must never
+    -- be recalled as a prior root cause, so it gets a status rather than a row
+    -- in some other table.
+    status      TEXT NOT NULL DEFAULT 'open'
+);
+CREATE INDEX IF NOT EXISTS idx_cases_service ON cases(service);
+CREATE INDEX IF NOT EXISTS idx_cases_status  ON cases(status);
+
+-- The paths that did not work. Conclusions were always stored; the dead ends
+-- only ever lived in the transcript, so every run paid for the same empty Tempo
+-- query again. Negative evidence is the half that makes recall cheaper.
+CREATE TABLE IF NOT EXISTS case_ruled_out (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_key  TEXT NOT NULL,
+    run_id    TEXT NOT NULL,
+    ts        TEXT NOT NULL,
+    -- hypothesis / query / action
+    kind      TEXT NOT NULL,
+    subject   TEXT NOT NULL,
+    evidence  TEXT NOT NULL DEFAULT '',
+    -- tool_result / grader / human / model. `model` is recorded but not
+    -- injected by default: "I ruled that out" with no tool evidence is the same
+    -- self-attestation problem one layer down, and feeding it back only makes
+    -- the next run stop thinking earlier.
+    disproved_by TEXT NOT NULL,
+    -- Environments change. "Tempo returned nothing" usually means the 1h
+    -- block_retention passed, not that the trace never existed — pinning that
+    -- forever would stop the next run from looking where it should.
+    still_valid  INTEGER NOT NULL DEFAULT 1,
+    expires_ts   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ruled_out_case ON case_ruled_out(case_key, still_valid);
 """
 
 # Additive migrations for columns added after initial schema creation.
@@ -204,7 +275,38 @@ _MIGRATIONS = [
     "ALTER TABLE executions ADD COLUMN drill INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE calibration ADD COLUMN correction_note TEXT",
     "ALTER TABLE calibration ADD COLUMN grading_mode TEXT",
+    # Case memory (additive; existing readers keep working untouched).
+    # `run_id` is per invocation. `investigations` used `fp` for this, so N runs
+    # of one alert shared one key and a single verdict on the latest row joined
+    # onto all of them — on the day36 snapshot that handed five recalled
+    # "incidents" a human's approval, three of which concluded "false alarm".
+    # eval/harness.py already worked around this with a nonce-bearing run_id;
+    # this puts the fix in the schema instead of in one caller.
+    "ALTER TABLE investigations ADD COLUMN run_id TEXT",
+    "ALTER TABLE investigations ADD COLUMN case_key TEXT",
+    "ALTER TABLE calibration ADD COLUMN case_key TEXT",
+    # The alert instance this run belonged to. calibration.run_id used to *be*
+    # the fingerprint, which is why a verdict could not name the run it judged.
+    # Now run_id identifies the run and `fp` keeps the grouping the labelers
+    # address by, so "the latest run of this alert" is a lookup someone wrote
+    # down rather than a collision nobody noticed.
+    "ALTER TABLE calibration ADD COLUMN fp TEXT",
+    # Which run produced this proposal — so the executor's own verification
+    # labels that run, not every run that ever shared the fingerprint.
+    "ALTER TABLE action_requests ADD COLUMN run_id TEXT",
 ]
+
+# Indexes on migration-added columns. Kept out of _SCHEMA because that script
+# runs before the ALTERs on an older store, where the columns do not exist yet.
+# Deliberately NOT unique on run_id: backfilled rows all carry their old fp, and
+# the colliding ones are exactly the history we are keeping. Uniqueness is a
+# property of the writer (nonce), not something to enforce retroactively.
+_POST_MIGRATION_SCHEMA = (
+    "CREATE INDEX IF NOT EXISTS idx_inv_run_id ON investigations(run_id)",
+    "CREATE INDEX IF NOT EXISTS idx_inv_case   ON investigations(case_key)",
+    "CREATE INDEX IF NOT EXISTS idx_cal_case   ON calibration(case_key)",
+    "CREATE INDEX IF NOT EXISTS idx_cal_fp     ON calibration(fp)",
+)
 
 
 def _resolve(path: str | Path | None) -> Path:
@@ -229,6 +331,11 @@ def _connect(path: str | Path | None = None) -> Iterator[sqlite3.Connection]:
                 conn.execute(migration)
             except sqlite3.OperationalError:
                 pass  # column already exists
+        for stmt in _POST_MIGRATION_SCHEMA:
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass  # column missing on a store too old to have been migrated
         yield conn
         conn.commit()
     finally:
@@ -242,6 +349,8 @@ _COUNTED_TABLES = (
     "executions",
     "audit",
     "runbook_feedback",
+    "cases",
+    "case_ruled_out",
 )
 
 
@@ -300,6 +409,8 @@ def cal_insert(
     suspected_version: str | None,
     services: list[str],
     grading_mode: str | None = None,
+    case_key: str | None = None,
+    fp: str | None = None,
     path: str | Path | None = None,
 ) -> None:
     """Append a pending calibration record (correct=NULL until labeled).
@@ -311,8 +422,8 @@ def cal_insert(
         conn.execute(
             "INSERT INTO calibration "
             "(run_id, ts, confidence, summary, hypothesis, suspected_version, services, "
-            "grading_mode) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "grading_mode, case_key, fp) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (
                 run_id,
                 ts,
@@ -322,6 +433,8 @@ def cal_insert(
                 suspected_version,
                 json.dumps(services),
                 grading_mode,
+                case_key,
+                fp,
             ),
         )
 
@@ -361,6 +474,40 @@ def cal_label(
             ),
         )
         return cur.rowcount > 0
+
+
+def cal_resolve_run_id(ident: str, path: str | Path | None = None) -> str | None:
+    """Turn whatever a labeler is holding into the run_id of one specific run.
+
+    `ident` is a run_id when the caller has one and a fingerprint when it does
+    not — the plugin's label endpoint and the executor's self-verification both
+    only ever had the fingerprint. Exact run_id wins; otherwise this resolves to
+    the *latest* run of that alert instance and says so by returning a different
+    string than it was given. Returns None when neither matches.
+
+    The resolution used to happen by accident, inside `cal_label`'s
+    "ORDER BY id DESC LIMIT 1" — same behaviour, except nothing anywhere said a
+    choice was being made, and the losing runs stayed unlabeled forever.
+    """
+    with _connect(path) as conn:
+        row = conn.execute("SELECT 1 FROM calibration WHERE run_id=? LIMIT 1", (ident,)).fetchone()
+        if row:
+            return ident
+        row = conn.execute(
+            "SELECT run_id FROM calibration WHERE fp=? ORDER BY id DESC LIMIT 1", (ident,)
+        ).fetchone()
+    return row["run_id"] if row else None
+
+
+def cal_latest(run_id: str, path: str | Path | None = None) -> dict[str, Any] | None:
+    """The most recent calibration row for a run_id — the same row `cal_label`
+    updates, so a caller can read back what it just labeled without guessing
+    which of the colliding rows it hit."""
+    with _connect(path) as conn:
+        row = conn.execute(
+            "SELECT * FROM calibration WHERE run_id=? ORDER BY id DESC LIMIT 1", (run_id,)
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def cal_count_by_source(
@@ -412,11 +559,22 @@ def cal_load(path: str | Path | None = None) -> list[dict[str, Any]]:
 # ---- investigations -------------------------------------------------------
 
 
-def inv_insert(fp: str, ts: str, payload_json: str, path: str | Path | None = None) -> None:
+def inv_insert(
+    fp: str,
+    ts: str,
+    payload_json: str,
+    path: str | Path | None = None,
+    *,
+    run_id: str | None = None,
+    case_key: str | None = None,
+) -> None:
+    """Append one investigation. `run_id` identifies this invocation, `case_key`
+    the incident it belongs to; both are optional so the legacy callers and the
+    backfilled history stay readable, but the live path always passes them."""
     with _write_lock, _connect(path) as conn:
         conn.execute(
-            "INSERT INTO investigations (fp, ts, payload) VALUES (?,?,?)",
-            (fp, ts, payload_json),
+            "INSERT INTO investigations (fp, ts, payload, run_id, case_key) VALUES (?,?,?,?,?)",
+            (fp, ts, payload_json, run_id, case_key),
         )
 
 
@@ -470,6 +628,316 @@ def inv_query_similar(
     return out
 
 
+# ---- case memory ----------------------------------------------------------
+
+# Sources whose word is enough to write a root cause into `cases`. These are the
+# `source` strings the labelers actually write: "ui" = a person in the plugin,
+# "manual" = a person at the CLI, "eval"/"eval-harness" = the o11y-bench grader.
+# "human"/"grader" are accepted as generic aliases for callers that have no
+# narrower name.
+#
+# An allowlist rather than governance's denylist (`_SELF_LABEL_SOURCES`) on
+# purpose: the two fail in opposite directions, and this output goes into a
+# prompt. A new label source that nobody thought about should be *ignored* here,
+# not trusted — the failure mode of the denylist is that a future self-attesting
+# source is trusted by default, which is exactly the thing this table exists to
+# prevent.
+TRUSTED_ROOT_CAUSE_SOURCES = ("ui", "manual", "eval", "eval-harness", "human", "grader")
+
+# Which ruled-out entries are worth putting back in a prompt. `model` is stored
+# and excluded; see the column comment.
+TRUSTED_DISPROOF_SOURCES = ("tool_result", "grader", "human")
+
+_CASE_RECALL_STATUSES = ("resolved", "recurring")
+
+
+def case_key(alertname: str | None, service: str | None, symptom: str = "") -> str:
+    """Signature of an *incident*: which alert, on which service, with which
+    symptom — and deliberately not which version.
+
+    `webhook.fingerprint()` includes git_version, which is correct for its jobs
+    (a redeploy is a new alert instance worth re-investigating) and wrong for
+    memory (a redeploy is not a new incident). Both keys therefore exist and
+    neither is derived from the other.
+
+    `symptom` is a placeholder for the chat path, which arrives with no
+    alertname. It is empty everywhere today; the parameter exists so adding it
+    later is not a key migration.
+    """
+    from .runbook import norm_alertname
+
+    key = "|".join([norm_alertname(alertname), (service or "").strip().lower(), symptom])
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+
+def new_run_id(fp: str) -> str:
+    """Identity for one invocation. `fp` stays in it so a row can still be traced
+    back to its alert instance by eye."""
+    return f"{fp}-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:6]}"
+
+
+def case_upsert(
+    *,
+    key: str,
+    ts: str,
+    alertname: str | None,
+    service: str | None,
+    symptom: str = "",
+    path: str | Path | None = None,
+) -> None:
+    """Record that this incident was investigated (again). Never touches
+    `root_cause` or `status`: observing a case is not concluding one."""
+    with _write_lock, _connect(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO cases (case_key, first_ts, last_ts, alertname, service, symptom,
+                               occurrences)
+            VALUES (?,?,?,?,?,?,1)
+            ON CONFLICT(case_key) DO UPDATE SET
+                last_ts     = excluded.last_ts,
+                occurrences = cases.occurrences + 1,
+                status      = CASE WHEN cases.status = 'resolved' THEN 'recurring'
+                                   ELSE cases.status END
+            """,
+            (key, ts, ts, alertname, service, symptom),
+        )
+
+
+def case_confirm(
+    key: str,
+    *,
+    root_cause: str,
+    source: str,
+    run_id: str,
+    ts: str,
+    resolution: dict | None = None,
+    path: str | Path | None = None,
+) -> bool:
+    """Promote one run's conclusion to the case's root cause.
+
+    Returns False without writing when `source` is not trusted — the caller is
+    not expected to know the policy, and a silent no-op here is safer than a
+    self-attested root cause becoming precedent. Returns False too when the case
+    row does not exist yet; confirming something never observed is a bug, not a
+    state to invent.
+    """
+    if source not in TRUSTED_ROOT_CAUSE_SOURCES:
+        logger.info("case_confirm ignored for %s: untrusted source %r", key, source)
+        return False
+    with _write_lock, _connect(path) as conn:
+        cur = conn.execute(
+            """
+            UPDATE cases SET root_cause=?, root_cause_source=?, confirmed_run_id=?,
+                             confirmed_ts=?, resolution=COALESCE(?, resolution),
+                             status='resolved'
+            WHERE case_key=?
+            """,
+            (
+                root_cause,
+                source,
+                run_id,
+                ts,
+                json.dumps(resolution) if resolution is not None else None,
+                key,
+            ),
+        )
+        return cur.rowcount > 0
+
+
+def case_set_status(key: str, status: str, path: str | Path | None = None) -> bool:
+    """Set the case's status directly. The caller that needs this is the
+    `inconclusive` grading path: "it rightly blamed nobody" is a verdict about
+    the case, not a root cause for it."""
+    with _write_lock, _connect(path) as conn:
+        cur = conn.execute("UPDATE cases SET status=? WHERE case_key=?", (status, key))
+        return cur.rowcount > 0
+
+
+def case_get(key: str, path: str | Path | None = None) -> dict[str, Any] | None:
+    with _connect(path) as conn:
+        row = conn.execute("SELECT * FROM cases WHERE case_key=?", (key,)).fetchone()
+    return dict(row) if row else None
+
+
+def ruled_out_insert(
+    *,
+    key: str,
+    run_id: str,
+    ts: str,
+    kind: str,
+    subject: str,
+    disproved_by: str,
+    evidence: str = "",
+    expires_ts: str | None = None,
+    path: str | Path | None = None,
+) -> None:
+    """Record a path that did not work. Cheap and append-only: the value is in
+    having many of them, so nothing here validates or dedupes."""
+    with _write_lock, _connect(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO case_ruled_out
+                (case_key, run_id, ts, kind, subject, evidence, disproved_by, expires_ts)
+            VALUES (?,?,?,?,?,?,?,?)
+            """,
+            (key, run_id, ts, kind, subject, evidence, disproved_by, expires_ts),
+        )
+
+
+def ruled_out_invalidate(key: str, kind: str | None = None, path: str | Path | None = None) -> int:
+    """Stop recalling these dead ends — the environment they were true in is
+    gone. Returns how many rows were retired."""
+    sql = "UPDATE case_ruled_out SET still_valid=0 WHERE case_key=? AND still_valid=1"
+    params: list[Any] = [key]
+    if kind:
+        sql += " AND kind=?"
+        params.append(kind)
+    with _write_lock, _connect(path) as conn:
+        return conn.execute(sql, params).rowcount
+
+
+def case_query_similar(
+    service: str,
+    alertname: str | None = None,
+    limit: int = 5,
+    path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Past incidents on this service worth putting in front of the model.
+
+    Structured filter first, ranking second, and **one row per case** — the
+    predecessor (`inv_query_similar`) joined investigations to calibration on
+    `fp`, so a single verdict fanned out over every run that shared the
+    fingerprint and the top-5 came back as five near-copies of one incident,
+    several of which had concluded there was no incident.
+
+    No embeddings at this size. Structured matching can be explained to whoever
+    is on call ("because the last three of these on payment-service"); a
+    similarity score cannot.
+
+    Recall requires a root cause from a trusted source and a status that means
+    something was actually wrong. `false_positive` cases are kept but never
+    returned here: they are useful context about the alert, not precedent about
+    a cause.
+    """
+    where = "service = ? AND root_cause IS NOT NULL"
+    params: list[Any] = [service]
+    if alertname:
+        where += " AND alertname = ?"
+        params.append(alertname)
+    where += (
+        f" AND root_cause_source IN ({','.join('?' * len(TRUSTED_ROOT_CAUSE_SOURCES))})"
+        f" AND status IN ({','.join('?' * len(_CASE_RECALL_STATUSES))})"
+    )
+    params.extend(TRUSTED_ROOT_CAUSE_SOURCES)
+    params.extend(_CASE_RECALL_STATUSES)
+    params.append(limit)
+    with _connect(path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM cases WHERE {where} ORDER BY occurrences DESC, last_ts DESC LIMIT ?",
+            params,
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        if d.get("resolution"):
+            try:
+                d["resolution"] = json.loads(d["resolution"])
+            except Exception:
+                pass
+        out.append(d)
+    return out
+
+
+def case_ruled_out_for(
+    case_keys: list[str],
+    limit: int = 10,
+    now_ts: str | None = None,
+    path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Still-valid dead ends for these cases, most recent first.
+
+    Ranked separately from `case_query_similar` on purpose: a root cause is
+    interesting because it keeps happening, a dead end because it was disproved
+    recently — the environment it was disproved in is more likely to still be
+    the current one.
+    """
+    if not case_keys:
+        return []
+    now = now_ts or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ph = ",".join("?" * len(case_keys))
+    src = ",".join("?" * len(TRUSTED_DISPROOF_SOURCES))
+    params: list[Any] = [*case_keys, *TRUSTED_DISPROOF_SOURCES, now, limit]
+    with _connect(path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM case_ruled_out
+            WHERE case_key IN ({ph}) AND still_valid=1 AND disproved_by IN ({src})
+              AND (expires_ts IS NULL OR expires_ts > ?)
+            ORDER BY id DESC LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def backfill_cases(path: str | Path | None = None) -> dict[str, int]:
+    """One-time: give existing investigations a run_id and a case_key, and
+    materialize the `cases` rows they imply.
+
+    Two deliberate omissions.
+
+    `run_id` is backfilled to `fp`, which reproduces the old collisions rather
+    than inventing identities that were never recorded. New rows carry a nonce;
+    history stays honest about not having one.
+
+    **No root cause is backfilled.** The old `correct=1` labels cannot be
+    attributed to a specific run — that ambiguity is the bug this table exists
+    to fix — so promoting them would freeze the wrong prior into the new schema.
+    The case library starts empty and earns its rows.
+    """
+    counts = {"run_id": 0, "case_key": 0, "cases": 0}
+    with _write_lock, _connect(path) as conn:
+        counts["run_id"] = conn.execute(
+            "UPDATE investigations SET run_id = fp WHERE run_id IS NULL"
+        ).rowcount
+        rows = conn.execute(
+            "SELECT id, fp, ts, payload FROM investigations WHERE case_key IS NULL ORDER BY id"
+        ).fetchall()
+        seen: dict[str, tuple[str, str, str | None, str | None]] = {}
+        for r in rows:
+            try:
+                payload = json.loads(r["payload"])
+            except Exception:
+                continue  # malformed row: leave case_key NULL rather than guess
+            alertname = payload.get("alertname")
+            service = payload.get("service")
+            key = case_key(alertname, service)
+            conn.execute("UPDATE investigations SET case_key=? WHERE id=?", (key, r["id"]))
+            counts["case_key"] += 1
+            ts = r["ts"] or payload.get("ts") or ""
+            if key in seen:
+                first, _last, an, sv = seen[key]
+                seen[key] = (min(first, ts) if first else ts, ts, an, sv)
+            else:
+                seen[key] = (ts, ts, alertname, service)
+        for key, (first, last, alertname, service) in seen.items():
+            occurrences = conn.execute(
+                "SELECT COUNT(*) FROM investigations WHERE case_key=?", (key,)
+            ).fetchone()[0]
+            conn.execute(
+                """
+                INSERT INTO cases (case_key, first_ts, last_ts, alertname, service, occurrences)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(case_key) DO UPDATE SET
+                    last_ts     = MAX(cases.last_ts, excluded.last_ts),
+                    occurrences = excluded.occurrences
+                """,
+                (key, first, last, alertname, service, occurrences),
+            )
+            counts["cases"] += 1
+    return counts
+
+
 # ---- action_requests (lifecycle state machine; 7b-1) ----------------------
 
 _AR_COLS = (
@@ -485,6 +953,7 @@ _AR_COLS = (
     "runbook_id",
     "params",
     "idem_key",
+    "run_id",
     "created_ts",
     "expires_ts",
     "actor",

@@ -30,6 +30,7 @@ import httpx
 from langchain_core.tools import StructuredTool, ToolException
 from pydantic import BaseModel, Field
 
+from .. import case_memory
 from ..config import settings
 
 logger = logging.getLogger("aiops_agent.query")
@@ -314,6 +315,16 @@ async def _prom_empty_note(expr: str) -> dict[str, Any] | None:
             "Check the label matchers (values are case-sensitive) or widen the range "
             "before assuming the value is zero."
         }
+    # A name that does not exist here is a property of the environment, not of
+    # the time window, so it is worth remembering against the case. The
+    # empty-window branch above deliberately is not: "nothing happened then" must
+    # not become "don't look there".
+    case_memory.remember_dead_end(
+        "query",
+        f"PromQL referencing {', '.join(missing)}",
+        disproved_by="tool_result",
+        evidence="no such metric in this Prometheus",
+    )
     return {
         "note": f"No such metric in Prometheus: {', '.join(missing)}.",
         "hint": "Call discover_metrics(service) for the names this service really "
@@ -344,6 +355,12 @@ async def _loki_empty_note(logql: str, start: datetime, end: datetime) -> dict[s
     unknown = sorted(k for k in used if k not in labels)
     if not unknown:
         return {"note": "The stream selector is valid but matched no lines in this window."}
+    case_memory.remember_dead_end(
+        "query",
+        f"LogQL stream selector on {', '.join(unknown)}",
+        disproved_by="tool_result",
+        evidence="not an indexable stream label in this Loki",
+    )
     return {
         "note": f"Not an indexable stream label: {', '.join(unknown)}. "
         f"Indexable labels here: {', '.join(sorted(labels))}.",

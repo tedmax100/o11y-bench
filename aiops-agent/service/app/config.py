@@ -74,6 +74,18 @@ class Settings(BaseSettings):
     investigations_enabled: bool = True
     investigations_log_path: str = "investigations.jsonl"
 
+    # --- Case memory (incident-level, version-free; see doc/aiops-agent-case-memory.md)
+    # Writes only: what was investigated, what a trusted labeler concluded, and
+    # which paths turned out to be dead ends. Off = the write side is inert and
+    # nothing new reaches a prompt, which is the safe default while the recall
+    # format is still being A/B'd against no-recall.
+    case_memory_enabled: bool = True
+    # Which side of the recall A/B this run is on. True = the case library
+    # (one row per incident, plus the dead ends). False = the pre-case-memory
+    # JOIN, kept as the control arm — swapping the source with nothing to
+    # compare against is how you get a second unprovable "the score moved".
+    case_recall_enabled: bool = True
+
     # --- Governance gate + action registry (ARE Governance plane; v3 §5.2) --
     # Decides per proposed remediation: AUTO / PROPOSE / ESCALATE, from the run's
     # confidence AND measured calibration. `actions_enabled` is the master kill

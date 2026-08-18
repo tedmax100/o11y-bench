@@ -290,11 +290,16 @@ def _learn_outcome(req: ActionRequest, *, verified: bool, path: Path | None) -> 
     if not settings.learn_remediation_into_ce:
         return
     source = "remediation-verified" if verified else "remediation-failed"
-    ok = label_run(req.fp, correct=verified, source=source, path=path)
+    # The run whose reasoning produced this proposal — not "the latest run of
+    # this alert", which after a storm is a different investigation than the one
+    # being acted on. Falls back to the fingerprint for proposals created before
+    # requests carried a run id.
+    ident = req.run_id or req.fp
+    ok = label_run(ident, correct=verified, source=source, path=path)
     if ok:
-        logger.info("learn: labeled fp=%s correct=%s source=%s", req.fp, verified, source)
+        logger.info("learn: labeled %s correct=%s source=%s", ident, verified, source)
     else:
-        logger.warning("learn: no CE record for fp=%s (run may predate this execution)", req.fp)
+        logger.warning("learn: no CE record for %s (run may predate this execution)", ident)
 
 
 async def _revalidate_preconditions(req: ActionRequest, path: Path | None) -> bool:

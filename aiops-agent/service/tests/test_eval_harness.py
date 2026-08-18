@@ -177,3 +177,55 @@ def test_default_fixtures_include_positive_and_negative():
     neg = fixtures["user-service-no-incident"]
     assert neg.expect == "inconclusive"
     assert "payment-service" in neg.forbid_services
+
+
+def _latency_fixture(**over):
+    base = {
+        "id": "payment-latency-false-alarm",
+        "alert": {"labels": {"service_name": "payment-service", "alertname": "X"}},
+        "expect": "inconclusive",
+        "max_confidence": 0.6,
+        "forbid_versions": ["v2.5.0"],
+    }
+    base.update(over)
+    return Fixture.model_validate(base)
+
+
+class _F:
+    def __init__(self, confidence, services, suspected_version=None):
+        self.confidence = confidence
+        self.services = services
+        self.suspected_version = suspected_version
+
+
+def test_forbid_versions_catches_a_culprit_inherited_from_recall():
+    """The failure `forbid_services` cannot see: the alert names payment-service
+    and so does the answer, but the version came from a past case about a
+    different symptom."""
+    fx = _latency_fixture()
+    correct, _, _ = grade_run(_F(0.5, ["payment-service"], "v2.5.0"), fx)
+    assert correct is False
+
+
+def test_forbid_versions_allows_an_honest_hedge():
+    fx = _latency_fixture()
+    correct, _, _ = grade_run(_F(0.5, ["payment-service"], None), fx)
+    assert correct is True
+
+
+def test_forbid_versions_is_opt_in():
+    fx = _latency_fixture(forbid_versions=[])
+    correct, _, _ = grade_run(_F(0.5, ["payment-service"], "v2.5.0"), fx)
+    assert correct is True
+
+
+def test_shipped_fixtures_include_a_clean_recall_control():
+    """payment-decline-service and payment-latency-false-alarm share a service
+    and differ in alertname — that is what makes one arm open book and the other
+    a control."""
+    fixtures = {f.id: f for f in load_fixtures(DEFAULT_FIXTURES)}
+    decline = fixtures["payment-decline-service"]
+    control = fixtures["payment-latency-false-alarm"]
+    assert decline.alert["labels"]["service_name"] == control.alert["labels"]["service_name"]
+    assert decline.alert["labels"]["alertname"] != control.alert["labels"]["alertname"]
+    assert control.forbid_versions == ["v2.5.0"]

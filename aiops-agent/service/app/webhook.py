@@ -17,6 +17,7 @@ import httpx
 
 from .agent import run_headless
 from .calibration import record_run
+from .case_memory import case_scope
 from .config import settings
 from .investigations import record_investigation
 
@@ -103,12 +104,32 @@ async def _sink_findings(alert: dict, fp: str, result: dict) -> None:
 
 
 async def _investigate_and_sink(alert: dict, fp: str) -> None:
+    labels = alert.get("labels") or {}
+    # Opened around the whole run, not just the recording: the dead ends worth
+    # remembering are discovered inside the tools, and asyncio copies the
+    # context into the tasks the graph spawns.
+    with case_scope(
+        fp=fp,
+        alertname=labels.get("alertname"),
+        service=labels.get("service_name") or labels.get("service"),
+    ) as scope:
+        await _run_and_sink(alert, fp, scope)
+
+
+async def _run_and_sink(alert: dict, fp: str, scope) -> None:
     try:
         result = await run_headless(alert, thread_id=fp)
         # Log the run's confidence for CE measurement (correctness is labeled
-        # offline). Best-effort inside record_run; fp doubles as the run_id so a
-        # later `label <fp>` ties the verdict back to this investigation.
-        record_run(result["findings"], run_id=fp)
+        # offline). The row is keyed by the run, and carries `fp` so a labeler
+        # holding only the fingerprint can still resolve to it — the fingerprint
+        # used to *be* the run_id, which is why one verdict silently covered
+        # every run of an alert and the rest stayed unlabeled forever.
+        record_run(
+            result["findings"],
+            run_id=scope.run_id if scope else fp,
+            case_key=scope.case_key if scope else None,
+            fp=fp,
+        )
         for d in result.get("decisions") or []:
             logger.info(
                 "governance fp=%s action=%s -> %s (%s)", fp, d.action, d.autonomy.value, d.reason

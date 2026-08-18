@@ -31,7 +31,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from . import store
+from . import case_memory, store
 from .config import settings
 
 logger = logging.getLogger("aiops_agent.calibration")
@@ -61,6 +61,9 @@ class CalibrationRecord(BaseModel):
     # right (the only reading the ECE/Brier math assumes); "inconclusive" = did
     # the run appropriately hedge on a non-incident. None = unknown.
     grading_mode: str | None = None
+    # The alert instance this run belonged to. Distinct from run_id since Day38;
+    # on rows written before that they are the same string.
+    fp: str | None = None
 
 
 # ---- store (durable SQLite via app.store; `path` = db path) -----------------
@@ -76,7 +79,14 @@ def load_records(path: Path | None = None) -> list[CalibrationRecord]:
     return out
 
 
-def record_run(findings: Any, run_id: str, path: Path | None = None) -> CalibrationRecord | None:
+def record_run(
+    findings: Any,
+    run_id: str,
+    path: Path | None = None,
+    *,
+    case_key: str | None = None,
+    fp: str | None = None,
+) -> CalibrationRecord | None:
     """Append a pending record for a finished headless run. Best-effort: returns
     None and logs on any failure, never raises into the run."""
     if not settings.calibration_enabled:
@@ -99,6 +109,8 @@ def record_run(findings: Any, run_id: str, path: Path | None = None) -> Calibrat
             hypothesis=rec.hypothesis,
             suspected_version=rec.suspected_version,
             services=rec.services,
+            case_key=case_key,
+            fp=fp,
             path=path,
         )
         return rec
@@ -124,6 +136,16 @@ def label_run(
     `grading_mode` says what this verdict is a verdict *about* — see the
     CalibrationRecord field. Leave it None if you don't know; None never
     overwrites a mode the row already carries."""
+    # The caller may be holding a run_id (the eval harness, the executor now)
+    # or a fingerprint (the plugin's endpoint). Resolve it once, out loud.
+    resolved = store.cal_resolve_run_id(run_id, path)
+    if resolved is None:
+        logger.warning("label_run: no record for %s", run_id)
+        return False
+    if resolved != run_id:
+        logger.info("label_run: %s is a fingerprint; labeling its latest run %s", run_id, resolved)
+        run_id = resolved
+
     ok = store.cal_label(
         run_id,
         correct,
@@ -136,6 +158,24 @@ def label_run(
     )
     if not ok:
         logger.warning("label_run: no record for run_id=%s", run_id)
+        return False
+
+    # A verdict from someone other than the agent is the only thing that turns a
+    # run into recallable precedent. Reading the row back rather than trusting
+    # the arguments: `cal_label` updates the *latest* row for this run_id, and
+    # that row is where the case_key and the conclusion actually live.
+    row = store.cal_latest(run_id, path)
+    if row and row.get("case_key"):
+        verdict = case_memory.confirm_from_label(
+            case_key=row["case_key"],
+            correct=correct,
+            source=source,
+            grading_mode=row.get("grading_mode"),
+            root_cause=row.get("summary") or row.get("hypothesis") or "",
+            run_id=run_id,
+            path=path,
+        )
+        logger.info("case %s after label(%s): %s", row["case_key"], source, verdict)
     return ok
 
 

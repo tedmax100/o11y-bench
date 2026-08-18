@@ -89,3 +89,43 @@
     grounded: true
     discover_before_retry: true
     evidence_or_hedge_ceiling: 0.4
+
+# ---- the recall A/B control (Day38) ----------------------------------------
+# The case library is keyed by (alertname, service). Once payment-service's
+# decline incident is a confirmed case, EVERY payment-service alert is one
+# loosened match away from being handed "v2.5.0 / new_validator is the cause" as
+# a prior — including alerts about something else entirely.
+#
+# This fixture is that something else. Latency in the baked data is flat (over a
+# 6h window the mean is 0.059s on v2.4.1 and 0.041s on v2.5.0 — the "bad"
+# version is faster), so the honest answer is that there is no latency incident.
+# An agent that inherits the decline case's culprit and pins slow charges on
+# v2.5.0 fails on `forbid_versions`, and that failure is the whole point: it
+# separates "recall helped" from "recall made it confident about everything".
+#
+# It is also the arm `library_overlap()` must report as clean while
+# payment-decline-service is reported as open book — same service, different
+# alert.
+- id: payment-latency-false-alarm
+  alert:
+    labels:
+      service_name: payment-service
+      alertname: PaymentChargeLatencyHigh
+    annotations:
+      summary: "payment-service charge latency above objective"
+      description: >-
+        Charge duration on payment-service looks elevated. Confirm whether
+        latency actually moved before attributing it to anything.
+    startsAt: now
+  expect: inconclusive
+  max_confidence: 0.6
+  forbid_services:
+    - order-service
+    - user-service
+  forbid_versions:
+    - v2.5.0        # the decline case's culprit; latency is flat on it
+  process:
+    queried_min: 1
+    grounded: true
+    discover_before_retry: true
+    evidence_or_hedge_ceiling: 0.4

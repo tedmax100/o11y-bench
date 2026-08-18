@@ -26,7 +26,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from . import audit, store
+from . import audit, case_memory, store
 from .config import settings
 from .governance import Autonomy, Decision
 
@@ -66,6 +66,10 @@ class ActionRequest(BaseModel):
     # action|target|fp — idempotency key so an alert storm can't act on the same
     # target twice for one incident (7b-3).
     idem_key: str = ""
+    # The investigation run that produced this proposal. Without it the
+    # executor's own verification could only label "the latest run of this
+    # alert", which is not necessarily the run whose reasoning is being acted on.
+    run_id: str | None = None
     created_ts: str
     expires_ts: str
     actor: str | None = None
@@ -131,6 +135,10 @@ def create_from_decision(
             # the dry-run before acting (the cluster moves between the two).
             blast_radius=blast_radius,
             idem_key=f"{decision.action}|{target_of(args)}|{fp}",
+            # Pulled from the ambient scope rather than added to this signature:
+            # every caller is inside the investigation that produced the
+            # decision, and none of them has a reason to know about run ids.
+            run_id=(sc.run_id if (sc := case_memory.current_scope()) else None),
             created_ts=_fmt(now),
             expires_ts=_fmt(now + timedelta(seconds=settings.approval_ttl_seconds)),
             actor="system" if auto_ok else None,

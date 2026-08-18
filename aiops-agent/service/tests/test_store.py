@@ -274,3 +274,166 @@ def test_describe_never_writes_to_the_store_it_reads(tmp_path, monkeypatch):
     assert d["tables"]["calibration"] == 0
     assert d["tables"]["audit"] is None  # table genuinely absent here
     assert old.read_bytes() == before  # byte-identical: nothing was migrated
+
+
+# ---- case memory ----------------------------------------------------------
+
+
+def _inv(store_path, fp, alertname, service, git_version="", summary=""):
+    payload = json.dumps(
+        {
+            "fp": fp,
+            "ts": "2026-08-16T05:00:00Z",
+            "alertname": alertname,
+            "service": service,
+            "git_version": git_version,
+            "summary": summary,
+        }
+    )
+    store.inv_insert(fp, "2026-08-16T05:00:00Z", payload, store_path)
+
+
+def test_case_key_ignores_version_and_alertname_spelling(tmp_path, monkeypatch):
+    """The whole reason this key exists: a redeploy is a new alert instance but
+    not a new incident, and the same alert is spelled three ways."""
+    a = store.case_key("PaymentDeclineRateHigh", "payment-service")
+    b = store.case_key("payment_decline_rate_high", "payment-service")
+    assert a == b
+    # version is not an input at all — no parameter to pass it through
+    assert a != store.case_key("payment-decline-rate-high", "order-service")
+
+
+def test_new_run_id_is_unique_per_call(tmp_path, monkeypatch):
+    ids = {store.new_run_id("fp") for _ in range(50)}
+    assert len(ids) == 50
+    assert all(i.startswith("fp-") for i in ids)
+
+
+def test_backfill_collapses_versioned_fingerprints_into_one_case(tmp_path, monkeypatch):
+    """Reproduces the day36 drill shape: one incident investigated across five
+    image tags, which `fp` split into five unrelated fingerprints."""
+    p = _cfg(monkeypatch, tmp_path)
+    for i in range(5):
+        _inv(p, f"fp{i}", "payment-decline-rate-high", "payment-service", f"v2.5.1-drill-{i}")
+    counts = store.backfill_cases(p)
+    assert counts == {"run_id": 5, "case_key": 5, "cases": 1}
+    key = store.case_key("payment-decline-rate-high", "payment-service")
+    assert store.case_get(key, p)["occurrences"] == 5
+    # backfill records the incident, never its cause
+    assert store.case_get(key, p)["root_cause"] is None
+
+
+def test_backfill_is_idempotent(tmp_path, monkeypatch):
+    p = _cfg(monkeypatch, tmp_path)
+    _inv(p, "fp0", "a", "svc")
+    store.backfill_cases(p)
+    assert store.backfill_cases(p) == {"run_id": 0, "case_key": 0, "cases": 0}
+    assert store.case_get(store.case_key("a", "svc"), p)["occurrences"] == 1
+
+
+def test_case_confirm_rejects_self_attestation(tmp_path, monkeypatch):
+    p = _cfg(monkeypatch, tmp_path)
+    key = store.case_key("a", "svc")
+    store.case_upsert(key=key, ts="t", alertname="a", service="svc", path=p)
+    assert (
+        store.case_confirm(key, root_cause="it was me", source="self", run_id="r1", ts="t", path=p)
+        is False
+    )
+    assert store.case_get(key, p)["root_cause"] is None
+    assert store.case_confirm(
+        key, root_cause="new_validator", source="human", run_id="r1", ts="t", path=p
+    )
+    assert store.case_get(key, p)["root_cause"] == "new_validator"
+
+
+def test_case_confirm_on_unknown_case_writes_nothing(tmp_path, monkeypatch):
+    p = _cfg(monkeypatch, tmp_path)
+    assert (
+        store.case_confirm("nope", root_cause="x", source="human", run_id="r", ts="t", path=p)
+        is False
+    )
+    assert store.case_get("nope", p) is None
+
+
+def test_recall_returns_one_row_per_case_not_per_run(tmp_path, monkeypatch):
+    """The predecessor joined on `fp` and returned five near-copies of one
+    incident. One confirmed case must yield exactly one recalled row."""
+    p = _cfg(monkeypatch, tmp_path)
+    key = store.case_key("a", "svc")
+    for i in range(9):
+        _inv(p, f"fp{i}", "a", "svc", f"v{i}")
+    store.backfill_cases(p)
+    store.case_confirm(
+        key,
+        root_cause="new_validator rejects odd cents",
+        source="grader",
+        run_id="fp0",
+        ts="t",
+        resolution={"action": "k8s.rollout_undo"},
+        path=p,
+    )
+    rows = store.case_query_similar("svc", path=p)
+    assert len(rows) == 1
+    assert rows[0]["occurrences"] == 9
+    assert rows[0]["resolution"] == {"action": "k8s.rollout_undo"}
+
+
+def test_false_positive_case_is_kept_but_never_recalled(tmp_path, monkeypatch):
+    p = _cfg(monkeypatch, tmp_path)
+    key = store.case_key("a", "svc")
+    store.case_upsert(key=key, ts="t", alertname="a", service="svc", path=p)
+    store.case_confirm(key, root_cause="noise", source="human", run_id="r", ts="t", path=p)
+    store.case_set_status(key, "false_positive", path=p)
+    assert store.case_get(key, p)["status"] == "false_positive"
+    assert store.case_query_similar("svc", path=p) == []
+
+
+def test_recurring_after_reoccurrence_stays_recallable(tmp_path, monkeypatch):
+    p = _cfg(monkeypatch, tmp_path)
+    key = store.case_key("a", "svc")
+    store.case_upsert(key=key, ts="t1", alertname="a", service="svc", path=p)
+    store.case_confirm(key, root_cause="rc", source="human", run_id="r", ts="t1", path=p)
+    store.case_upsert(key=key, ts="t2", alertname="a", service="svc", path=p)
+    assert store.case_get(key, p)["status"] == "recurring"
+    assert len(store.case_query_similar("svc", path=p)) == 1
+
+
+def test_ruled_out_excludes_model_claims_and_expired_rows(tmp_path, monkeypatch):
+    p = _cfg(monkeypatch, tmp_path)
+    key = store.case_key("a", "svc")
+    common = {"key": key, "run_id": "r", "ts": "t", "path": p}
+    store.ruled_out_insert(
+        kind="query", subject="tempo service_name=", disproved_by="tool_result", **common
+    )
+    store.ruled_out_insert(
+        kind="hypothesis", subject="db saturation", disproved_by="model", **common
+    )
+    store.ruled_out_insert(
+        kind="query",
+        subject="traces older than 1h",
+        disproved_by="tool_result",
+        expires_ts="2026-08-16T07:00:00Z",
+        **common,
+    )
+    rows = store.case_ruled_out_for([key], now_ts="2026-08-16T08:00:00Z", path=p)
+    assert [r["subject"] for r in rows] == ["tempo service_name="]
+
+
+def test_ruled_out_invalidate_by_kind(tmp_path, monkeypatch):
+    p = _cfg(monkeypatch, tmp_path)
+    key = store.case_key("a", "svc")
+    for kind in ("query", "query", "hypothesis"):
+        store.ruled_out_insert(
+            key=key, run_id="r", ts="t", kind=kind, subject=kind, disproved_by="human", path=p
+        )
+    assert store.ruled_out_invalidate(key, kind="query", path=p) == 2
+    rows = store.case_ruled_out_for([key], now_ts="t", path=p)
+    assert [r["kind"] for r in rows] == ["hypothesis"]
+
+
+def test_case_tables_survive_a_reconnect(tmp_path, monkeypatch):
+    p = _cfg(monkeypatch, tmp_path)
+    key = store.case_key("a", "svc")
+    store.case_upsert(key=key, ts="t", alertname="a", service="svc", path=p)
+    with sqlite3.connect(str(p)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM cases").fetchone()[0] == 1

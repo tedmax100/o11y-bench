@@ -101,11 +101,17 @@ def load_runbooks(directory: str | Path | None = None) -> list[Runbook]:
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 
 
-def _norm(name: str | None) -> str:
+def norm_alertname(name: str | None) -> str:
     """Alert names differ in case and separators across the tools that emit them
     (`PaymentDeclineRateHigh`, `payment-decline-rate-high`, `payment_decline_rate_high`
     are one alert). Compare on the letters and digits alone."""
     return _NON_ALNUM.sub("", (name or "").lower())
+
+
+# Kept as the in-module name; `store.case_key()` imports the public one so the
+# two places that decide "are these the same alert" cannot drift apart (the
+# trace-id regex already drifted once, for exactly this reason).
+_norm = norm_alertname
 
 
 def _labels_match(book: Runbook, labels: dict) -> bool:

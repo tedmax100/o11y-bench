@@ -974,9 +974,25 @@ def _investigation_instructions(services: list[str]) -> str:
     return "\n".join(lines)
 
 
-def _past_incident_context(service: str, alertname: str | None = None) -> str:
-    """Build a markdown block of past correct investigations for this service
-    (narrowed to the same alert when there is one). Empty string when none."""
+# The heading the recall block leads with. Named here because `leakcheck.py`
+# keys on it: this block is the one place where handing the model the previous
+# answer is the *intent*, so a leak scan has to be able to tell it apart from an
+# accident rather than either failing on it or silently passing it.
+PAST_CASES_HEADING = "## Past cases for this service (reference — current evidence wins)"
+
+
+def _legacy_past_incident_context(service: str, alertname: str | None = None) -> str:
+    """The pre-case-memory recall, kept as the A/B control arm.
+
+    Retained rather than deleted because Day32 already produced one "the score
+    moved but the causation is unprovable" result; swapping the recall source
+    with nothing to compare against would produce a second one.
+
+    Its defect is structural: the JOIN is on `fp`, so one verdict on the latest
+    row is inherited by every run that shared the fingerprint — on the day36
+    snapshot that returned ten "precedents" from two human verdicts, three of
+    which had concluded there was no incident.
+    """
     try:
         rows = store.inv_query_similar(service=service, alertname=alertname, limit=5)
     except Exception as e:
@@ -994,6 +1010,47 @@ def _past_incident_context(service: str, alertname: str | None = None) -> str:
             lines.append(f"  hypothesis: {r['hypothesis']}")
         if r.get("suspected_version"):
             lines.append(f"  culprit version: {r['suspected_version']}")
+    return "\n".join(lines)
+
+
+def _past_incident_context(service: str, alertname: str | None = None) -> str:
+    """What this service's history says, as a prior and a list of dead ends.
+
+    Two halves, ranked differently on purpose. A root cause is worth recalling
+    because it keeps happening; a dead end because it was disproved *recently* —
+    the environment it was disproved in is more likely to still be this one.
+
+    The dead ends are the half that changes behaviour without changing the
+    answer: they spend the budget the run would otherwise burn re-issuing a
+    query that cannot work here.
+    """
+    if not settings.case_recall_enabled:
+        return _legacy_past_incident_context(service, alertname)
+    try:
+        cases = store.case_query_similar(service=service, alertname=alertname, limit=3)
+        dead_ends = store.case_ruled_out_for([c["case_key"] for c in cases], limit=8)
+    except Exception as e:
+        logger.warning("past case recall failed: %s", e)
+        return ""
+    if not cases:
+        return ""
+    lines = [PAST_CASES_HEADING]
+    for c in cases:
+        seen = f"×{c['occurrences']}" if c["occurrences"] > 1 else "once"
+        lines.append(
+            f"- {c['alertname']} ({seen}, last {(c['last_ts'] or '')[:10]}, "
+            f"confirmed by {c['root_cause_source']})"
+        )
+        lines.append(f"  root cause: {c['root_cause']}")
+        resolution = c.get("resolution")
+        if isinstance(resolution, dict) and resolution.get("action"):
+            lines.append(f"  resolved by: {resolution['action']}")
+    if dead_ends:
+        lines.append("")
+        lines.append("### Already ruled out here — do not spend budget re-checking")
+        for d in dead_ends:
+            evidence = f" ({d['evidence']})" if d["evidence"] else ""
+            lines.append(f"- [{d['kind']}] {d['subject']}{evidence}")
     return "\n".join(lines)
 
 

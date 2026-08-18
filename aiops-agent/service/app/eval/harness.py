@@ -18,6 +18,8 @@ from __future__ import annotations
 import copy
 import json
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,6 +31,7 @@ from pydantic import BaseModel, Field
 from .. import store
 from ..agent import run_headless
 from ..calibration import grade_against_truth
+from ..config import settings
 from ..investigations import record_investigation
 from .process import CheckResult, ProcessSpec, grade_process
 
@@ -48,8 +51,9 @@ class Fixture(BaseModel):
       - "culprit" (default): the agent must finger `truth` (service + optional
         version). Graded by `grade_against_truth`.
       - "inconclusive": there is no real incident, so a good agent must NOT
-        confidently blame anyone — correct iff confidence ≤ `max_confidence` and
-        it named no service in `forbid_services`. This is the negative test that
+        confidently blame anyone — correct iff confidence ≤ `max_confidence`,
+        it named no service in `forbid_services`, and it pinned nothing on a
+        version in `forbid_versions`. This is the negative test that
         catches "confidently wrong on a non-incident" regressions, which a suite
         of only positive fixtures cannot.
     """
@@ -61,6 +65,11 @@ class Fixture(BaseModel):
     # inconclusive-mode knobs (ignored for culprit fixtures):
     max_confidence: float = 0.6  # appropriately-hedged ceiling
     forbid_services: list[str] = Field(default_factory=list)
+    # …and never pins it on a version it was primed to suspect. `forbid_services`
+    # cannot catch this on a fixture whose alert names the *right* service: an
+    # agent that inherits a past case's culprit blames the correct service for
+    # the wrong reason, and the service check waves it through.
+    forbid_versions: list[str] = Field(default_factory=list)
     # Process expectations graded from the transcript (see process.py). A
     # fixture can assert on *how* the answer was reached even when the verdict
     # itself is right — a correct culprit reached by rephrasing a query into an
@@ -127,7 +136,9 @@ def grade_run(findings: Any, fixture: Fixture) -> tuple[bool, bool, bool | None]
         conf = float(getattr(findings, "confidence", 0.0) or 0.0)
         blamed = {s.lower() for s in (getattr(findings, "services", []) or [])}
         named_forbidden = any(s.lower() in blamed for s in fixture.forbid_services)
-        correct = conf <= fixture.max_confidence and not named_forbidden
+        suspected = (getattr(findings, "suspected_version", None) or "").lower()
+        version_forbidden = any(v.lower() in suspected for v in fixture.forbid_versions if v)
+        correct = conf <= fixture.max_confidence and not named_forbidden and not version_forbidden
         # service_hit mirrors correctness (the "did it hedge" signal); no version.
         return correct, correct, None
 
@@ -293,6 +304,91 @@ async def run_suite(
             )
         summaries.append(summarize(fixture.id, runs))
     return summaries
+
+
+# ---- recall A/B -------------------------------------------------------------
+# Day38 swapped what past-incident recall reads. Measuring whether that helped
+# needs two arms of the same suite — and, more importantly, needs to know
+# whether the library has already seen the fixture, because a library that
+# contains the answer turns the "with recall" arm into an open-book exam and its
+# score into a measurement of retrieval, not reasoning.
+
+
+@contextmanager
+def recall_arm(enabled: bool) -> Iterator[None]:
+    """Run this block with case recall forced on or off."""
+    previous = settings.case_recall_enabled
+    settings.case_recall_enabled = enabled
+    try:
+        yield
+    finally:
+        settings.case_recall_enabled = previous
+
+
+def library_overlap(fixtures: list[Fixture]) -> list[tuple[str, int]]:
+    """Which fixtures the case library can already answer, and with how many
+    cases. Empty list = a clean A/B.
+
+    Reads the *production* store, not the eval store: `_past_incident_context`
+    takes no path, so recall during an eval run resolves through
+    `settings.store_path` like every other runtime read. Checking the eval store
+    here would report a clean experiment while the agent reads a dirty one.
+    """
+    out: list[tuple[str, int]] = []
+    for fx in fixtures:
+        labels = fx.alert.get("labels") or {}
+        service = labels.get("service_name") or labels.get("service")
+        if not service:
+            continue
+        try:
+            hits = store.case_query_similar(
+                service=service, alertname=labels.get("alertname"), limit=5
+            )
+        except Exception:
+            continue
+        if hits:
+            out.append((fx.id, len(hits)))
+    return out
+
+
+def format_ab_report(
+    on: list[FixtureSummary],
+    off: list[FixtureSummary],
+    overlap: list[tuple[str, int]],
+) -> str:
+    """Side by side, with the open-book warning first because it decides whether
+    the numbers below it mean anything."""
+    lines: list[str] = []
+    if overlap:
+        lines.append("OPEN BOOK — the case library already answers these fixtures:")
+        for fixture_id, n in overlap:
+            lines.append(f"  {fixture_id}: {n} case(s) recalled")
+        lines.append("  The recall arm is retrieving an answer it was told. Whatever the delta")
+        lines.append("  below is, it is not evidence that recall helps an unseen incident.")
+        lines.append("")
+    else:
+        lines.append("clean A/B: the case library answers none of these fixtures\n")
+
+    by_id = {s.fixture_id: s for s in off}
+    lines.append(f"{'fixture':<34} {'recall off':>11} {'recall on':>11} {'delta':>8}")
+    for s in on:
+        base = by_id.get(s.fixture_id)
+        if base is None:
+            continue
+        delta = s.correct_rate - base.correct_rate
+        lines.append(
+            f"{s.fixture_id:<34} {base.correct_rate:>10.0%} {s.correct_rate:>11.0%} {delta:>+8.0%}"
+        )
+    n_seeds = on[0].n if on else 0
+    lines.append("")
+    lines.append(
+        "A delta here is a difference between two small samples of a non-deterministic model."
+    )
+    lines.append(
+        "Day27 measured the same code scoring 2.5-3.5 across three runs; read the transcripts"
+    )
+    lines.append("before reading the delta." + (f"  (seeds/arm: {n_seeds})" if n_seeds else ""))
+    return "\n".join(lines)
 
 
 # ---- baseline / regression --------------------------------------------------

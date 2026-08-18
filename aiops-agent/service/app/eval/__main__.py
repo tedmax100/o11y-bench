@@ -18,9 +18,12 @@ from .harness import (
     DEFAULT_BASELINE,
     DEFAULT_FIXTURES,
     DEFAULT_STORE,
+    format_ab_report,
     format_report,
+    library_overlap,
     load_baseline,
     load_fixtures,
+    recall_arm,
     regression_diff,
     run_suite,
     save_baseline,
@@ -44,6 +47,13 @@ def _main(argv: list[str] | None = None) -> int:
     )
     pr.add_argument("-n", "--seeds", type=int, default=3, help="runs per fixture (default 3)")
     pr.add_argument("--only", default=None, help="run only the fixture with this id")
+    pr.add_argument(
+        "--recall",
+        choices=("on", "off", "both"),
+        default="on",
+        help="past-case recall arm: on (default, the runtime setting), off (the "
+        "control), or both (run the suite twice and print the delta)",
+    )
     pr.add_argument(
         "--save-baseline",
         action="store_true",
@@ -100,17 +110,33 @@ def _main(argv: list[str] | None = None) -> int:
                 return 1
             print("  stack ready; running against fixed data")
 
-        summaries = asyncio.run(
-            run_suite(
-                fixtures,
-                seeds=args.seeds,
-                store_path=args.store,
-                scenario_time=scenario_time,
-            )
-        )
+        def _suite(recall: bool):
+            with recall_arm(recall):
+                return asyncio.run(
+                    run_suite(
+                        fixtures,
+                        seeds=args.seeds,
+                        store_path=args.store,
+                        scenario_time=scenario_time,
+                    )
+                )
+
+        if args.recall == "both":
+            # Control first: the recall arm writes nothing to the case library
+            # (the harness opens no case scope), but running the control second
+            # would still put it after N more incidents of wall-clock drift.
+            off_summaries = _suite(False)
+            summaries = _suite(True)
+        else:
+            off_summaries = None
+            summaries = _suite(args.recall == "on")
     finally:
         if booted and not args.keep_stack:
             stackmod.teardown()
+
+    if off_summaries is not None:
+        print(format_ab_report(summaries, off_summaries, library_overlap(fixtures)))
+        print()
 
     baseline = load_baseline(args.baseline)
     diff = regression_diff(summaries, baseline)
