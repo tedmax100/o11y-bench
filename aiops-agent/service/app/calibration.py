@@ -161,9 +161,10 @@ def label_run(
         return False
 
     # A verdict from someone other than the agent is the only thing that turns a
-    # run into recallable precedent. Reading the row back rather than trusting
-    # the arguments: `cal_label` updates the *latest* row for this run_id, and
-    # that row is where the case_key and the conclusion actually live.
+    # run into recallable precedent, or into a refutation of one. Reading the
+    # row back rather than trusting the arguments: `cal_label` updates the
+    # *latest* row for this run_id, and that row is where the case_key and the
+    # conclusion actually live.
     row = store.cal_latest(run_id, path)
     if row and row.get("case_key"):
         verdict = case_memory.confirm_from_label(
@@ -173,6 +174,7 @@ def label_run(
             grading_mode=row.get("grading_mode"),
             root_cause=row.get("summary") or row.get("hypothesis") or "",
             run_id=run_id,
+            correction_note=row.get("correction_note"),
             path=path,
         )
         logger.info("case %s after label(%s): %s", row["case_key"], source, verdict)

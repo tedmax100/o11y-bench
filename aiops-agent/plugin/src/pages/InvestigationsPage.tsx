@@ -48,6 +48,15 @@ type ActionRequest = {
   action: string;
   status: string;
   blast_radius?: BlastRadius | null;
+  // Why a person decided the way they did. Only rejections carry one today,
+  // and it is the reason the case memory learns anything from a "no".
+  decision_note?: string | null;
+};
+
+type RejectModalState = {
+  requestId: string;
+  action: string;
+  reason: string;
 };
 
 type WrongModalState = {
@@ -88,6 +97,8 @@ function InvestigationsPage({ agentServiceUrl }: Props) {
   const [submitting, setSubmitting] = useState(false);
   const [reinvestigatingFps, setReinvestigatingFps] = useState<Set<string>>(new Set());
   const [proposals, setProposals] = useState<Record<string, ActionRequest[]>>({});
+  const [rejectModal, setRejectModal] = useState<RejectModalState | null>(null);
+  const [decidingId, setDecidingId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -156,6 +167,47 @@ function InvestigationsPage({ agentServiceUrl }: Props) {
     },
     [agentServiceUrl]
   );
+
+  // Approve/reject used to exist only as an endpoint, so the person in the loop
+  // had to reach for curl. The reason field is the half that outlives the
+  // request: it becomes a dead end on the incident, so the next investigation of
+  // the same thing is told what was already turned down.
+  const decide = useCallback(
+    async (requestId: string, verdict: 'approve' | 'reject', reason?: string) => {
+      setDecidingId(requestId);
+      try {
+        const res = await fetch(`${agentServiceUrl}/actions/requests/${requestId}/${verdict}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(verdict === 'reject' ? { reason: reason ?? '' } : {}),
+        });
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+        const updated: ActionRequest = await res.json();
+        setProposals((prev) => {
+          const next: Record<string, ActionRequest[]> = {};
+          Object.entries(prev).forEach(([fp, rows]) => {
+            next[fp] = rows.map((r) => (r.request_id === updated.request_id ? updated : r));
+          });
+          return next;
+        });
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setDecidingId(null);
+      }
+    },
+    [agentServiceUrl]
+  );
+
+  const submitReject = useCallback(async () => {
+    if (!rejectModal) {
+      return;
+    }
+    await decide(rejectModal.requestId, 'reject', rejectModal.reason);
+    setRejectModal(null);
+  }, [rejectModal, decide]);
 
   const openWrongModal = useCallback((fp: string) => {
     setWrongModal({ fp, errorDimension: 'root_cause', correctionNote: '' });
@@ -255,6 +307,48 @@ function InvestigationsPage({ agentServiceUrl }: Props) {
                             <span className={styles.reason}>{br.policy_reason}</span>
                           </div>
                         )}
+                        {req && (
+                          <div className={styles.footprint}>
+                            {req.status === 'proposed' ? (
+                              <>
+                                <Button
+                                  size="sm"
+                                  variant="primary"
+                                  fill="outline"
+                                  icon="check"
+                                  disabled={decidingId === req.request_id}
+                                  onClick={() => decide(req.request_id, 'approve')}
+                                >
+                                  Approve
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="destructive"
+                                  fill="outline"
+                                  icon="times"
+                                  disabled={decidingId === req.request_id}
+                                  onClick={() =>
+                                    setRejectModal({
+                                      requestId: req.request_id,
+                                      action: req.action,
+                                      reason: '',
+                                    })
+                                  }
+                                >
+                                  Reject
+                                </Button>
+                              </>
+                            ) : (
+                              <Badge
+                                text={req.status}
+                                color={req.status === 'rejected' ? 'red' : 'blue'}
+                              />
+                            )}
+                            {req.decision_note && (
+                              <span className={styles.reason}>“{req.decision_note}”</span>
+                            )}
+                          </div>
+                        )}
                       </div>
                     );
                   })}
@@ -287,6 +381,44 @@ function InvestigationsPage({ agentServiceUrl }: Props) {
           ))}
         </div>
       </div>
+
+      {rejectModal && (
+        <Modal
+          title="Why are you turning this down?"
+          isOpen
+          onDismiss={() => setRejectModal(null)}
+        >
+          <div className={styles.modalBody}>
+            <div className={styles.intro}>
+              Declining <code>{rejectModal.action}</code>. The reason is remembered against this
+              incident, so the next investigation of the same thing is told it was already turned
+              down — without one, all it learns is that somebody said no.
+            </div>
+            <Field label="Reason (optional)" description="Written in the operator's words; it goes in front of the model verbatim.">
+              <Input
+                placeholder="e.g. we roll forward here, never back — and payment can't restart during business hours"
+                value={rejectModal.reason}
+                onChange={(e) =>
+                  setRejectModal((prev) => (prev ? { ...prev, reason: e.currentTarget.value } : prev))
+                }
+              />
+            </Field>
+            <Stack direction="row" gap={1} justifyContent="flex-end">
+              <Button variant="secondary" onClick={() => setRejectModal(null)}>
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                icon="times"
+                onClick={submitReject}
+                disabled={decidingId === rejectModal.requestId}
+              >
+                {decidingId === rejectModal.requestId ? 'Submitting…' : 'Reject'}
+              </Button>
+            </Stack>
+          </div>
+        </Modal>
+      )}
 
       {wrongModal && (
         <Modal

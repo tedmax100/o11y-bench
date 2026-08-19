@@ -1028,11 +1028,19 @@ def _past_incident_context(service: str, alertname: str | None = None) -> str:
         return _legacy_past_incident_context(service, alertname)
     try:
         cases = store.case_query_similar(service=service, alertname=alertname, limit=3)
-        dead_ends = store.case_ruled_out_for([c["case_key"] for c in cases], limit=8)
+        # The dead ends of *this* incident, not only of the incidents that
+        # reached a confirmed root cause. A refuted hypothesis and a declined
+        # action are the whole record a case has before anyone gets it right,
+        # and keying the lookup off the recalled cases meant that record was
+        # unreachable in exactly the situation it was collected for.
+        keys = {c["case_key"] for c in cases}
+        if alertname:
+            keys.add(store.case_key(alertname, service))
+        dead_ends = store.case_ruled_out_for(sorted(keys), limit=8)
     except Exception as e:
         logger.warning("past case recall failed: %s", e)
         return ""
-    if not cases:
+    if not cases and not dead_ends:
         return ""
     lines = [PAST_CASES_HEADING]
     for c in cases:
@@ -1050,7 +1058,16 @@ def _past_incident_context(service: str, alertname: str | None = None) -> str:
         lines.append("### Already ruled out here — do not spend budget re-checking")
         for d in dead_ends:
             evidence = f" ({d['evidence']})" if d["evidence"] else ""
-            lines.append(f"- [{d['kind']}] {d['subject']}{evidence}")
+            # Who refuted it is part of the claim. A tool result means the query
+            # cannot work here; a person means it was looked at and rejected,
+            # and the model should weigh those differently instead of seeing one
+            # undifferentiated list of things not to do. When it was refuted is
+            # part of it too: these are facts about an environment, and the
+            # cutoff that drops the stale ones is a blunt line, not a promise
+            # that everything above it is still true.
+            by = " — ruled out by a person" if d["disproved_by"] == "human" else ""
+            when = f" [{(d['ts'] or '')[:10]}]" if d.get("ts") else ""
+            lines.append(f"- [{d['kind']}] {d['subject']}{evidence}{by}{when}")
     return "\n".join(lines)
 
 
@@ -1127,6 +1144,52 @@ async def _refresh_env_fit() -> None:
         logger.warning("env fit refresh failed: %s", e)
 
 
+def _prior_rejections(steps: list, params: dict) -> dict[str, dict]:
+    """{action name: the refusal a person wrote}, for this incident only.
+
+    Empty outside a case scope, which is every chat turn and every alert with no
+    service — the same degradation the rest of case memory takes when it cannot
+    tell which incident it is looking at.
+    """
+    from . import case_memory
+    from .runbook import _subst
+
+    sc = case_memory.current_scope()
+    if sc is None:
+        return {}
+    from .action_requests import target_of
+
+    out: dict[str, dict] = {}
+    for step in steps:
+        hit = case_memory.prior_rejection(
+            sc.case_key, step.action, target_of(_subst(step.args, params))
+        )
+        if hit:
+            out[step.action] = hit
+    return out
+
+
+def _runbook_track_record(runbook_id: str) -> str:
+    """One line of the runbook's own execution history, or nothing.
+
+    Nothing is the right output for a procedure with no record: "0 executions"
+    reads as a warning about the runbook, when it is a statement about us.
+    """
+    try:
+        h = store.rb_health(runbook_id)
+    except Exception as e:
+        logger.warning("runbook health lookup failed for %s: %s", runbook_id, e)
+        return ""
+    if h["status"] == store.RB_NO_RECORD:
+        return ""
+    if h["status"] == store.RB_HEALTHY:
+        return f"\n\n_Track record: {h['note']}._"
+    return (
+        f"\n\n**Track record: {h['note']}.** Treat the remediation below as a "
+        "hypothesis, not as the answer — say so if the evidence points elsewhere."
+    )
+
+
 async def _inject_runbook(turn_messages: list, labels: dict, annotations: dict):
     """Match a runbook to the alert; inject its rendered guidance (Tier 0) and,
     if enabled, the results of auto-running its read-only diagnostics (Tier 1).
@@ -1137,7 +1200,14 @@ async def _inject_runbook(turn_messages: list, labels: dict, annotations: dict):
         if rb is None:
             return None
         params = incident_params(labels, annotations)
-        turn_messages.append(SystemMessage(content=render_runbook(rb, params)))
+        block = render_runbook(rb, params)
+        # What happened the last few times this procedure was actually run. A
+        # runbook is a claim about how to fix something, and until now the claim
+        # was injected with the same authority whether it had worked four times
+        # or failed four times.
+        if settings.runbook_health_enabled:
+            block += _runbook_track_record(rb.id)
+        turn_messages.append(SystemMessage(content=block))
         if settings.runbook_run_diagnostics and rb.diagnostics:
             tool_map = {t.name: t for t in TOOLS}  # all read-only
             results = await run_diagnostics(rb, params, tool_map)
@@ -1331,7 +1401,7 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
     if matched_rb and matched_rb.remediation:
         try:
             from .calibration import compute_calibration, load_records
-            from .governance import propose_remediations
+            from .governance import propose_remediations, runbook_health_verdict
             from .runbook import _subst, incident_params
             from .signals.actuation import actuation_verdict, refresh_actuation
             from .signals.dq import dq_verdict
@@ -1346,12 +1416,21 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
             calib = compute_calibration(
                 load_records(), modes=tuple(settings.governance_calibration_modes)
             )
+            # What a person has already turned down on this incident. Looked up
+            # per (action, target) rather than per action: "don't restart
+            # payment" is not a statement about restarting anything else.
+            params = incident_params(labels, annotations)
+            step_by_action = {s.action: s for s in matched_rb.remediation}
+            rejected = _prior_rejections(matched_rb.remediation, params)
+
             decisions = propose_remediations(
                 [s.action for s in matched_rb.remediation],
                 findings.confidence,
                 calib,
                 dq_verdict(),
                 actuation_verdict(),
+                runbook_health_verdict(matched_rb.id) if settings.runbook_health_enabled else None,
+                rejected,
             )
 
             # Materialize each AUTO/PROPOSE decision as a tracked ActionRequest the
@@ -1361,8 +1440,6 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
             if settings.action_requests_enabled and decisions:
                 from . import action_requests
 
-                params = incident_params(labels, annotations)
-                step_by_action = {s.action: s for s in matched_rb.remediation}
                 for d in decisions:
                     step = step_by_action.get(d.action)
                     if step is None:

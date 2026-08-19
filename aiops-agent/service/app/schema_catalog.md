@@ -102,7 +102,7 @@ http.request_received  http.request_failed   cache.miss  deployment.started
 | `payment.gateway_error` | `order_id` |
 | `order.created` | `order_id`, `user_id`, `amount_cents` |
 | `order.cancelled` | `user_id`, `reason` (`auth_failed` / `payment_declined` / `unknown_product`), `upstream_status` |
-| `user.logged_in` / `user.auth_failed` | `user_id`, `reason` (`not_found` / `transient`) |
+| `user.logged_in` / `user.auth_failed` | `user_id`, `reason` (read the values off a result) |
 | `http.request_received` | `method`, `path` (template, e.g. `/api/users/{id}`) |
 | `http.request_failed` | `upstream`, `status`, `reason` (`network`) |
 

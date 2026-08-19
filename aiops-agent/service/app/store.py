@@ -294,6 +294,16 @@ _MIGRATIONS = [
     # Which run produced this proposal — so the executor's own verification
     # labels that run, not every run that ever shared the fingerprint.
     "ALTER TABLE action_requests ADD COLUMN run_id TEXT",
+    # Why a human approved or (much more usefully) declined this proposal. The
+    # rejection was already durable; the *reason* was not, so the next run had
+    # no way to know it had been told no, and proposing the same thing again was
+    # not a bug in the model, it was the only thing the record allowed.
+    "ALTER TABLE action_requests ADD COLUMN decision_note TEXT",
+    # Which incident the proposal belongs to, pinned when it is made. Resolving
+    # it later from run_id works only once the investigation row lands, and that
+    # row is written at the *end* of the run — a proposal decided on before then
+    # (or belonging to a run that died) had nowhere to file the rejection.
+    "ALTER TABLE action_requests ADD COLUMN case_key TEXT",
 ]
 
 # Indexes on migration-added columns. Kept out of _SCHEMA because that script
@@ -824,6 +834,14 @@ def case_query_similar(
     if alertname:
         where += " AND alertname = ?"
         params.append(alertname)
+    # An incident nobody has seen in months is history, not a prior. The row
+    # stays; it just stops being offered as what is probably happening now.
+    where += " AND last_ts >= ?"
+    params.append(
+        (datetime.now(UTC) - timedelta(days=settings.case_max_age_days)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+    )
     where += (
         f" AND root_cause_source IN ({','.join('?' * len(TRUSTED_ROOT_CAUSE_SOURCES))})"
         f" AND status IN ({','.join('?' * len(_CASE_RECALL_STATUSES))})"
@@ -848,6 +866,59 @@ def case_query_similar(
     return out
 
 
+def case_forget(key: str, path: str | Path | None = None) -> dict[str, int]:
+    """Retract what this case claims to know, without deleting the case.
+
+    Two halves, because they fail differently: the root cause stops being
+    offered as a prior, and every dead end on it is retired. Somebody is saying
+    the ground under this record has moved — an environment rebuilt, a policy
+    changed, a diagnosis that turned out to be wrong later — and the honest
+    response is to stop asserting all of it, not to argue about which half is
+    still true.
+
+    `occurrences`, `first_ts` and the rows themselves survive. That the incident
+    happened is not in dispute.
+    """
+    with _write_lock, _connect(path) as conn:
+        cleared = conn.execute(
+            """
+            UPDATE cases SET root_cause=NULL, root_cause_source=NULL,
+                             confirmed_run_id=NULL, confirmed_ts=NULL, status='open'
+            WHERE case_key=?
+            """,
+            (key,),
+        ).rowcount
+        retired = conn.execute(
+            "UPDATE case_ruled_out SET still_valid=0 WHERE case_key=? AND still_valid=1",
+            (key,),
+        ).rowcount
+    return {"cases": cleared, "dead_ends": retired}
+
+
+def case_key_for_run(run_id: str, path: str | Path | None = None) -> str | None:
+    """Which incident a given run was about.
+
+    Needed by the write paths that only ever hold a run id and are nowhere near
+    an open case scope — the human deciding on a proposal, minutes or hours
+    after the investigation ended. Investigations first because that row is
+    written at the end of every run; calibration only exists once someone (or
+    the executor) has had an opinion about it.
+    """
+    if not run_id:
+        return None
+    with _connect(path) as conn:
+        for sql in (
+            "SELECT case_key FROM investigations WHERE run_id=? AND case_key IS NOT NULL"
+            " ORDER BY id DESC LIMIT 1",
+            "SELECT case_key FROM calibration WHERE run_id=? AND case_key IS NOT NULL"
+            " ORDER BY id DESC LIMIT 1",
+        ):
+            row = conn.execute(sql, (run_id,)).fetchone()
+            if row and row["case_key"]:
+                return row["case_key"]
+    return None
+
+
 def case_ruled_out_for(
     case_keys: list[str],
     limit: int = 10,
@@ -863,21 +934,50 @@ def case_ruled_out_for(
     """
     if not case_keys:
         return []
-    now = now_ts or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now_dt = datetime.now(UTC)
+    now = now_ts or now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Everything here goes stale, including the entries with no expiry set.
+    # `expires_ts` was for the dead ends known to be short-lived when they were
+    # written (a trace outside the retention window); the ones a person wrote —
+    # "we don't roll back during business hours" — carry no expiry at all and
+    # would otherwise be recalled forever, long after whoever said it moved on.
+    cutoff = (now_dt - timedelta(days=settings.case_dead_end_max_age_days)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
     ph = ",".join("?" * len(case_keys))
     src = ",".join("?" * len(TRUSTED_DISPROOF_SOURCES))
-    params: list[Any] = [*case_keys, *TRUSTED_DISPROOF_SOURCES, now, limit]
+    params: list[Any] = [*case_keys, *TRUSTED_DISPROOF_SOURCES, now, cutoff, limit]
     with _connect(path) as conn:
         rows = conn.execute(
             f"""
             SELECT * FROM case_ruled_out
             WHERE case_key IN ({ph}) AND still_valid=1 AND disproved_by IN ({src})
               AND (expires_ts IS NULL OR expires_ts > ?)
+              AND ts >= ?
             ORDER BY id DESC LIMIT ?
             """,
             params,
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def ruled_out_find(
+    case_key: str,
+    *,
+    kind: str,
+    subject: str,
+    path: str | Path | None = None,
+) -> dict[str, Any] | None:
+    """The newest live dead end matching one exact subject, or None.
+
+    Shares `case_ruled_out_for`'s freshness rules by calling it: same expiry,
+    same age cutoff, same trusted sources. Filtering here on `subject` in SQL
+    instead would have been one query and two sets of rules.
+    """
+    for row in case_ruled_out_for([case_key], limit=200, path=path):
+        if row["kind"] == kind and row["subject"] == subject:
+            return row
+    return None
 
 
 def backfill_cases(path: str | Path | None = None) -> dict[str, int]:
@@ -954,6 +1054,7 @@ _AR_COLS = (
     "params",
     "idem_key",
     "run_id",
+    "case_key",
     "created_ts",
     "expires_ts",
     "actor",
@@ -1184,6 +1285,7 @@ def ar_transition(
     *,
     actor: str | None = None,
     outcome: str | None = None,
+    decision_note: str | None = None,
     blast_radius: dict | None = None,
     path: str | Path | None = None,
 ) -> bool:
@@ -1198,6 +1300,9 @@ def ar_transition(
     if outcome is not None:
         sets.append("outcome=?")
         params.append(outcome)
+    if decision_note is not None:
+        sets.append("decision_note=?")
+        params.append(decision_note)
     if blast_radius is not None:
         sets.append("blast_radius=?")
         params.append(json.dumps(blast_radius))
@@ -1356,29 +1461,99 @@ def rb_feedback_insert(
         )
 
 
+# What a runbook's execution record says about the runbook. One definition,
+# because the report a person reads and the gate that withholds autonomy have to
+# agree — two thresholds drifting apart is how a dashboard ends up saying a
+# procedure is fine while the governance plane treats it as suspended.
+RB_HEALTHY = "healthy"
+RB_NEEDS_REVIEW = "needs_review"
+RB_SUSPENDED = "suspended"
+RB_NO_RECORD = "insufficient_data"
+
+
+def _rb_verdict(counts: dict[str, int]) -> dict[str, Any]:
+    """Turn one runbook's outcome counts into a status, a rate and a sentence.
+
+    `rollback_failed` is its own status at any sample size: the number that
+    matters there is not a rate, it is that the escape hatch was tried and did
+    not work. A verify-failure rate needs enough executions to be a claim —
+    one failed run out of one is 100% and means nothing.
+    """
+    total = counts.get("total", 0)
+    vf = counts.get("verify_failed", 0)
+    rbf = counts.get("rollback_failed", 0)
+    rate = vf / total if total else 0.0
+    out = {**counts, "verify_failed_rate": round(rate, 3)}
+    if rbf:
+        return {
+            **out,
+            "status": RB_SUSPENDED,
+            "note": f"rollback_failed x{rbf} — this runbook's undo did not work",
+        }
+    if total < settings.runbook_health_min_runs:
+        return {
+            **out,
+            "status": RB_NO_RECORD,
+            "note": f"{total} recorded execution(s) — too few to rate",
+        }
+    if rate > settings.runbook_health_verify_failed_rate:
+        return {
+            **out,
+            "status": RB_NEEDS_REVIEW,
+            "note": f"verify_failed {rate:.0%} ({vf}/{total}) — the symptom survived the fix",
+        }
+    return {**out, "status": RB_HEALTHY, "note": f"{counts.get('ok', 0)}/{total} verified clean"}
+
+
+def rb_health(
+    runbook_id: str, days: int | None = None, path: str | Path | None = None
+) -> dict[str, Any]:
+    """One runbook's track record over the window. Always returns a verdict —
+    a runbook nobody has ever executed is `insufficient_data`, not an error."""
+    from datetime import UTC, datetime, timedelta
+
+    window = days if days is not None else settings.runbook_health_window_days
+    cutoff = (datetime.now(UTC) - timedelta(days=window)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _connect(path) as conn:
+        row = conn.execute(
+            f"""
+            SELECT {_RB_COUNT_COLS}
+            FROM runbook_feedback WHERE runbook_id = ? AND ts >= ?
+            """,
+            (runbook_id, cutoff),
+        ).fetchone()
+    counts = {
+        k: (row[k] or 0) for k in ("total", "verify_failed", "rollback_failed", "rollback", "ok")
+    }
+    return {"runbook_id": runbook_id, **_rb_verdict(counts)}
+
+
+_RB_COUNT_COLS = """
+    COUNT(*) AS total,
+    SUM(CASE WHEN outcome = 'verify_failed' THEN 1 ELSE 0 END) AS verify_failed,
+    SUM(CASE WHEN outcome = 'rollback_failed' THEN 1 ELSE 0 END) AS rollback_failed,
+    SUM(CASE WHEN outcome = 'rollback' THEN 1 ELSE 0 END) AS rollback,
+    SUM(CASE WHEN outcome = 'ok' THEN 1 ELSE 0 END) AS ok
+"""
+
+
 def rb_feedback_health_report(
     days: int = 30, path: str | Path | None = None
 ) -> list[dict[str, Any]]:
-    """Return a list of runbooks that show decay signals over the past `days` days.
+    """The runbooks whose record says something is wrong, worst first.
 
-    Decay signals (per design doc §1 閉環三):
-    - verify_failed rate > 30% in the window
-    - any rollback_failed (immediate flag)
-    Returns one dict per runbook that tripped at least one signal, sorted by
-    severity (rollback_failed first, then by verify_failed rate desc)."""
+    Shares `_rb_verdict` with the gate that acts on this, so the page a person
+    reads and the decision the agent makes cannot disagree. One behaviour
+    changed when they were merged: a runbook with two executions and one failure
+    used to be reported at "50%", and is now held back as too few to rate.
+    """
     from datetime import UTC, datetime, timedelta
 
     cutoff = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     with _connect(path) as conn:
         rows = conn.execute(
-            """
-            SELECT
-                runbook_id,
-                COUNT(*) AS total,
-                SUM(CASE WHEN outcome = 'verify_failed' THEN 1 ELSE 0 END) AS verify_failed,
-                SUM(CASE WHEN outcome = 'rollback_failed' THEN 1 ELSE 0 END) AS rollback_failed,
-                SUM(CASE WHEN outcome = 'rollback' THEN 1 ELSE 0 END) AS rollback,
-                SUM(CASE WHEN outcome = 'ok' THEN 1 ELSE 0 END) AS ok
+            f"""
+            SELECT runbook_id, {_RB_COUNT_COLS}
             FROM runbook_feedback
             WHERE ts >= ?
             GROUP BY runbook_id
@@ -1388,30 +1563,25 @@ def rb_feedback_health_report(
 
     results = []
     for r in rows:
-        total = r["total"]
-        vf_rate = r["verify_failed"] / total if total else 0.0
-        has_rb_failed = r["rollback_failed"] > 0
-        # Only surface runbooks with a decay signal
-        if vf_rate > 0.30 or has_rb_failed:
-            signals = []
-            if has_rb_failed:
-                n = r["rollback_failed"]
-                signals.append(f"rollback_failed x{n} — suspend auto-execution")
-            if vf_rate > 0.30:
-                vf, tot = r["verify_failed"], total
-                signals.append(f"verify_failed {vf_rate:.0%} ({vf}/{tot}) — needs-review")
-            results.append(
-                {
-                    "runbook_id": r["runbook_id"],
-                    "total_executions": total,
-                    "verify_failed": r["verify_failed"],
-                    "verify_failed_rate": round(vf_rate, 3),
-                    "rollback_failed": r["rollback_failed"],
-                    "rollback": r["rollback"],
-                    "ok": r["ok"],
-                    "decay_signals": signals,
-                }
-            )
+        counts = {
+            k: (r[k] or 0) for k in ("total", "verify_failed", "rollback_failed", "rollback", "ok")
+        }
+        v = _rb_verdict(counts)
+        if v["status"] not in (RB_SUSPENDED, RB_NEEDS_REVIEW):
+            continue
+        results.append(
+            {
+                "runbook_id": r["runbook_id"],
+                "total_executions": counts["total"],
+                "verify_failed": counts["verify_failed"],
+                "verify_failed_rate": v["verify_failed_rate"],
+                "rollback_failed": counts["rollback_failed"],
+                "rollback": counts["rollback"],
+                "ok": counts["ok"],
+                "status": v["status"],
+                "decay_signals": [v["note"]],
+            }
+        )
 
     # rollback_failed first (critical), then by verify_failed_rate desc
     results.sort(key=lambda x: (-x["rollback_failed"], -x["verify_failed_rate"]))

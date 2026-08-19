@@ -218,6 +218,13 @@ class ActorRequest(BaseModel):
     actor: str = "operator"
 
 
+class RejectRequest(ActorRequest):
+    # Optional, and the one field on this endpoint that outlives the request:
+    # it becomes a dead end on the incident, so the next investigation of the
+    # same thing is told what was already turned down.
+    reason: str = ""
+
+
 @app.get("/actions/requests")
 async def actions_requests_list(status: str | None = None, limit: int = 50):
     """List action requests (optionally filtered by status), newest first."""
@@ -248,13 +255,30 @@ async def actions_request_approve(request_id: str, body: ActorRequest):
 
 
 @app.post("/actions/requests/{request_id}/reject")
-async def actions_request_reject(request_id: str, body: ActorRequest):
-    req = action_requests.reject(request_id, actor=body.actor)
+async def actions_request_reject(request_id: str, body: RejectRequest):
+    req = action_requests.reject(request_id, actor=body.actor, reason=body.reason)
     if req is None:
         raise HTTPException(
             status_code=409, detail="request not rejectable (missing or already decided)"
         )
     return req.model_dump()
+
+
+@app.post("/cases/{case_key}/forget")
+async def case_forget(case_key: str, body: ActorRequest):
+    """Retract what a case claims to know: its root cause stops being recalled
+    and its dead ends are retired.
+
+    The counterpart to everything that writes into case memory. Recall ages out
+    on a fixed window, which handles the slow drift and nothing else — when an
+    environment is rebuilt or a policy changes on a Tuesday, somebody has to be
+    able to say so on that Tuesday rather than wait a month for the cutoff.
+    """
+    result = store.case_forget(case_key)
+    if not result["cases"]:
+        raise HTTPException(status_code=404, detail="no such case")
+    audit.record("case_forget", "ok", fp=case_key, actor=body.actor, detail=result)
+    return {"case_key": case_key, **result}
 
 
 @app.get("/actions/readiness")

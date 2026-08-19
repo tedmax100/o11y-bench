@@ -95,7 +95,13 @@ def test_dead_end_ttl_stops_being_recalled(monkeypatch, tmp_path):
 
 
 def _labeled_run(
-    p, *, source, grading_mode, correct=True, summary="new_validator rejects odd cents"
+    p,
+    *,
+    source,
+    grading_mode,
+    correct=True,
+    summary="new_validator rejects odd cents",
+    correction_note=None,
 ):
     """One recorded run, then a verdict on it, through the real entry points."""
     with _scope() as sc:
@@ -109,7 +115,14 @@ def _labeled_run(
 
         F.summary = summary
         calibration.record_run(F, run_id="fp1", path=p, case_key=sc.case_key)
-    calibration.label_run("fp1", correct=correct, source=source, grading_mode=grading_mode, path=p)
+    calibration.label_run(
+        "fp1",
+        correct=correct,
+        source=source,
+        grading_mode=grading_mode,
+        correction_note=correction_note,
+        path=p,
+    )
     return sc.case_key
 
 
@@ -147,10 +160,57 @@ def test_correct_hedge_is_a_false_positive_not_a_root_cause(monkeypatch, tmp_pat
     assert store.case_query_similar("payment-service", path=p) == []
 
 
-def test_wrong_label_teaches_the_case_nothing(monkeypatch, tmp_path):
+def test_wrong_label_leaves_the_root_cause_alone(monkeypatch, tmp_path):
     p = _cfg(monkeypatch, tmp_path)
     key = _labeled_run(p, source="ui", grading_mode=store.CULPRIT, correct=False)
     assert store.case_get(key, p)["root_cause"] is None
+
+
+def test_wrong_label_becomes_a_disproof(monkeypatch, tmp_path):
+    """Being told the answer was wrong is not knowing the answer, but it is
+    knowing one answer this incident does not have."""
+    p = _cfg(monkeypatch, tmp_path)
+    key = _labeled_run(
+        p,
+        source="ui",
+        grading_mode=store.CULPRIT,
+        correct=False,
+        correction_note="the flag was already off, this was the ConfigMap",
+    )
+    (row,) = store.case_ruled_out_for([key], path=p)
+    assert row["kind"] == "hypothesis"
+    assert row["subject"] == "new_validator rejects odd cents"
+    assert row["evidence"] == "the flag was already off, this was the ConfigMap"
+    assert row["disproved_by"] == "human"
+
+
+def test_a_disproof_needs_a_hypothesis_to_refute(monkeypatch, tmp_path):
+    """A wrong `inconclusive` run declined to blame anyone. There is nothing on
+    the table to rule out, and the correction note is the answer — recording it
+    under "already ruled out" would be worse than recording nothing."""
+    p = _cfg(monkeypatch, tmp_path)
+    key = _labeled_run(
+        p,
+        source="ui",
+        grading_mode=store.INCONCLUSIVE,
+        correct=False,
+        correction_note="payment v2.5.0, same as last time",
+    )
+    assert store.case_ruled_out_for([key], path=p) == []
+
+
+def test_self_verification_may_not_disprove_either(monkeypatch, tmp_path):
+    """The executor grading its own remediation is not evidence in either
+    direction."""
+    p = _cfg(monkeypatch, tmp_path)
+    key = _labeled_run(p, source="remediation-failed", grading_mode=store.CULPRIT, correct=False)
+    assert store.case_ruled_out_for([key], path=p) == []
+
+
+def test_disproof_from_an_unknown_source_is_ignored(monkeypatch, tmp_path):
+    p = _cfg(monkeypatch, tmp_path)
+    key = _labeled_run(p, source="some-new-bot", grading_mode=store.CULPRIT, correct=False)
+    assert store.case_ruled_out_for([key], path=p) == []
 
 
 def test_unknown_grading_mode_fails_closed(monkeypatch, tmp_path):
@@ -196,6 +256,36 @@ def test_recall_block_is_empty_without_a_confirmed_case(monkeypatch, tmp_path):
         path=p,
     )
     assert agent._past_incident_context("payment-service") == ""
+
+
+def test_a_human_disproof_reaches_the_prompt_with_no_confirmed_case(monkeypatch, tmp_path):
+    """The situation this is collected for: nobody has got it right yet. Keying
+    the dead ends off the *recalled* cases made them unreachable until a case
+    had a root cause, which is precisely when they stop being the only thing
+    known about the incident."""
+    p = _cfg(monkeypatch, tmp_path)
+    key = _labeled_run(
+        p,
+        source="ui",
+        grading_mode=store.CULPRIT,
+        correct=False,
+        correction_note="latency was flat on that version",
+    )
+    assert store.case_get(key, p)["root_cause"] is None
+
+    block = agent._past_incident_context("payment-service", "PaymentDeclineRateHigh")
+    assert "Already ruled out here" in block
+    assert "new_validator rejects odd cents" in block
+    assert "latency was flat on that version" in block
+    assert "ruled out by a person" in block
+
+
+def test_a_disproof_is_scoped_to_its_own_incident(monkeypatch, tmp_path):
+    """Same service, different alert. The dead end belongs to the incident, not
+    to everything that ever fired on payment-service."""
+    p = _cfg(monkeypatch, tmp_path)
+    _labeled_run(p, source="ui", grading_mode=store.CULPRIT, correct=False)
+    assert agent._past_incident_context("payment-service", "PaymentChargeLatencyHigh") == ""
 
 
 def test_recall_block_carries_cause_and_dead_ends(monkeypatch, tmp_path):
@@ -301,7 +391,7 @@ def test_a_verdict_no_longer_covers_every_run_of_the_alert(monkeypatch, tmp_path
     assert rows[0]["run_id"] == "fp1-run-8"
 
 
-def _inv_row(p, *, fp, run_id, summary):
+def _inv_row(p, *, fp, run_id, summary, case_key=None):
     rec = investigations.InvestigationRecord(
         fp=fp,
         run_id=run_id,
@@ -310,7 +400,7 @@ def _inv_row(p, *, fp, run_id, summary):
         service="payment-service",
         summary=summary,
     )
-    store.inv_insert(fp, rec.ts, rec.model_dump_json(), p, run_id=run_id, case_key=None)
+    store.inv_insert(fp, rec.ts, rec.model_dump_json(), p, run_id=run_id, case_key=case_key)
 
 
 def test_action_request_remembers_the_run_that_proposed_it(monkeypatch, tmp_path):
@@ -332,6 +422,94 @@ def test_action_request_remembers_the_run_that_proposed_it(monkeypatch, tmp_path
         )
     assert req.run_id == sc.run_id
     assert store.ar_get(req.request_id, p)["run_id"] == sc.run_id
+
+
+def _proposal(p, sc, *, args=None):
+    return action_requests.create_from_decision(
+        "fp1",
+        governance.Decision(
+            action="k8s.rollout_undo",
+            autonomy=governance.Autonomy.PROPOSE,
+            reason="test",
+            requires_human=True,
+            reversible=True,
+            confidence=0.7,
+            calibration_note="",
+            requires_approval=True,
+        ),
+        args=args or {"namespace": "demo", "deployment": "payment-service"},
+        path=p,
+    )
+
+
+def test_rejection_reason_becomes_a_dead_end_on_the_case(monkeypatch, tmp_path):
+    """The whole point of asking for a reason: it has to reach the next run."""
+    p = _cfg(monkeypatch, tmp_path)
+    with _scope() as sc:
+        case_memory.observe(sc, path=p)
+        _inv_row(p, fp="fp1", run_id=sc.run_id, summary="decline spike", case_key=sc.case_key)
+        req = _proposal(p, sc)
+    action_requests.reject(req.request_id, actor="nathan", reason="we roll forward here", path=p)
+
+    assert store.ar_get(req.request_id, p)["decision_note"] == "we roll forward here"
+    (row,) = store.case_ruled_out_for([sc.case_key], path=p)
+    assert row["kind"] == "action"
+    assert row["subject"] == "k8s.rollout_undo on demo/payment-service"
+    assert row["evidence"] == "we roll forward here"
+    assert row["disproved_by"] == "human"
+
+
+def test_rejection_without_a_reason_is_still_remembered(monkeypatch, tmp_path):
+    """Requiring a justification before the system remembers anything is how the
+    column ends up empty on every row."""
+    p = _cfg(monkeypatch, tmp_path)
+    with _scope() as sc:
+        case_memory.observe(sc, path=p)
+        _inv_row(p, fp="fp1", run_id=sc.run_id, summary="decline spike", case_key=sc.case_key)
+        req = _proposal(p, sc)
+    action_requests.reject(req.request_id, actor="nathan", path=p)
+    (row,) = store.case_ruled_out_for([sc.case_key], path=p)
+    assert "nathan" in row["evidence"]
+
+
+def test_approval_leaves_no_dead_end(monkeypatch, tmp_path):
+    """Only 'no' is evidence. A yes is what the proposal already said."""
+    p = _cfg(monkeypatch, tmp_path)
+    with _scope() as sc:
+        case_memory.observe(sc, path=p)
+        _inv_row(p, fp="fp1", run_id=sc.run_id, summary="decline spike", case_key=sc.case_key)
+        req = _proposal(p, sc)
+    action_requests.approve(req.request_id, actor="nathan", path=p)
+    assert store.case_ruled_out_for([sc.case_key], path=p) == []
+
+
+def test_rejection_lands_before_the_run_has_written_itself_down(monkeypatch, tmp_path):
+    """The investigation row is written when the run *ends*. A decision can
+    arrive at any time, so the proposal carries its own case key rather than
+    resolving one from a row that may not exist yet."""
+    p = _cfg(monkeypatch, tmp_path)
+    with _scope() as sc:
+        req = _proposal(p, sc)  # no investigation row, no calibration row
+    assert store.case_key_for_run(sc.run_id, path=p) is None
+    action_requests.reject(
+        req.request_id, actor="nathan", reason="not during business hours", path=p
+    )
+    (row,) = store.case_ruled_out_for([sc.case_key], path=p)
+    assert row["evidence"] == "not during business hours"
+
+
+def test_a_rejection_with_no_traceable_run_is_dropped(monkeypatch, tmp_path):
+    """A proposal made outside a case scope has no incident to hang the
+    rejection on. Better a lost note than one filed under the wrong case."""
+    p = _cfg(monkeypatch, tmp_path)
+    req = _proposal(p, None)
+    assert action_requests.reject(req.request_id, actor="nathan", reason="no", path=p) is not None
+    assert (
+        store.case_ruled_out_for(
+            [store.case_key("PaymentDeclineRateHigh", "payment-service")], path=p
+        )
+        == []
+    )
 
 
 # ---- the A/B is only an A/B if the library has not seen the fixture ---------
@@ -368,6 +546,16 @@ def test_open_book_detected_when_the_library_answers_the_fixture(monkeypatch, tm
     assert harness.library_overlap([_fixture()]) == [("payment-service-PaymentDeclineRateHigh", 1)]
 
 
+def test_a_disproof_alone_makes_the_fixture_open_book(monkeypatch, tmp_path):
+    """A human's "not that version" narrows the search as much as a root cause
+    does. A run that gets it is not running the same experiment as one that
+    doesn't, so the report has to say so."""
+    p = _cfg(monkeypatch, tmp_path)
+    _labeled_run(p, source="ui", grading_mode=store.CULPRIT, correct=False)
+    assert store.case_query_similar("payment-service", path=p) == []
+    assert harness.library_overlap([_fixture()]) == [("payment-service-PaymentDeclineRateHigh", 1)]
+
+
 def test_overlap_reads_the_store_the_agent_reads(monkeypatch, tmp_path):
     """The eval store and the runtime store are different files. Recall takes no
     path argument, so it resolves through settings.store_path — checking the
@@ -389,3 +577,146 @@ def test_ab_report_leads_with_the_open_book_warning(monkeypatch, tmp_path):
     assert clean.startswith("clean A/B")
     assert dirty.startswith("OPEN BOOK")
     assert "f1: 2 case(s) recalled" in dirty
+
+
+# ---- forgetting -------------------------------------------------------------
+
+
+def test_a_dead_end_ages_out_of_recall(monkeypatch, tmp_path):
+    """The explicit TTL covered the ones known to be short-lived when written.
+    Everything a person writes has no TTL at all and would otherwise be recalled
+    forever."""
+    p = _cfg(monkeypatch, tmp_path)
+    key = store.case_key("PaymentDeclineRateHigh", "payment-service")
+    store.case_upsert(
+        key=key,
+        ts="2026-08-16T05:00:00Z",
+        alertname="PaymentDeclineRateHigh",
+        service="payment-service",
+        path=p,
+    )
+    store.ruled_out_insert(
+        key=key,
+        run_id="r1",
+        ts="2026-01-01T00:00:00Z",
+        kind="action",
+        subject="k8s.rollout_undo on demo/payment-service",
+        evidence="not during business hours",
+        disproved_by="human",
+        path=p,
+    )
+    assert store.case_ruled_out_for([key], path=p) == []
+    monkeypatch.setattr(store.settings, "case_dead_end_max_age_days", 3650)
+    assert len(store.case_ruled_out_for([key], path=p)) == 1
+
+
+def test_a_case_nobody_has_seen_in_months_stops_being_a_prior(monkeypatch, tmp_path):
+    p = _cfg(monkeypatch, tmp_path)
+    _confirmed_case(p)
+    assert len(store.case_query_similar("payment-service", path=p)) == 1
+    monkeypatch.setattr(store.settings, "case_max_age_days", 1)
+    assert store.case_query_similar("payment-service", path=p) == []
+
+
+def test_forgetting_retracts_the_claims_and_keeps_the_history(monkeypatch, tmp_path):
+    """Somebody says the ground moved. What is dropped is what the case
+    asserts — not the fact that it happened."""
+    p = _cfg(monkeypatch, tmp_path)
+    key = _confirmed_case(p, occurrences=6)
+    store.ruled_out_insert(
+        key=key,
+        run_id="r1",
+        ts=store.datetime.now(store.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        kind="query",
+        subject="LogQL stream selector on service",
+        evidence="",
+        disproved_by="tool_result",
+        path=p,
+    )
+    assert store.case_query_similar("payment-service", path=p)
+    assert store.case_ruled_out_for([key], path=p)
+
+    assert store.case_forget(key, path=p) == {"cases": 1, "dead_ends": 1}
+
+    assert store.case_query_similar("payment-service", path=p) == []
+    assert store.case_ruled_out_for([key], path=p) == []
+    row = store.case_get(key, p)
+    assert row["occurrences"] == 6
+    assert row["status"] == "open"
+
+
+def test_forgetting_an_unknown_case_reports_nothing_changed(monkeypatch, tmp_path):
+    p = _cfg(monkeypatch, tmp_path)
+    assert store.case_forget("deadbeef", path=p) == {"cases": 0, "dead_ends": 0}
+
+
+# ---- a refusal that binds the next run --------------------------------------
+
+
+def _reject_once(p, sc, *, reason="not during business hours"):
+    req = _proposal(p, sc)
+    action_requests.reject(req.request_id, actor="nathan", reason=reason, path=p)
+
+
+def test_a_declined_action_is_not_proposed_again(monkeypatch, tmp_path):
+    """At PROPOSE it would make someone type the same refusal twice, and the
+    second refusal says less than the first — it is about our persistence."""
+    p = _cfg(monkeypatch, tmp_path)
+    monkeypatch.setattr(governance.settings, "governance_min_human_labeled_runs", 0)
+    with _scope() as sc:
+        _reject_once(p, sc)
+        hit = case_memory.prior_rejection(sc.case_key, "k8s.rollout_undo", "demo/payment-service")
+    assert hit is not None
+
+    d = governance.decide(
+        governance.registry.get("k8s.rollout_undo"), 0.95, {"labeled": 100}, rejected=hit
+    )
+    assert d.autonomy is governance.Autonomy.ESCALATE
+    assert "not during business hours" in d.reason
+
+
+def test_a_refusal_is_about_the_target_it_named(monkeypatch, tmp_path):
+    """ "Don't restart payment" is not a statement about restarting anything
+    else."""
+    p = _cfg(monkeypatch, tmp_path)
+    with _scope() as sc:
+        _reject_once(p, sc)
+        assert (
+            case_memory.prior_rejection(sc.case_key, "k8s.rollout_undo", "demo/order-service")
+            is None
+        )
+        assert (
+            case_memory.prior_rejection(sc.case_key, "k8s.restart", "demo/payment-service") is None
+        )
+
+
+def test_a_refusal_binds_only_its_own_incident(monkeypatch, tmp_path):
+    p = _cfg(monkeypatch, tmp_path)
+    with _scope() as sc:
+        _reject_once(p, sc)
+    other = store.case_key("PaymentChargeLatencyHigh", "payment-service")
+    assert case_memory.prior_rejection(other, "k8s.rollout_undo", "demo/payment-service") is None
+
+
+def test_a_refusal_stops_binding_when_it_stops_being_recalled(monkeypatch, tmp_path):
+    """The gate and the prompt read through the same freshness rules. A rule
+    enforced but no longer mentioned is a rule nobody can explain."""
+    p = _cfg(monkeypatch, tmp_path)
+    with _scope() as sc:
+        _reject_once(p, sc)
+    # A window that has already closed — the refusal was written seconds ago, so
+    # anything short of that keeps it inside a same-second boundary.
+    monkeypatch.setattr(store.settings, "case_dead_end_max_age_days", -1)
+    assert (
+        case_memory.prior_rejection(sc.case_key, "k8s.rollout_undo", "demo/payment-service") is None
+    )
+
+
+def test_forgetting_a_case_releases_its_refusals(monkeypatch, tmp_path):
+    p = _cfg(monkeypatch, tmp_path)
+    with _scope() as sc:
+        _reject_once(p, sc)
+    store.case_forget(sc.case_key, path=p)
+    assert (
+        case_memory.prior_rejection(sc.case_key, "k8s.rollout_undo", "demo/payment-service") is None
+    )

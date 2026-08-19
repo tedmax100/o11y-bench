@@ -70,10 +70,15 @@ class ActionRequest(BaseModel):
     # executor's own verification could only label "the latest run of this
     # alert", which is not necessarily the run whose reasoning is being acted on.
     run_id: str | None = None
+    # The incident it belongs to, so a decision made on this proposal can be
+    # remembered without waiting for the run to finish writing itself down.
+    case_key: str | None = None
     created_ts: str
     expires_ts: str
     actor: str | None = None
     outcome: str = ""
+    # Why the human decided the way they did. Only ever set by a person.
+    decision_note: str | None = None
 
 
 def target_of(args: dict | None) -> str:
@@ -139,6 +144,7 @@ def create_from_decision(
             # every caller is inside the investigation that produced the
             # decision, and none of them has a reason to know about run ids.
             run_id=(sc.run_id if (sc := case_memory.current_scope()) else None),
+            case_key=(sc.case_key if sc else None),
             created_ts=_fmt(now),
             expires_ts=_fmt(now + timedelta(seconds=settings.approval_ttl_seconds)),
             actor="system" if auto_ok else None,
@@ -321,7 +327,16 @@ def reconcile(path: Path | None = None) -> dict[str, Any]:
     return changed
 
 
-def reject(request_id: str, actor: str, path: Path | None = None) -> ActionRequest | None:
+def reject(
+    request_id: str, actor: str, reason: str = "", path: Path | None = None
+) -> ActionRequest | None:
+    """A human declines a proposed action, and says why.
+
+    `reason` is optional at the API and durable once given: it is the only
+    channel through which "we don't do that here" reaches the next
+    investigation. Without it a rejection was a fact about one request; with it
+    it becomes a fact about the incident.
+    """
     req = get(request_id, path)
     if req is None:
         return None
@@ -332,8 +347,33 @@ def reject(request_id: str, actor: str, path: Path | None = None) -> ActionReque
     if _expire_if_stale(req, path):
         return None
     if not store.ar_transition(
-        request_id, Status.PROPOSED.value, Status.REJECTED.value, actor=actor, path=path
+        request_id,
+        Status.PROPOSED.value,
+        Status.REJECTED.value,
+        actor=actor,
+        decision_note=reason or None,
+        path=path,
     ):
         return None
-    audit.record("rejected", "ok", request_id=request_id, fp=req.fp, actor=actor, path=path)
+    audit.record(
+        "rejected",
+        "ok",
+        request_id=request_id,
+        fp=req.fp,
+        actor=actor,
+        detail={"reason": reason} if reason else None,
+        path=path,
+    )
+    # Best effort, and after the transition: the decision is the durable part,
+    # remembering it is not allowed to fail it.
+    verdict = case_memory.remember_rejected_action(
+        case_key=req.case_key,
+        run_id=req.run_id,
+        action=req.action,
+        target=target_of(req.args),
+        reason=reason,
+        actor=actor,
+        path=path,
+    )
+    logger.info("rejection of %s remembered: %s", request_id, verdict)
     return get(request_id, path)

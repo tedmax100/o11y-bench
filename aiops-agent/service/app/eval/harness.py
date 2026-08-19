@@ -340,14 +340,21 @@ def library_overlap(fixtures: list[Fixture]) -> list[tuple[str, int]]:
         service = labels.get("service_name") or labels.get("service")
         if not service:
             continue
+        alertname = labels.get("alertname")
         try:
-            hits = store.case_query_similar(
-                service=service, alertname=labels.get("alertname"), limit=5
-            )
+            hits = store.case_query_similar(service=service, alertname=alertname, limit=5)
+            # Dead ends count as overlap too. A human disproof ("not the payment
+            # version") narrows the search as effectively as a root cause does,
+            # so a fixture carrying one is no longer unseen — counting only
+            # confirmed causes would report a clean A/B on a primed run.
+            keys = {c["case_key"] for c in hits}
+            if alertname:
+                keys.add(store.case_key(alertname, service))
+            hits_n = len(hits) + len(store.case_ruled_out_for(sorted(keys), limit=8))
         except Exception:
             continue
-        if hits:
-            out.append((fx.id, len(hits)))
+        if hits_n:
+            out.append((fx.id, hits_n))
     return out
 
 

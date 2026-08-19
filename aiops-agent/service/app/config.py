@@ -55,6 +55,16 @@ class Settings(BaseSettings):
     runbook_dir: str = "runbooks"
     runbook_enabled: bool = True
     runbook_run_diagnostics: bool = True
+    # How a runbook's own execution history feeds back into the next incident.
+    # `runbook_feedback` has recorded every outcome since 7b-4 and nothing read
+    # it but a report endpoint, so a procedure that had failed verification four
+    # times running was still injected as authoritative guidance.
+    runbook_health_enabled: bool = True
+    runbook_health_window_days: int = 30
+    # Below this many recorded executions a failure rate is a rumour, not a
+    # measurement — the report says so instead of printing a percentage.
+    runbook_health_min_runs: int = 3
+    runbook_health_verify_failed_rate: float = 0.30
 
     # --- Calibration-error (CE) harness (ARE gap-analysis §4.2 step 2) -----
     # Each headless run logs its Findings.confidence here; correctness is filled
@@ -80,6 +90,17 @@ class Settings(BaseSettings):
     # nothing new reaches a prompt, which is the safe default while the recall
     # format is still being A/B'd against no-recall.
     case_memory_enabled: bool = True
+    # Nothing here is true forever. A dead end is a fact about an environment
+    # ("that label is not indexed in this Loki"), a rejection is a fact about a
+    # policy ("not during business hours") — both outlive the day they were
+    # recorded and neither outlives the quarter. Explicit `expires_ts` covers
+    # the ones known to be short-lived at write time; this covers the rest,
+    # which is all of the ones a person wrote.
+    case_dead_end_max_age_days: int = 30
+    # A root cause on an incident nobody has seen in this long stops being
+    # recalled. It is still in the table; it is no longer put in front of the
+    # model as what is probably happening now.
+    case_max_age_days: int = 90
     # Which side of the recall A/B this run is on. True = the case library
     # (one row per incident, plus the dead ends). False = the pre-case-memory
     # JOIN, kept as the control arm — swapping the source with nothing to

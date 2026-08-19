@@ -129,3 +129,47 @@
     grounded: true
     discover_before_retry: true
     evidence_or_hedge_ceiling: 0.4
+
+# ---- the second incident (scenario: session-cache) --------------------------
+# Everything above happens inside payment-service: the alert, the metric, the
+# `reason` label carrying the answer. An agent can score well on all of it
+# while never once looking past the service named in the alert — and the
+# false-alarm fixture above shows it doing exactly that, pinning every
+# payment-service symptom on the one culprit it knows.
+#
+# This one is shaped to make that impossible. The alert fires on order-service
+# because its orders start failing an auth check; the cause is user-service,
+# one hop upstream, where the session cache has been turned off and every check
+# now falls through to a slow session store. Nothing in order-service's own
+# metrics names it. The path to the answer is
+#   orders_total{status="cancelled",reason="auth"}
+#     → who does order-service call for auth
+#     → user_auth_checks_total{status="error",reason="session_store_timeout"}
+# and there is no shortcut, which is the whole point of adding it.
+#
+# LIVE STACK ONLY for now: the prebuilt demo-services-o11y-stack image bakes the
+# payment incident and knows nothing about this one. Run it with
+# `python -m app.eval run --only order-service-auth-degradation` against a
+# cluster where `scripts/incident.sh start session-cache` is in effect.
+- id: order-service-auth-degradation
+  alert:
+    labels:
+      service_name: order-service
+      alertname: OrderAuthFailureRateHigh
+    annotations:
+      summary: "order-service orders failing the auth check"
+      description: >-
+        Orders on order-service are being cancelled at the auth step. Find what
+        is failing, not where the alert fired.
+    startsAt: now
+  truth:
+    service: user-service
+  forbid_services:
+    - payment-service     # the habitual culprit, and it is not in this path
+  forbid_versions:
+    - v2.5.0              # the other incident's answer, inherited by reflex
+  process:
+    queried_min: 2
+    grounded: true
+    discover_before_retry: true
+    evidence_or_hedge_ceiling: 0.4

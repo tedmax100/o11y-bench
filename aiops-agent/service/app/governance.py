@@ -12,9 +12,11 @@ harness) and **narrows autonomy when calibration is poor or unproven**:
   - requires_approval              → at most PROPOSE (never AUTO)
   - confidence < low               → ESCALATE
   - low ≤ confidence < high        → PROPOSE (human confirms)
+  - runbook's own rollback failed  → ESCALATE (its undo is known broken)
   - confidence ≥ high AND reversible AND not approval-gated AND calibration
         is proven-good                → AUTO
         calibration unproven/poor     → downgraded to PROPOSE
+        runbook's record unproven     → downgraded to PROPOSE
 
 "Calibration proven-good" = enough labeled runs exist AND the reliability curve
 holds up under four separate readings: mean overconfidence within tolerance, the
@@ -33,6 +35,7 @@ on purpose: "should we" vs "can we".
 
 from __future__ import annotations
 
+import logging
 from enum import StrEnum
 
 from pydantic import BaseModel
@@ -40,6 +43,8 @@ from pydantic import BaseModel
 from .actions import ActionSpec, registry
 from .calibration import bin_evidence
 from .config import settings
+
+logger = logging.getLogger("aiops_agent.governance")
 
 
 class Autonomy(StrEnum):
@@ -57,6 +62,7 @@ class Decision(BaseModel):
     calibration_note: str
     dq_note: str = ""
     act_note: str = ""
+    rb_note: str = ""
     reversible: bool
     requires_approval: bool
 
@@ -150,18 +156,21 @@ def decide(
     calib: dict,
     dq: dict | None = None,
     act: dict | None = None,
+    rb: dict | None = None,
+    rejected: dict | None = None,
     *,
     path=None,
 ) -> Decision:
     """Policy verdict for one proposed action given the run confidence, the
-    current calibration state, and (optionally) the data-quality and actuation
-    verdicts. When supplied, AUTO additionally requires each to be proven-good —
-    autonomy is withheld on a signal model that has drifted or gone stale, and on
-    a write credential that can no longer be shown to work.
+    current calibration state, and (optionally) the data-quality, actuation and
+    runbook-health verdicts. When supplied, AUTO additionally requires each to be
+    proven-good — autonomy is withheld on a signal model that has drifted or gone
+    stale, on a write credential that can no longer be shown to work, and on a
+    procedure whose own record says it does not fix this.
 
-    The three gates answer three different questions and none substitutes for
+    The four gates answer four different questions and none substitutes for
     another: *should we* (calibration), *is the map real* (DQ), *can we still
-    act* (actuation)."""
+    act* (actuation), *does this procedure still work* (runbook health)."""
     # For AUTO evaluation enforce the human-label minimum (§6.2 constraint 1).
     # Fetch lazily — only when confidence is high enough to reach the AUTO gate.
     # `path=None` means use settings.store_path; tests that don't wire a store
@@ -183,6 +192,7 @@ def decide(
     good, cal_note = _calibration_verdict(calib, human_labeled=human_labeled)
     dq_note = dq.get("note", "") if dq else "DQ not evaluated"
     act_note = act.get("note", "") if act else "actuation readiness not evaluated"
+    rb_note = rb.get("note", "") if rb else "runbook health not evaluated"
 
     def mk(level: Autonomy, reason: str) -> Decision:
         return Decision(
@@ -194,6 +204,7 @@ def decide(
             calibration_note=cal_note,
             dq_note=dq_note,
             act_note=act_note,
+            rb_note=rb_note,
             reversible=action.reversible,
             requires_approval=action.requires_approval,
         )
@@ -201,6 +212,27 @@ def decide(
     # Hard safety rules first — independent of confidence/calibration.
     if not action.reversible:
         return mk(Autonomy.ESCALATE, "action is irreversible — never autonomous")
+
+    # A runbook whose rollback has failed is not a confidence problem. The
+    # reason a reversible action is allowed at all is that it can be undone, and
+    # this one's record says the undo was tried and did not work — so it stops
+    # being reversible in the only sense that matters and goes to a person.
+    if rb is not None and rb.get("status") == "suspended":
+        return mk(Autonomy.ESCALATE, f"runbook suspended — {rb.get('note', '')}")
+
+    # A person already declined this exact action on this incident. Proposing it
+    # again is not a decision the agent gets to make twice: at PROPOSE it makes
+    # someone type the same refusal a second time, and the second refusal
+    # carries less information than the first — it is about our persistence, not
+    # about the action. ESCALATE creates no proposal, and the reason carries
+    # their words so the escalation is not a mystery.
+    if rejected:
+        why = (rejected.get("evidence") or "").strip()
+        return mk(
+            Autonomy.ESCALATE,
+            f"a person declined this on {(rejected.get('ts') or '')[:10]}"
+            + (f": {why}" if why else " without giving a reason"),
+        )
 
     if confidence < settings.governance_conf_low:
         return mk(
@@ -219,9 +251,12 @@ def decide(
         return mk(Autonomy.PROPOSE, "high confidence but data-quality (DQ) not proven-good")
     if act is not None and not act.get("proven_good"):
         return mk(Autonomy.PROPOSE, "high confidence but actuation readiness not proven-good")
+    if rb is not None and not rb.get("proven_good"):
+        return mk(Autonomy.PROPOSE, f"high confidence but {rb.get('note', 'runbook unproven')}")
     return mk(
         Autonomy.AUTO,
-        "high confidence, reversible, calibration + data-quality + actuation proven-good",
+        "high confidence, reversible, calibration + data-quality + actuation + "
+        "runbook health proven-good",
     )
 
 
@@ -231,17 +266,46 @@ def propose_remediations(
     calib: dict,
     dq: dict | None = None,
     act: dict | None = None,
+    rb: dict | None = None,
+    rejected: dict[str, dict] | None = None,
 ) -> list[Decision]:
     """Map a runbook's remediation step action names to registered actions and run
     each through the gate. Unregistered names are skipped (only the typed,
-    whitelisted vocabulary is eligible)."""
+    whitelisted vocabulary is eligible).
+
+    `rejected` maps an action name to the refusal a person already wrote on this
+    incident, if any."""
     out: list[Decision] = []
     for name in remediation_actions:
         spec = registry.get(name)
         if spec is None:
             continue
-        out.append(decide(spec, confidence, calib, dq, act))
+        out.append(decide(spec, confidence, calib, dq, act, rb, (rejected or {}).get(name)))
     return out
+
+
+def runbook_health_verdict(runbook_id: str, path=None) -> dict:
+    """The gate's view of a runbook's record: a `proven_good` verdict in the
+    same shape as the DQ and actuation ones, so `decide` treats all four alike.
+
+    A runbook nobody has executed enough times is *not* proven good. That reads
+    harsh for a freshly written procedure, and it is the same position this
+    system takes everywhere else: autonomy is earned against a record, and a
+    procedure with no record has not earned any. The cost of being wrong here is
+    a proposal a human reads.
+    """
+    from . import store
+
+    try:
+        h = store.rb_health(runbook_id, path=path)
+    except Exception as e:  # a missing record must not sink the gate
+        logger.warning("runbook health lookup failed for %s: %s", runbook_id, e)
+        return {"proven_good": False, "status": "unknown", "note": "runbook health unavailable"}
+    return {
+        "proven_good": h["status"] == store.RB_HEALTHY,
+        "status": h["status"],
+        "note": h["note"],
+    }
 
 
 def format_decisions(decisions: list[Decision]) -> str:
