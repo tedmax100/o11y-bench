@@ -147,10 +147,14 @@
 #     → user_auth_checks_total{status="error",reason="session_store_timeout"}
 # and there is no shortcut, which is the whole point of adding it.
 #
-# LIVE STACK ONLY for now: the prebuilt demo-services-o11y-stack image bakes the
-# payment incident and knows nothing about this one. Run it with
-# `python -m app.eval run --only order-service-auth-degradation` against a
-# cluster where `scripts/incident.sh start session-cache` is in effect.
+# `startsAt: now-6h` is not a detail. The baked stack now holds two incidents,
+# and two incidents that are both live at data-end are indistinguishable from
+# any one alert's point of view — every window contains both, and a fixture that
+# "passes" might have been answering the other one. The session-cache window is
+# bounded (data-end −7h to −5h) and this alert points into the middle of it.
+#
+# Live stack: `scripts/incident.sh start session-cache`, then use `startsAt: now`
+# instead — there the incident is whatever is happening while you watch.
 - id: order-service-auth-degradation
   alert:
     labels:
@@ -161,7 +165,7 @@
       description: >-
         Orders on order-service are being cancelled at the auth step. Find what
         is failing, not where the alert fired.
-    startsAt: now
+    startsAt: now-6h
   truth:
     service: user-service
   forbid_services:

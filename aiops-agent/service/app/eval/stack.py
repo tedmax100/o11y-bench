@@ -5,7 +5,8 @@ This is Path A of the reproducibility design: correctness comes from FIXED data,
 not from mocking. The `demo-services-o11y-stack` image bundles Prometheus / Loki
 / Tempo plus the telemetry generator; on boot it bakes 24h of history ending at
 `O11Y_SCENARIO_TIME_ISO`, with the payment-service v2.4.1→v2.5.0 decline incident
-at end−3h. We publish its native ports to the agent's defaults
+at end−3h, plus a session-cache incident on order-service/user-service bounded
+to end−7h..end−5h. We publish its native ports to the agent's defaults
 (localhost:9090/3100/3200), so `run_headless` hits it unchanged, and pin every
 fixture's clock to the same scenario time — so every run queries the same data
 while the agent stays free to issue whatever (real) queries it likes per seed.
@@ -64,19 +65,30 @@ def boot(scenario_time: str, *, image: str = DEFAULT_IMAGE, name: str = CONTAINE
     return res.stdout.strip()
 
 
+# One counter per baked incident. Waiting on the payment counter alone was
+# enough while there was one incident; with two, an image built before the
+# second generator lands would come up "ready" and the session-cache fixture
+# would then fail as if the agent had got it wrong.
+_READY_QUERIES = ("payment_charges_total", "user_auth_checks_total")
+
+
 def wait_ready(*, timeout: float = 180.0, poll: float = 3.0) -> bool:
     """Block until the incident data is actually queryable, not just until the
-    container is up — poll Prometheus for the payment counter the generator
-    emits. Returns False on timeout."""
-    query = "http://localhost:9090/api/v1/query?query=payment_charges_total"
+    container is up — poll Prometheus for a counter from each baked incident.
+    Returns False on timeout."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen(query, timeout=3) as resp:  # fixed localhost URL
-                data = json.load(resp)
-            if data.get("status") == "success" and data.get("data", {}).get("result"):
+            if all(_has_series(metric) for metric in _READY_QUERIES):
                 return True
         except Exception:
             pass  # container still starting / generator still loading
         time.sleep(poll)
     return False
+
+
+def _has_series(metric: str) -> bool:
+    url = f"http://localhost:9090/api/v1/query?query={metric}"
+    with urllib.request.urlopen(url, timeout=3) as resp:  # fixed localhost URL
+        data = json.load(resp)
+    return data.get("status") == "success" and bool(data.get("data", {}).get("result"))

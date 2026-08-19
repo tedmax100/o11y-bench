@@ -229,3 +229,34 @@ def test_shipped_fixtures_include_a_clean_recall_control():
     assert decline.alert["labels"]["service_name"] == control.alert["labels"]["service_name"]
     assert decline.alert["labels"]["alertname"] != control.alert["labels"]["alertname"]
     assert control.forbid_versions == ["v2.5.0"]
+
+
+# ---- a stack with two incidents needs a clock, not just a "now" -------------
+
+
+def test_relative_start_reaches_an_incident_that_is_not_now():
+    """Two incidents both live at data-end are indistinguishable from any one
+    alert's point of view, because every window contains both."""
+    fx = Fixture(id="x", alert={"labels": {}, "annotations": {}, "startsAt": "now-6h"})
+    assert fx.resolved_alert("2026-08-19T12:00:00Z")["startsAt"] == "2026-08-19T06:00:00Z"
+
+
+def test_relative_start_accepts_minutes():
+    fx = Fixture(id="x", alert={"labels": {}, "annotations": {}, "startsAt": "now-90m"})
+    assert fx.resolved_alert("2026-08-19T12:00:00Z")["startsAt"] == "2026-08-19T10:30:00Z"
+
+
+def test_an_absolute_start_is_left_alone():
+    fx = Fixture(
+        id="x", alert={"labels": {}, "annotations": {}, "startsAt": "2026-01-01T00:00:00Z"}
+    )
+    assert fx.resolved_alert("2026-08-19T12:00:00Z")["startsAt"] == "2026-01-01T00:00:00Z"
+
+
+def test_the_shipped_fixtures_point_at_the_incidents_the_stack_bakes():
+    """The session-cache window is bounded; a fixture left on `now` would be
+    asking about a quiet period and failing as if the agent were wrong."""
+    fixtures = load_fixtures(DEFAULT_FIXTURES)
+    by_id = {f.id: f for f in fixtures}
+    assert by_id["order-service-auth-degradation"].alert["startsAt"] == "now-6h"
+    assert by_id["payment-decline-service"].alert["startsAt"] == "now"

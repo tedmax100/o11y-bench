@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -77,15 +78,41 @@ class Fixture(BaseModel):
     process: ProcessSpec = Field(default_factory=ProcessSpec)
 
     def resolved_alert(self, now_iso: str | None = None) -> dict[str, Any]:
-        """Copy of the alert with `startsAt: now` resolved to a concrete UTC time.
+        """Copy of the alert with a relative `startsAt` resolved to a UTC time.
 
-        `now_iso` pins it to a scenario clock (the provisioned stack's data-end);
-        omitted, it falls back to wall-clock now (a live incident you triggered)."""
+        `now` and `now-<N>h` / `now-<N>m` are both accepted. `now_iso` pins them
+        to a scenario clock (the provisioned stack's data-end); omitted, they
+        fall back to wall-clock now (a live incident you triggered).
+
+        The offset form exists because a stack can bake more than one incident,
+        and two incidents that are both live at data-end are indistinguishable
+        from one alert's point of view — every window contains both. An absolute
+        timestamp cannot be written down here either: the data-end moves with
+        `O11Y_SCENARIO_TIME_ISO`. So the fixture says how far back its incident
+        sits, and the clock stays the stack's to decide.
+        """
         alert = copy.deepcopy(self.alert)
         starts = alert.get("startsAt")
-        if isinstance(starts, str) and starts.strip().lower() == "now":
-            alert["startsAt"] = now_iso or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if not isinstance(starts, str):
+            return alert
+        m = _RELATIVE_START.fullmatch(starts.strip().lower())
+        if m is None:
+            return alert
+        base = (
+            datetime.strptime(now_iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+            if now_iso
+            else datetime.now(UTC)
+        )
+        amount, unit = m.group(1), m.group(2)
+        if amount:
+            delta = timedelta(hours=int(amount)) if unit == "h" else timedelta(minutes=int(amount))
+            base -= delta
+        alert["startsAt"] = base.strftime("%Y-%m-%dT%H:%M:%SZ")
         return alert
+
+
+# `now`, or `now-6h` / `now-90m`.
+_RELATIVE_START = re.compile(r"now(?:\s*-\s*(\d+)\s*([hm]))?")
 
 
 def load_fixtures(path: Path) -> list[Fixture]:
