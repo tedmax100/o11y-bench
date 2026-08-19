@@ -102,7 +102,7 @@ groups:
               stability: development
             - id: authorized
               value: authorized
-              brief: Payment authorized.
+              brief: The subject was authorized — a payment charge, or an auth check.
               stability: development
             - id: declined
               value: declined
@@ -176,6 +176,26 @@ groups:
             - id: transient
               value: transient
               brief: Simulated transient failure.
+              stability: development
+            - id: session_store_timeout
+              value: session_store_timeout
+              brief: >-
+                The auth check had to reach the session store and it timed out.
+                Only produced while the session cache is off, so the value is
+                also the signal that it is off.
+              stability: development
+
+      - id: app.cache.name
+        stability: development
+        brief: >-
+          Which cache missed. Low-cardinality by construction — a cache is a
+          named piece of infrastructure, not a key.
+        note: "Flat key in current code: `cache`."
+        type:
+          members:
+            - id: user_session
+              value: user_session
+              brief: The user-service session cache in front of the session store.
               stability: development
 
       - id: app.user.operation

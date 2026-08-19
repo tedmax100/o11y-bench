@@ -1,3 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: user-flags
+  namespace: demo
+data:
+  # Read per request by the auth check, so flipping this ConfigMap changes
+  # behaviour without a restart — kubelet syncs the projected file within about
+  # a minute. A restart would put a pod rollout in the same minute as the fault
+  # and hand every latency chart a second explanation.
+  flags.json: |
+    {"user_session_cache_disabled": false}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -36,6 +49,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.labels['git_version']
+            - name: FEATURE_FLAGS_PATH
+              value: /etc/demo/flags.json
             - name: LOG_LEVEL
               value: INFO
             - name: OTEL_SERVICE_NAME
@@ -54,6 +69,10 @@ spec:
               value: otlp
             - name: OTEL_PYTHON_LOG_CORRELATION
               value: "true"
+          volumeMounts:
+            - name: flags
+              mountPath: /etc/demo
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /health
@@ -66,6 +85,10 @@ spec:
               port: 8000
             initialDelaySeconds: 10
             periodSeconds: 15
+      volumes:
+        - name: flags
+          configMap:
+            name: user-flags
 ---
 apiVersion: v1
 kind: Service

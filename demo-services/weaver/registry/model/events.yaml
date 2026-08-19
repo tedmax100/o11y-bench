@@ -163,7 +163,14 @@ groups:
     type: event
     name: cache.miss
     stability: development
-    brief: A cache lookup missed. (reserved — not yet emitted)
+    brief: >-
+      A cache lookup missed and the caller fell through to the origin store.
+      Emitted by user-service's auth check when the session cache is off.
+    attributes:
+      - ref: biz.user.id
+        requirement_level: required
+      - ref: app.cache.name
+        requirement_level: required
 
   - id: event.deployment.started
     type: event
