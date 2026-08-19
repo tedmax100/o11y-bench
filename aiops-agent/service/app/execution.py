@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -300,6 +301,57 @@ def _learn_outcome(req: ActionRequest, *, verified: bool, path: Path | None) -> 
         logger.info("learn: labeled %s correct=%s source=%s", ident, verified, source)
     else:
         logger.warning("learn: no CE record for %s (run may predate this execution)", ident)
+
+
+def _remember_fix(req: ActionRequest, *, path: Path | None) -> None:
+    """The incident now knows what worked on it.
+
+    `cases.resolution` and the `resolved by:` line in the recall block have both
+    existed since the case table was written, and nothing ever wrote the column,
+    so the line has never appeared in a prompt. This is the edge that was
+    missing: an incident could learn what it was, and could learn which paths
+    were dead, and could not learn what actually fixed it.
+    """
+    from . import case_memory
+
+    verdict = case_memory.remember_resolution(
+        case_key=req.case_key,
+        action=req.action,
+        args=req.args,
+        runbook_id=req.runbook_id,
+        request_id=req.request_id,
+        drill=_is_drill(req),
+        path=path,
+    )
+    logger.info("learn: fix for %s -> %s", req.case_key or req.fp, verdict)
+
+
+def _remember_failed_fix(req: ActionRequest, *, path: Path | None) -> None:
+    """It ran cleanly and the symptom stayed. That is a fact about this action on
+    this incident, and the next run should not spend an approval discovering it
+    again — so it goes on the same shelf as a declined action rather than into
+    `resolution`, which is reserved for what worked.
+
+    `disproved_by` is the tool result, not a person: nobody judged anything here,
+    the verify window did.
+    """
+    if _is_drill(req) or not req.case_key:
+        return
+    from . import case_memory
+
+    try:
+        store.ruled_out_insert(
+            key=req.case_key,
+            run_id=req.run_id or "",
+            ts=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            kind="action",
+            subject=case_memory.rejected_subject(req.action, ar.target_of(req.args)),
+            evidence="ran cleanly, symptom persisted through the verify window",
+            disproved_by="tool_result",
+            path=path,
+        )
+    except Exception as e:
+        logger.warning("remember_failed_fix failed for %s: %s", req.case_key, e)
 
 
 async def _revalidate_preconditions(req: ActionRequest, path: Path | None) -> bool:
@@ -674,6 +726,7 @@ async def run(request_id: str, path: Path | None = None) -> dict:
         _rb_feedback("ok", req, path)
         # --- 7. Learn: verified → correct label (§6.2 constraint 1+3) --------
         _learn_outcome(req, verified=True, path=path)
+        _remember_fix(req, path=path)
         return {"status": Status.SUCCEEDED.value}
 
     # --- 6. verify failed → auto-rollback ------------------------------------
@@ -698,6 +751,7 @@ async def run(request_id: str, path: Path | None = None) -> dict:
     )
     # Closed-loop 三: record verify failure before rollback.
     _rb_feedback("verify_failed", req, path)
+    _remember_failed_fix(req, path=path)
     ar_store_transition(
         req.request_id,
         Status.VERIFY_FAILED,

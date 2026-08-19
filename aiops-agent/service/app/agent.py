@@ -1061,14 +1061,16 @@ def _past_incident_context(service: str, alertname: str | None = None) -> str:
     lines = [PAST_CASES_HEADING]
     for c in cases:
         seen = f"×{c['occurrences']}" if c["occurrences"] > 1 else "once"
-        lines.append(
-            f"- {c['alertname']} ({seen}, last {(c['last_ts'] or '')[:10]}, "
-            f"confirmed by {c['root_cause_source']})"
-        )
-        lines.append(f"  root cause: {c['root_cause']}")
+        by = f", confirmed by {c['root_cause_source']}" if c["root_cause"] else ""
+        lines.append(f"- {c['alertname']} ({seen}, last {(c['last_ts'] or '')[:10]}{by})")
+        if c["root_cause"]:
+            lines.append(f"  root cause: {c['root_cause']}")
         resolution = c.get("resolution")
         if isinstance(resolution, dict) and resolution.get("action"):
-            lines.append(f"  resolved by: {resolution['action']}")
+            # Kept on its own line, and never merged into the cause. A fix that
+            # worked is not proof the diagnosis was right — a restart clears a
+            # great many things it does not explain.
+            lines.append(f"  resolved by: {resolution['action']} (verified)")
     if dead_ends:
         lines.append("")
         lines.append("### Already ruled out here — do not spend budget re-checking")

@@ -663,6 +663,7 @@ def test_forgetting_retracts_the_claims_and_keeps_the_history(monkeypatch, tmp_p
     assert store.case_forget(key, path=p) == {"cases": 1, "dead_ends": 1}
 
     assert store.case_query_similar("payment-service", path=p) == []
+    assert store.case_get(key, p)["resolution"] is None
     assert store.case_ruled_out_for([key], path=p) == []
     row = store.case_get(key, p)
     assert row["occurrences"] == 6
@@ -744,3 +745,97 @@ def test_forgetting_a_case_releases_its_refusals(monkeypatch, tmp_path):
     assert (
         case_memory.prior_rejection(sc.case_key, "k8s.rollout_undo", "demo/payment-service") is None
     )
+
+
+# ---- what actually fixed it -------------------------------------------------
+
+
+def _executed(p, sc, *, verified=True, drill=False):
+    """What the executor does at the end of a run, through the real entry point."""
+    if verified:
+        return case_memory.remember_resolution(
+            case_key=sc.case_key,
+            action="k8s.rollout_undo",
+            args={"namespace": "demo", "deployment": "payment-service"},
+            runbook_id="payment-bad-deploy",
+            request_id="req1",
+            drill=drill,
+            path=p,
+        )
+    return None
+
+
+def test_a_verified_fix_is_recorded_without_a_person(monkeypatch, tmp_path):
+    """The one thing a case can learn on its own. "I ran this and the symptom
+    stopped" is an observation the verify window checked, not the agent grading
+    its own reasoning."""
+    p = _cfg(monkeypatch, tmp_path)
+    with _scope() as sc:
+        case_memory.observe(sc, path=p)
+        assert _executed(p, sc) == "recorded"
+    row = store.case_get(sc.case_key, p)
+    assert row["resolution"]["action"] == "k8s.rollout_undo"
+    assert row["resolution"]["verified"] is True
+
+
+def test_a_fix_never_becomes_a_root_cause(monkeypatch, tmp_path):
+    """A restart clears a great many things it does not explain."""
+    p = _cfg(monkeypatch, tmp_path)
+    with _scope() as sc:
+        case_memory.observe(sc, path=p)
+        _executed(p, sc)
+    assert store.case_get(sc.case_key, p)["root_cause"] is None
+
+
+def test_a_drill_is_not_precedent(monkeypatch, tmp_path):
+    """A rehearsal on a fault someone injected is not evidence about the real
+    incident, and the ledger has marked drills since the game day."""
+    p = _cfg(monkeypatch, tmp_path)
+    with _scope() as sc:
+        case_memory.observe(sc, path=p)
+        assert _executed(p, sc, drill=True) == "ignored"
+    assert store.case_get(sc.case_key, p)["resolution"] is None
+
+
+def test_a_case_that_only_knows_its_fix_is_still_recalled(monkeypatch, tmp_path):
+    """Requiring a root cause kept an incident somebody had actually fixed
+    invisible until a second person labelled the diagnosis."""
+    p = _cfg(monkeypatch, tmp_path)
+    with _scope() as sc:
+        case_memory.observe(sc, path=p)
+        _executed(p, sc)
+    (hit,) = store.case_query_similar("payment-service", path=p)
+    assert hit["root_cause"] is None
+
+    block = agent._past_incident_context("payment-service", "PaymentDeclineRateHigh")
+    assert "resolved by: k8s.rollout_undo (verified)" in block
+    assert "root cause:" not in block
+
+
+def test_a_false_positive_is_still_never_recalled(monkeypatch, tmp_path):
+    """Opening recall up to fix-only cases must not open it to non-incidents."""
+    p = _cfg(monkeypatch, tmp_path)
+    with _scope() as sc:
+        case_memory.observe(sc, path=p)
+        _executed(p, sc)
+        store.case_set_status(sc.case_key, "false_positive", path=p)
+    assert store.case_query_similar("payment-service", path=p) == []
+
+
+def test_a_later_fix_replaces_an_earlier_one(monkeypatch, tmp_path):
+    """An incident fixed a different way the second time should recall the
+    second way."""
+    p = _cfg(monkeypatch, tmp_path)
+    with _scope() as sc:
+        case_memory.observe(sc, path=p)
+        _executed(p, sc)
+        case_memory.remember_resolution(
+            case_key=sc.case_key,
+            action="k8s.restart",
+            args={},
+            runbook_id=None,
+            request_id="req2",
+            drill=False,
+            path=p,
+        )
+    assert store.case_get(sc.case_key, p)["resolution"]["action"] == "k8s.restart"

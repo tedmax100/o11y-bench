@@ -659,6 +659,11 @@ TRUSTED_ROOT_CAUSE_SOURCES = ("ui", "manual", "eval", "eval-harness", "human", "
 TRUSTED_DISPROOF_SOURCES = ("tool_result", "grader", "human")
 
 _CASE_RECALL_STATUSES = ("resolved", "recurring")
+# The status that must never come back as precedent. Expressed as a denylist
+# because recall now covers cases that only know how they were fixed, and those
+# sit at `open` until somebody labels the diagnosis — an allowlist of statuses
+# would have silently excluded exactly the rows this was opened up for.
+_CASE_NEVER_RECALL_STATUSES = ("false_positive",)
 
 
 def case_key(alertname: str | None, service: str | None, symptom: str = "") -> str:
@@ -754,6 +759,26 @@ def case_confirm(
         return cur.rowcount > 0
 
 
+def case_set_resolution(key: str, *, resolution: dict, path: str | Path | None = None) -> bool:
+    """Record what actually fixed this incident, without touching the diagnosis.
+
+    Deliberately not part of `case_confirm`: that promotes a *conclusion* and
+    demands a trusted labeler, while this records an *event* that the executor
+    observed. The column has existed since the case table was written and the
+    recall block has been rendering `resolved by:` from it the whole time —
+    nothing ever wrote it, so that line has never once appeared.
+
+    The newest verified fix wins. An incident that recurs and is fixed a
+    different way the second time should recall the second way.
+    """
+    with _write_lock, _connect(path) as conn:
+        cur = conn.execute(
+            "UPDATE cases SET resolution=? WHERE case_key=?",
+            (json.dumps(resolution), key),
+        )
+        return cur.rowcount > 0
+
+
 def case_set_status(key: str, status: str, path: str | Path | None = None) -> bool:
     """Set the case's status directly. The caller that needs this is the
     `inconclusive` grading path: "it rightly blamed nobody" is a verdict about
@@ -763,10 +788,26 @@ def case_set_status(key: str, status: str, path: str | Path | None = None) -> bo
         return cur.rowcount > 0
 
 
+def _case_row(row: sqlite3.Row) -> dict[str, Any]:
+    """One `cases` row as a dict, with `resolution` decoded.
+
+    Shared because it was not: `case_query_similar` decoded the JSON and
+    `case_get` handed back the raw string, so which one you called decided
+    whether `row["resolution"]["action"]` worked or raised.
+    """
+    d = dict(row)
+    if d.get("resolution"):
+        try:
+            d["resolution"] = json.loads(d["resolution"])
+        except Exception:
+            pass
+    return d
+
+
 def case_get(key: str, path: str | Path | None = None) -> dict[str, Any] | None:
     with _connect(path) as conn:
         row = conn.execute("SELECT * FROM cases WHERE case_key=?", (key,)).fetchone()
-    return dict(row) if row else None
+    return _case_row(row) if row else None
 
 
 def ruled_out_insert(
@@ -829,7 +870,12 @@ def case_query_similar(
     returned here: they are useful context about the alert, not precedent about
     a cause.
     """
-    where = "service = ? AND root_cause IS NOT NULL"
+    # A case is worth recalling if it knows *something*: why it happened, or
+    # what made it stop. Requiring a root cause meant an incident somebody had
+    # actually fixed stayed invisible until a second person got round to
+    # labelling the diagnosis — and "the last three of these were fixed by
+    # rolling back" is the more actionable half of the two.
+    where = "service = ? AND (root_cause IS NOT NULL OR resolution IS NOT NULL)"
     params: list[Any] = [service]
     if alertname:
         where += " AND alertname = ?"
@@ -843,34 +889,30 @@ def case_query_similar(
         )
     )
     where += (
-        f" AND root_cause_source IN ({','.join('?' * len(TRUSTED_ROOT_CAUSE_SOURCES))})"
-        f" AND status IN ({','.join('?' * len(_CASE_RECALL_STATUSES))})"
+        f" AND (root_cause IS NULL OR root_cause_source IN "
+        f"({','.join('?' * len(TRUSTED_ROOT_CAUSE_SOURCES))}))"
+        f" AND status NOT IN ({','.join('?' * len(_CASE_NEVER_RECALL_STATUSES))})"
     )
     params.extend(TRUSTED_ROOT_CAUSE_SOURCES)
-    params.extend(_CASE_RECALL_STATUSES)
+    params.extend(_CASE_NEVER_RECALL_STATUSES)
     params.append(limit)
     with _connect(path) as conn:
         rows = conn.execute(
             f"SELECT * FROM cases WHERE {where} ORDER BY occurrences DESC, last_ts DESC LIMIT ?",
             params,
         ).fetchall()
-    out = []
-    for r in rows:
-        d = dict(r)
-        if d.get("resolution"):
-            try:
-                d["resolution"] = json.loads(d["resolution"])
-            except Exception:
-                pass
-        out.append(d)
-    return out
+    return [_case_row(r) for r in rows]
 
 
 def case_forget(key: str, path: str | Path | None = None) -> dict[str, int]:
     """Retract what this case claims to know, without deleting the case.
 
-    Two halves, because they fail differently: the root cause stops being
-    offered as a prior, and every dead end on it is retired. Somebody is saying
+    Three things go, because they are all things this case tells the next run:
+    the root cause stops being offered as a prior, the recorded fix stops being
+    offered as what works, and every dead end on it is retired. The fix is
+    included even though it was observed rather than claimed — "rolling back
+    cleared it" is exactly the kind of statement a rebuilt environment
+    invalidates, and this is the button for saying the ground moved. Somebody is saying
     the ground under this record has moved — an environment rebuilt, a policy
     changed, a diagnosis that turned out to be wrong later — and the honest
     response is to stop asserting all of it, not to argue about which half is
@@ -883,7 +925,8 @@ def case_forget(key: str, path: str | Path | None = None) -> dict[str, int]:
         cleared = conn.execute(
             """
             UPDATE cases SET root_cause=NULL, root_cause_source=NULL,
-                             confirmed_run_id=NULL, confirmed_ts=NULL, status='open'
+                             confirmed_run_id=NULL, confirmed_ts=NULL,
+                             resolution=NULL, status='open'
             WHERE case_key=?
             """,
             (key,),

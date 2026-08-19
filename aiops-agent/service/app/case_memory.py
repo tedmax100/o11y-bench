@@ -339,3 +339,53 @@ def prior_rejection(case_key: str, action: str, target: str, path=None) -> dict 
     except Exception as e:
         logger.warning("prior_rejection lookup failed for %s: %s", case_key, e)
         return None
+
+
+def remember_resolution(
+    *,
+    case_key: str | None,
+    action: str,
+    args: dict | None,
+    runbook_id: str | None,
+    request_id: str,
+    drill: bool,
+    path=None,
+) -> str:
+    """A remediation ran on this incident and the symptom went away.
+
+    This is the one thing the case can learn without a person in the loop, and
+    the reason is worth stating: "I ran this command and the symptom stopped" is
+    an observation, checked by the executor's own verify window against the same
+    metric the alert fired on. It is not the agent grading its own reasoning,
+    which is what `_SELF_LABEL_SOURCES` exists to keep out. A root cause is a
+    claim about why; a resolution is a record of what was done and what happened
+    next.
+
+    It writes only into `resolution`, never into `root_cause`. A fix that worked
+    is not proof the diagnosis was right — a restart clears a great many things
+    it does not explain — and the recall block keeps them in separate lines for
+    that reason.
+
+    Drills are excluded. A rehearsal on a fault someone injected on purpose is
+    not evidence about the real incident, and the ledger has been careful to
+    mark them since the game day; recalling one as precedent would undo that.
+    """
+    if drill or not case_key:
+        return "ignored"
+    try:
+        ok = store.case_set_resolution(
+            case_key,
+            resolution={
+                "action": action,
+                "args": args or {},
+                "runbook_id": runbook_id,
+                "request_id": request_id,
+                "verified": True,
+                "ts": _now(),
+            },
+            path=path,
+        )
+        return "recorded" if ok else "ignored"
+    except Exception as e:
+        logger.warning("remember_resolution failed for %s: %s", case_key, e)
+        return "ignored"
