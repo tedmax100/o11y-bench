@@ -16,9 +16,9 @@ tags: [OpenTelemetry, AIOps, Governance, Evaluation, 鐵人賽]
 
 那篇的重點因此變成那把尺，而不是那個功能。但收尾的時候有一句話我一直放不下：**人做的事，一件都沒被記下來。** agent 學自己，人在旁邊標了半天，系統只是安靜地收著。今天補的就是這件事，順便補一個讓它有機會被量出來的環境。
 
-程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day39/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day39)。驗證環境：本機 k3d 叢集（2026-08-19 實測）、加上重新烘過的 `demo-services-o11y-stack` image。測試從 495 條長到 532 條。
+程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day39/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day39)。驗證環境：本機 k3d 叢集（2026-08-19 實測）、重新烘過的 `demo-services-o11y-stack` image，以及對著它跑的兩輪 fixture（各 15 次真實 RCA，完整報表在 `day39/eval-20260819.txt`）。測試從 495 條長到 532 條。
 
-先講清楚今天的形狀：四條回饋通道接上了、第二個事故劇本做出來也驗過了、烤進 stack image 了，**但一次真實 RCA（Root Cause Analysis，根因分析）都還沒跑過**。所以今天沒有分數，只有機制跟環境。
+先講清楚今天的形狀：四條回饋通道接上了、第二個事故劇本做出來也驗過了、烤進 stack image 了，然後拿整套 fixture 跑了兩輪真實的 RCA（Root Cause Analysis，根因分析），拿到 0% 跟 60%。**同一份 agent 程式碼，中間我只動了環境跟一條判準，所以這兩個數字沒有一個是在講 agent。** 那一段在後面。
 
 ## 三條寫了沒人讀的表
 
@@ -277,9 +277,87 @@ orders cancelled/auth   26.4        3.1   （這是基線的偶發失敗）
 
 Loki 在同一個窗有 177 筆 `cache.miss` 配 27 筆 `order.cancelled`，Tempo 也查得到那些從 webapp 開始、錯在 user-service span 上的 trace。
 
+## 跑了兩輪，0% 跟 60%，而兩個都不是在講 agent
+
+環境弄好之後終於可以跑了。5 題 fixture 各 3 個 seed，15 次真實 RCA，第一輪的結果是這樣：
+
+```
+aiops-agent eval — 5 fixture(s), 15 run(s), overall correct 0%
+
+  fixture                              correct   service   version   conf
+  payment-decline-service                0% (0/3)    100%     100%   0.70
+  user-service-no-incident               0% (0/3)      0%    n/a     0.83
+  order-service-discover-before-query    0% (0/3)      0%    n/a     0.80
+  payment-latency-false-alarm            0% (0/3)      0%    n/a     0.80
+  order-service-auth-degradation         0% (0/3)      0%    n/a     0.60
+
+  regression vs baseline:
+    ▼ payment-decline-service: 100% → 0%
+```
+
+全軍覆沒，而且那題本來 100% 的也掛了。但這個 0% 拆開來是三種不同的東西。
+
+### 一、它答對了，然後被判準判死
+
+`payment-decline-service` 那一列，`service` 100%、`version` 100%，三個 seed 的摘要都是「Code regression in payment-service v2.5.0 caused increased declines due to new_validator_odd_cents」。答案一個字都沒錯。
+
+它敗在流程檢查：
+
+```
+x payment-decline-service seed0 — queried: 1 successful of 1 call(s)
+```
+
+`queried_min: 2` 要求至少兩次成功的工具呼叫，而它**只查了一次就答對了**。那條規則當初寫下來是要擋「一次都沒查就開始掰」，結果它擋到的是「一次就命中」。
+
+我把它改成 1。`grounded`（引用的 trace ID 必須真的在工具結果裡出現）跟 `discover_before_retry` 已經在守「憑空回答」那條線了。至於「一次查詢到底夠不夠格算一次調查」，那其實是在吵 schema catalog 洩了多少答案給它，而那是關於環境的爭論，流程檢查不是吵這個的地方。
+
+### 二、另外兩題是我自己弄壞的
+
+這個比較難堪。`user-service-no-incident` 問的是「面對一個真的沒事的服務，agent 會不會忍住不亂猜」。而在我動手之前，user-service 在烘好的 stack 裡**根本沒有任何資料**。那題之所以會過，是因為它問的是一個空的服務。
+
+我加第二個事故的時候順手給了 user-service baseline 流量，還很自然地放了 0.5% 的偶發 auth 失敗（因為真實的 auth check 就長那樣）。於是 agent 讀到那些失敗，說「v1.3.0 有 code regression 造成 transient 認證失敗」，信心度 0.83。照著資料看，它不算亂講。壞掉的是題目。
+
+`order-service-discover-before-query` 同理，它現在真的找得到東西了，但信心度 0.8 超過那題設的 0.75 上限。
+
+修法我選了改環境而不是改判準：烘好的 generator baseline 失敗率設成 0，`series` 從 11 掉到 10。**活的服務保留那 0.5%**，因為活叢集是 demo、烘好的是量尺，而一個對照組沒有真的安靜，它就不是對照組。
+
+### 三、第二輪：60%，以及唯一一個有意義的 0%
+
+```
+aiops-agent eval — 5 fixture(s), 15 run(s), overall correct 60%
+
+  payment-decline-service              100% (3/3)    100%     100%   0.90
+  user-service-no-incident             100% (3/3)    100%    n/a     0.60
+  order-service-discover-before-query  100% (3/3)    100%    n/a     0.60
+  payment-latency-false-alarm            0% (0/3)      0%    n/a     0.60
+  order-service-auth-degradation         0% (0/3)      0%    n/a     0.70
+```
+
+剩下兩個 0%，都是本來就設計成很難的那兩題，而新那題的失敗方式正是它被造出來要抓的：
+
+```
+1. code regression in the order-service, related to authentication failures
+2. high rate of order cancellations due to payment declines
+3. the payment-service is experiencing declined and gateway errors
+```
+
+三個 seed、三個不同的錯答案。一個怪 order-service 自己，兩個怪 payment。**而答案是 user-service。**「不往告警指名的服務外面看」跟「把手邊唯一認識的事故套上去」，兩種它都表演了一次。
+
+而且三次都掛在同一條流程檢查上：
+
+```
+discover_before_retry: query_loki_logs came back empty, retried query_loki_logs without discovering
+```
+
+查回空的，就換個寫法再查一次，沒有先去問「這個環境到底有哪些欄位」。這系列第一天挖出來的那個坑，今天還在，只是這次它踩在一個不離開原服務就答不出來的事故上。
+
+> 老實說第一輪跑出 0% 的時候我第一個念頭是「完了，我把什麼東西改壞了」。結果查下去發現，改壞的東西有一半是**題目**不是程式。這大概是這幾天最有用的一課：加一個事故到共用環境裡，等於默默改寫了每一題既有 fixture 的前提，而沒有任何東西會提醒你 XD
+
+baseline 也存下來了（100/100/100/0/0）。**這才是這兩輪真正的產出**：在這之前那個檔案裡只有一題，任何改動都沒有東西可以比。
+
 ## 今天沒做的事
 
-- **一次真實 RCA 都沒跑過。** 四條通道接上了、劇本驗過了、烤進 image 了，但 agent 沒有被它們影響過任何一次。今天沒有分數。
+- **那四條回饋通道還是沒有被量到。** 兩輪跑的都是空的案例庫，沒有人在中間標註或駁回過任何一次，所以「人的介入有沒有讓下一次變好」這個問題，今天一個字都沒回答到。
 - **雜訊底線 ±67 個百分點還在。** 要有結論得加 seed，而該加到多少目前只知道下界。
 - **`increase()` 那個 0 沒有被擋下來。** 我寫進文件了，但 fixture 的流程檢查裡沒有任何一條會在 agent 讀到 0 的時候要求它去對照日誌或 raw counter。
 - **`needs_review` 那條降級路徑量不到**（上面第三節）。
@@ -290,7 +368,7 @@ Loki 在同一個窗有 177 筆 `cache.miss` 配 27 筆 `order.cancelled`，Temp
 
 ## 小結
 
-總結來說，今天做的事情用一句話講就是「把三張寫了沒人讀的表接回去」，加上一個為了讓 agent 答錯而設計的事故。沒有分數，也沒有任何一個數字變好。
+總結來說，今天做的事情用一句話講就是「把三張寫了沒人讀的表接回去」，加上一個為了讓 agent 答錯而設計的事故。分數從 0% 到 60%，但那兩個數字都不是在講 agent 變好或變壞，是在講我的題目跟環境對不對得起來。
 
 但有兩件事我覺得帶得走。一是**一句「你錯了」值多少，取決於它被寫進哪張表**。同一個人花同樣的時間標註，資料落在 `calibration` 就只是一個統計樣本，落在案例上才會改變下一次的行為，而這兩者的成本差距只有幾十行程式碼。二是量測的前提不只是樣本數，還有環境：一座只有一個響亮事故的 demo，會安靜地訓練出一隻「把手邊唯一認識的事故套到所有症狀上」的 agent，而你在分數上看不出來，因為它答對了。
 
