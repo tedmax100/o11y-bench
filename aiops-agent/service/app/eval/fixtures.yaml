@@ -28,7 +28,17 @@
   # …and it has to get there honestly. These four are graded off the transcript,
   # not the prose: see eval/process.py.
   process:
-    queried_min: 2               # at least two tool calls came back non-empty
+    # One successful call, not two. `2` was written to catch an answer built on
+    # nothing, and what it caught instead was an answer reached in a single
+    # well-aimed query: three seeds named the service, the version and the
+    # reason correctly and were all scored wrong for "queried: 1 successful of
+    # 1 call(s)". Whether one query *should* be enough here is a separate
+    # question — `reason=new_validator_odd_cents` sits on a Prometheus label and
+    # the schema catalog describes the shape, so a direct hit is cheap. That is
+    # an argument about the environment, and the process check is not the place
+    # to litigate it: `grounded` and `discover_before_retry` already cover
+    # answering from thin air.
+    queried_min: 1
     grounded: true               # every trace ID cited exists in a tool result
     discover_before_retry: true  # an empty/error result is followed by discovery,
                                  # never by the same query reworded

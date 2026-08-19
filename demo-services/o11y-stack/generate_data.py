@@ -77,7 +77,15 @@ SESSION_INCIDENT_END_H = 5
 SESSION_STORE_LATENCY_S = (0.18, 0.42)
 SESSION_STORE_TIMEOUT_RATE = 0.12
 AUTHCHECK_BASELINE_S = (0.0008, 0.004)
-AUTH_TRANSIENT_RATE = 0.005
+# Zero on purpose, and it is the difference between a fixture and a demo. The
+# live service keeps a 0.5% transient failure rate because that is what a real
+# auth check looks like; the baked stack is graded against, and
+# `user-service-no-incident` asks whether the agent stays uncertain about a
+# service with *nothing wrong with it*. With any baseline failures at all, the
+# agent reads them, says "code regression in v1.3.0 causing transient auth
+# failures" at confidence 0.83, and is not really wrong — the fixture is. A
+# control arm has to be genuinely quiet or it is not a control.
+AUTH_TRANSIENT_RATE = 0.0
 
 # Duration histogram buckets in SECONDS (explicit — avoids the default-ms-bucket
 # constant-quantile artifact noted in memory/histogram_seconds_default_buckets).
@@ -625,6 +633,8 @@ def generate_all():
                     timed_out = random.random() < SESSION_STORE_TIMEOUT_RATE
                 else:
                     auth_s = random.uniform(*AUTHCHECK_BASELINE_S)
+                    # AUTH_TRANSIENT_RATE is 0 today (see the constant). The
+                    # branch stays so the knob is a knob and not a rewrite.
                     timed_out = random.random() < AUTH_TRANSIENT_RATE
                 auth_reason = (
                     ("session_store_timeout" if cache_off else "transient") if timed_out else None
