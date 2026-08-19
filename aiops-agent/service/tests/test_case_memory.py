@@ -258,11 +258,11 @@ def test_recall_block_is_empty_without_a_confirmed_case(monkeypatch, tmp_path):
     assert agent._past_incident_context("payment-service") == ""
 
 
-def test_a_human_disproof_reaches_the_prompt_with_no_confirmed_case(monkeypatch, tmp_path):
-    """The situation this is collected for: nobody has got it right yet. Keying
-    the dead ends off the *recalled* cases made them unreachable until a case
-    had a root cause, which is precisely when they stop being the only thing
-    known about the incident."""
+def test_a_human_disproof_does_not_reach_the_prompt(monkeypatch, tmp_path):
+    """It used to, and that was measured as harmful: naming the refuted branch
+    made three seeds out of three take it, at lower confidence than the arm that
+    never saw it. The verdict is still recorded and still used — after the
+    answer, in `refutation.py`, not before it."""
     p = _cfg(monkeypatch, tmp_path)
     key = _labeled_run(
         p,
@@ -271,13 +271,37 @@ def test_a_human_disproof_reaches_the_prompt_with_no_confirmed_case(monkeypatch,
         correct=False,
         correction_note="latency was flat on that version",
     )
-    assert store.case_get(key, p)["root_cause"] is None
+    (row,) = store.case_ruled_out_for([key], path=p)
+    assert row["kind"] == "hypothesis"
 
     block = agent._past_incident_context("payment-service", "PaymentDeclineRateHigh")
-    assert "Already ruled out here" in block
-    assert "new_validator rejects odd cents" in block
-    assert "latency was flat on that version" in block
-    assert "ruled out by a person" in block
+    assert "new_validator rejects odd cents" not in block
+
+
+def test_the_dead_ends_a_machine_can_enforce_still_reach_the_prompt(monkeypatch, tmp_path):
+    """The distinction the move rests on: a query that cannot work here is a
+    fact about the environment, not a suggestion about the cause."""
+    p = _cfg(monkeypatch, tmp_path)
+    key = store.case_key("PaymentDeclineRateHigh", "payment-service")
+    store.case_upsert(
+        key=key,
+        ts="2026-08-16T05:00:00Z",
+        alertname="PaymentDeclineRateHigh",
+        service="payment-service",
+        path=p,
+    )
+    store.ruled_out_insert(
+        key=key,
+        run_id="r1",
+        ts=store.datetime.now(store.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        kind="query",
+        subject="LogQL stream selector on service",
+        evidence="not an indexable stream label in this Loki",
+        disproved_by="tool_result",
+        path=p,
+    )
+    block = agent._past_incident_context("payment-service", "PaymentDeclineRateHigh")
+    assert "LogQL stream selector on service" in block
 
 
 def test_a_disproof_is_scoped_to_its_own_incident(monkeypatch, tmp_path):

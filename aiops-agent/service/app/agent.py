@@ -654,6 +654,11 @@ def _build_graph():
         except Exception as e:
             logger.warning("rubric_trace_node: check failed (%s) — passing through", e)
             ok, retry_prompt = True, ""
+        if ok:
+            # Trace IDs are about whether the evidence exists; this is about
+            # whether the conclusion was already crossed out. Second, because a
+            # fabricated citation is the more basic problem.
+            ok, retry_prompt = _refutation_check(answer)
         revision = state.get("rubric_revision_count", 0)
         return {
             "rubric_feedback": retry_prompt,
@@ -1036,7 +1041,18 @@ def _past_incident_context(service: str, alertname: str | None = None) -> str:
         keys = {c["case_key"] for c in cases}
         if alertname:
             keys.add(store.case_key(alertname, service))
-        dead_ends = store.case_ruled_out_for(sorted(keys), limit=8)
+        dead_ends = [
+            d
+            for d in store.case_ruled_out_for(sorted(keys), limit=8)
+            # Refuted hypotheses are deliberately absent. Day39 measured what
+            # happens when they are here: naming the branch made the model take
+            # it, three seeds out of three, at lower confidence than the arm
+            # that never saw it. They are checked against the answer afterwards
+            # instead (`refutation.py`). What stays is the half a machine can
+            # enforce — a query that cannot work here, an action a person
+            # declined, which the governance gate refuses on its own.
+            if d["kind"] != "hypothesis"
+        ]
     except Exception as e:
         logger.warning("past case recall failed: %s", e)
         return ""
@@ -1142,6 +1158,30 @@ async def _refresh_env_fit() -> None:
             await compute_env_fit()
     except Exception as e:
         logger.warning("env fit refresh failed: %s", e)
+
+
+def _refutation_check(answer: str) -> tuple[bool, str]:
+    """(passed, retry prompt). Fail-open: an answer is never blocked because the
+    case memory was unreachable."""
+    from . import case_memory, refutation
+
+    sc = case_memory.current_scope()
+    if sc is None or not answer:
+        return True, ""
+    # Under the same flag as recall: `case_recall_enabled` selects whether a run
+    # uses the case library at all, and this is now the library's main way of
+    # reaching an answer. Without the gate the A/B has two identical arms.
+    if not settings.case_recall_enabled:
+        return True, ""
+    try:
+        rows = store.case_ruled_out_for([sc.case_key])
+        hit = refutation.find_repeat(answer, rows)
+    except Exception as e:
+        logger.warning("refutation check failed: %s", e)
+        return True, ""
+    if hit is None:
+        return True, ""
+    return False, refutation.retry_prompt(hit)
 
 
 def _prior_rejections(steps: list, params: dict) -> dict[str, dict]:
