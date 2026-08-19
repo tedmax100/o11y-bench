@@ -4,8 +4,10 @@ These pin the grading (positive + negative/inconclusive), aggregation,
 regression diff, baseline round-trip, and `startsAt: now` resolution.
 """
 
+from pathlib import Path
 from types import SimpleNamespace as NS
 
+import app.eval.harness as harness
 from app.eval.harness import (
     DEFAULT_FIXTURES,
     Fixture,
@@ -260,3 +262,55 @@ def test_the_shipped_fixtures_point_at_the_incidents_the_stack_bakes():
     by_id = {f.id: f for f in fixtures}
     assert by_id["order-service-auth-degradation"].alert["startsAt"] == "now-6h"
     assert by_id["payment-decline-service"].alert["startsAt"] == "now"
+
+
+# ---- the sampling unit ------------------------------------------------------
+
+
+def _summary(fixture_id, correct_flags):
+    runs = [
+        RunResult(fixture_id, i, bool(c), bool(c), None, 0.7, [], None, "")
+        for i, c in enumerate(correct_flags)
+    ]
+    return summarize(fixture_id, runs)
+
+
+def test_passes_are_kept_not_averaged_away():
+    """A mean of 50% built from 100% and 0% is a different situation from one
+    built from 50% and 50%, and only the first says the number is unstable."""
+    merged = harness.merge_passes([[_summary("f", [1])], [_summary("f", [0])]])
+    (s,) = merged
+    assert s.correct_rate == 0.5
+    assert s.pass_rates == [1.0, 0.0]
+    assert s.spread == 1.0
+
+    steady = harness.merge_passes([[_summary("f", [1, 0])], [_summary("f", [1, 0])]])
+    assert steady[0].correct_rate == 0.5
+    assert steady[0].spread == 0.0
+
+
+def test_a_single_pass_has_no_spread():
+    """One pass cannot say how much it moves, and must not pretend to."""
+    (s,) = harness.merge_passes([[_summary("f", [1, 1, 1])]])
+    assert s.spread is None
+
+
+def test_fixture_order_survives_the_merge():
+    passes = [
+        [_summary("a", [1]), _summary("b", [0])],
+        [_summary("b", [1]), _summary("a", [0])],
+    ]
+    assert [s.fixture_id for s in harness.merge_passes(passes)] == ["a", "b"]
+
+
+def test_the_report_states_the_spread_as_the_floor():
+    merged = harness.merge_passes([[_summary("f", [1])], [_summary("f", [0])]])
+    text = harness.format_report(merged, [], store_path=Path("x.db"))
+    assert "between passes" in text
+    assert "100%" in text
+    assert "not a result" in text
+
+
+def test_a_single_pass_report_says_nothing_about_spread():
+    merged = harness.merge_passes([[_summary("f", [1])]])
+    assert "between passes" not in harness.format_report(merged, [], store_path=Path("x.db"))

@@ -45,7 +45,31 @@ def _main(argv: list[str] | None = None) -> int:
         default=DEFAULT_STORE,
         help="calibration store path (default: a dedicated eval.db; pass aiops.db to feed prod CE)",
     )
-    pr.add_argument("-n", "--seeds", type=int, default=3, help="runs per fixture (default 3)")
+    pr.add_argument(
+        "-n",
+        "--seeds",
+        type=int,
+        default=1,
+        help=(
+            "repeated calls per fixture within one pass (default 1). NOT a sampling "
+            "knob: the seed sets a thread id and a record id and never reaches the "
+            "model call, which runs at temperature 0 — across every run recorded, "
+            "26 of 27 multi-seed groups returned an identical verdict. Use --repeat."
+        ),
+    )
+    pr.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help=(
+            "passes over the whole suite (default 1). Under --stack the container "
+            "stays up, so passes differ only in what the model does with a byte-"
+            "identical prompt — measured at 0% spread across five fixtures, which is "
+            "what temperature 0 means. The swings this was built to chase happen "
+            "between invocations, where a new scenario time moves every timestamp in "
+            "the prompt; use this to confirm a result is stable, not to average one out."
+        ),
+    )
     pr.add_argument("--only", default=None, help="run only the fixture with this id")
     pr.add_argument(
         "--recall",
@@ -118,6 +142,7 @@ def _main(argv: list[str] | None = None) -> int:
                         seeds=args.seeds,
                         store_path=args.store,
                         scenario_time=scenario_time,
+                        repeats=args.repeat,
                     )
                 )
 

@@ -287,6 +287,18 @@ class FixtureSummary:
     mean_confidence: float
     errors: int
     runs: list[RunResult] = field(default_factory=list)
+    # One entry per pass over the suite. The sampling unit that matters: seeds
+    # inside a pass agreed on the verdict 26 of 27 recorded times, because the
+    # seed never reaches the model call and the model runs at temperature 0.
+    # What moved a fixture from 3/3 to 0/3 was one pass versus the next.
+    pass_rates: list[float] = field(default_factory=list)
+
+    @property
+    def spread(self) -> float | None:
+        """Widest gap between passes, or None with fewer than two."""
+        if len(self.pass_rates) < 2:
+            return None
+        return max(self.pass_rates) - min(self.pass_rates)
 
 
 def summarize(fixture_id: str, runs: list[RunResult]) -> FixtureSummary:
@@ -308,29 +320,76 @@ def summarize(fixture_id: str, runs: list[RunResult]) -> FixtureSummary:
     )
 
 
+def merge_passes(passes: list[list[FixtureSummary]]) -> list[FixtureSummary]:
+    """Fold repeated passes over the same suite into one summary per fixture.
+
+    The per-pass rates are kept rather than averaged away. A mean of 0.5 built
+    from 1.0 and 0.0 is a different situation from one built from 0.5 and 0.5,
+    and only the first tells you the number you are about to compare against is
+    not stable enough to compare.
+    """
+    if not passes:
+        return []
+    by_fixture: dict[str, list[FixtureSummary]] = {}
+    for one_pass in passes:
+        for summary in one_pass:
+            by_fixture.setdefault(summary.fixture_id, []).append(summary)
+
+    merged: list[FixtureSummary] = []
+    for fixture_id, parts in by_fixture.items():
+        runs = [r for part in parts for r in part.runs]
+        combined = summarize(fixture_id, runs)
+        combined.pass_rates = [part.correct_rate for part in parts]
+        merged.append(combined)
+    # Keep the fixture order of the first pass.
+    order = {s.fixture_id: i for i, s in enumerate(passes[0])}
+    merged.sort(key=lambda s: order.get(s.fixture_id, len(order)))
+    return merged
+
+
 async def run_suite(
     fixtures: list[Fixture],
     *,
     seeds: int,
     store_path: Path,
     scenario_time: str | None = None,
+    repeats: int = 1,
 ) -> list[FixtureSummary]:
-    run_nonce = str(int(time.time()))
-    summaries: list[FixtureSummary] = []
-    for fixture in fixtures:
-        runs: list[RunResult] = []
-        for seed in range(seeds):
-            runs.append(
-                await run_one(
-                    fixture,
-                    seed,
-                    run_nonce=run_nonce,
-                    store_path=store_path,
-                    scenario_time=scenario_time,
+    """Run every fixture, `repeats` times over the whole suite.
+
+    A pass is the sampling unit. Seeds inside a pass are the same request issued
+    again — the seed sets a thread id and a record id and never reaches the model
+    call, and the model is built at temperature 0 — so they come back correlated
+    and cost the same as real samples. Repeats re-ask the question.
+
+    Under `--stack` the container stays up across passes, so every pass queries
+    identical data and the spread that comes out is the model's, not the
+    generator's. Measured 2026-08-19 over five fixtures: that spread is 0% on
+    all of them, which is what temperature 0 is supposed to mean and rules the
+    model out as the source of the swings this was built to chase. Those
+    happened between *invocations*, where a fresh container moves every absolute
+    timestamp in the prompt. Varying the scenario time on purpose is the
+    experiment this does not yet run.
+    """
+    passes: list[list[FixtureSummary]] = []
+    for _ in range(max(1, repeats)):
+        run_nonce = str(int(time.time()))
+        summaries: list[FixtureSummary] = []
+        for fixture in fixtures:
+            runs: list[RunResult] = []
+            for seed in range(seeds):
+                runs.append(
+                    await run_one(
+                        fixture,
+                        seed,
+                        run_nonce=run_nonce,
+                        store_path=store_path,
+                        scenario_time=scenario_time,
+                    )
                 )
-            )
-        summaries.append(summarize(fixture.id, runs))
-    return summaries
+            summaries.append(summarize(fixture.id, runs))
+        passes.append(summaries)
+    return merge_passes(passes)
 
 
 # ---- recall A/B -------------------------------------------------------------
@@ -413,15 +472,28 @@ def format_ab_report(
         lines.append(
             f"{s.fixture_id:<34} {base.correct_rate:>10.0%} {s.correct_rate:>11.0%} {delta:>+8.0%}"
         )
-    n_seeds = on[0].n if on else 0
+    spreads = [s.spread for s in [*on, *off] if s.spread is not None]
     lines.append("")
     lines.append(
         "A delta here is a difference between two small samples of a non-deterministic model."
     )
+    if spreads:
+        lines.append(
+            f"The same arms varied by up to {max(spreads):.0%} between passes of identical "
+            "code; a delta under that is not a result."
+        )
+    else:
+        lines.append(
+            "Both arms ran a single pass, so nothing here measures how much they move on "
+            "their own. Add --repeat before reading the delta."
+        )
     lines.append(
         "Day27 measured the same code scoring 2.5-3.5 across three runs; read the transcripts"
     )
-    lines.append("before reading the delta." + (f"  (seeds/arm: {n_seeds})" if n_seeds else ""))
+    lines.append(
+        "before reading the delta."
+        + (f"  (passes/arm: {len(on[0].pass_rates) or 1})" if on else "")
+    )
     return "\n".join(lines)
 
 
@@ -480,6 +552,19 @@ def format_report(
             f"  {s.fixture_id:<28} "
             f"{s.correct_rate:>6.0%} ({sum(1 for r in s.runs if r.correct)}/{s.n}) "
             f"{s.service_rate:>7.0%}  {ver}  {s.mean_confidence:>5.2f}  {s.errors:>3}"
+        )
+
+    spreads = [(s.fixture_id, s.pass_rates, s.spread) for s in summaries if s.spread is not None]
+    if spreads:
+        lines.append("")
+        lines.append("  between passes (the sampling unit — seeds inside a pass are correlated):")
+        worst = max(sp for _, _, sp in spreads)
+        for fid, rates, sp in spreads:
+            shown = " ".join(f"{r:.0%}" for r in rates)
+            lines.append(f"    {fid:<38} {shown:<24} spread {sp:>4.0%}")
+        lines.append(
+            f"    Widest spread this run: {worst:.0%}. A difference smaller than that is "
+            "not a result."
         )
 
     failed = [
