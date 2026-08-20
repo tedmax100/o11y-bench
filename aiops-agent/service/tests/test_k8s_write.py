@@ -215,6 +215,6 @@ def test_write_client_sends_a_bearer_prefixed_header(monkeypatch, tmp_path):
     monkeypatch.setattr(kw, "_CLUSTER_CA_PATH", str(tmp_path / "ca.crt"))
     monkeypatch.setattr(kw, "in_cluster_write_creds", lambda: True)
 
-    _apps, authz = kw._build_write_clients()
+    _apps, _core, authz = kw._build_write_clients()
     cfg = authz.api_client.configuration
     assert cfg.auth_settings()["BearerToken"]["value"] == "Bearer fake.jwt.value"

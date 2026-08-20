@@ -18,6 +18,7 @@ than the patch it needs.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,7 @@ _WRITE_TOKEN_PATH = "/var/run/secrets/k8s-write/token"
 _CLUSTER_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
 _write_api = None
+_write_core_api = None
 _write_authz_api = None
 _write_error: str | None = None
 _write_token_fp: tuple[int, int] | None = None
@@ -61,20 +63,23 @@ def _invalidate_on_rotation() -> None:
     a credential stays dead for weeks while every client object in the process
     still looks perfectly healthy: nothing re-reads the file, and the only code
     path that would notice is the one that runs once a quarter."""
-    global _write_api, _write_authz_api, _write_error, _write_token_fp
+    global _write_api, _write_core_api, _write_authz_api, _write_error, _write_token_fp
     fp = _token_fingerprint()
     if fp != _write_token_fp:
         if _write_api is not None or _write_error is not None:
             logger.info("write token changed on disk; rebuilding client")
-        _write_api = _write_authz_api = None
+        _write_api = _write_core_api = _write_authz_api = None
         _write_error = None
         _write_token_fp = fp
 
 
-def _build_write_clients() -> tuple[Any, Any]:
-    """(AppsV1Api, AuthorizationV1Api) on the same credentials. The authz client
-    is built from the identical Configuration on purpose — a readiness check that
-    asks a different client is answering about a different identity."""
+def _build_write_clients() -> tuple[Any, Any, Any]:
+    """(AppsV1Api, CoreV1Api, AuthorizationV1Api) on the same credentials. The
+    authz client is built from the identical Configuration on purpose — a
+    readiness check that asks a different client is answering about a different
+    identity, and the same argument applies to the core client: a ConfigMap
+    patch that went out on a different identity than the one we preflighted is
+    not the thing we checked."""
     from kubernetes import client, config
     from kubernetes.config.config_exception import ConfigException
 
@@ -105,7 +110,11 @@ def _build_write_clients() -> tuple[Any, Any]:
         except ConfigException:
             config.load_kube_config()
         api_client = client.ApiClient()
-    return client.AppsV1Api(api_client), client.AuthorizationV1Api(api_client)
+    return (
+        client.AppsV1Api(api_client),
+        client.CoreV1Api(api_client),
+        client.AuthorizationV1Api(api_client),
+    )
 
 
 def _load_write_api() -> Any:
@@ -113,7 +122,7 @@ def _load_write_api() -> Any:
     is dropped when the token file changes (see `_invalidate_on_rotation`).
     In-cluster: uses the projected write SA token. Host-side dev: falls back
     to the local kubeconfig (which has full perms — dev only)."""
-    global _write_api, _write_authz_api, _write_error
+    global _write_api, _write_core_api, _write_authz_api, _write_error
     _invalidate_on_rotation()
     if _write_api is not None:
         return _write_api
@@ -121,11 +130,18 @@ def _load_write_api() -> Any:
         raise RuntimeError(_write_error)
 
     try:
-        _write_api, _write_authz_api = _build_write_clients()
+        _write_api, _write_core_api, _write_authz_api = _build_write_clients()
         return _write_api
     except Exception as e:
         _write_error = f"k8s write client unavailable ({type(e).__name__}: {e})"
         raise RuntimeError(_write_error) from e
+
+
+def _load_write_core_api() -> Any:
+    """CoreV1Api bound to the write SA — ConfigMap patches only. Same cache and
+    rotation handling as the deployment client."""
+    _load_write_api()
+    return _write_core_api
 
 
 def load_write_authz_api() -> Any:
@@ -250,3 +266,66 @@ async def impl_scale(args: dict) -> dict:
 
 # rollout undo's inverse is another rollout undo (go back to the version we left)
 rollback_rollout_undo = impl_rollout_undo
+
+
+async def impl_configmap_flag_set(args: dict) -> dict:
+    """Set one boolean flag inside a JSON document held in a ConfigMap key.
+
+    The demo services read their flags per request out of a mounted ConfigMap, so
+    this is the shape a real feature-flag rollback takes on this cluster: no pod
+    restart, no image change, and the blast radius is whatever mounts the map.
+
+    Deliberately narrow. It patches a *single key* inside the JSON document and
+    leaves every other flag on the same map untouched, because the interesting
+    failure here is not "the patch failed" — it is a patch that succeeds and
+    quietly reverts a second flag somebody set an hour ago. `strategic merge` on
+    `data` replaces the whole string value of `flags.json`, so the read-modify-
+    write has to happen here, on the current content, and the previous value goes
+    into the result so the executor's rollback has something to put back.
+    """
+    name = args["configmap"]
+    ns = _ns(args)
+    key = args.get("key", "flags.json")
+    flag = args["flag"]
+    value = bool(args["value"])
+
+    # --- read phase (read SA) ------------------------------------------------
+    core_r, _ = await asyncio.to_thread(k8s._load_client)
+    cm = await asyncio.to_thread(core_r.read_namespaced_config_map, name, ns)
+    raw = (cm.data or {}).get(key)
+    if raw is None:
+        raise RuntimeError(f"configmap {ns}/{name} has no key '{key}'")
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"configmap {ns}/{name} key '{key}' is not JSON: {e}") from e
+    if not isinstance(doc, dict):
+        raise RuntimeError(f"configmap {ns}/{name} key '{key}' is not a JSON object")
+    if flag not in doc:
+        # An unknown flag would be *created* by a plain assignment, and a flag
+        # that only exists because we invented it is not a flag anybody reads.
+        raise RuntimeError(
+            f"configmap {ns}/{name} key '{key}' has no flag '{flag}' (present: {sorted(doc)})"
+        )
+    previous = doc[flag]
+    doc[flag] = value
+
+    # --- write phase (write SA) ----------------------------------------------
+    core_w = await asyncio.to_thread(_load_write_core_api)
+    await asyncio.to_thread(
+        core_w.patch_namespaced_config_map,
+        name=name,
+        namespace=ns,
+        body={"data": {key: json.dumps(doc)}},
+    )
+
+    logger.warning("configmap_flag_set: %s/%s %s.%s %s→%s", ns, name, key, flag, previous, value)
+    return {
+        "action": "configmap_flag_set",
+        "configmap": name,
+        "namespace": ns,
+        "key": key,
+        "flag": flag,
+        "previous_value": previous,
+        "new_value": value,
+    }

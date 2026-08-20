@@ -1,0 +1,94 @@
+# Tier 0/1 runbook for the session-cache incident (the second demo scenario).
+#
+# The point of this one is the hop. The alert fires on order-service, and every
+# diagnostic below that stays on order-service comes back healthy — the failure
+# is one service upstream, in user-service's auth check, and the only thing that
+# says so is a `reason` label on somebody else's counter. That is the exact step
+# the agent has not been able to take on its own (it answers "order-service's own
+# code" and stops), so the runbook's job here is to carry the on-call — and the
+# Tier 1 auto-diagnostics — across the hop before the reasoning starts.
+#
+# Diagnostics are READ-ONLY and auto-run before the RCA; remediation is rendered
+# for the on-call and executed only by the Tier 2 action registry, after approval.
+id: session-cache-timeout
+title: order-service cancellations from a degraded user-service session store
+
+trigger:
+  alertname: order-cancel-rate-high
+  labels:
+    service_name: order-service
+
+diagnostics:
+  - desc: The cancellations are concentrated on auth, not on payment
+    action: query_prometheus
+    args:
+      expr: 'sum by (reason) (rate(orders_total{status="cancelled"}[5m]))'
+      queryType: instant
+    expect: reason="auth" dominates; a payment-heavy split means this is the wrong runbook
+    check:
+      nonempty: true
+
+  # The hop. Same window, one service upstream: if this is empty, the story
+  # ends here and the cause really is inside order-service.
+  - desc: user-service's auth checks are failing on the session store
+    action: query_prometheus
+    args:
+      expr: 'sum by (reason) (rate(user_auth_checks_total{status="error"}[5m]))'
+      queryType: instant
+    expect: reason="session_store_timeout" present
+    check:
+      nonempty: true
+
+  - desc: The auth check's own latency moved (the symptom is time, not logic)
+    action: query_prometheus
+    args:
+      expr: 'histogram_quantile(0.95, sum by (le) (rate(user_authcheck_duration_seconds_bucket[5m])))'
+      queryType: instant
+    expect: p95 in the hundreds of milliseconds, against ~1ms healthy
+    check:
+      nonempty: true
+
+  - desc: The same story in user-service's logs
+    action: query_loki_logs
+    args:
+      query: '{service_name="user-service"} | json | event="cache.miss"'
+    expect: cache misses running alongside the auth failures
+    check:
+      nonempty: true
+
+remediation:
+  # Turning the session cache off is the real fix here, not a workaround: the
+  # flag is what puts the auth check on the slow path. Scaling user-service is
+  # deliberately NOT offered — more replicas each waiting on the same session
+  # store does not make the store answer faster, and an action whose verify
+  # cannot pass teaches the case memory something false when it fails.
+  - desc: Disable the degraded session cache on user-service
+    action: k8s.configmap_flag_set
+    args:
+      configmap: user-flags
+      namespace: demo
+      key: flags.json
+      flag: user_session_cache_disabled
+      value: true
+    reversible: true
+    requires_approval: true
+    # The services re-read this file per request, so neither the change nor its
+    # undo needs a restart — which is also why the verify window can be short.
+    rollback:
+      action: k8s.configmap_flag_set
+      args:
+        configmap: user-flags
+        namespace: demo
+        key: flags.json
+        flag: user_session_cache_disabled
+        value: false
+    # Verify against the *upstream* signal, not the alert's. The alert would go
+    # quiet either way once orders stop being placed, and "the pager stopped" is
+    # not the same claim as "the auth checks recovered".
+    verify:
+      action: query_prometheus
+      args:
+        expr: 'sum(rate(user_auth_checks_total{status="error", reason="session_store_timeout"}[2m]))'
+        queryType: instant
+      check:
+        max_value: 0.01

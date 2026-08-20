@@ -25,6 +25,12 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "events"]
     verbs: ["get", "list", "watch"]
+  # ConfigMaps are read so the flag action's dry-run can report the flag's
+  # current value and list the workloads that mount the map. Read only, and only
+  # here — the write role below reaches the two flag maps and nothing else.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
     resources: ["deployments", "replicasets"]
     verbs: ["get", "list", "watch"]
@@ -62,6 +68,16 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments", "replicasets"]
     verbs: ["get", "list", "watch", "patch", "update"]
+  # Feature-flag remediation (k8s.configmap_flag_set). resourceNames pins this
+  # to the two flag maps: a blanket "patch configmaps" in this namespace would
+  # also hand over prometheus-config, loki-config and the collector's pipeline —
+  # a far larger grant than the action needs. resourceNames cannot scope
+  # list/watch, so those verbs stay out: the action reads through the read SA
+  # above and only patches here.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["payment-flags", "user-flags"]
+    verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

@@ -17,6 +17,7 @@ permissions. Wiring a *mutating* impl is a later, separately-reviewed change
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
 from pydantic import BaseModel, Field
@@ -221,3 +222,118 @@ def format_blast_radius(br: BlastRadius) -> str:
     if br.notes:
         bits.append("; ".join(br.notes))
     return ", ".join(bits)
+
+
+def _mounts_configmap(dep, name: str) -> bool:
+    """True when this Deployment's pod template reads the named ConfigMap —
+    as a volume, an envFrom source, or a single env var's valueFrom."""
+    spec = getattr(getattr(dep.spec, "template", None), "spec", None)
+    if spec is None:
+        return False
+    for vol in getattr(spec, "volumes", None) or []:
+        cm = getattr(vol, "config_map", None)
+        if cm is not None and getattr(cm, "name", None) == name:
+            return True
+    containers = list(getattr(spec, "containers", None) or []) + list(
+        getattr(spec, "init_containers", None) or []
+    )
+    for c in containers:
+        for src in getattr(c, "env_from", None) or []:
+            cm = getattr(src, "config_map_ref", None)
+            if cm is not None and getattr(cm, "name", None) == name:
+                return True
+        for env in getattr(c, "env", None) or []:
+            ref = getattr(getattr(env, "value_from", None), "config_map_key_ref", None)
+            if ref is not None and getattr(ref, "name", None) == name:
+                return True
+    return False
+
+
+async def dry_run_configmap_flag_set(args: dict) -> BlastRadius:
+    """Predict a flag flip: which ConfigMap, and every workload that reads it.
+
+    A ConfigMap patch touches no pod directly, which is exactly why its footprint
+    has to be computed rather than assumed — the effect lands on whatever mounts
+    it, and one shared map can reach services nobody was thinking about. So the
+    footprint here is the set of Deployments reading the map, and `affected_pods`
+    is their combined replicas even though not a single pod is restarted.
+
+    Reaching more than one workload is not refused here (that is policy's call),
+    but it is recorded as a note, because "this flag is not only yours" is the
+    thing the on-call needs to see before approving.
+    """
+    from .tools import k8s
+
+    namespace = args.get("namespace") or settings.k8s_namespace
+    name = args.get("configmap") or ""
+    key = args.get("key", "flags.json")
+    flag = args.get("flag") or ""
+    target = f"{namespace}/{name}"
+
+    if not name or not flag:
+        return _unavailable(
+            "k8s.configmap_flag_set", namespace, target, "configmap and flag are required"
+        )
+
+    try:
+        core, apps = await asyncio.to_thread(k8s._load_client)
+        cm = await asyncio.to_thread(core.read_namespaced_config_map, name, namespace)
+        deps = await asyncio.to_thread(apps.list_namespaced_deployment, namespace=namespace)
+    except RuntimeError as e:  # k8s not wired
+        return _unavailable("k8s.configmap_flag_set", namespace, target, str(e))
+    except Exception as e:
+        if getattr(e, "status", None) == 404:
+            return _unavailable(
+                "k8s.configmap_flag_set",
+                namespace,
+                target,
+                f"no ConfigMap named '{name}' in {namespace}",
+            )
+        return _unavailable(
+            "k8s.configmap_flag_set", namespace, target, f"k8s API error: {type(e).__name__}: {e}"
+        )
+
+    notes: list[str] = []
+    raw = (cm.data or {}).get(key)
+    current: object | None = None
+    if raw is None:
+        notes.append(f"configmap has no key '{key}'")
+    else:
+        try:
+            doc = json.loads(raw)
+        except json.JSONDecodeError:
+            notes.append(f"key '{key}' is not JSON")
+            doc = {}
+        if isinstance(doc, dict):
+            if flag in doc:
+                current = doc[flag]
+            else:
+                notes.append(f"key '{key}' has no flag '{flag}'")
+
+    readers = [d for d in deps.items if _mounts_configmap(d, name)]
+    reader_names = sorted(d.metadata.name for d in readers)
+    pods = sum((d.spec.replicas or 0) for d in readers if d.spec is not None)
+    if not readers:
+        notes.append("no workload in this namespace reads this ConfigMap")
+    elif len(readers) > 1:
+        notes.append(f"read by {len(readers)} workloads: {', '.join(reader_names)}")
+
+    target_value = bool(args.get("value"))
+    if current is not None and bool(current) == target_value:
+        notes.append(f"'{flag}' is already {target_value}; the flip would change nothing")
+
+    return BlastRadius(
+        action="k8s.configmap_flag_set",
+        target=target,
+        namespace=namespace,
+        current_revision=None if current is None else f"{flag}={current}",
+        target_revision=f"{flag}={target_value}",
+        affected_pods=pods,
+        # No pod is replaced, so "one replica" carries none of the usual
+        # single-point-of-failure meaning here.
+        singleton=False,
+        cross_namespace=False,
+        in_protected_namespace=namespace in settings.protected_namespaces,
+        notes=notes,
+        detail=", ".join(reader_names),
+    )

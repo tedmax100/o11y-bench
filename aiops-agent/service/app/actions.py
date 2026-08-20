@@ -89,8 +89,13 @@ class ActionRegistry:
 
 
 # Module-level registry. dry_run wired since 7b-2; impl wired now (7b-4).
-from .blast_radius import dry_run_rollout_undo, dry_run_scale  # noqa: E402
+from .blast_radius import (  # noqa: E402
+    dry_run_configmap_flag_set,
+    dry_run_rollout_undo,
+    dry_run_scale,
+)
 from .tools.k8s_write import (  # noqa: E402
+    impl_configmap_flag_set,
     impl_rollout_undo,
     impl_scale,
 )
@@ -114,5 +119,18 @@ registry.register(
         requires_approval=True,
         dry_run=dry_run_scale,
         impl=impl_scale,
+    )
+)
+registry.register(
+    ActionSpec(
+        name="k8s.configmap_flag_set",
+        description=(
+            "Set one boolean flag inside a JSON document in a ConfigMap "
+            "(e.g. turn a degraded feature off). No pod restart."
+        ),
+        reversible=True,
+        requires_approval=True,
+        dry_run=dry_run_configmap_flag_set,
+        impl=impl_configmap_flag_set,
     )
 )
