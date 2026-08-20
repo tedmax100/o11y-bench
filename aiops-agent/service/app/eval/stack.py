@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import subprocess
 import time
+import urllib.parse
 import urllib.request
 
 DEFAULT_IMAGE = "demo-services-o11y-stack:latest"
@@ -72,14 +73,24 @@ def boot(scenario_time: str, *, image: str = DEFAULT_IMAGE, name: str = CONTAINE
 _READY_QUERIES = ("payment_charges_total", "user_auth_checks_total")
 
 
-def wait_ready(*, timeout: float = 180.0, poll: float = 3.0) -> bool:
+def wait_ready(
+    scenario_time: str | None = None, *, timeout: float = 180.0, poll: float = 3.0
+) -> bool:
     """Block until the incident data is actually queryable, not just until the
     container is up — poll Prometheus for a counter from each baked incident.
-    Returns False on timeout."""
+    Returns False on timeout.
+
+    `scenario_time` must be the one the stack was booted with. An instant query
+    only sees a sample inside Prometheus's 5m lookback, and the baked data ends
+    at the scenario time — so asking at wall-clock now returns an empty result
+    for every clock except one that happens to be roughly now. That made the
+    check pass only while the scenario time was not being varied, which is the
+    one condition under which it is not worth checking.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            if all(_has_series(metric) for metric in _READY_QUERIES):
+            if all(_has_series(metric, scenario_time) for metric in _READY_QUERIES):
                 return True
         except Exception:
             pass  # container still starting / generator still loading
@@ -87,8 +98,10 @@ def wait_ready(*, timeout: float = 180.0, poll: float = 3.0) -> bool:
     return False
 
 
-def _has_series(metric: str) -> bool:
+def _has_series(metric: str, scenario_time: str | None = None) -> bool:
     url = f"http://localhost:9090/api/v1/query?query={metric}"
+    if scenario_time:
+        url += f"&time={urllib.parse.quote(scenario_time)}"
     with urllib.request.urlopen(url, timeout=3) as resp:  # fixed localhost URL
         data = json.load(resp)
     return data.get("status") == "success" and bool(data.get("data", {}).get("result"))

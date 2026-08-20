@@ -129,7 +129,7 @@ def _main(argv: list[str] | None = None) -> int:
             print(f"booting {args.image} (scenario time {scenario_time})…")
             stackmod.boot(scenario_time, image=args.image)
             booted = True
-            if not stackmod.wait_ready(timeout=args.boot_timeout):
+            if not stackmod.wait_ready(scenario_time, timeout=args.boot_timeout):
                 print("  stack did not produce queryable incident data in time")
                 return 1
             print("  stack ready; running against fixed data")
