@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from . import action_requests, audit, breaker, execution, store
+from . import action_requests, actions, agent, audit, breaker, execution, store
 from .agent import lifespan, stream_chat
 from .alerts import AlertProvisioningDisabled, AlertSpec, build_alert_rule, provision_alert
 from .calibration import CULPRIT, label_run
@@ -223,6 +223,49 @@ class RejectRequest(ActorRequest):
     # it becomes a dead end on the incident, so the next investigation of the
     # same thing is told what was already turned down.
     reason: str = ""
+
+
+@app.get("/actions")
+async def actions_list():
+    """What this build can do — the registry's contract, not its wiring.
+
+    `executable` is the pair that decides whether a proposal can ever become an
+    execution: an action with no impl is propose-only no matter what the gate
+    says, and the kill switch is reported separately because "this build knows
+    the action" and "this deployment may run it" are different questions that
+    look identical from the outside when both are false.
+    """
+    specs = []
+    for name in actions.registry.names():
+        spec = actions.registry.get(name)
+        specs.append(
+            {
+                "name": spec.name,
+                "description": spec.description,
+                "reversible": spec.reversible,
+                "requires_approval": spec.requires_approval,
+                "category": spec.category,
+                "executable": spec.impl is not None,
+                "has_dry_run": spec.dry_run is not None,
+            }
+        )
+    return {"actions": specs, "actions_enabled": settings.actions_enabled}
+
+
+@app.get("/cases/context")
+async def cases_context(service: str, alertname: str | None = None):
+    """The recall block exactly as the next run would receive it.
+
+    Deliberately returns the rendered text rather than the rows behind it: the
+    rows are queryable elsewhere, and what matters here is the thing that reaches
+    a prompt. A caller checking whether an incident learned anything should be
+    reading the same string the model reads, not a second rendering of it.
+    """
+    return {
+        "service": service,
+        "alertname": alertname,
+        "context": agent._past_incident_context(service, alertname),
+    }
 
 
 @app.get("/actions/requests")

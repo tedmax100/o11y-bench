@@ -167,8 +167,11 @@ def test_session_cache_runbook_matches_the_order_service_alert():
     assert step.requires_approval and step.reversible
     # The undo puts the flag back rather than doing something merely similar.
     assert step.rollback["action"] == "k8s.configmap_flag_set"
-    assert step.rollback["args"]["value"] is False
-    assert step.args["value"] is True
+    # The flag's healthy state is False: `user_session_cache_disabled` is TRUE
+    # during the incident. Pinned here because a name like that invites the
+    # opposite reading, and the opposite reading re-fires the incident.
+    assert step.args["value"] is False
+    assert step.rollback["args"]["value"] is True
     # Verify reads the upstream signal, not the alert's own metric: the pager
     # going quiet is a different claim from the auth checks recovering.
     assert "user_auth_checks_total" in step.verify["args"]["expr"]
@@ -181,3 +184,38 @@ def test_session_cache_runbook_crosses_the_hop_in_diagnostics():
     exprs = " ".join(str(d.args) for d in rb.diagnostics)
     assert "orders_total" in exprs  # the alerting service
     assert "user_auth_checks_total" in exprs  # one hop upstream — the point of it
+
+
+# ---- the two read-only endpoints the game day preflights on ----------------
+
+
+def _client():
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    return TestClient(app)
+
+
+def test_actions_endpoint_reports_contract_and_kill_switch():
+    body = _client().get("/actions").json()
+    by_name = {a["name"]: a for a in body["actions"]}
+    flag = by_name["k8s.configmap_flag_set"]
+    assert flag["executable"] and flag["has_dry_run"]
+    assert flag["requires_approval"] and flag["reversible"]
+    # Knowing the action and being allowed to run it are separate facts, and a
+    # preflight that conflates them cannot tell a stale image from a closed
+    # kill switch.
+    assert "actions_enabled" in body
+
+
+def test_cases_context_endpoint_returns_the_rendered_recall_block(monkeypatch):
+    import app.agent as agent_mod
+
+    monkeypatch.setattr(
+        agent_mod,
+        "_past_incident_context",
+        lambda service, alertname=None: f"## {service}/{alertname}",
+    )
+    body = _client().get("/cases/context?service=order-service&alertname=order-cancel").json()
+    assert body["context"] == "## order-service/order-cancel"

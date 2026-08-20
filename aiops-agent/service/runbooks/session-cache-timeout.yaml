@@ -62,18 +62,29 @@ remediation:
   # deliberately NOT offered — more replicas each waiting on the same session
   # store does not make the store answer faster, and an action whose verify
   # cannot pass teaches the case memory something false when it fails.
-  - desc: Disable the degraded session cache on user-service
+  # Read the flag's name carefully before approving: `user_session_cache_disabled`
+  # is TRUE during the incident — the cache is off, so every auth check falls
+  # through to the slow session store. The fix sets it back to false. A flag
+  # whose healthy state is `false` and whose name contains "disabled" is exactly
+  # the kind that gets flipped the wrong way at 3am, which is a good reason for
+  # the action to be spelled out here rather than composed on the fly.
+  - desc: Re-enable the session cache on user-service (stop falling through to the session store)
     action: k8s.configmap_flag_set
     args:
       configmap: user-flags
       namespace: demo
       key: flags.json
       flag: user_session_cache_disabled
-      value: true
+      value: false
     reversible: true
     requires_approval: true
     # The services re-read this file per request, so neither the change nor its
     # undo needs a restart — which is also why the verify window can be short.
+    # The undo puts the flag back where it was — which means back into the
+    # degraded state. That reads wrong until you remember what a rollback is
+    # for: it is not "make things good", it is "return the system to the state
+    # the on-call was looking at", so nobody has to reason about a third
+    # configuration that nobody has seen.
     rollback:
       action: k8s.configmap_flag_set
       args:
@@ -81,7 +92,7 @@ remediation:
         namespace: demo
         key: flags.json
         flag: user_session_cache_disabled
-        value: false
+        value: true
     # Verify against the *upstream* signal, not the alert's. The alert would go
     # quiet either way once orders stop being placed, and "the pager stopped" is
     # not the same claim as "the auth checks recovered".
