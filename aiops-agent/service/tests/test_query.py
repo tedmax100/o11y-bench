@@ -499,3 +499,32 @@ async def test_query_loki_byte_cap_triggers_fallback(monkeypatch):
     result = await q._query_loki_logs('{service_name="x"} | json')
     assert result.get("truncated") is True
     assert "fallback" in result or "original_query" in result
+
+
+# ---- metric-name extraction: labels are not metrics -------------------------
+
+
+def test_metric_names_ignores_grouping_labels():
+    """A live drill wrote five dead ends named `reason` — a label, not a metric —
+    into the recall block, which then told the next run not to query the labels
+    the answer is written in."""
+    from app.tools.query import _metric_names
+
+    assert _metric_names('sum by (reason) (rate(orders_total{status="cancelled"}[5m]))') == {
+        "orders_total"
+    }
+    assert _metric_names("sum without (le, reason) (rate(x_total[5m]))") == {"x_total"}
+
+
+def test_metric_names_ignores_label_matchers():
+    from app.tools.query import _metric_names
+
+    expr = 'sum(rate(user_auth_checks_total{status="error", reason="session_store_timeout"}[2m]))'
+    assert _metric_names(expr) == {"user_auth_checks_total"}
+
+
+def test_metric_names_keeps_both_sides_of_a_join():
+    from app.tools.query import _metric_names
+
+    expr = "sum(rate(a_total[5m])) / on(job) group_left(pod) sum(rate(b_total[5m]))"
+    assert _metric_names(expr) == {"a_total", "b_total"}

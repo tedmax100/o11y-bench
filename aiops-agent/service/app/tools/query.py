@@ -296,6 +296,28 @@ _PROMQL_KEYWORDS = frozenset(
 )
 
 
+# Grouping clauses and label matchers hold *label* names, and a label name run
+# through the metric extractor is always "missing" — there is no series called
+# `reason`. A live drill recorded five dead ends of that shape in one run, and
+# because they go into the recall block, the next investigation of the same
+# incident is told not to spend budget on the labels the answer is written in.
+# Strip both regions before looking for metric names.
+_PROM_GROUPING_RE = re.compile(
+    r"\b(?:by|without|on|ignoring|group_left|group_right)\s*\([^)]*\)", re.IGNORECASE
+)
+_PROM_MATCHER_RE = re.compile(r"\{[^}]*\}")
+
+
+def _metric_names(expr: str) -> set[str]:
+    """The metric names an expression actually references."""
+    stripped = _PROM_MATCHER_RE.sub("{}", _PROM_GROUPING_RE.sub(" ", expr))
+    return {
+        m
+        for m in _PROM_METRIC_RE.findall(stripped)
+        if m not in _PROMQL_KEYWORDS and not m.isdigit()
+    }
+
+
 async def _prom_empty_note(expr: str) -> dict[str, Any] | None:
     """Which metric names in this expression don't exist in Prometheus at all."""
     try:
@@ -305,9 +327,7 @@ async def _prom_empty_note(expr: str) -> dict[str, Any] | None:
         return None
     if not known:
         return None
-    used = {
-        m for m in _PROM_METRIC_RE.findall(expr) if m not in _PROMQL_KEYWORDS and not m.isdigit()
-    }
+    used = _metric_names(expr)
     missing = sorted(m for m in used if m not in known)
     if not missing:
         return {

@@ -87,6 +87,18 @@ def target_of(args: dict | None) -> str:
     scope so both name the same thing."""
     args = args or {}
     ns = args.get("namespace") or settings.k8s_namespace
+    # Deployment-shaped actions name a deployment; the flag action names a
+    # ConfigMap and a flag inside it. Falling through to the empty string gave
+    # every ConfigMap action the target "demo/", which is not a typo in a log —
+    # it is one breaker scope and one idempotency key shared by every flag on
+    # every map in the namespace, so tripping the breaker on one would gag the
+    # rest, and two different flips would look like a retry of each other.
+    if "deployment" in args:
+        return f"{ns}/{args['deployment']}"
+    if "configmap" in args:
+        flag = args.get("flag")
+        cm = args["configmap"]
+        return f"{ns}/{cm}#{flag}" if flag else f"{ns}/{cm}"
     return f"{ns}/{args.get('deployment', '')}"
 
 

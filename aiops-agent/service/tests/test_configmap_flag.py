@@ -219,3 +219,17 @@ def test_cases_context_endpoint_returns_the_rendered_recall_block(monkeypatch):
     )
     body = _client().get("/cases/context?service=order-service&alertname=order-cancel").json()
     assert body["context"] == "## order-service/order-cancel"
+
+
+def test_target_names_the_configmap_and_the_flag():
+    from app.action_requests import target_of
+
+    t = target_of(
+        {"configmap": "user-flags", "namespace": "demo", "flag": "user_session_cache_disabled"}
+    )
+    # Not "demo/": the breaker scope and the idempotency key are both built from
+    # this string, so an empty tail pools every flag on every map in the namespace.
+    assert t == "demo/user-flags#user_session_cache_disabled"
+    assert (
+        target_of({"deployment": "payment-service", "namespace": "demo"}) == "demo/payment-service"
+    )

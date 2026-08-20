@@ -569,3 +569,29 @@ def test_zero_delay_is_an_explicit_opt_out(monkeypatch):
     monkeypatch.setattr(ex.settings, "verify_delay_seconds", 0)
     settle, why = ex._settle_seconds({"args": {"expr": "sum(rate(x[2m]))"}})
     assert settle == 0 and "disabled" in why
+
+
+# ---- verify: an empty result is not a recovery ------------------------------
+
+
+def test_verify_fails_closed_on_an_empty_vector():
+    """The bug a live drill found: the demo metrics were never scraped, the
+    verify query matched nothing, and 'no series' was read as 0 — so a fix that
+    nothing had observed was recorded as executed and verified."""
+    ok, detail = ex._eval_verify_check({"max_value": 0.01}, {"resultType": "vector", "result": []})
+    assert not ok and "no series" in detail
+
+
+def test_verify_allows_empty_when_the_runbook_says_absence_is_the_signal():
+    ok, detail = ex._eval_verify_check(
+        {"max_value": 0.01, "empty_ok": True}, {"resultType": "vector", "result": []}
+    )
+    assert ok and "0" in detail
+
+
+def test_verify_still_reads_a_real_value():
+    out = {"resultType": "vector", "result": [{"value": 0.004}]}
+    ok, _ = ex._eval_verify_check({"max_value": 0.01}, out)
+    assert ok
+    ok2, _ = ex._eval_verify_check({"max_value": 0.001}, out)
+    assert not ok2

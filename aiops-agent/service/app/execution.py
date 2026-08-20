@@ -56,7 +56,20 @@ def _eval_verify_check(check: dict, output: Any) -> tuple[bool, str]:
 
     if "max_value" in check:
         # Prometheus instant vector: {"resultType": "vector", "result": [{..., "value": float}]}
-        # Empty result = 0 (no series = metric is 0).
+        #
+        # An empty result is NOT zero here, and this gate learned that the
+        # expensive way: a drill remediated an incident on a cluster whose demo
+        # metrics were never scraped, the verify query matched no series, the old
+        # code read that as 0, 0 ≤ the threshold, and the executor recorded
+        # "executed and verified" for a fix nothing had observed. The failure
+        # mode generalises — a metric renamed, a scrape target down, a label
+        # dropped — and every one of them makes this gate pass at exactly the
+        # moment it is the only thing standing between a wrong action and the
+        # case memory learning that the action works.
+        #
+        # So: no series ⇒ the query cannot see the symptom ⇒ it cannot say the
+        # symptom stopped. Fail closed, and let a runbook opt out with
+        # `empty_ok: true` where absence genuinely is the signal.
         val: float | None = None
         if isinstance(output, dict):
             rt = output.get("resultType")
@@ -65,6 +78,11 @@ def _eval_verify_check(check: dict, output: Any) -> tuple[bool, str]:
                 val = float(output.get("value", 0))
             elif rt == "vector":
                 if not result:
+                    if not check.get("empty_ok"):
+                        return False, (
+                            "verify query matched no series — absence of data is not "
+                            "recovery (set empty_ok: true if it is, for this check)"
+                        )
                     val = 0.0
                 else:
                     raw = result[0].get("value")
