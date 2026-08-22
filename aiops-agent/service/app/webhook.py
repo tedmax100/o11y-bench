@@ -15,6 +15,7 @@ import time
 
 import httpx
 
+from .action_requests import is_drill
 from .agent import run_headless
 from .calibration import record_run
 from .case_memory import case_scope
@@ -46,8 +47,25 @@ def fingerprint(labels: dict) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
 
-def _in_cooldown(fp: str) -> bool:
-    last = _last_run.get(fp)
+def _cooldown_key(fp: str, labels: dict) -> str:
+    """What counts as "the same alert, again" for suppression purposes.
+
+    The fingerprint on its own conflates a rehearsal with the incident it
+    rehearses, and the cooldown is ten minutes wide — so a drill silently ate
+    the real alert that followed it four minutes later, and the RCA never ran.
+    The execution plane learned this same lesson one layer down (`idem_key`);
+    this is the gate in front of it.
+
+    The suffix goes on the drill side, so a production alert's key is exactly
+    what it has always been. `fp` itself is left alone on purpose: it is also
+    the LangGraph thread id and the key past cases are retrieved by, and
+    splitting it would hide a rehearsal's findings from the incident it is
+    about."""
+    return f"{fp}|drill" if is_drill(labels) else fp
+
+
+def _in_cooldown(key: str) -> bool:
+    last = _last_run.get(key)
     return last is not None and (time.monotonic() - last) < settings.alert_cooldown_seconds
 
 
@@ -190,11 +208,12 @@ async def handle_alert(payload: dict) -> dict:
 
         labels = alert.get("labels") or {}
         fp = fingerprint(labels)
-        if _in_cooldown(fp):
+        cooldown_key = _cooldown_key(fp, labels)
+        if _in_cooldown(cooldown_key):
             skipped.append({"fingerprint": fp, "reason": "cooldown"})
             continue
 
-        _last_run[fp] = time.monotonic()
+        _last_run[cooldown_key] = time.monotonic()
         task = asyncio.create_task(_investigate_and_sink(alert, fp))
         _tasks.add(task)
         task.add_done_callback(_tasks.discard)

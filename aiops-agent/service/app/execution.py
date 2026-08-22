@@ -479,7 +479,7 @@ def _is_drill(req: ActionRequest) -> bool:
     reads the ledger next year will not be able to reconstruct which rows were
     drills from the timestamps, and an un-marked drill is indistinguishable from
     a production incident in every ratio computed on top of it."""
-    return str((req.params or {}).get("drill", "")).lower() in ("true", "1", "yes")
+    return ar.is_drill(req.params)
 
 
 def _rubric_context(req: ActionRequest) -> str:

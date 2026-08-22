@@ -160,6 +160,23 @@ async def test_idempotent_duplicate_aborts(tmp_path, monkeypatch):
     assert "idempotent" in res["outcome"]
 
 
+async def test_a_rehearsal_does_not_block_the_real_execution(tmp_path, monkeypatch):
+    """Day41: the drill ran, then the real alert on the same incident and target
+    was refused as a duplicate of the practice run. The gate was doing its job
+    with a key that could not tell a rehearsal from the thing it rehearsed."""
+    p = _db(monkeypatch, tmp_path)
+    _wire_ok_dry_run(monkeypatch)
+    args = {"deployment": "x"}
+    drill = create_from_decision("fp1", _decision(), args=args, params={"drill": "True"}, path=p)
+    approve(drill.request_id, actor="alice", path=p)
+    store.ar_transition(drill.request_id, "approved", "executing", path=p)
+
+    real = create_from_decision("fp1", _decision(), args=args, params={"drill": "False"}, path=p)
+    approve(real.request_id, actor="bob", path=p)
+    res = await run(real.request_id, path=p)
+    assert res["status"] != Status.ABORTED.value
+
+
 async def test_open_breaker_aborts(tmp_path, monkeypatch):
     p = _db(monkeypatch, tmp_path)
     _wire_ok_dry_run(monkeypatch)

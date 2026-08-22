@@ -422,7 +422,7 @@ async def actions_grade_outcome(request_id: str, body: ActionOutcomeRequest):
         if row["phase"] == "verify" and row["verdict"] in ("pass", "fail"):
             verify_said = row["verdict"] == "pass"
 
-    drill = str((req.params or {}).get("drill", "")).lower() in ("true", "1", "yes")
+    drill = action_requests.is_drill(req.params)
     _store.action_outcome_put(
         request_id=request_id,
         resolved=body.resolved,

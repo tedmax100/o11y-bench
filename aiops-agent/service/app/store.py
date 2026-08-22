@@ -91,7 +91,7 @@ CREATE TABLE IF NOT EXISTS action_requests (
     blast_radius TEXT,                       -- json (filled in 7b-2)
     runbook_id TEXT,                         -- source runbook, for precondition revalidation
     params     TEXT NOT NULL DEFAULT '{}',   -- json incident params for revalidation
-    idem_key   TEXT NOT NULL DEFAULT '',     -- action|target|fp, for idempotency (7b-3)
+    idem_key   TEXT NOT NULL DEFAULT '',     -- action|target|fp[|drill], for idempotency (7b-3)
     created_ts TEXT NOT NULL,
     expires_ts TEXT NOT NULL,
     actor      TEXT,
@@ -1177,7 +1177,8 @@ def ar_find_ran(
     idem_key that already ran or is running **within the window**, else None.
     Empty idem_key never matches (no target to dedup on).
 
-    The window is the whole point. `idem_key` is `action|target|fp`, and `fp` is
+    The window is the whole point. `idem_key` is `action|target|fp` (rehearsals
+    carry a `|drill` suffix so they cannot spend a real incident's one action), and `fp` is
     deliberately stable across recurrences (it is also the investigation's
     thread_id), so an unbounded lookup does not mean "don't act twice on this
     incident" — it means "never act on this kind of incident again, for the life

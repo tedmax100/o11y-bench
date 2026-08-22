@@ -63,8 +63,8 @@ class ActionRequest(BaseModel):
     # diagnostics and confirm the preconditions still hold before acting (7b-2).
     runbook_id: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
-    # action|target|fp — idempotency key so an alert storm can't act on the same
-    # target twice for one incident (7b-3).
+    # action|target|fp (plus |drill on rehearsals) — idempotency key so an alert
+    # storm can't act on the same target twice for one incident (7b-3).
     idem_key: str = ""
     # The investigation run that produced this proposal. Without it the
     # executor's own verification could only label "the latest run of this
@@ -100,6 +100,33 @@ def target_of(args: dict | None) -> str:
         cm = args["configmap"]
         return f"{ns}/{cm}#{flag}" if flag else f"{ns}/{cm}"
     return f"{ns}/{args.get('deployment', '')}"
+
+
+def is_drill(params: dict | None) -> bool:
+    """Whether this request belongs to a rehearsal, read from the alert's own
+    labels. One parser, because three copies of `.lower() in ("true", ...)`
+    drift and a drill that reads as production is worse than either answer."""
+    return str((params or {}).get("drill", "")).lower() in ("true", "1", "yes")
+
+
+def idem_key_for(action: str, args: dict | None, fp: str, params: dict | None) -> str:
+    """`action|target|fp`, plus a `|drill` suffix on rehearsals.
+
+    Without the suffix a drill and the real incident share one key, so
+    rehearsing on an incident spends the one action that incident is allowed —
+    the real execution minutes later is refused as a duplicate of the practice
+    run. That happened, and it cost the only chance `remember_resolution()` had
+    to record what actually fixed the second incident, because drills
+    deliberately write nothing there. The two halves of the system already agree
+    a rehearsal is not evidence about a real incident; this is the last place
+    that still conflated them.
+
+    The suffix goes on the drill side on purpose. Production keys keep the exact
+    shape they have had since 7b-3, so every key already in the ledger still
+    matches itself — changing those would silently retire the deduplication
+    history instead of fixing it."""
+    key = f"{action}|{target_of(args)}|{fp}"
+    return f"{key}|drill" if is_drill(params) else key
 
 
 def _now() -> datetime:
@@ -151,7 +178,7 @@ def create_from_decision(
             # it isn't a suggestion, it's a surprise. The executor still re-runs
             # the dry-run before acting (the cluster moves between the two).
             blast_radius=blast_radius,
-            idem_key=f"{decision.action}|{target_of(args)}|{fp}",
+            idem_key=idem_key_for(decision.action, args, fp, params),
             # Pulled from the ambient scope rather than added to this signature:
             # every caller is inside the investigation that produced the
             # decision, and none of them has a reason to know about run ids.
