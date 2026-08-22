@@ -37,9 +37,11 @@ from __future__ import annotations
 
 import logging
 from enum import StrEnum
+from pathlib import Path
 
 from pydantic import BaseModel
 
+from . import store
 from .actions import ActionSpec, registry
 from .calibration import bin_evidence
 from .config import settings
@@ -63,6 +65,7 @@ class Decision(BaseModel):
     dq_note: str = ""
     act_note: str = ""
     rb_note: str = ""
+    ev_note: str = ""
     reversible: bool
     requires_approval: bool
 
@@ -150,6 +153,57 @@ def _calibration_verdict(calib: dict, *, human_labeled: int | None = None) -> tu
     )
 
 
+def regression_verdict(path=None) -> dict:
+    """The gate's view of the fixture record, in the same `proven_good` shape as
+    the DQ, actuation and runbook-health verdicts.
+
+    This is deliberately *not* merged into the production calibration curve. The
+    two answer different questions with evidence of different worth:
+
+    - production labels: is this agent right about live incidents, judged by a
+      person who read the transcript;
+    - the harness: has it regressed on questions whose answers we already know,
+      judged mechanically against a truth file on a baked stack.
+
+    Merging them would let dozens of grader labels vouch for a write to a live
+    cluster, and the clock probe already measured what that vouching is worth —
+    one fixture went 100% to 0% between two boots with untouched code, so a
+    fixture pass is evidence about the fixture. Kept apart, the harness answers
+    the one question it is good at, and AUTO requires both to clear the same
+    bar: the standard is identical, the bodies of evidence are not.
+
+    A missing or unreadable store is "no record", which earns no autonomy —
+    the same position taken on a runbook nobody has run.
+    """
+    if not settings.governance_regression_gate_enabled:
+        return {"proven_good": True, "note": "regression gate disabled"}
+    store_path = path or settings.eval_store_path
+    if not store_path or not Path(store_path).exists():
+        return {
+            "proven_good": False,
+            "note": "no fixture record to read; autonomy withheld",
+        }
+    try:
+        from .calibration import compute_calibration, load_records
+
+        modes = tuple(settings.governance_calibration_modes)
+        records = load_records(Path(store_path))
+        calib = compute_calibration(records, modes=modes)
+        graded = store.cal_count_by_source(
+            exclude_sources=_SELF_LABEL_SOURCES, modes=modes, path=store_path
+        )
+        good, note = _calibration_verdict(calib, human_labeled=graded)
+        return {
+            "proven_good": good,
+            "note": f"fixtures: {note}",
+            "labeled": calib.get("labeled") or 0,
+            "overconfidence": calib.get("overconfidence"),
+        }
+    except Exception as e:  # a gate that crashes must not read as a pass
+        logger.warning("regression verdict unavailable: %s", e)
+        return {"proven_good": False, "note": f"fixture record unreadable: {e}"}
+
+
 def decide(
     action: ActionSpec,
     confidence: float,
@@ -158,6 +212,7 @@ def decide(
     act: dict | None = None,
     rb: dict | None = None,
     rejected: dict | None = None,
+    ev: dict | None = None,
     *,
     path=None,
 ) -> Decision:
@@ -168,9 +223,16 @@ def decide(
     stale, on a write credential that can no longer be shown to work, and on a
     procedure whose own record says it does not fix this.
 
-    The four gates answer four different questions and none substitutes for
+    The five gates answer five different questions and none substitutes for
     another: *should we* (calibration), *is the map real* (DQ), *can we still
-    act* (actuation), *does this procedure still work* (runbook health)."""
+    act* (actuation), *does this procedure still work* (runbook health), *has it
+    regressed on what we already know the answer to* (the fixture record).
+
+    The last two are both "a record", and they are still not the same question:
+    runbook health is about one procedure, the fixture record is about the
+    agent's judgement. Nor is the fixture record a substitute for the
+    calibration curve — see `regression_verdict` for why they are counted
+    separately."""
     # For AUTO evaluation enforce the human-label minimum (§6.2 constraint 1).
     # Fetch lazily — only when confidence is high enough to reach the AUTO gate.
     # `path=None` means use settings.store_path; tests that don't wire a store
@@ -193,6 +255,7 @@ def decide(
     dq_note = dq.get("note", "") if dq else "DQ not evaluated"
     act_note = act.get("note", "") if act else "actuation readiness not evaluated"
     rb_note = rb.get("note", "") if rb else "runbook health not evaluated"
+    ev_note = ev.get("note", "") if ev else "fixture record not evaluated"
 
     def mk(level: Autonomy, reason: str) -> Decision:
         return Decision(
@@ -205,6 +268,7 @@ def decide(
             dq_note=dq_note,
             act_note=act_note,
             rb_note=rb_note,
+            ev_note=ev_note,
             reversible=action.reversible,
             requires_approval=action.requires_approval,
         )
@@ -253,10 +317,14 @@ def decide(
         return mk(Autonomy.PROPOSE, "high confidence but actuation readiness not proven-good")
     if rb is not None and not rb.get("proven_good"):
         return mk(Autonomy.PROPOSE, f"high confidence but {rb.get('note', 'runbook unproven')}")
+    if ev is not None and not ev.get("proven_good"):
+        return mk(
+            Autonomy.PROPOSE, f"high confidence but {ev.get('note', 'fixture record unproven')}"
+        )
     return mk(
         Autonomy.AUTO,
         "high confidence, reversible, calibration + data-quality + actuation + "
-        "runbook health proven-good",
+        "runbook health + fixture record proven-good",
     )
 
 
@@ -268,6 +336,7 @@ def propose_remediations(
     act: dict | None = None,
     rb: dict | None = None,
     rejected: dict[str, dict] | None = None,
+    ev: dict | None = None,
 ) -> list[Decision]:
     """Map a runbook's remediation step action names to registered actions and run
     each through the gate. Unregistered names are skipped (only the typed,
@@ -280,7 +349,7 @@ def propose_remediations(
         spec = registry.get(name)
         if spec is None:
             continue
-        out.append(decide(spec, confidence, calib, dq, act, rb, (rejected or {}).get(name)))
+        out.append(decide(spec, confidence, calib, dq, act, rb, (rejected or {}).get(name), ev))
     return out
 
 

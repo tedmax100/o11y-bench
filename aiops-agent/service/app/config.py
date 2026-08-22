@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -222,6 +224,18 @@ class Settings(BaseSettings):
     # question on the same column. Mixing them lets one mode's error cancel the
     # other's. Rows with no recorded mode are excluded (fail-closed).
     governance_calibration_modes: list[str] = ["culprit"]
+    # --- the regression gate: the fixture record, kept apart on purpose -------
+    # Production labels answer "is this agent right about live incidents"; the
+    # eval harness answers "has it regressed on the questions we already know
+    # the answers to". Merging the two stores would let 94 grader labels on a
+    # baked stack vouch for a write to a live cluster, and the clock probe
+    # measured what that evidence is worth: the same fixture went 100% to 0%
+    # between two boots with untouched code. So they are counted separately and
+    # AUTO requires both — same bar, two bodies of evidence.
+    governance_regression_gate_enabled: bool = True
+    # Where the harness writes. Empty string disables the gate the honest way
+    # (an unreadable store is "no record", which earns no autonomy).
+    eval_store_path: str = str(Path(__file__).resolve().parent / "eval" / "eval.db")
 
     # --- Draft runbook synthesis (knowledge-loop §1 閉環二) ----------------
     # When an investigation is labeled correct=True and no active runbook matched

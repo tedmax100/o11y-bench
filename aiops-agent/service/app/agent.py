@@ -1443,7 +1443,11 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
     if matched_rb and matched_rb.remediation:
         try:
             from .calibration import compute_calibration, load_records
-            from .governance import propose_remediations, runbook_health_verdict
+            from .governance import (
+                propose_remediations,
+                regression_verdict,
+                runbook_health_verdict,
+            )
             from .runbook import _subst, incident_params
             from .signals.actuation import actuation_verdict, refresh_actuation
             from .signals.dq import dq_verdict
@@ -1473,6 +1477,7 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
                 actuation_verdict(),
                 runbook_health_verdict(matched_rb.id) if settings.runbook_health_enabled else None,
                 rejected,
+                regression_verdict(),
             )
 
             # Materialize each AUTO/PROPOSE decision as a tracked ActionRequest the
