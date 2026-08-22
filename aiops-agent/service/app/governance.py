@@ -189,7 +189,9 @@ def regression_verdict(path=None) -> dict:
     - production labels: is this agent right about live incidents, judged by a
       person who read the transcript;
     - the harness: has it regressed on questions whose answers we already know,
-      judged mechanically against a truth file on a baked stack.
+      judged mechanically against a truth file on a baked stack. That record is
+      a committed file, not the harness's working database — see
+      app/eval/record.py for why the difference matters.
 
     Merging them would let dozens of grader labels vouch for a write to a live
     cluster, and the clock probe already measured what that vouching is worth —
@@ -206,17 +208,18 @@ def regression_verdict(path=None) -> dict:
     """
     if not settings.governance_regression_gate_enabled:
         return {"proven_good": True, "note": "regression gate disabled"}
-    store_path = path or settings.eval_store_path
-    if not store_path or not Path(store_path).exists():
+    record_path = path or settings.fixture_record_path
+    if not record_path or not Path(record_path).exists():
         return {
             "proven_good": False,
             "note": "no fixture record to read; autonomy withheld",
         }
     try:
-        from .calibration import compute_calibration, load_records
+        from .calibration import compute_calibration
+        from .eval.record import load as load_fixture_record
 
         modes = tuple(settings.governance_calibration_modes)
-        records = load_records(Path(store_path))
+        records = load_fixture_record(record_path)
         fresh, newest_age = _within_fixture_window(records)
         if not fresh:
             age_note = (

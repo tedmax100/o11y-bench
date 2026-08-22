@@ -16,6 +16,7 @@ from pathlib import Path
 from . import stack as stackmod
 from .harness import (
     DEFAULT_BASELINE,
+    DEFAULT_FIXTURE_RECORD,
     DEFAULT_FIXTURES,
     DEFAULT_STORE,
     format_ab_report,
@@ -39,6 +40,17 @@ def _main(argv: list[str] | None = None) -> int:
     pr = sub.add_parser("run", help="run the fixtures and print the report")
     pr.add_argument("--fixtures", type=Path, default=DEFAULT_FIXTURES)
     pr.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE)
+    pr.add_argument(
+        "--fixture-record",
+        type=Path,
+        default=DEFAULT_FIXTURE_RECORD,
+        help="committed JSONL the autonomy gate reads; new labels are appended for review",
+    )
+    pr.add_argument(
+        "--no-record",
+        action="store_true",
+        help="do not touch the fixture record (experiments that should not vouch for anything)",
+    )
     pr.add_argument(
         "--store",
         type=Path,
@@ -170,6 +182,21 @@ def _main(argv: list[str] | None = None) -> int:
     if args.save_baseline:
         save_baseline(args.baseline, summaries)
         print(f"  baseline saved to {args.baseline}")
+
+    # Copy the labels this run earned into the committed record the autonomy
+    # gate reads. Appending to a tracked file rather than writing the cluster
+    # directly is the point: the evidence that can unlock AUTO arrives as a diff
+    # a person merges. Nothing is committed here — that decision stays with the
+    # human who is about to read it.
+    if not args.no_record:
+        from ..calibration import load_records
+        from .record import append as append_record
+
+        added = append_record(load_records(args.store), args.fixture_record)
+        if added:
+            print(f"  {added} label(s) appended to {args.fixture_record} — review the diff")
+        else:
+            print(f"  no new labels for {args.fixture_record}")
 
     # Exit non-zero on a regression so CI can gate on it.
     regressed = any(base is not None and cur < base for _, base, cur in diff)

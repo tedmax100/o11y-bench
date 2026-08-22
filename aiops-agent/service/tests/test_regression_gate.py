@@ -8,6 +8,7 @@ clock probe had already measured what that vouching is worth (one fixture went
 against the same bar, and AUTO requires both.
 """
 
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -15,8 +16,8 @@ import pytest
 import app.governance as gov
 from app.actions import ActionSpec
 from app.calibration import CalibrationRecord, compute_calibration
+from app.eval.record import append as append_record
 from app.governance import Autonomy, decide, regression_verdict
-from app.store import cal_insert, cal_label
 
 
 def _spec(name="k8s.test"):
@@ -58,33 +59,23 @@ def _thresholds(monkeypatch):
 
 
 def _eval_store(tmp_path, *groups, source="eval-harness", age_days=1):
-    """A real eval store written through the same calls the harness uses."""
-    p = tmp_path / "eval.db"
+    """A fixture record written through the same call the harness uses."""
+    p = tmp_path / "fixture_record.jsonl"
     ts = (datetime.now(UTC) - timedelta(days=age_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    i = 0
+    records = []
     for conf, n_ok, n_bad in groups:
         for correct in [True] * n_ok + [False] * n_bad:
-            run_id = f"f{i}"
-            i += 1
-            cal_insert(
-                run_id=run_id,
-                ts=ts,
-                confidence=conf,
-                summary="s",
-                hypothesis="h",
-                suspected_version=None,
-                services=["order-service"],
-                grading_mode="culprit",
-                path=p,
+            records.append(
+                CalibrationRecord(
+                    run_id=f"eval-fx-{uuid.uuid4().hex[:8]}",
+                    ts=ts,
+                    confidence=conf,
+                    correct=correct,
+                    source=source,
+                    grading_mode="culprit",
+                )
             )
-            cal_label(
-                run_id=run_id,
-                correct=correct,
-                score=None,
-                source=source,
-                grading_mode="culprit",
-                path=p,
-            )
+    append_record(records, p)
     return p
 
 
@@ -113,15 +104,15 @@ def test_a_thin_fixture_record_earns_nothing(tmp_path):
     assert not regression_verdict(path=p)["proven_good"]
 
 
-def test_a_missing_store_is_no_record_not_a_pass(tmp_path):
-    v = regression_verdict(path=tmp_path / "does-not-exist.db")
+def test_a_missing_record_is_no_record_not_a_pass(tmp_path):
+    v = regression_verdict(path=tmp_path / "does-not-exist.jsonl")
     assert not v["proven_good"]
     assert "no fixture record" in v["note"]
 
 
 def test_the_gate_can_be_turned_off_explicitly(tmp_path, monkeypatch):
     monkeypatch.setattr(gov.settings, "governance_regression_gate_enabled", False)
-    assert regression_verdict(path=tmp_path / "nope.db")["proven_good"]
+    assert regression_verdict(path=tmp_path / "nope.jsonl")["proven_good"]
 
 
 def test_self_produced_labels_cannot_carry_the_fixture_record(tmp_path, monkeypatch):

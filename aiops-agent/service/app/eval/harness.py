@@ -40,6 +40,10 @@ _HERE = Path(__file__).parent
 DEFAULT_FIXTURES = _HERE / "fixtures.yaml"
 DEFAULT_BASELINE = _HERE / "baseline.json"
 DEFAULT_STORE = _HERE / "eval.db"  # separate from prod aiops.db unless overridden
+# The committed record the autonomy gate reads. eval.db is this harness's
+# working store and is gitignored; the gate must not depend on a file that only
+# exists on the machine that ran the build. See record.py.
+DEFAULT_FIXTURE_RECORD = _HERE / "fixture_record.jsonl"
 
 
 # ---- fixtures ---------------------------------------------------------------

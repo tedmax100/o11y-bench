@@ -247,9 +247,13 @@ class Settings(BaseSettings):
     # honest key would be the code version that produced them, which the
     # calibration rows do not carry.
     governance_fixture_max_age_days: int = 14
-    # Where the harness writes. Empty string disables the gate the honest way
-    # (an unreadable store is "no record", which earns no autonomy).
-    eval_store_path: str = str(Path(__file__).resolve().parent / "eval" / "eval.db")
+    # The committed record the gate reads — not `eval/eval.db`, which is
+    # gitignored and reached the image only because the build happened on a
+    # machine that had one. See app/eval/record.py. Empty string disables the
+    # gate the honest way (no record earns no autonomy).
+    fixture_record_path: str = str(
+        Path(__file__).resolve().parent / "eval" / "fixture_record.jsonl"
+    )
 
     # --- Draft runbook synthesis (knowledge-loop §1 閉環二) ----------------
     # When an investigation is labeled correct=True and no active runbook matched
