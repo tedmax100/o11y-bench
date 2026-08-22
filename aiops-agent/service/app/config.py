@@ -233,6 +233,20 @@ class Settings(BaseSettings):
     # between two boots with untouched code. So they are counted separately and
     # AUTO requires both — same bar, two bodies of evidence.
     governance_regression_gate_enabled: bool = True
+    # A regression gate reads a record with no expiry on it, which is how the
+    # first version of this gate came to read seven weeks of labels pooled into
+    # one number — and the pool was flattering: the same store reports +0.19
+    # mean overconfidence over everything and +0.42 over the last fortnight, so
+    # runs that predate most of the agent's code were voting that it is better
+    # calibrated than it is. DQ and actuation both expire their evidence; this
+    # one now does too.
+    #
+    # 14 days is the shortest window that still clears
+    # governance_min_labeled_runs on the current record (32 labels), and it
+    # drops the June runs. It is a proxy for "labels about *this* agent" — the
+    # honest key would be the code version that produced them, which the
+    # calibration rows do not carry.
+    governance_fixture_max_age_days: int = 14
     # Where the harness writes. Empty string disables the gate the honest way
     # (an unreadable store is "no record", which earns no autonomy).
     eval_store_path: str = str(Path(__file__).resolve().parent / "eval" / "eval.db")

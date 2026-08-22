@@ -8,6 +8,8 @@ clock probe had already measured what that vouching is worth (one fixture went
 against the same bar, and AUTO requires both.
 """
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 import app.governance as gov
@@ -51,12 +53,14 @@ def _thresholds(monkeypatch):
     monkeypatch.setattr(gov.settings, "governance_min_band_accuracy", 0.7)
     monkeypatch.setattr(gov.settings, "governance_min_human_labeled_runs", 0)
     monkeypatch.setattr(gov.settings, "governance_regression_gate_enabled", True)
+    monkeypatch.setattr(gov.settings, "governance_fixture_max_age_days", 14)
     yield
 
 
-def _eval_store(tmp_path, *groups, source="eval-harness"):
+def _eval_store(tmp_path, *groups, source="eval-harness", age_days=1):
     """A real eval store written through the same calls the harness uses."""
     p = tmp_path / "eval.db"
+    ts = (datetime.now(UTC) - timedelta(days=age_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     i = 0
     for conf, n_ok, n_bad in groups:
         for correct in [True] * n_ok + [False] * n_bad:
@@ -64,7 +68,7 @@ def _eval_store(tmp_path, *groups, source="eval-harness"):
             i += 1
             cal_insert(
                 run_id=run_id,
-                ts="2026-01-01T00:00:00Z",
+                ts=ts,
                 confidence=conf,
                 summary="s",
                 hypothesis="h",
@@ -165,3 +169,43 @@ def test_an_unevaluated_fixture_record_is_not_a_veto(tmp_path):
     d = decide(_spec(), 0.9, _good_curve(), None, None, None, None, None)
     assert d.autonomy is Autonomy.AUTO
     assert d.ev_note == "fixture record not evaluated"
+
+
+# ---- freshness: a regression gate reading old labels is not a regression gate
+
+
+def test_labels_older_than_the_window_stop_counting(tmp_path):
+    """The shipped version pooled seven weeks into one number, and the pool was
+    flattering: +0.19 over everything, +0.42 over the last fortnight. Runs that
+    predate most of the agent's code were voting it well calibrated."""
+    p = _eval_store(tmp_path, (0.9, 9, 1), (0.6, 6, 4), (0.3, 3, 7), age_days=40)
+    v = regression_verdict(path=p)
+    assert not v["proven_good"]
+    assert "older code" in v["note"]
+    assert v["newest_age_days"] == 40
+
+
+def test_a_stale_record_cannot_be_rescued_by_its_own_size(tmp_path):
+    """Many old labels are still old labels — volume is not freshness."""
+    p = _eval_store(tmp_path, (0.9, 90, 10), age_days=90)
+    assert not regression_verdict(path=p)["proven_good"]
+
+
+def test_only_the_labels_inside_the_window_shape_the_curve(tmp_path, monkeypatch):
+    """A clean recent record must not be dragged under by an old bad one, and
+    the reverse — which is the direction that actually happened."""
+    p = _eval_store(tmp_path, (0.9, 9, 1), (0.6, 6, 4), (0.3, 3, 7), age_days=1)
+    v_fresh = regression_verdict(path=p)
+    assert v_fresh["proven_good"], v_fresh["note"]
+    # Now add a wildly overconfident batch from outside the window.
+    _add = _eval_store(tmp_path, (0.9, 0, 30), age_days=60)
+    assert _add == p  # same file
+    v = regression_verdict(path=p)
+    assert v["proven_good"], f"out-of-window labels leaked into the curve: {v['note']}"
+
+
+def test_the_note_says_how_old_the_evidence_is(tmp_path):
+    """Same courtesy the actuation verdict pays ("checked 11s ago") — a gate
+    that refuses should say what it read."""
+    p = _eval_store(tmp_path, (0.9, 9, 1), (0.6, 6, 4), (0.3, 3, 7), age_days=2)
+    assert "newest label 2d ago" in regression_verdict(path=p)["note"]

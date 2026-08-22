@@ -36,12 +36,13 @@ on purpose: "should we" vs "can we".
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel
 
-from . import store
 from .actions import ActionSpec, registry
 from .calibration import bin_evidence
 from .config import settings
@@ -153,6 +154,31 @@ def _calibration_verdict(calib: dict, *, human_labeled: int | None = None) -> tu
     )
 
 
+def _within_fixture_window(records: list) -> tuple[list, int | None]:
+    """(records inside the freshness window, age in days of the newest label).
+
+    Returns an empty list when the newest label is already outside the window,
+    so the caller fails closed rather than computing a curve over nothing.
+    """
+    max_age = settings.governance_fixture_max_age_days
+    now = datetime.now(UTC)
+    ages: list[tuple[int, Any]] = []
+    for r in records:
+        if r.correct is None or not r.ts:
+            continue
+        try:
+            ts = datetime.strptime(r.ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        except ValueError:  # an unparseable stamp is not evidence of freshness
+            continue
+        ages.append(((now - ts).days, r))
+    if not ages:
+        return [], None
+    newest = min(a for a, _ in ages)
+    if newest > max_age:
+        return [], newest
+    return [r for a, r in ages if a <= max_age], newest
+
+
 def regression_verdict(path=None) -> dict:
     """The gate's view of the fixture record, in the same `proven_good` shape as
     the DQ, actuation and runbook-health verdicts.
@@ -173,7 +199,10 @@ def regression_verdict(path=None) -> dict:
     bar: the standard is identical, the bodies of evidence are not.
 
     A missing or unreadable store is "no record", which earns no autonomy —
-    the same position taken on a runbook nobody has run.
+    the same position taken on a runbook nobody has run. So is a record that has
+    gone stale: labels age out of the window, and a store whose newest label
+    falls outside it stops counting entirely rather than quietly vouching for
+    code it never ran against.
     """
     if not settings.governance_regression_gate_enabled:
         return {"proven_good": True, "note": "regression gate disabled"}
@@ -188,16 +217,37 @@ def regression_verdict(path=None) -> dict:
 
         modes = tuple(settings.governance_calibration_modes)
         records = load_records(Path(store_path))
-        calib = compute_calibration(records, modes=modes)
-        graded = store.cal_count_by_source(
-            exclude_sources=_SELF_LABEL_SOURCES, modes=modes, path=store_path
+        fresh, newest_age = _within_fixture_window(records)
+        if not fresh:
+            age_note = (
+                f"newest label {newest_age}d old (> {settings.governance_fixture_max_age_days}d)"
+                if newest_age is not None
+                else "no labels with a readable timestamp"
+            )
+            return {
+                "proven_good": False,
+                "note": f"fixtures: {age_note}; the record is about older code",
+                "labeled": 0,
+                "newest_age_days": newest_age,
+            }
+        calib = compute_calibration(fresh, modes=modes)
+        # Count the floor over the same rows the curve is computed over — in
+        # window, same modes — for the reason cal_count_by_source states: a
+        # floor counted on a wider set than the curve is not a floor.
+        graded = sum(
+            1
+            for r in fresh
+            if r.correct is not None
+            and r.source not in _SELF_LABEL_SOURCES
+            and (r.grading_mode in modes if modes else True)
         )
         good, note = _calibration_verdict(calib, human_labeled=graded)
         return {
             "proven_good": good,
-            "note": f"fixtures: {note}",
+            "note": f"fixtures: {note} (newest label {newest_age}d ago)",
             "labeled": calib.get("labeled") or 0,
             "overconfidence": calib.get("overconfidence"),
+            "newest_age_days": newest_age,
         }
     except Exception as e:  # a gate that crashes must not read as a pass
         logger.warning("regression verdict unavailable: %s", e)
