@@ -1,0 +1,13 @@
+讀 /home/nathan/Project/o11y-bench/demo-services/story-to-handdrawn-video/codex-image-jobs.json。
+
+照 jobs 陣列的順序執行，總共 19 個：先做 id=character_reference，再做 01 到 18。
+順序不能亂——每個場景 job 的 references 欄位都指向 00_character_reference.png，
+那張必須先存在，後面的角色才會一致。
+
+每一個 job：
+- prompt 用該 job 的 prompt_file 那個檔案的完整內容，不要改寫、不要摘要
+- references 陣列裡列的圖當輸入參考圖
+- 產出用 Image2 生成，存成該 job 的 output_master 指定的絕對路徑，PNG 格式
+
+全部做完之後不要自己 render，也不要改 storyboard，
+只回報哪幾個 id 成功、哪幾個失敗。
