@@ -44,11 +44,20 @@ Day1 有事故、有數字，故事線是現成的。Day2 是純概念日，沒�
 
 ## 做第二天以後要記得的兩件事
 
-**渲染輸出的檔名是固定的。** `--mode render` 一律寫到 `<專案>/out/picture_silent.mp4`，
-所以下一天一渲染就把上一天蓋掉。跑之前先把前一支複製到這裡的 `out/`（檔名帶日號）。
-那個資料夾不進版控，影片一支七 MB。
+**渲染輸出的檔名是固定的。** `--mode render` 一律寫到
+`demo-services/story-to-handdrawn-video/out/picture_silent.mp4`，所以下一天一渲染
+就把上一天蓋掉。渲染完馬上複製一份到這裡的 `out/`，檔名帶日號：
+
+```bash
+cp /home/nathan/Project/o11y-bench/demo-services/story-to-handdrawn-video/out/picture_silent.mp4 \
+   /home/nathan/Project/o11y-bench/weaver-demo/ironman-2026/video/out/dayNN-picture_silent.mp4
+```
+
+那個 `out/` 不進版控，影片一支七 MB。
 
 **角色表要沿用，不要重畫。** 每換一次標題就是一個新的 fingerprint 資料夾，
 照流程會重畫一張角色表，機器人就會長得不太一樣。把前一天的
-`00_character_reference.png` 複製到新資料夾再跑 `gen_images.py`，
-它會 skip 掉那一張，於是所有場景參照的是同一張表。
+`00_character_reference.png` 複製到新資料夾再跑 `gen_images.py`，它會 skip 掉那一張，
+於是所有場景參照的是同一張表。新舊資料夾的名字在 `--mode generate` 的輸出裡（
+`prompts/generated/codex/<標題>-<fingerprint>`），對應的圖放在
+`public/assets/generated/codex/<同名>/`。
