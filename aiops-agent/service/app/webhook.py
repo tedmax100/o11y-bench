@@ -147,6 +147,10 @@ async def _run_and_sink(alert: dict, fp: str, scope) -> None:
             run_id=scope.run_id if scope else fp,
             case_key=scope.case_key if scope else None,
             fp=fp,
+            # A rehearsal says so in its alert labels, and this is where that
+            # fact has to be written down: nothing downstream can tell a drill
+            # from an incident by looking at the run.
+            drill=is_drill(alert.get("labels") or {}),
         )
         for d in result.get("decisions") or []:
             logger.info(

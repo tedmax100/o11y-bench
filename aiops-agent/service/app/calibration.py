@@ -61,6 +61,10 @@ class CalibrationRecord(BaseModel):
     # right (the only reading the ECE/Brier math assumes); "inconclusive" = did
     # the run appropriately hedge on a non-incident. None = unknown.
     grading_mode: str | None = None
+    # A rehearsal, not a live incident. Kept out of the production curve and out
+    # of the gate's human-label floor: replaying one drill six times is one piece
+    # of evidence recorded six times, and the gate would read it as six.
+    drill: bool = False
     # The alert instance this run belonged to. Distinct from run_id since Day38;
     # on rows written before that they are the same string.
     fp: str | None = None
@@ -86,6 +90,7 @@ def record_run(
     *,
     case_key: str | None = None,
     fp: str | None = None,
+    drill: bool = False,
 ) -> CalibrationRecord | None:
     """Append a pending record for a finished headless run. Best-effort: returns
     None and logs on any failure, never raises into the run."""
@@ -100,6 +105,7 @@ def record_run(
             hypothesis=getattr(findings, "hypothesis", "") or "",
             suspected_version=getattr(findings, "suspected_version", None),
             services=list(getattr(findings, "services", []) or []),
+            drill=drill,
         )
         store.cal_insert(
             run_id=rec.run_id,
@@ -111,6 +117,7 @@ def record_run(
             services=rec.services,
             case_key=case_key,
             fp=fp,
+            drill=drill,
             path=path,
         )
         return rec
@@ -227,6 +234,19 @@ def filter_by_mode(
     if modes is None:
         return list(records)
     return [r for r in records if r.grading_mode in modes]
+
+
+def production_records(records: list[CalibrationRecord]) -> list[CalibrationRecord]:
+    """The rows that are evidence about live incidents — everything but drills.
+
+    A rehearsal is a real run and it stays in the store; it just does not get to
+    vouch for autonomy. The demo record makes the reason concrete: six replays of
+    one drill, all at 0.95 and all right about the same seeded fault, would have
+    lifted the decision band on their own. That is one piece of evidence counted
+    six times, which is the mistake `executions.drill` already exists to prevent
+    one layer down.
+    """
+    return [r for r in records if not r.drill]
 
 
 def hedging_rate(records: list[CalibrationRecord]) -> dict[str, Any]:

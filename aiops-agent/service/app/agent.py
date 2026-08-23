@@ -1442,7 +1442,7 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
     decisions: list = []
     if matched_rb and matched_rb.remediation:
         try:
-            from .calibration import compute_calibration, load_records
+            from .calibration import compute_calibration, load_records, production_records
             from .governance import (
                 propose_remediations,
                 regression_verdict,
@@ -1459,8 +1459,12 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
 
             # Only the grading modes whose `correct` means what the calibration
             # math assumes — see settings.governance_calibration_modes.
+            # Rehearsals are excluded here for the same reason the executor
+            # counts them apart: a drill replayed is one piece of evidence, not
+            # many, and this number decides whether the next action needs a human.
             calib = compute_calibration(
-                load_records(), modes=tuple(settings.governance_calibration_modes)
+                production_records(load_records()),
+                modes=tuple(settings.governance_calibration_modes),
             )
             # What a person has already turned down on this incident. Looked up
             # per (action, target) rather than per action: "don't restart

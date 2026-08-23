@@ -188,3 +188,62 @@ def test_record_run_disabled_is_noop(tmp_path, monkeypatch):
     monkeypatch.setattr(cal.settings, "calibration_enabled", False)
     assert record_run(NS(confidence=0.5), run_id="x") is None
     assert not p.exists()
+
+
+# ---- rehearsals are not evidence about live incidents ------------------------
+
+
+def _rec_drill(conf, correct, drill, mode="culprit"):
+    return CalibrationRecord(
+        run_id=f"r{conf}{correct}{drill}",
+        ts="2026-08-23T00:00:00Z",
+        confidence=conf,
+        correct=correct,
+        grading_mode=mode,
+        drill=drill,
+    )
+
+
+def test_production_records_drops_drills():
+    recs = [_rec_drill(0.9, True, True), _rec_drill(0.9, False, False)]
+    assert [r.drill for r in cal.production_records(recs)] == [False]
+
+
+def test_a_replayed_drill_cannot_lift_the_curve():
+    """Six replays of one rehearsal, all right at 0.95, is one piece of evidence
+    recorded six times — the exact shape that would have opened the decision
+    band on its own."""
+    drills = [_rec_drill(0.95, True, True) for _ in range(6)]
+    real = [_rec_drill(0.95, False, False)]
+    everything = compute_calibration(drills + real, modes=("culprit",))
+    production = compute_calibration(cal.production_records(drills + real), modes=("culprit",))
+    assert everything["labeled"] == 7
+    assert production["labeled"] == 1
+    # And the sign of the verdict flips with it.
+    assert everything["overconfidence"] < production["overconfidence"]
+
+
+def test_drill_flag_round_trips_through_the_store(tmp_path, monkeypatch):
+    p = tmp_path / "aiops.db"
+    monkeypatch.setattr(cal.store.settings, "store_path", str(p))
+    for run_id, drill in (("real", False), ("rehearsal", True)):
+        cal.store.cal_insert(
+            run_id=run_id,
+            ts="t",
+            confidence=0.9,
+            summary="s",
+            hypothesis="h",
+            suspected_version=None,
+            services=[],
+            grading_mode="culprit",
+            drill=drill,
+            path=p,
+        )
+        cal.store.cal_label(run_id, correct=True, score=1.0, source="human", path=p)
+    assert {r.run_id: r.drill for r in load_records(p)} == {
+        "real": False,
+        "rehearsal": True,
+    }
+    # The gate's human-label floor is counted over the same rows as the curve.
+    assert cal.store.cal_count_by_source(modes=("culprit",), path=p) == 2
+    assert cal.store.cal_count_by_source(modes=("culprit",), exclude_drills=True, path=p) == 1

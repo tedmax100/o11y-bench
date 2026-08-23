@@ -291,6 +291,12 @@ _MIGRATIONS = [
     # address by, so "the latest run of this alert" is a lookup someone wrote
     # down rather than a collision nobody noticed.
     "ALTER TABLE calibration ADD COLUMN fp TEXT",
+    # A rehearsal is a real run and belongs in the ledger, but it is not evidence
+    # about live incidents: the same drill replayed six times would vouch for
+    # autonomy six times over. `executions.drill` already made this split for the
+    # action ledger; the calibration curve was still averaging both together,
+    # which is the same mistake one layer up.
+    "ALTER TABLE calibration ADD COLUMN drill INTEGER NOT NULL DEFAULT 0",
     # Which run produced this proposal — so the executor's own verification
     # labels that run, not every run that ever shared the fingerprint.
     "ALTER TABLE action_requests ADD COLUMN run_id TEXT",
@@ -421,6 +427,7 @@ def cal_insert(
     grading_mode: str | None = None,
     case_key: str | None = None,
     fp: str | None = None,
+    drill: bool = False,
     path: str | Path | None = None,
 ) -> None:
     """Append a pending calibration record (correct=NULL until labeled).
@@ -432,8 +439,8 @@ def cal_insert(
         conn.execute(
             "INSERT INTO calibration "
             "(run_id, ts, confidence, summary, hypothesis, suspected_version, services, "
-            "grading_mode, case_key, fp) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "grading_mode, case_key, fp, drill) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (
                 run_id,
                 ts,
@@ -445,6 +452,7 @@ def cal_insert(
                 grading_mode,
                 case_key,
                 fp,
+                1 if drill else 0,
             ),
         )
 
@@ -524,6 +532,7 @@ def cal_count_by_source(
     *,
     exclude_sources: tuple[str, ...] = (),
     modes: tuple[str, ...] | None = None,
+    exclude_drills: bool = False,
     path: str | Path | None = None,
 ) -> int:
     """Count labeled calibration records, optionally excluding specific sources
@@ -532,8 +541,14 @@ def cal_count_by_source(
 
     `modes` must match whatever the caller feeds `compute_calibration` — a floor
     counted over a wider set than the curve is computed over is not a floor.
-    NULL grading_mode never matches a mode filter (fail-closed on unknowns)."""
+    NULL grading_mode never matches a mode filter (fail-closed on unknowns).
+
+    `exclude_drills` is the same rule for the same reason: the gate counts this
+    floor over the rows the curve is computed over, and the curve does not count
+    rehearsals."""
     where = ["correct IS NOT NULL"]
+    if exclude_drills:
+        where.append("drill = 0")
     params: list[Any] = []
     if exclude_sources:
         placeholders = ",".join("?" * len(exclude_sources))
@@ -554,13 +569,20 @@ def cal_load(path: str | Path | None = None) -> list[dict[str, Any]]:
     correct mapped back to bool/None)."""
     with _connect(path) as conn:
         rows = conn.execute(
+            # The record model declares error_dimension and correction_note;
+            # this list did not select them, so every reader that went through
+            # load_records() saw a wrong verdict with no trace of why — which is
+            # exactly the field you need when auditing whether a verdict was
+            # itself a mistake.
             "SELECT run_id, ts, confidence, correct, score, source, summary, "
-            "hypothesis, suspected_version, services, grading_mode FROM calibration ORDER BY id"
+            "hypothesis, suspected_version, services, grading_mode, drill, "
+            "error_dimension, correction_note FROM calibration ORDER BY id"
         ).fetchall()
     out: list[dict[str, Any]] = []
     for r in rows:
         d = dict(r)
         d["correct"] = None if d["correct"] is None else bool(d["correct"])
+        d["drill"] = bool(d.get("drill"))
         d["services"] = json.loads(d["services"] or "[]")
         out.append(d)
     return out
