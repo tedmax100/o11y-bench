@@ -1,6 +1,8 @@
 import asyncio
 import json
 import uuid
+from datetime import UTC, datetime
+from typing import Any
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -268,6 +270,54 @@ async def cases_context(service: str, alertname: str | None = None):
     }
 
 
+@app.get("/cases")
+async def cases_list(
+    service: str | None = None,
+    status: str | None = None,
+    unlabeled: bool | None = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    """Browse case memory. Everything is here — including what recall hides.
+
+    Until now the only way to see what this system had learned was to exec into
+    the pod and open the SQLite file, which meant in practice that nobody
+    looked. `unlabeled=true` is the query a todo view wants: the cases carrying
+    no trusted root cause, i.e. the ones a human could still turn into
+    precedent.
+    """
+    return store.case_list(
+        service=service, status=status, unlabeled=unlabeled, limit=limit, offset=offset
+    )
+
+
+@app.get("/cases/{case_key}")
+async def cases_get(case_key: str):
+    """One case with the two things that explain it: the runs it was made of and
+    the paths already ruled out.
+
+    `recallable` is answered by asking the recall query itself rather than by
+    re-deriving its conditions here — a second copy of "is this fresh and
+    trusted enough" would drift from the one that decides what a prompt
+    actually sees, and this endpoint exists to tell the truth about that.
+    """
+    case = store.case_get(case_key)
+    if case is None:
+        raise HTTPException(status_code=404, detail=f"no such case {case_key}")
+    recallable = any(
+        c["case_key"] == case_key
+        for c in store.case_query_similar(
+            service=case.get("service") or "", alertname=case.get("alertname"), limit=50
+        )
+    )
+    return {
+        "case": case,
+        "recallable": recallable,
+        "runs": store.case_runs(case_key),
+        "dead_ends": store.case_dead_ends_all(case_key),
+    }
+
+
 @app.get("/actions/requests")
 async def actions_requests_list(status: str | None = None, limit: int = 50):
     """List action requests (optionally filtered by status), newest first."""
@@ -305,6 +355,49 @@ async def actions_request_reject(request_id: str, body: RejectRequest):
             status_code=409, detail="request not rejectable (missing or already decided)"
         )
     return req.model_dump()
+
+
+class RootCauseRequest(ActorRequest):
+    root_cause: str
+    # Which run's reasoning is being blessed, when the person is looking at one.
+    # Optional because a root cause can also be known from outside the agent
+    # entirely — a postmortem, a vendor's status page — and that is still worth
+    # recording; it just names no run.
+    run_id: str | None = None
+
+
+@app.post("/cases/{case_key}/root-cause")
+async def case_set_root_cause(case_key: str, body: RootCauseRequest):
+    """A person says what actually caused this incident.
+
+    The missing half of case memory. Everything else could already write a root
+    cause — the grader, the eval harness, the label path on an investigation —
+    but a human looking straight at the case could not, so the queue of
+    incidents with no cause had no way to be worked down. `source` is fixed to
+    `human` here rather than taken from the request: this endpoint is the human,
+    and letting a caller name its own source is exactly how self-attestation
+    gets in.
+    """
+    root_cause = body.root_cause.strip()
+    if not root_cause:
+        raise HTTPException(status_code=400, detail="root_cause must not be empty")
+    ok = store.case_confirm(
+        case_key,
+        root_cause=root_cause,
+        source="human",
+        run_id=body.run_id or "",
+        ts=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"no such case {case_key}")
+    audit.record(
+        "case_root_cause",
+        "ok",
+        fp=case_key,
+        actor=body.actor,
+        detail={"root_cause": root_cause, "run_id": body.run_id},
+    )
+    return store.case_get(case_key)
 
 
 @app.post("/cases/{case_key}/forget")

@@ -904,6 +904,96 @@ def case_query_similar(
     return [_case_row(r) for r in rows]
 
 
+def case_list(
+    service: str | None = None,
+    status: str | None = None,
+    unlabeled: bool | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Every case, newest activity first — the browse view, not the recall view.
+
+    Deliberately *not* `case_query_similar` with the filters relaxed. That query
+    answers "what should the next run be told", so it hides everything a person
+    browsing most needs to see: the case nobody has labelled, the one that aged
+    out of the window, the false positive. Two queries with two different jobs
+    beat one query with a `trusted_only=False` flag that nobody can keep
+    straight at the call site.
+
+    `unlabeled=True` narrows to the cases with no root cause from a trusted
+    source — the ones a human could still turn into precedent, which is the
+    only reason a todo view would call this.
+
+    Returns the page plus the unpaged `total`, because a list that cannot say
+    "12 more" is a list that quietly lies about how much is waiting.
+    """
+    where = "1=1"
+    params: list[Any] = []
+    if service:
+        where += " AND service = ?"
+        params.append(service)
+    if status:
+        where += " AND status = ?"
+        params.append(status)
+    if unlabeled is not None:
+        src = ",".join("?" * len(TRUSTED_ROOT_CAUSE_SOURCES))
+        cond = f"(root_cause IS NOT NULL AND root_cause_source IN ({src}))"
+        where += f" AND {'NOT ' if unlabeled else ''}{cond}"
+        params.extend(TRUSTED_ROOT_CAUSE_SOURCES)
+    with _connect(path) as conn:
+        total = conn.execute(f"SELECT COUNT(*) AS n FROM cases WHERE {where}", params).fetchone()[
+            "n"
+        ]
+        rows = conn.execute(
+            f"SELECT * FROM cases WHERE {where} ORDER BY last_ts DESC, occurrences DESC"
+            " LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        ).fetchall()
+    return {"cases": [_case_row(r) for r in rows], "total": total}
+
+
+def case_dead_ends_all(
+    key: str, limit: int = 100, path: str | Path | None = None
+) -> list[dict[str, Any]]:
+    """Every dead end on this case, retired ones included, newest first.
+
+    The recall path (`case_ruled_out_for`) drops what it no longer trusts. Here
+    that would be the wrong answer twice over: "this was ruled out and then
+    un-ruled-out" is exactly what somebody auditing a case has come to find out,
+    and a detail view that silently omits rows makes the case look emptier than
+    it is.
+    """
+    with _connect(path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM case_ruled_out WHERE case_key=? ORDER BY id DESC LIMIT ?",
+            (key, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def case_runs(key: str, limit: int = 20, path: str | Path | None = None) -> list[dict[str, Any]]:
+    """The runs that were about this case, newest first, with their verdict.
+
+    Investigations is the spine: it has a row per run whether or not anyone ever
+    had an opinion. The calibration join is left, so an unlabelled run shows up
+    with `correct = None` rather than vanishing — those are precisely the runs a
+    todo view is looking for.
+    """
+    with _connect(path) as conn:
+        rows = conn.execute(
+            """
+            SELECT i.run_id, i.fp, i.ts, c.correct, c.grading_mode, c.error_dimension
+            FROM investigations i
+            LEFT JOIN calibration c ON c.run_id = i.run_id
+            WHERE i.case_key = ?
+            ORDER BY i.id DESC LIMIT ?
+            """,
+            (key, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def case_forget(key: str, path: str | Path | None = None) -> dict[str, int]:
     """Retract what this case claims to know, without deleting the case.
 

@@ -437,3 +437,90 @@ def test_case_tables_survive_a_reconnect(tmp_path, monkeypatch):
     store.case_upsert(key=key, ts="t", alertname="a", service="svc", path=p)
     with sqlite3.connect(str(p)) as conn:
         assert conn.execute("SELECT COUNT(*) FROM cases").fetchone()[0] == 1
+
+
+# ---- The read side of case memory: browse, not recall ------------------------
+
+
+def _case(p, key, *, ts, service="payment-service", alertname="a", status="open"):
+    store.case_upsert(key=key, ts=ts, alertname=alertname, service=service, path=p)
+    if status != "open":
+        store.case_set_status(key, status, p)
+    return key
+
+
+def test_case_list_shows_what_recall_hides(tmp_path, monkeypatch):
+    """The browse view must include the unlabelled and the false-positive cases —
+    they are exactly the ones a person needs to act on."""
+    p = _cfg(monkeypatch, tmp_path)
+    _case(p, "k-open", ts="2026-08-20T00:00:00Z")
+    _case(p, "k-fp", ts="2026-08-21T00:00:00Z", status="false_positive")
+    assert store.case_query_similar("payment-service", path=p) == []
+    out = store.case_list(path=p)
+    assert out["total"] == 2
+    assert [c["case_key"] for c in out["cases"]] == ["k-fp", "k-open"]  # newest activity first
+
+
+def test_case_list_unlabeled_is_the_todo_query(tmp_path, monkeypatch):
+    p = _cfg(monkeypatch, tmp_path)
+    _case(p, "k-labeled", ts="2026-08-20T00:00:00Z")
+    _case(p, "k-todo", ts="2026-08-21T00:00:00Z")
+    store.case_confirm(
+        "k-labeled",
+        root_cause="new_validator rejects odd cents",
+        source="human",
+        run_id="r1",
+        ts="2026-08-20T01:00:00Z",
+        path=p,
+    )
+    assert [c["case_key"] for c in store.case_list(unlabeled=True, path=p)["cases"]] == ["k-todo"]
+    assert [c["case_key"] for c in store.case_list(unlabeled=False, path=p)["cases"]] == [
+        "k-labeled"
+    ]
+
+
+def test_case_list_paginates_without_lying_about_the_total(tmp_path, monkeypatch):
+    p = _cfg(monkeypatch, tmp_path)
+    for i in range(3):
+        _case(p, f"k{i}", ts=f"2026-08-2{i}T00:00:00Z")
+    out = store.case_list(limit=1, offset=1, path=p)
+    assert out["total"] == 3 and [c["case_key"] for c in out["cases"]] == ["k1"]
+
+
+def test_case_dead_ends_all_keeps_the_retired_ones(tmp_path, monkeypatch):
+    """A dead end that was later un-ruled-out is the audit trail, not noise."""
+    p = _cfg(monkeypatch, tmp_path)
+    key = _case(p, "k", ts="2026-08-20T00:00:00Z")
+    for subject in ("live", "retired"):
+        store.ruled_out_insert(
+            key=key, run_id="r", ts="t", kind="query", subject=subject, disproved_by="human", path=p
+        )
+    store.ruled_out_invalidate(key, path=p)
+    store.ruled_out_insert(
+        key=key, run_id="r", ts="t", kind="query", subject="fresh", disproved_by="human", path=p
+    )
+    rows = store.case_dead_ends_all(key, path=p)
+    assert [r["subject"] for r in rows] == ["fresh", "retired", "live"]
+    assert [r["still_valid"] for r in rows] == [1, 0, 0]
+
+
+def test_case_runs_keeps_the_unlabelled_run(tmp_path, monkeypatch):
+    p = _cfg(monkeypatch, tmp_path)
+    key = _case(p, "k", ts="2026-08-20T00:00:00Z")
+    for run_id, ts in (("r1", "t1"), ("r2", "t2")):
+        store.inv_insert(
+            "fp1", ts, json.dumps({"service": "payment-service"}), p, run_id=run_id, case_key=key
+        )
+    store.cal_insert(
+        run_id="r2",
+        ts="t2",
+        confidence=0.7,
+        summary="s",
+        hypothesis="h",
+        suspected_version=None,
+        services=["payment-service"],
+        path=p,
+    )
+    store.cal_label("r2", correct=True, score=1.0, source="human", path=p)
+    runs = store.case_runs(key, path=p)
+    assert [(r["run_id"], r["correct"]) for r in runs] == [("r2", 1), ("r1", None)]
