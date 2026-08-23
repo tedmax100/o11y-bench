@@ -41,6 +41,20 @@
     },
     {
       "type": "page",
+      "icon": "check-square",
+      "name": "Todo",
+      "path": "/a/%PLUGIN_ID%/todo",
+      "addToNav": true
+    },
+    {
+      "type": "page",
+      "icon": "book",
+      "name": "Cases",
+      "path": "/a/%PLUGIN_ID%/cases",
+      "addToNav": true
+    },
+    {
+      "type": "page",
       "icon": "cog",
       "name": "Configuration",
       "path": "/plugins/%PLUGIN_ID%",

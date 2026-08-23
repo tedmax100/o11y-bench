@@ -6,6 +6,8 @@ export enum ROUTES {
   Chat = 'chat',
   Traces = 'traces',
   Investigations = 'investigations',
+  Cases = 'cases',
+  Todo = 'todo',
 }
 
 export const DEFAULT_AGENT_SERVICE_URL = 'http://localhost:8000';
