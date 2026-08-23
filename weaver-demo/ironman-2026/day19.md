@@ -1,216 +1,176 @@
 ---
-title: "【Day19】逐項打勾：四項職責裡我只做到一項半"
+title: "【Day19】為什麼不是一個 while 迴圈就好"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
-tags: [OpenTelemetry, AIOps, CEL, Signal Plane, 鐵人賽]
+tags: [OpenTelemetry, AIOps, LangGraph, Agent, 鐵人賽]
 ---
 
-# Day19：這一階段做到哪裡，沒做到哪裡
+# Day19：從一問一答，到一隻會自己查東西的 agent
 
-> 寫一份宣告很便宜
-> 貴的是持續證明它還準
-> 中間那段沒有人做的話
-> 它會慢慢變成一份謊話
+> 選一個框架而不是自己寫迴圈
+> 換到的往往不是功能
+> 是有一天要跟別人解釋的時候
+> 講得出來
 
-昨天把 CEL（Context Enrichment Layer，情境豐富層）的三個職責跟溯源攤開來講，也貼了一份決策級遙測該長什麼樣的 JSON，並且說明那個物件現在沒有任何一支程式會吐出來。今天把帳算清楚：這一階段實際蓋出來的東西，對照那四項，逐一打勾或留白。
+前面七天都在處理同一件事：讓資料本身帶著足夠的上下文。昨天把 CEL（Context Enrichment Layer，情境豐富層）那四項職責逐項打勾，結論是只做到一項半。從今天開始換一邊看，讀這些資料的那個東西到底怎麼運作。
 
-會這樣收尾是因為概念日很容易變成一種漂亮的空話。講完 enrichment、correlation、projection、grounding，讀者很自然會以為這個 repo 就是照這樣做的。它不是。
+這是概念日。今天講的東西跟 OTel（OpenTelemetry）沒有關係，講的是 agent 這個詞在這個 repo 裡具體指什麼。因為接下來幾天要拆的 `agent.py`，如果不先講清楚它的骨架，會變成逐行讀一份看不懂的程式碼。
 
-## 先看蓋了什麼
+驗證環境：langgraph 1.2.2、langchain-core 1.4.0。
 
-第二階段的程式碼在 `app/signals/`，八個模組（加一個 `__init__.py`）1545 行，六份對應的測試檔 69 條（這是寫這篇那天數的，後面幾天還會再長）。設計稿把它切成四個階段，代號 s1 到 s4：
+## 一個 LLM 能做的事，跟一個 agent 能做的事
 
-```mermaid
-flowchart TB
-    S1["s1 拓撲升為第一級 artifact<br/>topology.yaml + 查詢 API<br/>criticality / journey / 上下游"]
-    S2["s2 活的對齊<br/>reconcile.py<br/>宣告的邊 vs Tempo 看到的邊"]
-    S3["s3 訊號契約<br/>contracts.yaml<br/>權威 SLI / 目標值 / 新鮮度 / LogQL"]
-    S4["s4 依賴健康與歸因<br/>health.py<br/>誰是根因、誰只是相鄰"]
-    S1 --> S2 --> S3 --> S4
-    S4 --> OUT["注入 RCA 的三段文字"]
-    S1 --> OUT
-```
+LLM（Large Language Model，大型語言模型）本身的介面很單純：你給它一段文字，它回你一段文字。就這樣。
 
-（圖裡那個 SLI 是 Service Level Indicator，服務水準指標，也就是「用哪一句查詢判斷這個服務好不好」；RCA 是 root cause analysis，根因分析，agent 被叫去做的那件事。）
+拿它來做根因分析，你會先撞到一個很硬的牆：**它沒有辦法去查東西。** 你問「payment-service 現在的拒絕率是多少」，它只能根據訓練資料猜，而訓練資料裡沒有你的 Prometheus。它會給你一個看起來很有道理的答案，然後那個答案是編的。
 
-四個階段全部唯讀，這是設計稿一開始就定下的鐵律：整個第二階段不能有任何副作用。這個限制回頭看是對的，它讓每一段都可以單獨上線、單獨驗證，而且錯了也只是 context 難看，不會壞掉任何東西。
+第一個直覺的修法是把資料塞給它。把最近一小時的指標、log、trace 全部倒進 prompt 裡，讓它從裡面找。這個做法在小規模時可以動，但很快就會壞掉，因為你不知道要塞什麼。一次事故可能需要看 payment 的拒絕率，也可能需要看 order 的取消原因，也可能需要看某個 deployment 的重啟次數。全部塞進去就是前面講過的 signal flood，而且 context window 也放不下。
 
-## 逐項對照
+真正的解法是反過來：**不要事先決定要看什麼，讓它自己決定，然後給它去看的能力。**
 
-| CEL 的職責 | 這一階段做到的 | 判定 |
-| --- | --- | --- |
-| enrichment：baseline | 只有 `attribution` 那條邊有（s4.2 拿 current 比 offset 前） | 部分 |
-| enrichment：trajectory | 沒有。`signals/` 裡沒有任何算趨勢、斜率的東西 | 缺 |
-| enrichment：topology context | s1 全做到，而且是宣告加對帳兩層 | 有 |
-| enrichment：change context | 沒有。`git_version` 只是一個被搬運的欄位 | 缺 |
-| correlation | 沒有。三段文字各自生成、各自注入 | 缺 |
-| projection | 沒有，一行都沒有 | 缺 |
-| grounding | 權威查詢可以重跑、log 帶著 trace ID；但注入的那段話本身沒有任何識別碼 | 半 |
+## 這個迴圈叫 ReAct
 
-四項裡沒有一項是完整的：enrichment 四格只有拓撲那一格做滿，grounding 一半，correlation 跟 projection 整格空白。加起來大概一項半。下面把每一項的證據攤開。
+具體的做法是把「回一段文字」變成「回一個要做的動作」。
 
-### enrichment：只有一條邊有 baseline
+你事先告訴模型有哪些工具可以用，每個工具叫什麼、吃什麼參數、回傳什麼。模型不直接回答問題，而是回一個結構化的東西：我要呼叫 `query_prometheus`，參數是這句 PromQL。你的程式碼真的去執行那次查詢，把結果貼回對話裡，再問一次模型。模型看到結果之後，可能決定再查一次別的，也可能覺得夠了，開始寫結論。
 
-補基準線這件事，`signals/` 裡只有一個地方在做：
-
-```console
-$ grep -rn "baseline\|trajectory\|trend\|slope\|forecast" app/signals/*.py | cut -d: -f1 | sort -u
-app/signals/health.py
-```
-
-而且 `health.py` 裡那個 baseline 不是給 SLI 用的，是給 `attribution` 那條邊用的。也就是說「order-service 歸因到 payment 的失敗量比三十分鐘前漲了沒」有基準線，但「payment 的拒絕率 55% 算不算異常」沒有。後者靠的是契約裡宣告的一個固定目標值 `declined_rate < 1%`。
-
-固定目標值跟基準線不是同一件事。目標值回答「這個數字合不合格」，基準線回答「這個數字對這個服務、這個時段來說正不正常」。**一個半夜流量只有白天十分之一的服務，用同一個目標值判斷，白天漏報、半夜誤報。**
-
-trajectory 更乾脆，完全沒有。系統現在有辦法說「payment 的拒絕率是 55%」，沒有辦法說「它從 2% 一路爬上來，爬了二十分鐘」。而後面那句話對值班的人來說資訊量大得多，它同時回答了「什麼時候開始的」跟「還在惡化嗎」。
-
-change context 那格是最尷尬的一格，因為它看起來像有做。`topology.yaml` 每個節點都帶著 `git_version`，看起來就是變更情境。但那個欄位從來沒有被拿去對照任何東西，下一節就是在講這件事。
-
-### correlation：三段文字，各自為政
-
-前面那個模組關係圖已經畫出結論了：`context.py`、`health.py`、`dq.py` 三個各自生一段文字，各自注入。沒有任何一個地方問過「這三段講的是不是同一件事」。
-
-這不是抽象的缺點，它已經咬過兩次。一次是同一條邊在呼叫方跟被呼叫方各出現一個 ⚠，另一次是標題說 100% 而底下掛著兩個警告。**那兩個 bug 我當時是各自修掉的，但它們的成因是同一個：沒有一層負責把散落的判斷收成一個一致的說法。**
-
-### projection：一行都沒有
-
-沒什麼好講的，這個系列從一開始就沒有打算做。理由是推估要有意義，得先有校準。一個沒有被驗證過準確度的預測，比沒有預測更危險，因為它會讓人採取行動。校準機制是另一個層次的東西，不是這個階段收得完的。
-
-### grounding：一半
-
-這一項比想像中好，但也只有一半。
-
-好的那半是契約帶來的。注入給 agent 的每一條 SLI 都附上權威的 PromQL，log 也附上權威的 LogQL。這代表 agent 講出來的任何結論，都可以有人把那句查詢複製出來重跑一次，看看數字對不對。這是很實用的一種溯源，而且成本幾乎是零。
-
-Loki 那邊更完整。隨手撈一筆 `payment.declined`，它自己就帶著 trace 的識別碼。這裡要注意它在 Loki 裡的形狀跟服務 stdout 印出來的那份 JSON 不一樣：走 OTLP 進來之後，log 的本體只剩一句話，其他全部變成 structured metadata：
-
-```console
-$ curl -sG localhost:3100/loki/api/v1/query_range --data-urlencode \
-    'query={service_name="payment-service"} | event="payment.declined"' ...
-
-body: "declined by new validator"
-  event:        payment.declined
-  reason:       new_validator_odd_cents
-  order_id:     o-25779
-  git_version:  v2.5.0
-  otelTraceID:  e18757726d5af93fe9fabd3d9d82adee
-  span_id:      6a6aeadc9c010352
-```
-
-（那個欄位叫 `otelTraceID` 不叫 `trace_id`，是 OTLP 進 Loki 之後被改名的，寫查詢的時候會踩到。）從這一行可以直接跳到那一條 trace。這是三種訊號裡唯一一種本來就走得回去的。
-
-缺的那半是：**注入的那段話本身沒有身分。** 它是一段散文，裡面的每一個數字都沒有標記它是什麼時候、用哪一句查詢、在哪個視窗算出來的。agent 讀完之後如果說「payment 拒絕率 55%」，沒有任何機制可以從那句話走回產生它的那次查詢。前面那個兩個 replica 疊成一條 series 的坑會沒有人發現，根本原因就在這裡。
-
-## 一個現行的 silent decay
-
-[《代理式可靠性工程》（Agentic Reliability Engineering，簡稱 ARE）](https://learning.oreilly.com/library/view/agentic-reliability-engineering/0642572294809/) 第三章列了五種「從 dashboard 上看不見」的失效模式，第一種叫 `silent decay`：宣告當初是對的，然後系統變了，宣告沒跟上，而且沒有任何東西會叫。
-
-寫這篇的時候我順手對了一下宣告的版本跟實際跑的版本：
-
-```console
-$ grep git_version aiops-agent/service/app/signals/topology.yaml
-  git_version: v4.0.0     # api-gateway
-  git_version: v3.1.2     # order-service
-  git_version: v2.4.1     # payment-service
-  git_version: v1.3.0     # user-service
-  git_version: v5.2.0     # webapp
-
-$ curl -sG localhost:9090/api/v1/query --data-urlencode \
-    'query=count by (service_name, git_version) ({__name__=~".+"})'
-  api-gateway      v4.0.0
-  order-service    v3.1.2
-  payment-service  v2.5.0     ← 宣告寫 v2.4.1
-  user-service     v1.3.0
-  webapp           v5.2.0
-  aiops-agent      v0.0.1     ← 它自己也在噴指標，而拓撲裡沒有它
-```
-
-五個宣告的服務裡四個對得上，payment 對不上。而它是這整個階段所有實測都繞著跑的那個服務。（多出來的 `aiops-agent` 就是前面提過那個「沒被宣告卻活著」的服務，agent 自己。）
-
-問題不在那個數字錯了，在於**這一階段有三條對帳路徑，沒有一條覆蓋這個欄位**：
+這個模式叫 ReAct，reason 加 act 的合寫：推理、行動、觀察結果，然後再推理。
 
 ```mermaid
 flowchart LR
-    R["reconcile.py"] --> RE["對帳「邊」<br/>宣告 vs Tempo"]
-    W["topology_watch<br/>（獨立腳本，不在 agent 裡）"] --> WS["對帳「服務名單」<br/>宣告 vs 三個 store"]
-    V["weaver.py"] --> VM["對帳「metric 名字」<br/>契約 vs registry"]
-    G["git_version"] --> N["沒有任何人對帳"]
+    Q["事故告警<br/>+ 注入的 context"] --> R["模型推理<br/>下一步要看什麼"]
+    R -->|"要查"| A["執行工具<br/>PromQL / LogQL / TraceQL"]
+    A --> O["結果貼回對話"]
+    O --> R
+    R -->|"夠了"| ANS["寫結論"]
 ```
 
-這裡順帶要補一句：那三條路徑裡只有兩條真的住在 agent 裡（`reconcile.py` 跟 `weaver.py`），對服務名單那一條是隨文附的獨立腳本，agent 執行時完全不會碰到它。所以「三條」這個說法其實已經有點寬容了。
+`tool calling` 是這個迴圈的骨架。它不是模型「會用工具」這種魔法，它只是模型被訓練成能夠輸出一種符合你給的 schema 的結構化請求，而真正去執行的是你的程式碼。這個分工很重要：**模型從頭到尾沒有碰到你的 Prometheus，它只是說出它想查什麼。**
 
-我去 grep 過整包程式碼，`git_version` 在 `signals/` 底下出現在三個地方，但沒有一個是在讀它：
+前面幾天做的所有事情，在這個迴圈裡的位置就很清楚了。注入的那些 context 是在 `R` 那個框第一次執行之前就塞進去的，目的是讓模型的第一次推理不要從零開始猜。契約裡宣告的權威查詢就是為了讓它輸出的那句 PromQL 是對的。
 
-```console
-$ grep -rn "git_version" app/signals/*.py
-app/signals/topology.py:45:    git_version: str = ""          # 定義這個欄位存在
-app/signals/compile.py:56:    git_version: str = ""           # 從各服務的宣告搬進來
-app/signals/compile.py:123:            git_version=f.git_version,
-app/signals/health.py:328: "correlate with git_version (sum by git_version,reason) ..."
+## 為什麼不是一個 while 迴圈
+
+看到上面那張圖，很自然的反應是這件事寫成十行程式碼就好：
+
+```python
+while True:
+    resp = llm.invoke(messages)
+    if not resp.tool_calls:
+        return resp.content
+    for tc in resp.tool_calls:
+        messages.append(run_tool(tc))
 ```
 
-前三筆是定義跟搬運，第四筆是一句寫給 agent 看的文案。**沒有任何一行程式碼把這個宣告的值拿去跟任何東西比對。**
+這確實會動，而且很多教學就是這樣寫的。它壞掉的地方不在正常路徑，在所有其他路徑。
 
-而諷刺的地方在這裡。`health.py` 判定一個服務是根因的時候，結論那句話是這樣寫的：
+**第一個問題是它停不下來。** 上面那個 `while True` 唯一的出口是模型自己決定不再呼叫工具。如果模型不肯停呢？這不是假設，是這個 repo 真的踩過的。`tools_node` 裡有一段註解記著：
 
+```python
+# Identical-retry guard: a small model will re-send the exact same broken /
+# empty query until the budget runs out (we saw 4x). Short-circuit any call
+# whose (name, args) already ran earlier this turn
 ```
-it is the LIKELY ROOT CAUSE, not a symptom. Do NOT dismiss this as normal;
-correlate with git_version (sum by git_version,reason) to find which deploy
-introduced it.
+
+同一句查不到東西的查詢，模型會原封不動再送一次，連送四次。它沒有壞掉，它只是不知道換一個問法。**一個沒有預算上限的迴圈，遇到這種行為就是無限跑下去，而且每一圈都在花錢。**
+
+**第二個問題是狀態。** 那個 `while` 迴圈裡只有 `messages` 一個東西在累積。但實際上需要跨圈傳遞的不只對話：用掉幾次工具呼叫了、這一輪的上限是多少、上一次檢查發現的問題要不要餵回去讓它重寫。這些東西塞進 `messages` 會污染對話，放在迴圈外的區域變數則會讓「這個流程現在的狀態是什麼」散在各處。
+
+**第三個問題是分支。** 真正要做的判斷不只「有沒有工具要呼叫」。預算用完了要不要強制它作答？作答之後要不要檢查它有沒有唬爛？檢查沒過要不要讓它重寫，重寫幾次算數？每多一個判斷，那個 `while` 裡就多一層 `if`，而它們之間的關係只存在於縮排裡。
+
+## LangGraph 的模型
+
+LangGraph 做的事情就是把上面那三件事變成一個明確的結構。核心只有四個概念。
+
+`StateGraph` 定義**狀態的型別**。整個流程共用一份狀態，你先宣告它有哪些欄位。這個 repo 的長這樣：
+
+```python
+class RcaState(TypedDict):
+    messages: Annotated[list, add_messages]
+    tool_calls_used: int          # 這一輪已經用掉幾次工具呼叫
+    budget: int                   # 這一輪的上限
+    rubric_feedback: str          # 檢查沒過時要餵回去的修正提示
+    rubric_revision_count: int    # 這一輪已經重寫幾次
 ```
 
-**系統叫 agent 拿 `git_version` 去找是哪次部署造成的，而系統自己宣告的那個 `git_version` 是過期的。** 好在這句話是叫 agent 去查指標上的 label（那個是真的），不是去讀宣告，所以實務上不會出錯。但這個巧合不是設計出來的，是運氣。
+`messages` 那個 `Annotated[list, add_messages]` 是 LangGraph 的 reducer 語法，意思是「這個欄位每次更新是**追加**而不是覆蓋」。其他欄位沒有標記，預設就是覆蓋。這個小地方解掉了前面那個「狀態散在各處」的問題：跨圈要傳的東西全部有名字、有型別、有明確的合併規則。
 
-這個漂移怎麼發生的也很典型。那個欄位住在 `demo-services/services/payment/signal.yaml`，是服務團隊自己擁有的宣告，手工維護。payment 從 v2.4.1 發到 v2.5.0 的時候，沒有任何一道關卡問過「你的 signal.yaml 要不要跟著改」。
+順帶一提，這兩種合併規則剛好對應到兩種生命週期：`messages` 會跨輪累積，同一條對話問第二次時前面的東西都還在；`tool_calls_used` 每輪的輸入都被覆蓋回 0，所以預算是「每一輪」的上限，不是「這條對話一輩子」的上限。
 
-## 訊號斷崖：這個系列沒有實例
+`node` 是一個步驟。它是一個函式，吃當前狀態，回傳要更新的欄位。它可以是一次 LLM 呼叫，也可以是純粹的程式邏輯，兩者在圖裡沒有差別。
 
-五種失效模式裡，前面幾天各自撞到過四種：
+`add_edge` 跟 `add_conditional_edges` 決定下一步去哪。前者是固定的（做完 A 一定去 B），後者吃一個路由函式，讓它看著當前狀態決定去哪一個。**分支的條件因此變成一個可以單獨測試的函式，而不是縮排裡的一層 `if`。**
 
-| 失效模式 | 這個系列的實例 |
-| --- | --- |
-| silent decay | 上面那個 `git_version`；還有寫好卻從來沒被呼叫過的對帳程式 |
-| stale topology | 宣告了六條邊只觀察到五條；以及沒被宣告卻活著的那個服務 |
-| ambiguous semantics | 大小寫對不上的 `level`、`{service=}` 跟 `{service_name=}` 之爭 |
-| signal flood | 平鋪掃描零事故給二十個候選，事故時十一條在講同一件事 |
-| signal cliff | 沒有 |
+`checkpointer` 讓狀態可以被存下來。每走一步就存一次，於是流程可以中斷、可以從中間接著跑、也可以事後回放。
 
-`signal cliff`（訊號斷崖）是 flood 的反面：團隊把訊號修剪得太乾淨，砍掉了那些「目前沒有任何決策用得到」的訊號，於是遇到沒見過的失效模式時，agent 手上沒有任何能區分這次跟別次的東西，只能亂做或全部升級。
+這個 repo 用的是 `MemorySaver()`，存在記憶體裡。同一條對話的多輪之間狀態會留著，但服務重啟就沒了。要真的做到「昨天那次調查今天接著查」得換成有持久化的 checkpointer，這件事現在沒做。
 
-最接近的候選是 api-gateway 完全沒有 error SLI 這件事。效果確實很像：真的出事的時候，那個節點在依賴健康分析裡是一片空白。
+## 這個 repo 的圖
 
-但它不算實例，因為成因反過來了。api-gateway 不是被修剪掉的，是從來沒有裝過。它是一個薄轉發層，寫契約的當下判斷「這裡沒有自訂指標」完全合理。**訊號斷崖真正危險的地方，是那個砍掉訊號的決定在當下看起來是對的**：有人做了「這條指標沒有任何決策在用，砍掉省成本」的判斷，而且他是對的，直到出現一個沒人預料過的失效模式。
+`agent.py` 裡建圖的那段程式碼是這樣，四個 node：
 
-我沒有這種案例，因為這個 demo 從頭到尾在加東西，沒有經歷過任何一次「為了降成本砍訊號」的決策。這個反模式要真的長出來，需要的是時間跟成本壓力，不是一座跑了兩個月的 demo。
+```python
+graph = StateGraph(RcaState)
+graph.add_node("agent", agent_node)
+graph.add_node("tools", tools_node)
+graph.add_node("force_answer", force_answer_node)
+graph.add_node("rubric_trace", rubric_trace_node)
+graph.add_edge(START, "agent")
+graph.add_conditional_edges(
+    "agent",
+    route_after_agent,
+    {"tools": "tools", "force_answer": "force_answer", "rubric_trace": "rubric_trace"},
+)
+graph.add_edge("tools", "agent")
+graph.add_edge("force_answer", "rubric_trace")
+graph.add_conditional_edges("rubric_trace", route_after_rubric, {"agent": "agent", END: END})
+return graph.compile(checkpointer=MemorySaver())
+```
 
-書裡給的解方也值得抄下來：決策級訊號集要對著 agent **可能**需要做的決策空間去設計，不是只對著它今天在做的決策。留一小批目前沒人用的訊號不是浪費。
+畫出來是這樣：
 
-## 誰的帳，誰來還
+```mermaid
+flowchart TB
+    START(["START"]) --> AG["agent<br/>LLM 決定下一步"]
+    AG -->|"有工具要呼叫<br/>且預算還夠"| TL["tools<br/>真的去執行查詢"]
+    TL --> AG
+    AG -->|"還想呼叫工具<br/>但預算用完了"| FA["force_answer<br/>拿掉工具，逼它作答"]
+    AG -->|"沒有工具要呼叫<br/>它答完了"| RB["rubric_trace<br/>檢查答案裡的 trace ID<br/>是不是真的存在"]
+    FA --> RB
+    RB -->|"檢查沒過<br/>且重寫次數還夠"| AG
+    RB -->|"通過，或重寫超過上限"| E(["END"])
+```
 
-從平台工程的角度，今天這份對照表其實是一份技術債清單，而它有一個共同點：**缺的四項裡有三項，缺的原因不是「難做」，是「沒有人擁有」。**
+（這張圖不是我照著程式碼畫的，是把編譯完的 graph 直接吐出來的：`graph.get_graph().draw_mermaid()`，四個 node 跟七條邊都對得起來，只是我把 LangGraph 產的標籤換成中文說明。）
 
-baseline 跟 trajectory 要有人決定「正常長什麼樣」。這件事不能是產品團隊各自填一個數字，因為那會退化成每個服務一套標準；也不能純靠平台團隊算，因為平台團隊不知道哪些波動是業務性的。correlation 更明顯，它天生只能發生在看得到全部訊號的那一層。
+`agent` 那個框往外分三條，判斷的順序是先看「這一次模型有沒有要呼叫工具」，沒有就直接去 `rubric_trace`；有的話才去比預算。所以 `force_answer` 只會發生在「它還想查，但額度沒了」的情況，而不是預算一到就被打斷。
 
-而那個過期的 `git_version` 是同一個問題的另一種形狀：它有人擁有（服務團隊），但沒有人負責檢查。**宣告加對帳是一組的，只做前者等於把「這份宣告還準不準」這個問題丟給未來的自己。** 這一階段對邊、對服務名單、對 metric 名字都寫了對帳，唯獨對版本沒寫，而版本是變得最快的那一個。
+`agent` 跟 `tools` 兩個 node 加上它們中間那條來回，就是前面那個 ReAct 迴圈。另外兩個 node 是為了前面講的那些「其他路徑」而存在的。
 
-補的方式也不用很聰明。三條對帳路徑已經在跑了，多一個欄位進去比對，就是幾行程式碼的事。難的從來不是那幾行，是有人想到要做。
+`force_answer` 處理預算用完的情況。它做的事情很直接：同一個模型，但**不綁任何工具**，於是它想呼叫也呼叫不了，只能作答。這比在 `while` 裡 `break` 掉好，因為 `break` 會讓你拿到一個沒有結論的空回應。
 
-## 今天沒做的事
+`rubric_trace` 是答完之後的檢查。它去驗證答案裡引用的 trace ID 是不是真的存在，沒過就把修正提示寫進 `rubric_feedback`，路由回 `agent` 讓它重寫。除了 ReAct 那條來回之外，這是圖裡唯一一條往回走的邊，而且它有次數上限（`_max_rubric_revisions = 1`）：第一次抓到就放它回去重寫，重寫完的答案如果又被抓到一次，就不再給機會，直接結束。也就是這條回頭路一輪最多走一次。
 
-沒有補那個 `git_version` 對帳。今天只是把它找出來、確認沒有人在檢查它。要修得決定紅燈的定義：宣告落後一版該不該擋，還是只該提醒。
+而建圖那段函式的說明寫得很白：
 
-沒有動 correlation。要做得先讓三段文字變成三個物件，那是一次不小的重構，而且會影響注入格式，得配著 agent 那一側一起改。
+> Explicit StateGraph replacing `create_react_agent`. Same agent↔tools ReAct loop, but with a **hard** tool-call budget: once `tool_calls_used` hits `budget` the graph routes to `force_answer` (LLM with no tools bound) so a headless run can't loop forever.
 
-`trust` 那一段還是沒有。前面那個兩個 replica 疊成一條 series 的坑，現在依然只存在於文章裡，程式碼沒有任何地方會發現它。
+LangGraph 本身提供了一個現成的 `create_react_agent`，一行就能生出 agent 跟 tools 那個迴圈。這個 repo 沒有用它，換成手寫的圖，理由就是那句 `so a headless run can't loop forever`。**一個沒有人在旁邊看著的流程，需要一個它自己關不掉的上限。**
 
-也沒有量這一整個階段對 agent 實際表現的影響。從頭到尾都是在看注入的文字本身，沒有跑一次完整的評測去比對加了 Signal Plane 前後的分數差。這件事欠第三次了，而它大概是這一階段最該補的一項。
+## 值班的時候差在哪
+
+這些結構聽起來很像工程潔癖，但它們解的是很具體的問題。
+
+半夜三點告警觸發，這隻 agent 被自動叫起來跑。沒有人在看它。如果它卡在一個死迴圈裡，你早上會看到的是一張帳單跟一份沒有結論的報告。如果它把一個不存在的 trace ID 寫進結論，值班的人會拿著那個 ID 去查，查不到，然後開始懷疑整份報告。
+
+`force_answer` 保證前者不會發生，`rubric_trace` 保證後者會被抓到一次。這兩個 node 都不是為了讓 agent 更聰明，是為了讓它**在表現不好的時候，壞得比較安全**。
 
 ## 小結
 
-總結來說，這一階段最有用的產出其實不是那 1545 行程式碼，是三條對帳路徑。宣告本身很便宜，任何人都可以寫一份 YAML 說自己的服務長什麼樣；貴的是持續證明那份宣告還準。而今天找到的那個過期版本號正好說明了為什麼：**沒有對帳的宣告，會在沒有人發現的情況下慢慢變成一份謊話。**
+總結來說，agent 這個詞被用得很鬆，什麼東西都可以叫 agent。放在這個 repo 裡它的意思很具體：一個會反覆「推理、呼叫工具、看結果」的迴圈，加上一組讓它在異常路徑上不會失控的護欄。
 
-對照表上兩個空白格我不打算粉飾。projection 是刻意不做的，correlation 是還沒做的，這兩件事的性質不一樣，混在一起講會讓讀者以為都是取捨。
+而選 LangGraph 而不是自己寫迴圈，換到的東西其實是可讀性。那張圖畫出來之後，「什麼情況會走哪條路」是看得見的，不用去讀縮排。這件事在需要跟別人解釋「為什麼 agent 那次會那樣做」的時候特別有用。
 
-接下來要換一個角度，從「資料準備好了沒」轉到「拿到這些資料的那個 agent 到底怎麼做決定」。
+明天把這張圖跟實際的決策鏈對起來，看看它從哪一步開始讀前面那六天做出來的 context。
 
-> 逐項打勾這種事，勾到自己那一格是空的時候特別難下筆。
-> 但空著不寫，讀者會以為我做完了 :(
+> 「這不就是一個 while 迴圈嗎」——這句話我自己講過。
+> 講完之後我回去讀了自己那份縮排七層的 while 迴圈 XD

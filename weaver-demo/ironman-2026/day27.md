@@ -1,151 +1,157 @@
 ---
-title: "【Day27】回頭算總帳：最後一天，同一組題目考幾分"
+title: "【Day27】提案不是一句話，是一列會自己走完的狀態"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
-tags: [OpenTelemetry, AIOps, Evaluation, 鐵人賽]
+tags: [OpenTelemetry, AIOps, Governance, 鐵人賽]
 ---
 
-> 二十六天前那隻 agent 拿了 4.5/9
-> 今天這隻，同一組題目、同一支評分器
-> 拿了 3.5
+# Day27：提案不是一句話，是一列會自己走完的狀態
 
-最後一天，把帳算清楚。
+> 「建議回滾 payment-service」是一句話
+> 一句話沒有狀態、不會過期
+> 也沒有辦法在事後回答
+> 那天到底是誰按的
 
-Day1 留下的東西一直都在：九題自然語言的 RCA（root cause analysis，根因分析）問題、一支不接 LLM 的評分器、真值在打分當下去 stack 現算。這一路講了治理、schema、拓撲、契約、agent、守門、評測，最後幾天才把人打字那一側補起來。如果這些真的有用，就應該在那張分數表上看得到。
+昨天把四個平面跟那條從建議到自主的光譜攤開，收在一張狀態圖上，圖裡唯一一條不需要任何人做任何事就會走到的路叫`已過期`。今天把那張圖真的做出來，看它在資料庫裡長什麼樣子。
 
 程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day27/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day27)。
 
-## 為了讓這個比較成立
+## 為什麼是一列資料，不是一支腳本
 
-比之前得先把兩件事釘住，不然數字沒有意義。
+最直覺的做法是讓 agent 判斷完之後直接呼叫一支腳本。這條路上藏著三個問題，而且三個都只在**壞掉的那天**才會出現。
 
-**同一份資料。** 那九題是對著 Day1 那座產生器 stack 寫的，它的指標叫 `http_requests_total`，label 是 `job`。這系列後面用的 demo-services 叢集完全不是這個 schema。所以今天兩隻 agent 都跑在同一個容器上，就是 Day1 那個 image。
+第一，腳本沒有身分。事後想問「上週四那次回滾是誰決定的、根據哪一次調查」，只能去翻 log，而 log 是 agent 自己寫的，agent 自己說自己當時很有把握，這句話沒有證據力。
 
-**同一支評分器。** `bench/grade.py` 從 `day01/` 直接 import，一個字都沒改，真值一樣在打分當下去 stack 現算。
+第二，腳本沒有時效。判斷的那一刻跟動手的那一刻中間隔了多久，腳本不知道。一個十五分鐘前算出來的「現在可以回滾」，在告警風暴裡可能已經是上一個世界的事。
 
-然後跑三輪：Day1 那隻、今天這隻、以及今天這隻但把治理資產拿掉。
+第三，也是最貴的一個：腳本會被重複呼叫。同一個告警在十分鐘內連續打進來三次，就會有三次判斷、三次呼叫，而 `kubectl rollout undo` 連按三次的結果不是「回滾三次」，是回到三個版本之前。
 
-## 數字
+所以提案在這套系統裡不是一句話，是資料庫裡的一列，有主鍵、有狀態、有到期時間、有動作對象。`actions.py` 只放型別化的動作註冊表，`action_requests.py` 管這列資料的生命週期，兩者刻意分開：**能做什麼**跟**現在准不准做**是兩個不同的問題，壓在一起就是昨天講的那種「執行跟治理被壓成一格」。
 
-同一小時、同一座 stack、每題跑一次：
+## 註冊表：agent 講得出口的動作只有三個
 
-| | 總分 | metrics | logs | traces |
-| --- | --- | --- | --- | --- |
-| Day1 那隻（寫死 schema、4 次預算） | **5.5/9** | 1.5 | 1.0 | 3.0 |
-| 今天這隻（三次） | **3.5 / 2.5 / 3.5** | 1.0 / 1.0 / 0.5 | 1.0 / 0.0 / 0.0 | 1.5 / 1.5 / 3.0 |
-| 今天這隻，拿掉治理資產 | **2.5/9** | 0.5 | 1.0 | 1.0 |
+`GET /actions` 回的是這個 build 的契約，不是它的接線：
 
-第一行就先打了我一巴掌：Day1 當時記錄的是 4.5/9，同一隻 agent、同一組題目，今天跑出 5.5/9。第二行更清楚，同一份程式碼、同一座 stack、連著跑三次，總分在 2.5 到 3.5 之間跳，logs 那一欄從 1.0 掉到 0.0 然後就留在 0.0。
-
-**LLM 的變異就是這麼大**，所以這裡所有數字都只能當訊號，不能當測量值。這其實是 Day22 那句「一個 fixture 跑兩次講不了穩定度」的另一個版本，而我到最後一天，還是只有一顆種子可以給。
-
-不過在這個雜訊之下，那個排序是穩的：**二十六天之後，今天這隻在這座 stack 上比 Day1 那隻還差。**
-
-## 為什麼
-
-報告裡看得很清楚：
-
-```console
-promql-highest-backend-error-ratio  FAIL
-  answer: I couldn't find a metric named `http_server_requests_total`.
-          Please check the metric name and try again.
-
-traceql-error-chain-orders          PARTIAL
-  call: query_tempo_traces {'traceql': '{http.request.method="POST" && …}'}
-        -> 400 invalid TraceQL query: unknown identifier: http
-  call: query_tempo_traces {'traceql': '{span.http.request.method="POST" && …}'}
+```json
+{
+  "actions": [
+    {"name": "k8s.configmap_flag_set", "reversible": true, "requires_approval": true, "executable": true, "has_dry_run": true},
+    {"name": "k8s.rollout_undo",       "reversible": true, "requires_approval": true, "executable": true, "has_dry_run": true},
+    {"name": "k8s.scale",              "reversible": true, "requires_approval": true, "executable": true, "has_dry_run": true}
+  ],
+  "actions_enabled": true
+}
 ```
 
-它去查 `http_server_requests_total`、用 `service_name` 當 label、用 `span.http.request.method` 這種 OTel 語意慣例的屬性名。這些在 demo-services 那座叢集上全部是對的，**在這座 stack 上全部是錯的**。
+三個動作，全部可逆、全部需要核准、全部有乾跑。這個清單短得有點誇張，但那是刻意的：agent 能提的動作只有被寫進註冊表的那幾個，它沒有辦法自己組一句 `kubectl` 出來。自然語言在這裡被擋在門外，因為`型別化的動作`是後面每一道檢查的前提，你沒辦法對一段任意字串算影響範圍。
 
-也就是說，今天這隻 agent 犯的錯，跟 Day1 那隻犯的錯是同一種：**帶著一份寫死的環境知識，自信地查了不存在的東西。** 差別只在 Day1 那隻的寫死知識剛好對應這座 stack（它就是為了這座 stack 寫的），而今天這隻的寫死知識是我這一路做出來的 schema catalog 跟 Signal Plane 契約，對應的是另一座環境。
+`executable` 跟 `actions_enabled` 分開回報也有原因。前者是「這個 build 有沒有實作」，後者是「這個部署准不准跑」。兩個都是 false 的時候從外面看起來一模一樣，但一個要改程式、一個只要改環境變數。
 
-我第一天在 Day1 罵的那個反面教材，今天是我自己。
-
-有一個地方倒是看得出這幾天的東西有在工作。Day23 那個「空結果自己解釋」的提示，真的出現在它的回答裡：
-
-```console
-promql-highest-backend-error-ratio  FAIL
-  answer: I'm sorry, I encountered an error when running the query. There were no results,
-          and the following hint was returned: "Call discover_metrics(service)…"
-```
-
-工具告訴它「這個名字不存在，去 discover」，它把這句話原封不動講給使用者聽，然後就停在那裡。**提示送到了，但它沒有照著做。** 這比它默默重寫一次查詢好一點（至少使用者知道發生什麼事），但離「自己修好」還有一段距離。
-
-## 那把治理拿掉呢
-
-這是我今天做的第三輪，也是唯一能救回一點顏面的一輪：把 schema catalog 換成一段「什麼都不宣稱、請自己 discover」的中性文字，signal context 整段不注入，其他都不動。
-
-結果是 **2.5/9，比帶著錯的治理資產還差一分。**
-
-所以結論不是「治理沒用」，而是更精確的一句：**治理是環境的函數。** 對的環境上它是資產，錯的環境上它是負債，而完全沒有比帶錯的還糟：就算內容是錯的，那份 catalog 至少還教會它「查詢要先想清楚 label 是什麼」這件事的形狀。
+## 狀態機的真實長相
 
 ```mermaid
-flowchart TB
-    Q["同樣九題<br/>同樣一座 stack"] --> A["Day1 那隻<br/>寫死的知識剛好對<br/>5.5/9"]
-    Q --> B["今天這隻<br/>寫死的知識屬於另一座環境<br/>3.5/9"]
-    Q --> C["今天這隻，沒有治理資產<br/>只能靠 discover_*<br/>2.5/9"]
+stateDiagram-v2
+    [*] --> proposed
+    proposed --> approved: 人核准
+    proposed --> rejected: 人拒絕
+    proposed --> expired: 沒有人按
+    approved --> executing
+    executing --> aborted: 執行前的閘門擋下
+    executing --> succeeded
+    executing --> verify_failed
+    verify_failed --> rolling_back
+    rolling_back --> rolled_back
+    rolling_back --> rollback_failed
 ```
 
-這張圖是我這一路做出來的東西裡，最不想承認、但也最有用的一個結論。
+叢集裡那張帳現在是 28 列，攤開來長這樣：
 
-## 那今天這隻到底好在哪
+| 狀態 | 筆數 |
+| --- | --- |
+| `aborted` | 10 |
+| `expired` | 10 |
+| `succeeded` | 5 |
+| `rolled_back` | 2 |
+| `rollback_failed` | 1 |
 
-上面那組數字量的是「換一座陌生環境」。在它自己的環境上，Day25 那條端到端的鏈給的是另一個答案：
+`autonomy` 欄位 28 列全部是 `propose`，自主那一格到現在一次都沒有觸發過。
 
-```console
-conclusion : Code regression in payment-service v2.5.0 introduced a spike in
-             decline rate due to the new_validator reason.
-confidence : 0.7
-trace_id   : abb6fac796db47d684ed5238a5e37b36
-next step  : k8s.rollout_undo -> propose
-footprint  : 2 pod(s), revision 25->24, policy_ok=True
+這張表最值得看的是**成功只有五筆，而被擋下來的有十筆**。被擋下來不是壞事，那正是這一層要做的事；真正的問題在旁邊那個 10，那是沒有人按的數量，跟被擋下來的一樣多。
+
+## 執行之前的四道閘門，跟它們各自擋下了什麼
+
+核准不等於執行。`execute` 這個階段開始之後，還有四件事會讓它在碰到叢集之前停下來。這四道全部寫進 audit，所以可以直接數：
+
+| 閘門 | 問的問題 | 實際擋下 |
+| --- | --- | --- |
+| 前置條件重驗 | 核准當下的症狀，現在還在嗎 | 18 次通過 |
+| 乾跑與影響範圍 | 這個動作會動到幾個東西 | 3 次擋下 |
+| 冪等 | 同一件事是不是已經有人在做了 | 6 次擋下 |
+| 熔斷 | 這個目標最近是不是一直失敗 | 1 次擋下 |
+
+冪等那六筆全部長同一個樣子：
+
+```
+idempotency abort  {'superseded_by': '92690e7562a54af8',
+                    'idem_key': 'k8s.configmap_flag_set|demo/user-flags#user_session_cache_disabled|...'}
 ```
 
-而且這是在 Day22 把洩題拿掉之後跑的，evaluation 上 payment 那題兩顆種子都對、版本也對。
+`idem_key` 是`動作|對象|告警指紋`三段組成的。三段缺一不可：只有動作會把不同服務的回滾當成同一件事，只有對象會把兩個不同事故對同一個 deployment 的處置合併，只有指紋則根本沒有對象概念。有了這把 key，告警風暴打進來三次，第二第三次會在 `superseded_by` 上指回第一次，然後停手。
 
-把兩邊放在一起，這一路真正換到的東西可以講得很具體，而且沒有一項是「分數變高」：
+熔斷那一筆是這樣紅的：
 
-- **答案裡的每一個東西都有地方可以查證。** trace ID 會被守門去 Tempo 對（Day23）、數字要有非空的查詢結果撐著（Day22）、推理過程有一條 trace 可以逐格看（Day25）。
-- **「下一步」會連它的大小一起講。** 回滾兩個 pod、revision 25→24、在 policy 範圍內（Day24）。
-- **失敗會講話。** 空結果會說哪個 label 不存在（Day23）、alertname 拼法不同會吵一聲（Day24）、prompt 裡有答案會 exit 1（Day22）。
-- **表現不好可以歸因。** 以前只能說「它今天怪怪的」，現在可以說「它查回空的之後沒有 discover 就換句話再問」，而那是報表上會自己跳出來的一行（Day22）。
+```
+breaker abort  {'reason': 'breaker open for demo/payment-service
+                (2 consecutive failures on demo/payment-service)'}
+```
 
-這四項的共同點是：**它們都不是讓 agent 更聰明，是讓它更容易被檢查。**
+門檻是同一個目標連續失敗兩次就跳開，另外還有一個一小時三次的頻率上限。這道門保護的不是叢集，是**人**：一個一直失敗又一直重試的自動化，會把值班的人淹沒在通知裡，而且每一則都長得一樣。
 
-## 對誰有價值
+現在 `GET /actions/breaker` 回的是 `{"open": []}`，沒有任何目標處在熔斷狀態。這種空結果很容易被當成「這個機制沒在跑」，所以那一筆歷史紀錄比現值有用得多。
 
-如果只能講一件事：**新服務要接上這套東西，從「讀十幾篇文件然後問人」變成「跑一支腳本，它會告訴你缺哪一項、下一步做什麼」**（Day12 那 13 項檢查）。平台團隊推得動的東西，通常不是最正確的那個，是成本最低的那個。
+## 授權會過期，而且過期是預設
 
-第二件事是給值班的人的。凌晨三點那個場景，這一路做的所有事情最後都落在同一句話上：**你不需要相信它，你可以查它。** 一個能被檢討的 agent 可以慢慢變好，一個查不出原因的 agent 只會在第二次出錯之後被關掉。
+`approval_ttl_seconds` 預設 900，十五分鐘。超過就自己走到 `expired`，不需要任何人做任何事。
 
-第三件事是給我自己的。這系列有一半的內容是我踩到的坑：`-r .` 的假綠燈、policy 只比名字前綴、洩題寫在 catalog 裡、守門看不到一到三成的 trace ID、影響範圍在人同意之後才算、以及今天這個。**把坑寫出來的成本是難堪，收益是它不會再吃我一次。**
+一開始我覺得這個設計有點嚴格，直到把那十筆過期的提案攤開看時間分佈才改觀。它們不是在十五分零一秒的時候擦邊過期的，是**根本沒有人打開過**。也就是說 TTL 在這裡沒有擋掉任何一個「本來想按但太慢」的人，它擋掉的是十次「沒有人在看」。
 
-## 還缺什麼
+這裡有一個很容易寫錯的細節：過期必須是**寫進資料庫的狀態轉換**，不能只是查詢時的一句 `WHERE created_ts > now() - 900`。差別在事後。前者留下一列「這件事被提出來過、沒有人理它」的紀錄，後者只是讓那列資料安靜地從查詢結果裡消失，而那正是你最需要知道的一件事。
 
-分兩類。第一類是能補只是還沒補的，全部來自前面每一天的「今天沒做的事」：
+> 我一開始真的是用查詢條件寫的。改成狀態轉換是因為某天想回答「這個月有幾個提案沒人看」，發現這個問題在原本的設計下**問不出來** QQ
 
-- `regress.sh`、`leakcheck.py`、`e2e.sh` 都沒進 CI，所以它們現在都是「我記得跑」的東西
-- `eval/fixtures.yaml` 只有三個 case，而且其中兩個換到固定資料上就失效（Day25）
-- `baseline.json` 還是舊的，回歸目前沒有基準可比
-- Tempo 只留一小時，超過一小時的事故，第四步抓 trace 結構上必失敗（Day21），而昨天的推理過程今天也已經沒了（Day25）
-- 提案的範圍存進去了，但 plugin 還沒把它畫在卡片上（Day24）
-- judge 的判決沒有進評測，「judge 準不準」還是手動跑一批案例（Day23）
-- 只有兩種動作有乾跑，沒有乾跑的動作會直接跳過那道門（Day24）
-- 叢集裡的 image 比程式碼舊（Day25）
+## 一個名字說錯了話：`rollback_failed`
 
-第二類是結構性的，要下一個系列才處理：
+跑完幾輪之後，帳上出現一筆 `rollback_failed`，而它的故事是這樣：動作執行時 401、回滾也 401，因為那張憑證根本沒有寫入權限。
 
-- **信心分數還沒有被校準。** 0.7 這個數字現在只是模型自己講的，沒有人回頭統計「它說 0.7 的時候實際上對幾成」。`calibration.py` 已經在 repo 裡了。
-- **授權層級沒有真的分級。** `governance.py` 會依信心跟校準決定 AUTO / PROPOSE / ESCALATE，但 `actions_enabled` 一直是關的，所以那條路徑從來沒有被走過（Day23 那個安靜的洞就是這個）。
-- **回饋迴圈沒有閉合。** 過去事故庫從 Day21 到今天都是空的，agent 每次調查都像第一次。
+```
+execute  fail  {'error': '(401)\nReason: Unauthorized ...'}
+rollback fail  {'action': 'k8s.rollout_undo', 'error': 'UnauthorizedException: (401) ...'}
+```
 
-上面這三件事對應到的四支檔案（`governance.py`／`calibration.py`／`breaker.py`／`action_requests.py`）其實都已經在 repo 裡躺著，我刻意沒有展開它們，因為要先把校準跟授權層級講清楚，這些程式碼才有意義。
+問題是 `rollback_failed` 這個名字讀起來像「我們動了它，然後收不回來」，值班的人看到會立刻去確認現場被改成什麼樣子。實際上什麼都沒有發生，兩次呼叫都在認證那一關就被打回來了。
+
+同一個狀態名蓋住了兩種完全不同的現場：**改到一半收不回來**，跟**從頭到尾沒碰到**。這兩種在半夜三點的處置方式差得非常遠。狀態機的名字不只是給程式看的，它是值班的人第一眼會讀到的那句話，取錯名字等於在事故當下說謊。
+
+## 這對值班的人有什麼差別
+
+把提案做成一列有狀態的資料，值班的人拿到的是三個原本要自己補完的東西。
+
+**這次會動到什麼。** 乾跑會先算出影響範圍（`revision 58→57, replicas 1→1, affected 1 pod(s), singleton`），這句話比「建議回滾」有用得多，因為它同時回答了「這是不是唯一一個副本」。
+
+**這件事是不是已經有人在做。** 冪等那六筆擋下的就是這個。沒有它的話，兩個人同時看到同一個告警、同時按下核准，系統會老老實實做兩次。
+
+**事後問得出來。** 每一筆都有核准的人、時間、以及當時的判斷來源。這是自主那一格的前提：一個沒辦法還原「當時為什麼准」的系統，不該被放到不用問人的位置。
+
+## 今天沒做的事
+
+- **五道門一道都還沒接上。** 今天講的四道閘門全部發生在核准**之後**，管的是「這次執行安不安全」。決定「這件事需不需要人核准」的那五道門是另一組東西，留給後面。
+- **驗證只看一個 PromQL 條件。** `verify` 現在是拿一條查詢比一個閾值（`value 3.407 > max_value 0.01`），符合就算修好。這個判準太窄，留給後面。
+- **失敗之後的清理是我手動做的。** 熔斷跳開之後要重置、卡住的 `executing` 要收，這些都還沒有自動化。
 
 ## 小結
 
-總結來說，這二十七天沒有讓 agent 在同一組題目上考得更高分，今天的實測甚至是倒退的，而倒退的原因是我做出來的治理資產屬於另一座環境。這件事本來可以不寫，只要我拿 demo-services 上那條漂亮的端到端輸出當結尾就好。但寫出來之後，這系列的主張反而變得比較精確：治理不是一個放諸四海的加分項，它是「這座環境的知識被寫下來、而且持續對帳」這件事本身，換一座環境就得重來一次。而沒有它的版本更差，這一點至少是站得住的。
+總結來說，今天把「建議」變成了一列會自己走完的資料。這件事的價值不在自動化程度，而在**每一個轉換都留下了可以事後問的東西**：誰按的、什麼時候、當時算出來的影響範圍是多少、以及為什麼中途停下來。
 
-如果要用一句話收掉這二十七天：**我沒有做出一隻更聰明的 agent，我做出了一隻可以被檢查的 agent，而在凌晨三點，後者比較有用。**
+帳上那 28 列裡最刺眼的還是那個 10。被閘門擋下的十筆是機制在工作，沒有人按的十筆是機制在空轉，兩個數字一樣大，但只有後者是我造成的。
 
-> 寫到最後一天才發現最有力的證據是自己打自己臉，這種事大概只有跑實測才會遇到。
-> 下一個系列要處理的第一個問題，就是那個 0.7 到底是不是 0.7 XD
+> 那筆 `rollback_failed` 我盯著看了很久，一直覺得哪裡不對勁。
+> 後來發現不對勁的不是系統，是我給那個狀態取的名字 XD

@@ -1,208 +1,410 @@
 ---
-title: "【Day16】圖準了，但太吵：一個 100% 配兩個驚嘆號"
+title: "【Day16】順著圖走：221 條 series 裡，只有兩條能判生死"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
 tags: [OpenTelemetry, AIOps, Signal Plane, 鐵人賽]
 ---
 
-# Day16：圖準了，但太吵
+# Day16：順著圖走，然後發現圖上有一半的節點不能判生死
 
-> 一份報告裡最危險的不是錯的數字
-> 是一個正確的數字
-> 沒講清楚自己回答的是哪個問題
+> 順著圖走的前提
+> 是圖上每個節點都判得動
+> 而這個前提在真實環境裡不成立
 
-前面把拓撲對帳跑起來、把 schema 對齊接上之後，那個資料品質判定第一次拿到 `proven_good: True`。照理說接下來該往前走，但我把注入給 agent 的那段 context 印出來看的時候，看到這個：
+昨天把注入的 context 降噪，⚠ 從兩個變一個而且帶著證據。那件事處理的是「已經知道的東西怎麼講」。今天換一個問題：**當一個服務真的出事了，要從哪裡開始找**。
 
-```
-Topology data-quality (last reconcile, 30 traces): declared/observed agreement 100%.
+這是 `health.py` 的職責，Signal Plane 這一段最後一塊、也是唯一一塊會真的去打 API 的。前面幾天做的東西，拓撲、契約、對帳，到這裡才第一次被花掉。
 
-### api-gateway
-- downstream (dependencies — could be blocking this): order-service,
-  payment-service (⚠ declared, not seen in recent traces), user-service
+（前面把 Signal Plane 切成四步在做，編號沿用到今天：s1 拓撲、s2 拿真的 trace 對帳、s3 每個服務的權威 SLI 契約，而 s4 就是今天這塊，順著圖走的依賴健康分析。）
 
-### payment-service
-- upstream (callers — degrade if this fails):
-  api-gateway (⚠ declared, not seen in recent traces), order-service
-```
+程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day16/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day16)。底下的輸出都是真的跑出來的，環境是那座 k3d 上的 demo stack。要提醒一件事：這一篇的每一個數字都跟當下的流量綁死，你照著跑一定會拿到不一樣的數值，該對得上的是形狀（誤報有幾十個、五個節點只有兩個判得動），不是小數點。
 
-**標題那行說一致性 100%，往下兩行就有兩個 ⚠。** 而那兩個 ⚠ 講的是同一條邊。
+## 平鋪掃全部指標，為什麼行不通
 
-今天處理的就是這件事。程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day16/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day16)，改的是 agent 服務自己的 `reconcile.py` 跟 `context.py`。底下的輸出都是真的跑出來的，最近一次重跑是 2026-08-16，環境是那座 k3d 上的 demo stack，取樣 30 筆 trace。
+先講不用圖會怎樣。
 
-## 為什麼一份「正確」的報告會是壞的
+最直覺的異常偵測是這樣：把所有指標拉出來，每一條跟一段時間之前比，變化超過某個幅度就標成異常候選。這個做法的好處是不用維護任何東西：不用宣告拓撲、不用寫契約，新服務上線自動就被涵蓋。它也確實是很多「AI 維運」產品的第一版。
 
-先講清楚這不是 bug。那三行每一行單獨看都是對的：對帳確實觀察到的邊全部都有宣告（所以 100%）、`api-gateway → payment-service` 確實沒在取樣裡出現、而那條邊確實同時是 api-gateway 的下游跟 payment-service 的上游。
+我把這個做法寫成一支 130 行的 `flat_scan.py`，而且刻意寫成講道理的版本：只看現在真的有資料的 series、跟一段時間前的自己比而不是跟一個寫死的門檻比、累積型的 counter 一律先過 `rate()`（不然每一條都會「上升」）、`_bucket` 跳過（它跟 `_count`/`_sum` 是同一件事攤在 `le` 上）。
 
-問題是它們擺在一起之後，讀的人會拿到三個互相打架的訊息。而這裡的「讀的人」是一個模型，它不會停下來問「這個 100% 跟這兩個驚嘆號是不是在講同一件事」，它只會把整段當成事實照單全收。
-
-這是可觀測性裡那個老問題換了一個位置。告警疲勞不是因為告警錯了，是因為**大部分告警是對的但不重要，於是值班的人學會了全部略過**，然後真的那一次也跟著被略過。同一件事發生在注入給 agent 的 context 裡，代價一模一樣：一個大部分時候是雜訊的 ⚠，會讓那個符號整個貶值。
-
-前面查過那條 `api-gateway → payment-service` 的來歷，它是活的，前面撈到過一筆真的走過那條邊的 trace，只是它太稀有，這批取樣沒抽到。所以現在這個 ⚠ 有很高的機率根本不是漂移，是取樣的產物。
-
-## 三個問題，各自的成因
-
-拆開來看是三件不同的事。
-
-```mermaid
-flowchart TB
-    D["reconcile 回報<br/>一條 unobserved 的邊"] --> P1["問題一：講兩次<br/>caller 的 downstream 一次<br/>callee 的 upstream 一次"]
-    D --> P2["問題二：沒有證據就下判斷<br/>「沒看到」不等於<br/>「有機會看到卻沒看到」"]
-    S["dq_score 只算<br/>observed → declared 這個方向"] --> P3["問題三：標題說 100%<br/>因為 unobserved 根本不進分母"]
-    P1 --> N["讀的人收到<br/>互相矛盾的三段訊息"]
-    P2 --> N
-    P3 --> N
-```
-
-**問題一**是純粹的呈現。一條邊有兩個端點，而 `_annotate()` 對上游跟下游都套用了，於是同一個事實被講成兩次，讀起來像兩個獨立的問題。
-
-**問題二**比較本質。原本的判斷條件只有一行：這條邊在不在 `unobserved_edges` 裡。但「我沒看到 A 呼叫 B」有兩種完全不同的來源：A 在取樣裡跑了三十次，每次都沒呼叫 B；或者 A 根本沒出現在取樣裡。前者是證據，後者是沉默。而報告把它們寫成同一句話。
-
-**問題三**是前面就量出來的那件事：`dq_score` 算的是「觀察到的邊裡有幾成是宣告過的」，`unobserved` 那個方向不進分母。所以一份宣告了六條邊、只有一條在跑的圖，分數照樣是 100%。這個設計本身沒錯（未宣告的邊是比較危險的那一種），錯的是報告沒有講出這個分數不涵蓋什麼。
-
-## 讓「沒看到」帶著證據
-
-先補證據。`reconcile.py` 在掃 trace 的時候，順手記下每個服務出現在幾筆取樣的 trace 裡：
-
-```python
-def services_from_trace(raw: dict) -> set[str]:
-    """Every service that appears anywhere in one trace. Used to tell 'this
-    caller ran and never made the call' apart from 'this caller never ran'."""
-    seen: set[str] = set()
-    for batch in raw.get("batches", []):
-        service = _otlp_service(batch.get("resource", {}))
-        if service and any(ss.get("spans") for ss in batch.get("scopeSpans", [])):
-            seen.add(service)
-    return seen
-```
-
-原本掃 trace 的那個迴圈只做 `observed |= edges_from_trace(raw)`，現在多一行把這個集合裡的每個服務各加一次計數。這個東西是免費的，同一批 trace 已經抓回來了，只是原本只從裡面挑邊。跑起來長這樣：
+先在**完全沒有事故**的穩定流量下跑一次，baseline 取十分鐘前。這裡有個重現的前提，我自己重跑的時候踩到過：流量要先穩定跑滿一個 baseline 視窗再掃。stack 才剛起來就掃，十分鐘前是零流量，於是幾乎每一條 series 都是 `inf%`，候選數會變成兩百多個。那不是這個做法比較爛的證據，是量測還沒站穩：
 
 ```console
-unobserved: [('api-gateway', 'payment-service')]
-caller_samples: {'webapp': 30, 'api-gateway': 30, 'order-service': 19,
-                 'user-service': 17, 'payment-service': 5}
+$ python3 flat_scan.py --baseline 10m --min-rel 0.5
+metric families: 34  series sampled: 221
+anomaly candidates (rel change >= 50%): 20
+
+      inf%  otel_sdk_processor_span_queue_size{service_name=payment-service,...}   0 -> 12
+      inf%  otel_sdk_processor_log_queue_size{service_name=order-service,...}      0 -> 3
+   1277.8%  otel_sdk_processor_span_queue_size{service_name=webapp,...}            9 -> 124
+   1210.0%  otel_sdk_processor_span_queue_size{service_name=api-gateway,...}      10 -> 131
+    730.8%  otel_sdk_processor_span_queue_size{service_name=order-service,...}    13 -> 108
+    ...
 ```
 
-api-gateway 出現在三十筆 trace 裡，一次都沒呼叫 payment-service。**這是一句有份量的話，而原本的報告只會說「沒看到」。**
+**二十個異常候選，而這座 stack 一切正常。** 排在最前面的全部是 OTel（OpenTelemetry）SDK 自己的 batch processor 佇列長度。那個東西本來就會隨著送出的時機起起伏伏，跳一個數量級是它的日常。
 
-於是 `context.py` 那個標記函式就有東西可以判斷了：
+很自然的下一個念頭是把門檻調高。同一批資料掃四次：
 
-```python
-def _annotate(edge: tuple[str, str], drift: TopologyDrift | None) -> str:
-    if not drift or not any((e.caller, e.callee) == edge for e in drift.unobserved_edges):
-        return ""                       # 這條邊有被走到，什麼都不用標
-    caller = edge[0]
-    seen = drift.evidence_for(caller)   # caller 出現在幾筆取樣的 trace 裡
-    if seen >= _MIN_CALLER_EVIDENCE:
-        return f" (⚠ not seen in {seen} sampled traces of {caller})"
-    return " (not exercised in this sample)"
+```console
+min-rel 0.5 -> anomaly candidates (rel change >= 50%): 20
+min-rel 1.0 -> anomaly candidates (rel change >= 100%): 18
+min-rel 2.0 -> anomaly candidates (rel change >= 200%): 18
+min-rel 5.0 -> anomaly candidates (rel change >= 500%): 8
 ```
 
-呼叫方被跑過夠多次，才給 ⚠，而且把次數寫進去；不夠的時候退成一句沒有警示符號的描述。門檻現在是 5，這個數字沒有什麼理論根據，就是一個「至少要多看幾眼才算數」的下限。
+**門檻拉十倍，誤報只從二十個掉到八個。** 這座 stack 從頭到尾沒有任何事故，所以這八個也全部是誤報。它們留下來是因為它們的 baseline 是零，相對變化算出來是 `inf%`，多高的門檻都擋不住。而這中間被濾掉的十二個，跟留下來的八個，在這個做法眼裡沒有任何本質差別。
+
+問題不在門檻設在哪裡，在**排序的依據**。這一輪排在最前面的（含被上面那個 `...` 折掉的部分）是 SDK 那幾條佇列長度，跟 user-service `/authcheck` 的 401，後者是 demo 裡本來就有的少量認證失敗，前者是那個東西的日常起伏。**這個做法從頭到尾不知道哪一條指標代表「這個服務還活著」，所以它沒有辦法把重要的排前面，只能把變化大的排前面。**
+
+## 換成順著圖走
+
+Signal Plane 的做法是反過來的：不從指標出發，從**被調查的那個服務**出發，只走它的鄰居。
 
 ```mermaid
 flowchart TB
-    E["一條宣告的邊 A → B"] --> O{"取樣裡看到<br/>A 呼叫 B 嗎？"}
-    O -->|"看到了"| N["不標任何東西"]
-    O -->|"沒看到"| C{"A 出現在<br/>幾筆取樣的 trace 裡？"}
-    C -->|"≥ 5"| W["⚠ not seen in N sampled traces of A<br/>（有機會看到卻沒看到，是證據）"]
-    C -->|"< 5"| Q["not exercised in this sample<br/>（沒有警示符號，因為這是沉默）"]
+    subgraph FLAT["平鋪掃描"]
+        A1["列出所有 metric family"] --> A2["展開成 221 條 series"]
+        A2 --> A3["每條跟 baseline 比"]
+        A3 --> A4["超過門檻就是候選<br/>→ 20 個"]
+    end
+    subgraph WALK["順著圖走"]
+        B1["被調查的服務"] --> B2["topology.yaml<br/>取 downstream / upstream"]
+        B2 --> B3["contracts.yaml<br/>每個鄰居的權威 SLI"]
+        B3 --> B4["各跑一次 instant query<br/>→ 5 行"]
+        B4 --> B5["歸因：誰是根因<br/>誰只是症狀"]
+    end
 ```
 
-> 這個門檻應該要跟著取樣總數走才對，抓 30 筆跟抓 300 筆時的「夠多次」不會是同一個數字。我先寫成常數，因為要把它做對得先有取樣涵蓋率，而那個東西前面就欠著了。
+差別不只在數量。平鋪掃描那一支最後給你的是一份排序過的清單，**它沒有辦法告訴你這些東西之間的關係**；順著圖走那一支最後給你的是一句話：這個服務是根因，還是別人的症狀。
 
-## 一條邊只講一次
+判斷規則本身很短，寫在 `health.py` 的模組說明裡：
 
-第二個改動只有一行，把上游那側的標記拿掉：
+> if a **downstream dependency** is unhealthy, the service under investigation is probably a *symptom* — investigate the dependency first. If all dependencies are healthy, the fault is likely local.
+
+`downstream`（下游）在這裡是「我呼叫的人」，`upstream`（上游）是「呼叫我的人」。這個方向感很容易搞反，而搞反的代價是整個歸因倒過來。
+
+它需要三個前面幾天的產出：`topology.yaml` 給邊、`contracts.yaml` 給每個服務的權威 SLI（Service Level Indicator，服務水準指標，也就是「用哪一句 PromQL 判斷這個服務好不好」）、還有一個叫 `attribution` 的欄位，那是 s4 自己要用的東西，等一下會講。
+
+## 製造一次真的事故
+
+要驗證這件事就得有真的壞掉的東西。demo 環境裡 payment-service 有一個 feature flag `payment_use_new_validator`，打開之後金額是奇數分的請求會被拒絕：
+
+```bash
+kubectl -n demo patch cm payment-flags --type merge \
+  -p '{"data":{"flags.json":"{\"payment_use_new_validator\": true}\n"}}'
+kubectl -n demo rollout restart deploy payment-service
+```
+
+這裡有個踩過的坑：**flag 是啟動時讀進記憶體的，改完 ConfigMap 不 restart 完全沒有效果**，而且沒有任何錯誤訊息告訴你這件事。
+
+第二個坑更有意思。order-service 的商品價格是 `100 * i`，乘上數量之後永遠是偶數分，所以**光是打開 flag、照原本的流量跑，一筆都不會被拒絕**。要看到事故得直接對 payment 打奇數分的請求：
+
+```bash
+curl -X POST localhost:8001/charge -H 'content-type: application/json' \
+  -d '{"order_id":"o-1","user_id":"u-1","amount_cents":101}'   # → 402
+```
+
+這個限制等一下會變成今天最有價值的一段實測，先記著：**payment 壞了，但 order 走的那條路完全沒被影響到。**
+
+幾分鐘後指標追上來：
+
+```console
+$ curl -sG localhost:9090/api/v1/query --data-urlencode \
+    'query=sum by (status) (rate(payment_charges_total[5m]))'
+{'status': 'error'}       0.0167
+{'status': 'authorized'}  1.8457
+{'status': 'declined'}    2.1975
+```
+
+declined 佔了 54%，而契約裡宣告的目標是 `declined_rate < 1%`。
+
+## 兩種做法在同一場事故上的表現
+
+先看平鋪掃描：
+
+```console
+$ python3 flat_scan.py --baseline 30m --min-rel 0.5
+metric families: 34  series sampled: 230
+anomaly candidates (rel change >= 50%): 22
+
+      inf%  payment_charges_total{reason=new_validator,status=declined,...}          0 -> 2.401
+      inf%  payment_charge_duration_seconds_count{status=declined,...}               0 -> 2.401
+      inf%  payment_charge_duration_seconds_sum{status=declined,...}                 0 -> 0.001003
+      inf%  http_server_response_size_bytes_count{http_status_code=402,...}          0 -> 2.399
+      inf%  http_server_request_size_bytes_count{http_status_code=402,...}           0 -> 2.399
+      inf%  http_server_duration_milliseconds_count{http_status_code=402,...}        0 -> 2.399
+      ...（其餘 402 相關的 sum / size 各一條，以及 SDK 佇列那幾條）
+```
+
+事故發生了，候選數從 20 變成 22。**多兩個。**
+
+真正的訊號當然在裡面（第一行就是），但它跟另外十條講同一件事的 series 並排。同一批 402 回應在 duration、request size、response size 三個 family 的 `_sum` 跟 `_count` 各留一條，全部都是 `inf%`，全部排在最前面。而平常就在那裡的二十個誤報一個都沒有走。
+
+換順著圖走，直接問 payment-service：
+
+```
+## Dependency health (live) — payment-service
+Each service's SLI, read just now, to attribute root cause to the right node:
+- this service payment-service: error 55.7% — UNHEALTHY (breaches objective declined_rate < 1%)
+- upstream order-service: error 0.0% — healthy
+→ payment-service is itself breaching its error SLO and it has no downstream
+  dependencies to inherit a fault from — it is the LIKELY ROOT CAUSE, not a
+  symptom. Do NOT dismiss this as normal; correlate with git_version
+  (sum by git_version,reason) to find which deploy introduced it.
+```
+
+兩行資料、一行結論，而且結論不只說「payment 壞了」，它說 payment **是根因不是症狀**，理由是它沒有下游可以繼承錯誤，並且直接給下一步該打哪一句查詢。
+
+（那個 `55.7%` 這篇文章寫完之後被我發現是不準的，差多少、為什麼，寫在後面「這些百分比不能當真」那一段。結論不受影響，但數字本身要打折看。）
+
+## 相鄰不等於受影響
+
+再問 order-service，這裡才是 s4 真正花力氣的地方：
+
+```
+## Dependency health (live) — order-service
+- this service order-service: error 0.0% — healthy
+- downstream payment-service: error 55.7% — UNHEALTHY (breaches objective declined_rate < 1%)
+- downstream user-service: throughput 1.5 rps (liveness only; no error SLI)
+- impact of payment-service on order-service: failures attributed to it 0.0167/s
+  (baseline 0.0125/s, Δ+0.00417/s) — flat (no material rise; baseline-level)
+→ payment-service is unhealthy, but order-service's own failures attributed to it
+  did NOT rise vs baseline (Δ≈0, see impact line) — it is NOT materially impacted
+  by this incident, only topologically adjacent. Fix payment-service as its own
+  problem; do not report order-service as a symptom of it.
+```
+
+那句 `only topologically adjacent`（只是拓撲上相鄰）就是前面留著的伏筆。order-service 確實呼叫 payment-service，payment-service 確實正在噴 55% 的拒絕率，光看圖任何人都會說 order 是受害者。但它不是，因為它送過去的金額全部是偶數分，那個壞掉的驗證器根本碰不到它。
+
+能講出這句話是因為 `topology.yaml` 的邊上多帶了一個欄位：
+
+```yaml
+- caller: order-service
+  callee: payment-service
+  attribution: sum(rate(orders_total{reason=~"payment|payment_upstream"}[5m]))
+```
+
+`attribution` 是「呼叫方自己身上、可以歸因到這個被呼叫方的失敗量」。s4 拿它跟一段時間前的自己比，漲了就是真的症狀，沒漲就只是相鄰。
+
+```mermaid
+flowchart LR
+    S["downstream 不健康"] --> Q{"這條邊有<br/>attribution 嗎？"}
+    Q -->|沒有| C["請 agent 自己確認<br/>不下判斷"]
+    Q -->|有| D{"呼叫方的歸因失敗量<br/>比 baseline 漲了嗎？"}
+    D -->|漲了| E["verdict=rising<br/>genuine SYMPTOM<br/>修下游就會好"]
+    D -->|沒漲| F["verdict=flat<br/>only topologically adjacent<br/>不要當成症狀報上去"]
+```
+
+圖裡 `verdict=flat` 那一支之所以重要，是因為它是**唯一一條會主動阻止 agent 把一個健康的服務寫進事故報告的路徑**。拓撲圖天生鼓勵過度歸因，圖上連著就看起來有關係，而這條邊上的那一句 PromQL 是唯一能反駁它的證據。
+
+## 然後 api-gateway 出事了
+
+跑到這裡都很順。接著我問 api-gateway，因為它在圖上正好夾在 webapp 跟三個後端之間，是最容易被誤判的位置：
+
+```
+## Dependency health (live) — api-gateway
+- downstream order-service: error 0.0% — healthy
+- downstream payment-service: error 57.5% — UNHEALTHY (breaches objective declined_rate < 1%)
+- downstream user-service: throughput 1.5 rps (liveness only; no error SLI)
+→ A downstream dependency is unhealthy (payment-service), but the service(s)
+  under investigation show HEALTHY SLIs themselves. ...
+```
+
+**api-gateway 沒有 SLI。** 它的契約裡一條都沒有。回頭看前面 payment-service 那段輸出，`upstream` 那兩行只列了 order-service，api-gateway 也是在那裡被同一個方式吃掉的，只是那一段在講別的事，我當下沒注意到。那是它自己宣告的，`exclusions` 寫得清清楚楚「No custom application metrics」，錯誤要從 Loki 的 `event=http.request_failed` 看。
+
+所以上面那段輸出裡，`this service api-gateway` 那一行從頭到尾沒有出現過，因為 `_health_sli()` 回 `None`，而 `_evaluate()` 看到 `None` 就直接把這個服務丟掉：
 
 ```python
-up = topo.upstream(svc)
-if up:
-    # Deliberately unannotated: the same edge is already flagged on the
-    # caller's own downstream line, and saying it twice reads as two
-    # independent problems.
-    rendered = ", ".join(up)
+async def _evaluate(svc: str, relation: str) -> NeighborHealth | None:
+    sli = _health_sli(svc)
+    if sli is None:
+        return None            # ← 靜靜消失
 ```
 
-選擇留在呼叫方那側，是因為**呼叫方才是那條邊的擁有者**。前面設計那份 `signal.yaml` 的時候就是這樣決定的，每個服務只宣告自己打出去的邊。既然宣告的責任在呼叫方，那「這條邊沒被走到」的通知也該出現在呼叫方的區塊裡，這樣看到的人跟能處理的人是同一個。
+然後結論那一行照樣宣告 `the service(s) under investigation show HEALTHY SLIs themselves`。
 
-## 讓分數承認自己漏了什麼
+**它從一個「查不到」推導出了一個「沒問題」。**
 
-第三個改動是在 DQ（data quality，資料品質，就是前面那個 `dq_verdict()` 在判的東西）那行後面補一句，只在「分數滿分但有邊沒被走到」的時候出現：
+這是這個系列第四次遇到同一個形狀。對帳分不出「圖錯了」跟「沒流量」、服務清單分不出「沒這個服務」跟「Loki 看不到」、schema 檢查分不出「沒宣告」跟「讀不到 registry」，現在是「這個服務健康」跟「這個服務我沒辦法判斷」。前面收斂出來的那條規則，任何回傳集合的檢查函式都要能回答「這個空集合是結論還是我根本沒查成功」，在這裡有一個更難察覺的變形：**這次消失的不是集合，是集合裡的一個元素，而剩下的元素看起來一切正常。**
 
-```
-declared/observed agreement 100%. That score only grades edges seen in
-traffic; 1 declared edge(s) were not exercised in this sample and are
-marked below.
-```
+順手量一下這個洞有多大。拓撲上五個節點：
 
-這句話做的事情是把標題跟底下的標記接起來，而不是讓它們互相打臉。讀到這裡的模型現在知道：100% 是一個單向的分數，另一個方向的東西寫在下面。
+| 服務 | 拿來判生死的 SLI | 走得到嗎 |
+| --- | --- | --- |
+| payment-service | `error`：declined_rate | 可以判 |
+| order-service | `error`：orders error rate | 可以判 |
+| user-service | `throughput`：lookups rps | 只能判死活，不能判好壞 |
+| api-gateway | 無 | 完全看不到 |
+| webapp | 無 | 完全看不到 |
 
-## 改完之後
-
-同一座 stack、同一批流量、同一次對帳：
-
-```
-Topology data-quality (last reconcile, 30 traces): declared/observed agreement 100%.
-That score only grades edges seen in traffic; 1 declared edge(s) were not
-exercised in this sample and are marked below.
-
-### api-gateway
-- downstream (dependencies — could be blocking this): order-service,
-  payment-service (⚠ not seen in 30 sampled traces of api-gateway), user-service
-
-### payment-service
-- upstream (callers — degrade if this fails): api-gateway, order-service
-```
-
-⚠ 從兩個變一個，而且那一個帶著它的證據。payment-service 那個區塊乾淨了，因為那條邊不歸它管。
-
-差別不在字數，在於**現在每一個符號都還有意義**。前面那版讀完之後，一個合理的反應是「這裡有兩個警告但分數是滿分，大概都可以不用理」；這一版讀完之後，那個 ⚠ 是一句具體的話：api-gateway 跑了三十次，沒有一次走過這條路。
-
-四條測試釘住這幾個行為：三條是新加的，另外一條是原本那條「有沒有標出來」的斷言被改嚴，現在連那句話的內容跟次數都一起釘。其中兩條是專門盯著退化的：
+**五個節點，只有兩個有 error SLI。** 而 webapp 更慘。它唯一的下游是 api-gateway，兩個都沒有 SLI，所以 `evaluated` 是空的，整個函式回 `None`，agent 那一側連一個字都收不到：
 
 ```python
-def test_context_withholds_warning_without_evidence(monkeypatch):
-    """The caller barely ran, so its unused edges are silence, not drift."""
-
-def test_context_does_not_repeat_the_edge_on_the_callee(monkeypatch):
-    """The same missing edge must be stated once, on the caller's side."""
+if not evaluated:
+    return None
 ```
 
-整包 325 條通過（這是寫這篇那天的數字，後面幾天還會一直往上加，你現在照著跑只會更多）。
+問 webapp 的時候，這段「順著圖走的依賴健康分析」是完全不存在的。而它是使用者第一個碰到的服務。
+
+## 改法：把走不到的地方講出來
+
+修法很短，重點是**沒有一個地方去猜那些節點的狀態**，只是把「我判斷不了」變成一句話。
+
+`_evaluate()` 不再丟掉沒有 SLI 的服務，改成回一個新的 verdict：
+
+```python
+if sli is None:
+    # No SLI declared for this service — that is a gap in the contract, not
+    # a clean bill of health. Say so on its own line instead of dropping the
+    # service, so no downstream sentence can read the silence as "healthy".
+    return NeighborHealth(..., verdict="unjudgeable")
+```
+
+然後在結論那一段收集兩份清單，判不了的自己跟判不了的下游，每一句宣告都要先過這兩份清單：
+
+```python
+_blind = ("unjudgeable", "unavailable", "unknown")
+blind_self = [h.service for h in evaluated if h.relation == "self" and h.verdict in _blind]
+blind_deps = [h.service for h in evaluated if h.relation == "downstream" and h.verdict in _blind]
+```
+
+`unknown` 也在裡面，那是 user-service 那種只有 throughput 的情況。原本的文案在三個地方會踩到這件事：說自己健康（`show HEALTHY SLIs themselves`）、說下游健康（`its downstream dependencies are healthy`）、說全體沒事（`Neither the service(s) ... show an unhealthy SLI`）。三句話都是在講一件它沒有量過的事。
+
+改完之後，同一座 stack、同一場事故：
+
+```
+## Dependency health (live) — api-gateway
+- this service api-gateway: no error SLI declared — CANNOT be judged from metrics
+  (a missing declaration, not a healthy verdict; judge it from its logs)
+- downstream order-service: error 0.0% — healthy
+- downstream payment-service: error 61.2% — UNHEALTHY (breaches objective declined_rate < 1%)
+- downstream user-service: throughput 1.2 rps (liveness only; no error SLI)
+- upstream webapp: no error SLI declared — CANNOT be judged from metrics
+  (a missing declaration, not a healthy verdict; judge it from its logs)
+→ A downstream dependency is unhealthy (payment-service), but the service(s) under
+  investigation could NOT be judged from metrics. ... NOTE: api-gateway has no error
+  SLI of its own, so this verdict says nothing about it — judge it from its logs
+  before ruling it out. NOTE: 1 downstream dependency/dependencies (user-service)
+  could NOT be judged (no error SLI), so a fault inherited from them is not ruled out.
+```
+
+webapp 那一段也從「什麼都沒有」變成兩行誠實的話：
+
+```
+## Dependency health (live) — webapp
+- this service webapp: no error SLI declared — CANNOT be judged from metrics ...
+- downstream api-gateway: no error SLI declared — CANNOT be judged from metrics ...
+→ No unhealthy SLI among the services this walk could judge. NOTE: webapp has no
+  error SLI of its own ... NOTE: 1 downstream dependency/dependencies (api-gateway)
+  could NOT be judged ...
+```
+
+注意最後那句從 `Neither the service(s) ... show an unhealthy SLI` 變成 `No unhealthy SLI among the services this walk could judge`。差別是後者說清楚了這句話的適用範圍。這跟昨天在 DQ 那一行補的「這個分數不涵蓋什麼」是同一個修法，只是換了一個模組。
+
+兩條新測試專門盯著退化，一條盯服務不再被靜靜丟掉，一條盯根因結論不會順手把判不了的下游一起宣告成健康：
+
+```python
+async def test_service_without_sli_is_stated_not_dropped(monkeypatch):
+    """webapp and its only dependency both lack an SLI. The walk used to return
+    nothing at all; it must now say that it could not judge either of them."""
+
+async def test_root_cause_verdict_does_not_clear_unjudgeable_deps(monkeypatch):
+    """order breaching, payment healthy, user-service throughput-only. Calling
+    order the root cause is fine; claiming its dependencies are healthy is not."""
+```
+
+另外三條既有測試的斷言被改掉了，因為它們原本釘的就是舊的錯誤行為（`assert "HEALTHY SLIs themselves" in block`）。整包 327 條通過（這是寫這篇那天的數字，後面幾天還會一直往上加）。
 
 ## 值班的時候差在哪
 
-凌晨三點，agent 跟你說「order-service 在噴錯，而它下游的 payment-service 那條邊有警告」。
+凌晨三點被叫起來，兩份東西攤在你面前。
 
-如果那個警告是取樣造成的，你會白跑一趟去查 payment，而真正的問題還在原地。更糟的是第二次、第三次也是這樣之後，你會開始跳過所有帶 ⚠ 的段落，然後某一次那個 ⚠ 是真的。**這就是為什麼「多報一點總比漏報好」在有人值班的系統裡是錯的**，多報的成本不是那一次的白工，是把整個警示機制的可信度花掉。
+一份是二十二個異常候選，第一行是 payment 的拒絕率，後面十條在用不同的單位重講同一件事，再後面是每天都在跳的 SDK 佇列長度。你要自己從裡面認出哪一條是因、哪一條是果，而你剛睡醒。
 
-換到 agent 身上更直接。它不會累，但它會照著 context 裡的東西排優先順序。一段充滿低價值警告的 context，會讓它把推理預算花在追不存在的問題上，而它每題只有四次工具呼叫。
+另一份是五行字，最後一行告訴你 payment 是根因、order 只是相鄰、api-gateway 判斷不了要去看它的 log。
 
-## 誰決定什麼東西該被標出來
+**第二份最大的價值不是它比較短，是它承認了自己看不到什麼。** 第一份也「看不到」api-gateway 有沒有事，它甚至沒有這個概念，只是掃到什麼算什麼，但它不會告訴你這件事，你得自己知道那個服務沒有錯誤指標。
 
-從平台工程的角度，今天做的事其實是在替產品團隊過濾。
+而修好之前的第二份是三者裡最糟的：它短、它有結論、然後它說了一句沒有根據的 healthy。**一個看起來像結論的猜測，比一份雜訊還危險，因為雜訊至少不會被相信。**
 
-那段 context 是平台團隊產的，讀它的是 agent，而最後為結論負責的是被叫醒的那個人。中間沒有任何一個環節會有人說「這個警告不重要，別理它」，所以**「什麼東西值得被標出來」這個決定，只能在產生它的地方做**。這跟前面那道 CI gate 的判準是同一件事的反面：那次講的是被擋下來的人要能自己修好，這次講的是不該擋的東西就不要擋。
+## 誰該有 SLI，誰決定
 
-而這裡有一個平台團隊很容易做錯的選擇。把所有查到的東西都端出去，看起來比較「透明」，也比較安全，因為漏掉東西的責任比較大。但那等於把過濾的工作推給下游，而下游是一個沒有上下文的模型跟一個半夜被吵醒的人。**願意把不確定的訊號降級成一句不帶警示符號的描述，是平台團隊在替這兩者承擔一部分判斷責任。**
+從平台工程的角度，今天暴露出來的東西其實不是 `health.py` 的 bug，是一個宣告覆蓋率的問題：五個服務裡有兩個沒宣告任何 error SLI。
+
+而那兩個不是隨便哪兩個，是 webapp 跟 api-gateway，**整條 checkout 路徑上最外面的兩層**。它們的共同點也很有代表性：兩個都沒有自己的商業邏輯，只是轉發，所以「沒有自訂指標」在寫的當下完全合理，甚至是對的架構決定。它們的契約裡老老實實寫著錯誤要去 Loki 看。
+
+問題是那個決定的後果落在別的地方。寫契約的人做的是「我要不要為這個服務加一個 error counter」的判斷；付出代價的是三個月後半夜被叫醒、拿到一段沒有提到 api-gateway 的依賴分析的人。**這兩件事中間沒有任何一個環節會把後果回饋給前者**，除非平台團隊主動去量。
+
+所以今天真正該留下來的東西不是那幾行文案，是一個可以定期量的數字：**拓撲上有幾個節點是這個分析走得到的**。這跟前面講過的能力覆蓋率是同一種東西，不是合規率、不是「有沒有照規定填」，而是「這份宣告目前能支撐多少決策」。五分之二會慢慢變成五分之四，而它變好的每一步都對得上某一個服務團隊的某一次補宣告。
+
+至於要不要強制每個服務都有 error SLI，答案是不要。api-gateway 的判斷是對的，硬逼它生一個 error counter 只會多一個沒人維護的指標。該做的是讓「這個服務只能從 log 判斷」變成一句被宣告出來、會被下游讀到的話，而不是一個要靠讀原始碼才知道的事實。
+
+## 這些百分比不能當真
+
+這篇寫完、環境收拾完之後，我順手查了一下 payment 的吞吐量，想確認壓力程序真的都停了：
+
+```console
+$ curl -sG localhost:9090/api/v1/query --data-urlencode \
+    'query=sum by (status) (rate(payment_charges_total[2m]))'
+{'status': 'authorized'}  40.86
+```
+
+每秒四十筆成功付款，而那個時候本機沒有任何東西在打它，pod 日誌裡連一筆 `charge requested` 都沒有。
+
+原因是 payment 跑兩個 replica，但它的 metric 只有一條 series：
+
+```console
+$ curl -sG localhost:9090/api/v1/query --data-urlencode 'query=payment_charges_total'
+series count: 2      # 只有 status / reason 的組合
+labels: [__name__, deployment_environment, git_repo, git_version, job, reason,
+         service_name, service_namespace, service_version, status, telemetry_*]
+
+$ kubectl -n demo get deploy payment-service -o jsonpath='{.spec.replicas}'
+2
+```
+
+那份 label 裡沒有 pod、沒有 instance、沒有 `service.instance.id`，兩個各自累加的計數器就這樣寫進同一條線。Prometheus 看到的是一條忽高忽低的曲線，`rate()` 把每一次交錯都當成 counter reset，然後補上它以為漏掉的量。
+
+所以上面那些 `55.7%`、`57.5%`、`61.2%` 是不準的。拿 Loki 的事件計數當基準對一次，log 是逐行的，不受計數器合併影響：
+
+```bash
+# 同一個 5 分鐘視窗，兩邊各問一次
+curl -sG localhost:3100/loki/api/v1/query --data-urlencode \
+  'query=sum(count_over_time({service_name="payment-service"} | event="payment.declined" [5m]))' \
+  -d "time=${TS}000000000"
+```
+
+| 時間 (UTC) | Loki 事件計數算出來的拒絕率 | 指標算出來的 |
+| --- | --- | --- |
+| 15:25 | 77.2% | 60.2% |
+| 15:30 | 76.9% | 62.6% |
+| 15:35 | 36.5% | 80.2% |
+
+差 15 到 44 個百分點，而且 15:35 那一列方向是反的：實際上拒絕率正在掉下來，指標說它衝上去。吞吐量也一樣，同一個視窗 Loki 數到 2429 筆請求（8.1 rps），指標報 4.98 rps。
+
+結論本身站得住。1% 的目標值被 36% 跟 77% 打穿的程度是一樣的，`payment-service` 是根因、`order-service` 只是相鄰，這兩件事不會因為小數點後一位而翻案。要打折看的是那幾個數字本身。
+
+但這件事真正尷尬的地方在別的地方。**那個順著圖走的分析讀到 `55.7%` 的時候，沒有任何辦法懷疑它**。它拿到的是一個裸的浮點數，而「這條 series 背後有兩個發射源」這個資訊，在它讀到的那份 JSON 裡根本沒有位置可以存在。今天整篇在講的是圖上有節點走不到，這裡則是走得到的那些節點，回報的數字本身也帶著一個沒有人會發現的洞。
+
+> 這個坑我到現在還沒補。要補得讓 collector 保留 `service.instance.id`，而那會讓每個服務的 series 數量乘上 replica 數，是一個要先想清楚成本的決定。
 
 ## 今天沒做的事
 
-那個 `_MIN_CALLER_EVIDENCE = 5` 是拍腦袋的常數，沒有跟取樣總數連動。要做對得先有涵蓋率，那個東西前面就欠著。
+`unjudgeable` 只是把洞講出來，沒有補洞。api-gateway 的契約裡明明白白寫著錯誤在 `event=http.request_failed`，而 `health.py` 完全沒有去打 Loki 的能力，它只會跑 PromQL。要讓這個分析真的走完整張圖，得讓 SLI 可以是一句 LogQL，這件事留給後面。
 
-沒有處理歷史。一條邊這次沒被走到跟連續三天沒被走到，現在還是同一句話，而後者才是真的該有人去看的。前面提過這件事，今天依然沒做，因為對帳結果只存在記憶體裡，重開就沒了。
+user-service 那個 `throughput ... (liveness only)` 也還是半殘的。throughput 掉到零其實是很強的訊號，但現在的程式碼一律回 `unknown`，理由是「零可能只是沒流量」。這跟前面對帳那邊「沒觀察到不等於不存在」是同一個問題，而那邊已經有解法了（用呼叫方的樣本數當證據）。這裡沒有接上去。
 
-沒有動 `undeclared_edges` 那一側的呈現。觀察到但沒宣告的邊現在還是每個沾到的服務各印一次，跟今天修掉的那個重複是同一個形狀，只是它比較少見所以還沒有咬到我。
+`rising` 那一支這次沒有在真環境跑出來。demo 的價格全是偶數分，order 走的路碰不到壞掉的驗證器，所以我拿到的一直是 `flat`。那一支目前只有單元測試蓋著，這篇裡面關於它的敘述是照程式碼講的，不是照實測講的。
 
-也沒有量這個改動對 agent 實際輸出的影響。今天全部是看那段注入的文字本身，沒有跑一次完整的 RCA（root cause analysis，根因分析）去比對改前改後的結論差在哪。
+也沒有量這個改動對 agent 最終結論的影響。今天全部是在看注入的文字本身，跟昨天一樣。這件事欠第二次了。
 
 ## 小結
 
-總結來說，今天沒有讓那張圖變得更準，準確度一個字都沒動，改的全部是怎麼把已經知道的事情講出來。
+總結來說，順著圖走贏平鋪掃描的地方，不是它比較準，兩邊都看到 payment 的拒絕率漲了。是**它知道自己在看什麼，所以它有辦法說出「這兩個服務之間的關係是什麼」**，而平鋪掃描永遠只能給你一份排序過的清單。
 
-比較有感的是那個 `caller_samples`。它的資料早就在手上了，同一批 trace 掃過去的時候順手數一下就有，而它把「沒看到」從一句判斷變成一句有證據的話。**我原本以為要降噪就得少講一點，結果實際做出來是多講了一個數字，然後噪音就不見了。** 少的不是資訊，是那個沒有依據的警示符號。
+但今天更值得記著的是後半段。順著圖走的前提是圖上每個節點都能被判生死，而這個前提在真實環境裡不成立。我這個只有五個服務、而且是自己設計的 demo，就已經有兩個節點走不到。原本的程式碼碰到走不到的節點的處理方式是不講，而不講在一份看起來像結論的報告裡，會被讀成「沒問題」。
 
-還有一個地方值得記著：那個 100% 從頭到尾沒有錯，它只是回答了一個比讀者以為的更窄的問題。而在報告裡，一個沒有講清楚自己邊界的正確數字，跟一個錯的數字造成的後果差不多。
+昨天那句話今天換了個場景又成立一次：**一個沒有講清楚自己邊界的正確數字，跟一個錯的數字造成的後果差不多。** 今天的版本是：一個沒有講清楚自己走不到哪裡的分析，跟一個亂猜的分析造成的後果差不多。
 
-> 那個 100% 我盯了很久，一直想它到底哪裡不對。
-> 它沒有不對，是我問的問題比它答的大 QQ
+> 五個服務的 demo，還是我自己設計的，就有兩個節點走不到。
+> 真實環境裡有幾個，我暫時不太敢算 QQ

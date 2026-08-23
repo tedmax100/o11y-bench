@@ -1,10 +1,10 @@
 ---
-title: "【Day14】那張圖準不準：邊對不對，跟名單上該有誰"
+title: "【Day14】那張圖準不準，跟一份 100% 的報告為什麼是壞的"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
 tags: [OpenTelemetry, AIOps, Tempo, Loki, Signal Plane, 鐵人賽]
 ---
 
-# Day14：拓撲對帳，跟一個問了三次才問對的問題
+# Day14：那張圖準不準，跟一份 100% 的報告為什麼是壞的
 
 > 一張沒有人驗過的架構圖
 > 跟一張畫錯的架構圖
@@ -272,23 +272,192 @@ flowchart TB
 
 真正該補的是把 `dq_score` 跟那份 `unobserved` 清單也送到值班的人面前，至少你會知道「這個判斷是建立在一張有一條邊沒被驗證的圖上」。這個資訊現在算得出來，`context.py` 也真的會把它寫進注入的標頭，但前提是有人跑過對帳。而今天之前，沒有人跑過，所以那段標頭是空的，整張圖看起來就跟驗過一樣。
 
+## 圖準了，但太吵
+
+對帳跑得動、邊也對得上之後，那個資料品質判定第一次拿到 `proven_good: True`。照理說可以往前走了，但我把注入給 agent 的那段 context 印出來，看到這個：
+
+```
+Topology data-quality (last reconcile, 30 traces): declared/observed agreement 100%.
+
+### api-gateway
+- downstream (dependencies — could be blocking this): order-service,
+  payment-service (⚠ declared, not seen in recent traces), user-service
+
+### payment-service
+- upstream (callers — degrade if this fails):
+  api-gateway (⚠ declared, not seen in recent traces), order-service
+```
+
+**標題那行說一致性 100%，往下兩行就有兩個 ⚠。** 而那兩個 ⚠ 講的是同一條邊。
+
+今天處理的就是這件事。程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day14/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day16)，改的是 agent 服務自己的 `reconcile.py` 跟 `context.py`。底下的輸出都是真的跑出來的，最近一次重跑是 2026-08-16，環境是那座 k3d 上的 demo stack，取樣 30 筆 trace。
+
+## 為什麼一份「正確」的報告會是壞的
+
+先講清楚這不是 bug。那三行每一行單獨看都是對的：對帳確實觀察到的邊全部都有宣告（所以 100%）、`api-gateway → payment-service` 確實沒在取樣裡出現、而那條邊確實同時是 api-gateway 的下游跟 payment-service 的上游。
+
+問題是它們擺在一起之後，讀的人會拿到三個互相打架的訊息。而這裡的「讀的人」是一個模型，它不會停下來問「這個 100% 跟這兩個驚嘆號是不是在講同一件事」，它只會把整段當成事實照單全收。
+
+這是可觀測性裡那個老問題換了一個位置。告警疲勞不是因為告警錯了，是因為**大部分告警是對的但不重要，於是值班的人學會了全部略過**，然後真的那一次也跟著被略過。同一件事發生在注入給 agent 的 context 裡，代價一模一樣：一個大部分時候是雜訊的 ⚠，會讓那個符號整個貶值。
+
+前面查過那條 `api-gateway → payment-service` 的來歷，它是活的，前面撈到過一筆真的走過那條邊的 trace，只是它太稀有，這批取樣沒抽到。所以現在這個 ⚠ 有很高的機率根本不是漂移，是取樣的產物。
+
+## 三個問題，各自的成因
+
+拆開來看是三件不同的事。
+
+```mermaid
+flowchart TB
+    D["reconcile 回報<br/>一條 unobserved 的邊"] --> P1["問題一：講兩次<br/>caller 的 downstream 一次<br/>callee 的 upstream 一次"]
+    D --> P2["問題二：沒有證據就下判斷<br/>「沒看到」不等於<br/>「有機會看到卻沒看到」"]
+    S["dq_score 只算<br/>observed → declared 這個方向"] --> P3["問題三：標題說 100%<br/>因為 unobserved 根本不進分母"]
+    P1 --> N["讀的人收到<br/>互相矛盾的三段訊息"]
+    P2 --> N
+    P3 --> N
+```
+
+**問題一**是純粹的呈現。一條邊有兩個端點，而 `_annotate()` 對上游跟下游都套用了，於是同一個事實被講成兩次，讀起來像兩個獨立的問題。
+
+**問題二**比較本質。原本的判斷條件只有一行：這條邊在不在 `unobserved_edges` 裡。但「我沒看到 A 呼叫 B」有兩種完全不同的來源：A 在取樣裡跑了三十次，每次都沒呼叫 B；或者 A 根本沒出現在取樣裡。前者是證據，後者是沉默。而報告把它們寫成同一句話。
+
+**問題三**是前面就量出來的那件事：`dq_score` 算的是「觀察到的邊裡有幾成是宣告過的」，`unobserved` 那個方向不進分母。所以一份宣告了六條邊、只有一條在跑的圖，分數照樣是 100%。這個設計本身沒錯（未宣告的邊是比較危險的那一種），錯的是報告沒有講出這個分數不涵蓋什麼。
+
+## 讓「沒看到」帶著證據
+
+先補證據。`reconcile.py` 在掃 trace 的時候，順手記下每個服務出現在幾筆取樣的 trace 裡：
+
+```python
+def services_from_trace(raw: dict) -> set[str]:
+    """Every service that appears anywhere in one trace. Used to tell 'this
+    caller ran and never made the call' apart from 'this caller never ran'."""
+    seen: set[str] = set()
+    for batch in raw.get("batches", []):
+        service = _otlp_service(batch.get("resource", {}))
+        if service and any(ss.get("spans") for ss in batch.get("scopeSpans", [])):
+            seen.add(service)
+    return seen
+```
+
+原本掃 trace 的那個迴圈只做 `observed |= edges_from_trace(raw)`，現在多一行把這個集合裡的每個服務各加一次計數。這個東西是免費的，同一批 trace 已經抓回來了，只是原本只從裡面挑邊。跑起來長這樣：
+
+```console
+unobserved: [('api-gateway', 'payment-service')]
+caller_samples: {'webapp': 30, 'api-gateway': 30, 'order-service': 19,
+                 'user-service': 17, 'payment-service': 5}
+```
+
+api-gateway 出現在三十筆 trace 裡，一次都沒呼叫 payment-service。**這是一句有份量的話，而原本的報告只會說「沒看到」。**
+
+於是 `context.py` 那個標記函式就有東西可以判斷了：
+
+```python
+def _annotate(edge: tuple[str, str], drift: TopologyDrift | None) -> str:
+    if not drift or not any((e.caller, e.callee) == edge for e in drift.unobserved_edges):
+        return ""                       # 這條邊有被走到，什麼都不用標
+    caller = edge[0]
+    seen = drift.evidence_for(caller)   # caller 出現在幾筆取樣的 trace 裡
+    if seen >= _MIN_CALLER_EVIDENCE:
+        return f" (⚠ not seen in {seen} sampled traces of {caller})"
+    return " (not exercised in this sample)"
+```
+
+呼叫方被跑過夠多次，才給 ⚠，而且把次數寫進去；不夠的時候退成一句沒有警示符號的描述。門檻現在是 5，這個數字沒有什麼理論根據，就是一個「至少要多看幾眼才算數」的下限。
+
+```mermaid
+flowchart TB
+    E["一條宣告的邊 A → B"] --> O{"取樣裡看到<br/>A 呼叫 B 嗎？"}
+    O -->|"看到了"| N["不標任何東西"]
+    O -->|"沒看到"| C{"A 出現在<br/>幾筆取樣的 trace 裡？"}
+    C -->|"≥ 5"| W["⚠ not seen in N sampled traces of A<br/>（有機會看到卻沒看到，是證據）"]
+    C -->|"< 5"| Q["not exercised in this sample<br/>（沒有警示符號，因為這是沉默）"]
+```
+
+> 這個門檻應該要跟著取樣總數走才對，抓 30 筆跟抓 300 筆時的「夠多次」不會是同一個數字。我先寫成常數，因為要把它做對得先有取樣涵蓋率，而那個東西前面就欠著了。
+
+## 一條邊只講一次
+
+第二個改動只有一行，把上游那側的標記拿掉：
+
+```python
+up = topo.upstream(svc)
+if up:
+    # Deliberately unannotated: the same edge is already flagged on the
+    # caller's own downstream line, and saying it twice reads as two
+    # independent problems.
+    rendered = ", ".join(up)
+```
+
+選擇留在呼叫方那側，是因為**呼叫方才是那條邊的擁有者**。前面設計那份 `signal.yaml` 的時候就是這樣決定的，每個服務只宣告自己打出去的邊。既然宣告的責任在呼叫方，那「這條邊沒被走到」的通知也該出現在呼叫方的區塊裡，這樣看到的人跟能處理的人是同一個。
+
+## 讓分數承認自己漏了什麼
+
+第三個改動是在 DQ（data quality，資料品質，就是前面那個 `dq_verdict()` 在判的東西）那行後面補一句，只在「分數滿分但有邊沒被走到」的時候出現：
+
+```
+declared/observed agreement 100%. That score only grades edges seen in
+traffic; 1 declared edge(s) were not exercised in this sample and are
+marked below.
+```
+
+這句話做的事情是把標題跟底下的標記接起來，而不是讓它們互相打臉。讀到這裡的模型現在知道：100% 是一個單向的分數，另一個方向的東西寫在下面。
+
+## 改完之後
+
+同一座 stack、同一批流量、同一次對帳：
+
+```
+Topology data-quality (last reconcile, 30 traces): declared/observed agreement 100%.
+That score only grades edges seen in traffic; 1 declared edge(s) were not
+exercised in this sample and are marked below.
+
+### api-gateway
+- downstream (dependencies — could be blocking this): order-service,
+  payment-service (⚠ not seen in 30 sampled traces of api-gateway), user-service
+
+### payment-service
+- upstream (callers — degrade if this fails): api-gateway, order-service
+```
+
+⚠ 從兩個變一個，而且那一個帶著它的證據。payment-service 那個區塊乾淨了，因為那條邊不歸它管。
+
+差別不在字數，在於**現在每一個符號都還有意義**。前面那版讀完之後，一個合理的反應是「這裡有兩個警告但分數是滿分，大概都可以不用理」；這一版讀完之後，那個 ⚠ 是一句具體的話：api-gateway 跑了三十次，沒有一次走過這條路。
+
+四條測試釘住這幾個行為：三條是新加的，另外一條是原本那條「有沒有標出來」的斷言被改嚴，現在連那句話的內容跟次數都一起釘。其中兩條是專門盯著退化的：
+
+```python
+def test_context_withholds_warning_without_evidence(monkeypatch):
+    """The caller barely ran, so its unused edges are silence, not drift."""
+
+def test_context_does_not_repeat_the_edge_on_the_callee(monkeypatch):
+    """The same missing edge must be stated once, on the caller's side."""
+```
+
+整包 325 條通過（這是寫這篇那天的數字，後面幾天還會一直往上加，你現在照著跑只會更多）。
+
+## 誰決定什麼東西該被標出來
+
+從平台工程的角度，今天做的事其實是在替產品團隊過濾。
+
+那段 context 是平台團隊產的，讀它的是 agent，而最後為結論負責的是被叫醒的那個人。中間沒有任何一個環節會有人說「這個警告不重要，別理它」，所以**「什麼東西值得被標出來」這個決定，只能在產生它的地方做**。這跟前面那道 CI gate 的判準是同一件事的反面：那次講的是被擋下來的人要能自己修好，這次講的是不該擋的東西就不要擋。
+
+而這裡有一個平台團隊很容易做錯的選擇。把所有查到的東西都端出去，看起來比較「透明」，也比較安全，因為漏掉東西的責任比較大。但那等於把過濾的工作推給下游，而下游是一個沒有上下文的模型跟一個半夜被吵醒的人。**願意把不確定的訊號降級成一句不帶警示符號的描述，是平台團隊在替這兩者承擔一部分判斷責任。**
+
 ## 今天沒做的事
 
-- **對帳跟那支 watch 都沒有排程。** 今天全部是手動敲的，而一個要靠人記得跑的資料品質檢查，跟前面那些「寫好了但沒有在跑」的東西是同一個問題。要真的排上去，得先決定 exit 2 的時候通知誰、以及連續幾次 exit 1 才值得吵人。
-- **沒有處理取樣。** 最直接的做法是把取樣數調高，但那只是把界線往後推。比較對的方向大概是讓對帳留下歷史，用「這條邊連續幾天沒被看到」取代「這一次沒看到」。
-- **`unobserved` 沒有帶上時間。** 一條邊上次被觀察到是十分鐘前還是三個月前，是決定要不要動手刪它的關鍵，而現在這兩者在報告上完全一樣。
-- **沒有量「取樣涵蓋率」。** 要判斷 50 筆夠不夠，得先知道那個視窗裡總共有多少筆，而那個數字現在只有我手動用探針工具問出來。`caller_samples` 那個欄位已經有一半的答案（每個服務被抽到幾次），但沒有分母。
-- **沒有把 `list_service_names()` 改掉。** 今天做的是一支獨立的腳本，agent 服務裡那個只讀 Loki 的函式一個字都沒動，所以 `topology validate` 那條路現在依然會給出那個假綠燈。要決定的是「多一個資料源」還是「換一個資料源」，兩者對其他呼叫端影響不同。
+- **對帳跟那支 watch 都沒有排程。** 今天全部是手動敲的，而一個要靠人記得跑的資料品質檢查，跟前面那些「寫好了但沒有在跑」的東西是同一個問題。
+- **沒有處理取樣，也沒有處理歷史。** 一條邊這次沒被走到、跟連續三天沒被走到，現在還是同一句話，而後者才是真的該有人去看的。要做到後者，對帳結果不能只活在記憶體裡。
+- **`unobserved` 沒有帶上時間。** 一條邊上次被觀察到是十分鐘前還是三個月前，是決定要不要動手刪它的關鍵，現在這兩者在報告上完全一樣。
+- **沒有量「取樣涵蓋率」。** 要判斷 50 筆夠不夠，得先知道那個視窗裡總共有多少筆。`_MIN_CALLER_EVIDENCE = 5` 這個常數也是拍腦袋的，它應該跟涵蓋率連動。
 - **沒有處理服務改名。** 一個服務從 `user-service` 改叫 `identity-service`，這支腳本會報成一個死掉加一個新增，而不是一次更名。
-- **`--lookback` 沒有下放到各服務自己宣告。**
+- **沒有量這個改動對 agent 實際輸出的影響。** 今天全部是看那段注入的文字本身，沒有跑一次完整的根因分析去比對改前改後的結論差在哪。
 
 ## 小結
 
-總結來說，今天做的事其實只有「把一支寫好很久的程式跑起來，然後把一個問題問三次而不是一次」。但跑之前我以為的結果是「圖大概八成準」，跑完拿到的是三個不同的答案，取決於我把取樣數設成多少；而那個「完全對齊」的綠燈，是因為我問的那個 store 剛好是唯一看不到第六個服務的那一個。
+總結來說，今天做的事是把一支寫好很久的程式跑起來，然後把同一個問題問了三次而不是一次。跑之前我以為結果會是「圖大概八成準」，跑完拿到的是三個不同的答案，取決於取樣數設成多少；而那個「完全對齊」的綠燈，是因為我問的那個 store 剛好是唯一看不到第六個服務的那一個。
 
-比較有價值的大概是那條 `api-gateway → payment-service`，它被報成一條死掉的邊，實際上活得好好的，而我是靠著撈一筆單獨的 trace、把同一個函式套上去，才證明它存在。**一個對帳工具說「這裡有差異」的時候，你還是得有辦法去驗證那個差異本身。** 這跟第一天寫評分器時得出的那句「一個會給錯答案的評分器比沒有評分器更糟」是同一件事，只是這次的受測物換成了一張圖。
+後半段更彆扭一點：圖準了之後，那份報告反而變得不能看。而修法不是少講，是多講一個數字。`caller_samples` 的資料早就在手上，同一批 trace 掃過去的時候順手數一下就有，它把「沒看到」從一句判斷變成一句有證據的話。少掉的不是資訊，是那個沒有依據的警示符號。
 
-要繼續往下做之前，這張圖上的節點至少得先是活的、邊至少得先被驗過。接下來要處理的是圖以外的東西：那些宣告出來的欄位，跑起來之後到底有沒有照著送。
+兩件事合起來是同一個教訓：**一個對帳工具說「這裡有差異」的時候，你還是得有辦法去驗證那個差異本身**；而一個沒有講清楚自己邊界的正確數字，在報告裡跟一個錯的數字造成的後果差不多。
 
 > 那一個多小時，我對著一座根本不相干的 Tempo 做根因分析。查得很認真，方法也沒錯，就是查錯了那一台 XD
-> 然後又寫了一個「誰漏了宣告」的檢查，第一個被漏掉的是它自己。這種巧合我只能說「很棒！」
+> 後面那個 100% 我也盯了很久，一直想它到底哪裡不對。它沒有不對，是我問的問題比它答的大 QQ

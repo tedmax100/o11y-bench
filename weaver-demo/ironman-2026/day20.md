@@ -1,176 +1,386 @@
 ---
-title: "【Day20】為什麼不是一個 while 迴圈就好"
+title: "【Day20】跑了一場漂亮的 RCA，然後發現答案寫在 prompt 裡"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
 tags: [OpenTelemetry, AIOps, LangGraph, Agent, 鐵人賽]
 ---
 
-# Day20：從一問一答，到一隻會自己查東西的 agent
+# Day20：決策鏈實際跑起來長什麼樣
 
-> 選一個框架而不是自己寫迴圈
-> 換到的往往不是功能
-> 是有一天要跟別人解釋的時候
-> 講得出來
+> 我本來想量的是這隻 agent 表現如何
+> 先量到的是自己那把尺
+> 上面刻著答案
 
-前面七天都在處理同一件事：讓資料本身帶著足夠的上下文。昨天把 CEL（Context Enrichment Layer，情境豐富層）那四項職責逐項打勾，結論是只做到一項半。從今天開始換一邊看，讀這些資料的那個東西到底怎麼運作。
+昨天畫了 `agent.py` 那張四個 node 的圖，但沒有拆它。今天把它跟實際的決策鏈對起來，順便回答一個從第二階段就欠著的問題：**前面七天做出來的那些 context，到底是在哪一步被讀進去的？**
 
-這是概念日。今天講的東西跟 OTel（OpenTelemetry）沒有關係，講的是 agent 這個詞在這個 repo 裡具體指什麼。因為接下來幾天要拆的 `agent.py`，如果不先講清楚它的骨架，會變成逐行讀一份看不懂的程式碼。
+答案有點出乎意料，它不在圖裡面。而今天真的跑了一次之後，還撞到一件更難堪的事。
 
-驗證環境：langgraph 1.2.2、langchain-core 1.4.0。
+程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day20/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day20)。
 
-## 一個 LLM 能做的事，跟一個 agent 能做的事
+## 先看輸入，不用花一個 token
 
-LLM（Large Language Model，大型語言模型）本身的介面很單純：你給它一段文字，它回你一段文字。就這樣。
+想看清楚 agent 拿到什麼，最直接的方法是跑一次然後把輸入印出來。但那要等模型、要花錢，而且輸出裡混著它的推理，很難一眼看出「它開始想之前手上有什麼」。
 
-拿它來做根因分析，你會先撞到一個很硬的牆：**它沒有辦法去查東西。** 你問「payment-service 現在的拒絕率是多少」，它只能根據訓練資料猜，而訓練資料裡沒有你的 Prometheus。它會給你一個看起來很有道理的答案，然後那個答案是編的。
+前面驗證治理資產的時候用過一個做法：**要驗證的東西如果不在模型那一側，就不要把模型接上去。** 這裡完全適用。我要看的是「圖被呼叫的那一刻，state 裡有什麼」，那時候模型還沒開始想，所以模型可以整隻換掉。
 
-第一個直覺的修法是把資料塞給它。把最近一小時的指標、log、trace 全部倒進 prompt 裡，讓它從裡面找。這個做法在小規模時可以動，但很快就會壞掉，因為你不知道要塞什麼。一次事故可能需要看 payment 的拒絕率，也可能需要看 order 的取消原因，也可能需要看某個 deployment 的重啟次數。全部塞進去就是前面講過的 signal flood，而且 context window 也放不下。
-
-真正的解法是反過來：**不要事先決定要看什麼，讓它自己決定，然後給它去看的能力。**
-
-## 這個迴圈叫 ReAct
-
-具體的做法是把「回一段文字」變成「回一個要做的動作」。
-
-你事先告訴模型有哪些工具可以用，每個工具叫什麼、吃什麼參數、回傳什麼。模型不直接回答問題，而是回一個結構化的東西：我要呼叫 `query_prometheus`，參數是這句 PromQL。你的程式碼真的去執行那次查詢，把結果貼回對話裡，再問一次模型。模型看到結果之後，可能決定再查一次別的，也可能覺得夠了，開始寫結論。
-
-這個模式叫 ReAct，reason 加 act 的合寫：推理、行動、觀察結果，然後再推理。
-
-```mermaid
-flowchart LR
-    Q["事故告警<br/>+ 注入的 context"] --> R["模型推理<br/>下一步要看什麼"]
-    R -->|"要查"| A["執行工具<br/>PromQL / LogQL / TraceQL"]
-    A --> O["結果貼回對話"]
-    O --> R
-    R -->|"夠了"| ANS["寫結論"]
-```
-
-`tool calling` 是這個迴圈的骨架。它不是模型「會用工具」這種魔法，它只是模型被訓練成能夠輸出一種符合你給的 schema 的結構化請求，而真正去執行的是你的程式碼。這個分工很重要：**模型從頭到尾沒有碰到你的 Prometheus，它只是說出它想查什麼。**
-
-前面幾天做的所有事情，在這個迴圈裡的位置就很清楚了。注入的那些 context 是在 `R` 那個框第一次執行之前就塞進去的，目的是讓模型的第一次推理不要從零開始猜。契約裡宣告的權威查詢就是為了讓它輸出的那句 PromQL 是對的。
-
-## 為什麼不是一個 while 迴圈
-
-看到上面那張圖，很自然的反應是這件事寫成十行程式碼就好：
+`probe_turn.py` 做的就是這件事，核心只有幾行：
 
 ```python
-while True:
-    resp = llm.invoke(messages)
-    if not resp.tool_calls:
-        return resp.content
-    for tc in resp.tool_calls:
-        messages.append(run_tool(tc))
+class _StubGraph:
+    """Stands in for the compiled StateGraph. Records the state, answers nothing."""
+
+    async def ainvoke(self, state: dict, config: dict | None = None) -> dict:
+        captured["state"] = state
+        return {"messages": list(state["messages"])}
+
+
+agent_mod._build_agent = lambda: asyncio.sleep(0, result=_StubGraph())
 ```
 
-這確實會動，而且很多教學就是這樣寫的。它壞掉的地方不在正常路徑，在所有其他路徑。
+然後照正常路徑呼叫 `run_headless()`。所有注入照跑、該打的 API 照打，只有最後那個「交給模型」的動作被換成記錄下來。零個 token。
 
-**第一個問題是它停不下來。** 上面那個 `while True` 唯一的出口是模型自己決定不再呼叫工具。如果模型不肯停呢？這不是假設，是這個 repo 真的踩過的。`tools_node` 裡有一段註解記著：
+## 那一輪實際長什麼樣
 
-```python
-# Identical-retry guard: a small model will re-send the exact same broken /
-# empty query until the budget runs out (we saw 4x). Short-circuit any call
-# whose (name, args) already ran earlier this turn
+丟一個 payment 拒絕率過高的告警進去：
+
+```console
+$ uv run python probe_turn.py
+runbook payment-bad-deploy matched alertname 'PaymentDeclineRateHigh' only after
+normalization (trigger says 'payment-decline-rate-high') — align the alert rule
+or the runbook trigger
+budget: 6 tool calls
+messages handed to the graph: 6
+
+0. [system   ]    517 chars  ## Live capability snapshot
+1. [system   ]   2212 chars  ## Signal context (topology v1.0.0)
+2. [system   ]    785 chars  ## Runbook: payment-bad-deploy — payment-service decline-rate spike after…
+3. [system   ]   1305 chars  ## Runbook diagnostics auto-run: payment-bad-deploy
+4. [system   ]    572 chars  ## Dependency health (live) — payment-service
+5. [user     ]   3444 chars  An alert just fired. Investigate the root cause and conclude with the sin…
+
+total: 8835 chars before the first token of reasoning
 ```
 
-同一句查不到東西的查詢，模型會原封不動再送一次，連送四次。它沒有壞掉，它只是不知道換一個問法。**一個沒有預算上限的迴圈，遇到這種行為就是無限跑下去，而且每一圈都在花錢。**
+六則訊息，八千八百個字元，而模型連第一個字都還沒吐。**其中前五則全部是平台這一側先備好的東西（第二階段那幾天的產出加上 runbook），最後一則才是那個告警本身。**
 
-**第二個問題是狀態。** 那個 `while` 迴圈裡只有 `messages` 一個東西在累積。但實際上需要跨圈傳遞的不只對話：用掉幾次工具呼叫了、這一輪的上限是多少、上一次檢查發現的問題要不要餵回去讓它重寫。這些東西塞進 `messages` 會污染對話，放在迴圈外的區域變數則會讓「這個流程現在的狀態是什麼」散在各處。
+順序是有意義的。`0` 是能力快照，回答「這個服務有哪些指標真的存在」；`1` 是拓撲跟契約，回答「它在哪裡、該用哪一句查詢判斷它」；`2` 跟 `3` 是比對到的 runbook 跟它自動跑完的唯讀診斷，回答「這種告警以前是怎麼查的、那幾項檢查現在過不過」；`4` 是依賴健康，回答「它的鄰居現在誰好誰壞」。等到 `5` 那則使用者訊息說「有個告警燒起來了，去查」的時候，模型手上已經有一張地圖。
 
-**第三個問題是分支。** 真正要做的判斷不只「有沒有工具要呼叫」。預算用完了要不要強制它作答？作答之後要不要檢查它有沒有唬爛？檢查沒過要不要讓它重寫，重寫幾次算數？每多一個判斷，那個 `while` 裡就多一層 `if`，而它們之間的關係只存在於縮排裡。
+第一行那個 `only after normalization` 值得順手記一筆。runbook 的 trigger 寫的是 `payment-decline-rate-high`，我隨手編的告警名字是 `PaymentDeclineRateHigh`，兩邊靠正規化才接上，而程式碼選擇「接上，但大聲講出來」。這句話是寫給平台團隊看的：現在能動，但兩邊的命名沒有對齊，哪天多一個 `payment_decline_rate_high` 就會開始靠運氣。
 
-## LangGraph 的模型
+## 入口點在圖的外面
 
-LangGraph 做的事情就是把上面那三件事變成一個明確的結構。核心只有四個概念。
-
-`StateGraph` 定義**狀態的型別**。整個流程共用一份狀態，你先宣告它有哪些欄位。這個 repo 的長這樣：
-
-```python
-class RcaState(TypedDict):
-    messages: Annotated[list, add_messages]
-    tool_calls_used: int          # 這一輪已經用掉幾次工具呼叫
-    budget: int                   # 這一輪的上限
-    rubric_feedback: str          # 檢查沒過時要餵回去的修正提示
-    rubric_revision_count: int    # 這一輪已經重寫幾次
-```
-
-`messages` 那個 `Annotated[list, add_messages]` 是 LangGraph 的 reducer 語法，意思是「這個欄位每次更新是**追加**而不是覆蓋」。其他欄位沒有標記，預設就是覆蓋。這個小地方解掉了前面那個「狀態散在各處」的問題：跨圈要傳的東西全部有名字、有型別、有明確的合併規則。
-
-順帶一提，這兩種合併規則剛好對應到兩種生命週期：`messages` 會跨輪累積，同一條對話問第二次時前面的東西都還在；`tool_calls_used` 每輪的輸入都被覆蓋回 0，所以預算是「每一輪」的上限，不是「這條對話一輩子」的上限。
-
-`node` 是一個步驟。它是一個函式，吃當前狀態，回傳要更新的欄位。它可以是一次 LLM 呼叫，也可以是純粹的程式邏輯，兩者在圖裡沒有差別。
-
-`add_edge` 跟 `add_conditional_edges` 決定下一步去哪。前者是固定的（做完 A 一定去 B），後者吃一個路由函式，讓它看著當前狀態決定去哪一個。**分支的條件因此變成一個可以單獨測試的函式，而不是縮排裡的一層 `if`。**
-
-`checkpointer` 讓狀態可以被存下來。每走一步就存一次，於是流程可以中斷、可以從中間接著跑、也可以事後回放。
-
-這個 repo 用的是 `MemorySaver()`，存在記憶體裡。同一條對話的多輪之間狀態會留著，但服務重啟就沒了。要真的做到「昨天那次調查今天接著查」得換成有持久化的 checkpointer，這件事現在沒做。
-
-## 這個 repo 的圖
-
-`agent.py` 裡建圖的那段程式碼是這樣，四個 node：
-
-```python
-graph = StateGraph(RcaState)
-graph.add_node("agent", agent_node)
-graph.add_node("tools", tools_node)
-graph.add_node("force_answer", force_answer_node)
-graph.add_node("rubric_trace", rubric_trace_node)
-graph.add_edge(START, "agent")
-graph.add_conditional_edges(
-    "agent",
-    route_after_agent,
-    {"tools": "tools", "force_answer": "force_answer", "rubric_trace": "rubric_trace"},
-)
-graph.add_edge("tools", "agent")
-graph.add_edge("force_answer", "rubric_trace")
-graph.add_conditional_edges("rubric_trace", route_after_rubric, {"agent": "agent", END: END})
-return graph.compile(checkpointer=MemorySaver())
-```
-
-畫出來是這樣：
+回到開頭那個問題。把 `run_headless()` 的組裝順序畫出來：
 
 ```mermaid
 flowchart TB
-    START(["START"]) --> AG["agent<br/>LLM 決定下一步"]
-    AG -->|"有工具要呼叫<br/>且預算還夠"| TL["tools<br/>真的去執行查詢"]
-    TL --> AG
-    AG -->|"還想呼叫工具<br/>但預算用完了"| FA["force_answer<br/>拿掉工具，逼它作答"]
-    AG -->|"沒有工具要呼叫<br/>它答完了"| RB["rubric_trace<br/>檢查答案裡的 trace ID<br/>是不是真的存在"]
-    FA --> RB
-    RB -->|"檢查沒過<br/>且重寫次數還夠"| AG
-    RB -->|"通過，或重寫超過上限"| E(["END"])
+    A["capability_for_services()<br/>這個服務有哪些指標真的存在"] --> B["_inject_signal_context()<br/>s1-s3：拓撲 / 分級 / 權威 SLI<br/>純記憶體，不打任何 API"]
+    B --> C["_inject_past_incidents()<br/>同一個告警上次的根因"]
+    C --> D["_inject_runbook()<br/>步驟 + 自動跑唯讀診斷"]
+    D --> E["_inject_dependency_health()<br/>s4：真的去打 Prometheus<br/>釘在事故當下的時鐘"]
+    E --> F["告警本身變成 user message"]
+    F --> G["agent.ainvoke(state)"]
+    G --> H["圖開始跑"]
 ```
 
-（這張圖不是我照著程式碼畫的，是把編譯完的 graph 直接吐出來的：`graph.get_graph().draw_mermaid()`，四個 node 跟七條邊都對得起來，只是我把 LangGraph 產的標籤換成中文說明。）
+**六個注入全部在 `ainvoke` 之前跑完，圖裡的四個 node 沒有任何一個會回頭呼叫 `signals/`。** 這代表決策級 context 的入口點是「組裝那一輪」這個階段，不是圖的某一步。
 
-`agent` 那個框往外分三條，判斷的順序是先看「這一次模型有沒有要呼叫工具」，沒有就直接去 `rubric_trace`；有的話才去比預算。所以 `force_answer` 只會發生在「它還想查，但額度沒了」的情況，而不是預算一到就被打斷。
+這個設計有個直接的後果：那些 context 是**一次性**的。圖跑了幾圈、模型查了什麼、發現了什麼，都不會讓那幾個區塊重算。s4 的依賴健康是在調查開始前讀的一個快照，如果調查跑了三分鐘，那三分鐘內鄰居的狀態變了，模型不會知道。
 
-`agent` 跟 `tools` 兩個 node 加上它們中間那條來回，就是前面那個 ReAct 迴圈。另外兩個 node 是為了前面講的那些「其他路徑」而存在的。
+這是刻意的取捨，理由在 `health.py` 的說明裡：
 
-`force_answer` 處理預算用完的情況。它做的事情很直接：同一個模型，但**不綁任何工具**，於是它想呼叫也呼叫不了，只能作答。這比在 `while` 裡 `break` 掉好，因為 `break` 會讓你拿到一個沒有結論的空回應。
+> This is the one Signal Plane piece that does live I/O, so it runs *before* the agent loop like the runbook diagnostics — read-only, off the agent's tool budget.
 
-`rubric_trace` 是答完之後的檢查。它去驗證答案裡引用的 trace ID 是不是真的存在，沒過就把修正提示寫進 `rubric_feedback`，路由回 `agent` 讓它重寫。除了 ReAct 那條來回之外，這是圖裡唯一一條往回走的邊，而且它有次數上限（`_max_rubric_revisions = 1`）：第一次抓到就放它回去重寫，重寫完的答案如果又被抓到一次，就不再給機會，直接結束。也就是這條回頭路一輪最多走一次。
+**它不佔預算。** 六次工具呼叫的上限是留給模型自己決定要查什麼的，如果依賴健康也從那裡扣，等於平台團隊先花掉了使用者的額度。放在迴圈外面就不用跟模型搶。
 
-而建圖那段函式的說明寫得很白：
+## 那則沒有出現的訊息
 
-> Explicit StateGraph replacing `create_react_agent`. Same agent↔tools ReAct loop, but with a **hard** tool-call budget: once `tool_calls_used` hits `budget` the graph routes to `force_answer` (LLM with no tools bound) so a headless run can't loop forever.
+上面那份輸出是六則，但注入有六個，而其中 runbook 那一個自己就產了兩則。少掉的那則是過去事故：
 
-LangGraph 本身提供了一個現成的 `create_react_agent`，一行就能生出 agent 跟 tools 那個迴圈。這個 repo 沒有用它，換成手寫的圖，理由就是那句 `so a headless run can't loop forever`。**一個沒有人在旁邊看著的流程，需要一個它自己關不掉的上限。**
+```console
+$ uv run python -c "from app.agent import _past_incident_context; \
+    print(repr(_past_incident_context('payment-service','PaymentDeclineRateHigh')))"
+''
+```
+
+空的，因為這台環境從來沒有存過一次成功的調查。
+
+它是 fail-open：拿不到東西就不注入，不會炸掉整輪。這個行為本身是對的，但它讓那份輸出有一點誤導性：**看到六則訊息，你不會知道本來可以有七則。** 這跟前面幾天一直在修的形狀是同一個：沒東西的時候，「沒有」跟「有但是空的」在輸出上長得一樣。差別只在這次咬到的是我自己在讀 debug 輸出，不是模型。
+
+> 順帶一提，同樣一個 `match_runbook()`，只丟 `alertname` 進去是比對不到的，
+> 要連 `service_name`、`severity` 一起丟才會中。
+> 我第一次拿一行 `python -c` 去驗，看到 `None` 就以為它沒比對到，
+> 結果是我自己少餵了 label，跟程式沒關係 QQ
+
+## 然後真的跑一次
+
+輸入那一側看完了，接下來把模型接回去，看它實際做一次 RCA（root cause analysis，根因分析）怎麼走。同一個告警、同一個釘住的時鐘，`run_rca.py` 用的是真的圖，只是把每一則訊息側錄下來。
+
+十三秒、四次工具呼叫（上限是六次），結論是對的：
+
+```console
+[1] CALL query_prometheus
+    {"expr": "sum by (git_version, reason) (rate(payment_charges_total{service_name=\"payment-service\", status=\"declined\"}[5m]))", ...}
+    -> {"result": [{"metric": {"git_version": "v2.5.0", "reason": "new_validator"},
+        "points": 24, "last": 2.955, "min": 0.0, "max": 2.955, "avg": 0.9487, ...
+
+[2] CALL k8s_pod_status
+    {"service": "payment-service"}
+    -> {"pod_count": 2, "pods": [{"phase": "Running", "ready": "1/1", "restarts": 0,
+        "git_version": "v2.5.0", ...
+
+[3] CALL query_tempo_traces
+    {"traceql": "{service_name=\"payment-service\" status=error}", "start": "now-1h"}
+    -> Error: ToolException('... 400: invalid TraceQL query: parse error at line 1,
+       col 2: syntax error: unexpected IDENTIFIER
+       HINT: TraceQL predicates must be inside braces ... Use dotted attribute names
+
+[4] CALL query_tempo_traces
+    {"traceql": "{resource.service.name=\"payment-service\" && status=error}", "start": "now-1h"}
+    -> {"traces": [], "count": 0}
+```
+
+最後的結論指名 `v2.5.0`、`new_validator`、程式碼迴歸，信心 0.8。這是對的，但先別急著替它高興，等一下會講為什麼這個「對」要打折。
+
+而且它在第一次呼叫之前，真的先列了假設樹：
+
+```
+**Hypotheses:**
+
+1.  **Code Regression:** The recent deployment introduced a bug causing increased payment declines.
+    *   **Confirm:** A spike in declines concentrated on a single `git_version`.
+    *   **Refute:** Declines are spread across multiple `git_version`s, or no new deployment is recent.
+2.  **Upstream Dependency Issue:** ...
+3.  **Infrastructure Problem:** ...
+```
+
+三個互斥假設、每個都寫了什麼證據會確認、什麼會推翻，順序也照著先驗機率排。prompt 裡 Step 0 那段要求它做的事，它照做了。我原本以為它會直接開查，寫這段之前特地回頭把推理文字印出來確認，結果是我猜錯。
+
+另外三件事值得看。
+
+**第一，它照著 playbook 走，而且會自己跳過步驟。** 第 1 次呼叫就是「歸因尖峰」那一步，一句查詢同時 by `git_version` 跟 by `reason`，完全照著方法寫的形狀。第 2 步部署關聯它沒有打 `github_compare`，而是在結論裡寫「本來會用它比對，但既然指標訊號已經很強，這一步不是必要的」。第 3 步基礎設施排除、第 4 步抓 trace，都有做。**它把有限的預算花在資訊量最高的地方，而不是把五個步驟全部跑完。**
+
+**第二，工具出錯之後它自己救回來了。** 第 3 次呼叫的 TraceQL 語法是錯的，Tempo 回 400。這個錯誤沒有讓整輪掛掉，因為 `ToolNode` 是這樣建的：
+
+```python
+# handle_tool_errors=True turns ToolException into a ToolMessage the LLM can
+# read and recover from, instead of bubbling up and terminating the run.
+tool_node = ToolNode(TOOLS, handle_tool_errors=True)
+```
+
+錯誤訊息連同那句 `HINT` 被當成一則工具回應餵回去，第 4 次呼叫就改成了帶 `resource.` 前綴、用 `&&` 連接的正確寫法。**這是設計在真實輸出裡被兌現的一次。**
+
+**第三，它沒有掰一個 trace ID。** 第 4 次查詢回 0 筆，它就在結論裡寫 `Trace ID: N/A (no error traces found)`，並且把信心從更高的位置往下調。prompt 裡那句 `never invent a trace ID` 有生效。
+
+## 那兩次 trace 查詢從一開始就不可能成功
+
+不過 0 筆這件事我不放心，就自己去查了一次。結果是那個時段連一條 payment 的 trace 都沒有，不分 status：
+
+```console
+$ curl -sG localhost:3200/api/search --data-urlencode \
+    'q={resource.service.name="payment-service"}' -d start=... -d end=...
+traces: 0
+```
+
+原因在 Tempo 的設定裡：
+
+```yaml
+compactor:
+  compaction:
+    block_retention: 1h
+```
+
+**保留一小時。** 而我這個告警釘的是二十五小時前。Tempo 自己的查詢日誌講得更白，事故時段 `total_blocks=0`，最近一小時 `total_blocks=2`。
+
+所以 agent 猜的原因（「可能是 trace 寫入有延遲」）是錯的，真正的原因是資料早就被壓掉了。它猜錯不奇怪，**因為沒有任何人告訴過它 trace 只留一小時。**
+
+這件事的代價很具體：六次預算裡有兩次花在一個結構上不可能成功的步驟上。這次還好，因為指標那一步已經足夠下結論；換一個必須靠 trace 才能分辨的事故，這兩次就是白花的。
+
+而它接不上的原因，正好是前面那份決策級遙測 JSON 裡沒有的東西。契約有宣告 `freshness`（樣本多舊算過期），但**沒有任何欄位宣告「這個 store 記得多久以前的事」**。這兩個是不同的問題：前者講的是資料新不新，後者講的是資料還在不在。
+
+## 這場考試是開書的
+
+回頭看那份逐字稿，有一句話我怎麼想都不對勁。第一次查詢之後它寫：
+
+```
+**Deploy Correlation:** The spike is clearly linked to `git_version` "v2.5.0".
+The previous version was "v2.4.1".
+```
+
+`v2.4.1` 是哪來的？工具回傳裡沒有這個字串，注入的 signal context 沒有，能力快照也沒有。而 Prometheus 在整個保留範圍內，`payment_charges_total` 只有 `v2.5.0` 這一個版本：
+
+```console
+$ curl -sG localhost:9090/api/v1/series --data-urlencode 'match[]=payment_charges_total' ...
+  ['v2.5.0']
+```
+
+它在系統 prompt 裡。而且不只一處：
+
+```
+**payment-service** has a `payment_use_new_validator` flag (from `flags.json`, a
+ConfigMap). Flipping it `true` and bumping `git_version` `v2.4.1` → `v2.5.0`
+simulates a bad deploy where odd-cents amounts get declined — `payment.declined`
+spikes under `git_version="v2.5.0"` ...
+```
+
+```
+2. Previous version = the `git_version` value just before the spike
+   (e.g. `v2.4.1` if the spike is on `v2.5.0`).
+```
+
+還有一段格式範例，直接就是這次事故：
+
+```
+payment-service 在 14:05 後 decline 率從 0% 跳到 18%，全集中在 v2.5.0、
+reason 是 `new_validator_odd_cents`。看起來跟新部署的 validator 有關。
+```
+
+**這隻 agent 不用查任何東西，就能從 prompt 裡讀到這次事故的服務、版本、原因跟機制。** 那份兩萬三千字的系統 prompt 裡有一份 schema catalog，而 catalog 為了教它「這座 demo 長什麼樣」，把 demo 唯一的那個內建事故也一起寫進去了。
+
+所以剛才那份看起來很漂亮的逐字稿，實際上是一場開書考。它確實有去查、查出來的數字也對得上，但「根因是 v2.5.0 的 new_validator」這個結論在它第一次呼叫工具之前就已經在桌上了。
+
+這是這座 demo 自己長出來的問題，寫 catalog 的時候完全合理：你要讓 agent 知道 `payment_use_new_validator` 這個 flag 存在，而解釋這個 flag 最自然的方式就是講它會造成什麼。但代價是**這個環境上跑出來的 RCA 成績，沒有辦法拿來說 agent 有多強。**
+
+要驗證它真的會做根因分析，得換一個 catalog 裡沒有寫過的失效模式。這件事今天沒做，但它是後面評測那一段真正要處理的問題。
+
+## 決策鏈：規定在 prompt，執行在圖
+
+`discover → query → hypothesize → verify` 這條鏈，在程式碼裡其實分成兩半。
+
+圖負責的是**執行**：agent 想查東西就去 tools、查完回 agent、預算用完轉 force_answer、答完進 rubric_trace。它完全不知道「discover」跟「query」有什麼差別，對它來說都只是一次工具呼叫。
+
+順序則是 prompt 負責的。那份 `_RCA_PLAYBOOK` 把方法寫死在裡面，開頭第一段是這樣：
+
+```
+## Step 0 — Hypothesis tree (do this BEFORE any tool call)
+
+State 2–3 mutually exclusive hypotheses ranked by prior probability. For each:
+- What evidence would CONFIRM it?
+- What evidence would REFUTE it?
+```
+
+然後才是五個步驟：歸因尖峰、部署關聯、基礎設施 vs 程式碼、抓一條 trace 佐證、下結論。
+
+```mermaid
+flowchart LR
+    subgraph P["prompt 規定的順序"]
+        H["Step 0 假設樹<br/>2-3 個互斥假設"] --> Q1["1 歸因尖峰<br/>by git_version, reason"]
+        Q1 --> Q2["2 部署關聯"]
+        Q2 --> Q3["3 基礎設施 vs 程式碼"]
+        Q3 --> Q4["4 抓一條 trace"]
+        Q4 --> C["5 下結論<br/>+ 信心分數"]
+    end
+    subgraph G["圖負責的執行"]
+        AG["agent"] <--> TL["tools"]
+    end
+    P -.->|"每一步都是<br/>agent→tools 一圈"| G
+```
+
+值得注意的是為什麼這份方法要寫在 prompt 裡。註解交代得很清楚：
+
+> The headless run has no human to nudge it toward deploy-correlation, so the kickoff must carry the RCA method explicitly — otherwise (observed) it finds a failure *reason* but never breaks down by `git_version`, skipping the deploy correlation that is the whole point.
+
+`(observed)` 那個括號是重點。**這不是預防性的設計，是修 bug 修出來的。** 沒有這段方法的時候，agent 會查到「拒絕原因是 new_validator」然後就收工，它找到了 what，沒有去找 which deploy。
+
+而 Step 0 那個假設樹更明顯是為了對付一種特定的失敗：模型很容易咬住第一個看起來合理的解釋不放。強迫它**先**列出互斥假設、而且每個都要寫出什麼證據會推翻它，是在它還沒有偏見的時候先把退路留好。
+
+## 外面還有一層迴圈
+
+昨天那張圖不是全部。`run_headless()` 在圖外面還包了一層：
+
+```python
+findings = await extract_findings(messages)
+
+while (
+    findings.confidence < settings.confidence_loop_threshold
+    and loop_count < settings.max_hypothesis_loops
+):
+    ...
+    result = await agent.ainvoke({"messages": [{"role": "user", "content": pivot_msg}], ...})
+```
+
+圖跑完之後，另一次 LLM 呼叫把結論抽成結構化的 `Findings`，包含一個信心分數。如果分數低於門檻，就把 pivot 提示丟回去再跑一次，要求它**換一個假設**：
+
+```
+Do NOT repeat the same investigation. From the 2–3 hypotheses you listed
+at the start, pick a DIFFERENT one you have not yet fully explored.
+```
+
+這裡有一個細節很容易漏掉：每一輪 pivot 都拿到一份**全新的預算**，但 `messages` 是累積的（`MemorySaver` 綁在同一個 `thread_id` 上）。所以它記得自己試過什麼，只是額度重置。
+
+```mermaid
+flowchart TB
+    T["組裝那一輪<br/>六個注入"] --> IN["agent.ainvoke<br/>預算 6 次"]
+    IN --> GR["圖：agent ↔ tools 迴圈"]
+    GR --> EF["extract_findings<br/>抽出信心分數"]
+    EF -->|"信心夠 或 已達上限"| DONE["產出結論"]
+    EF -->|"信心不足"| PV["pivot：換一個假設<br/>預算重置、對話保留"]
+    PV --> IN
+```
+
+所以嚴格講有三層迴圈：圖裡面那個 ReAct（reason + act，想一下、呼叫一次工具、再想一下的來回）、`rubric_trace` 那條檢查後重寫的回頭邊、以及最外面這個換假設的。三層各自解決不同的問題：查不夠、講錯了、想錯了。
+
+## 順手修掉一個矛盾
+
+跑 probe 的時候我把告警的 `startsAt` 釘在昨天事故發生的那個時間點，想確認 s4 讀的是事故當下而不是現在。它確實是：
+
+```
+- this service payment-service: error 61.5% — UNHEALTHY (breaches objective declined_rate < 1%)
+```
+
+現在那座 stack 是平靜的，61.5% 只可能來自昨天。釘住時鐘那件事是有效的。
+
+但同一段輸出的第一行原本寫著：
+
+```
+Each service's SLI, read just now, to attribute root cause to the right node:
+```
+
+**`read just now`，而它讀的是一天前。** 這句話在真的即時調查時是對的，在補跑一個舊告警的時候就是錯的，而且錯得很難察覺，因為它讀出來的數字看起來完全合理。
+
+改法很短，把實際用的那個時鐘印出來：
+
+```python
+read_at = current_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+```
+
+改完之後：
+
+```
+Each service's SLI, read at 2026-08-05T15:30:00Z (the incident clock for this
+investigation, not necessarily wall-clock now), to attribute root cause to the
+right node:
+```
+
+一條新測試釘住這個行為，整包 328 通過。
+
+這件事順便補了一點前面欠的東西：注入的那段話裡，現在至少有一個數字知道自己是什麼時候被讀出來的。
 
 ## 值班的時候差在哪
 
-這些結構聽起來很像工程潔癖，但它們解的是很具體的問題。
+半夜的告警跟早上補查的告警，對這隻 agent 來說走的是同一條路，差別只在那個 `startsAt`。
 
-半夜三點告警觸發，這隻 agent 被自動叫起來跑。沒有人在看它。如果它卡在一個死迴圈裡，你早上會看到的是一張帳單跟一份沒有結論的報告。如果它把一個不存在的 trace ID 寫進結論，值班的人會拿著那個 ID 去查，查不到，然後開始懷疑整份報告。
+如果注入的文字說「read just now」，而值班的人是早上九點在讀昨晚兩點的報告，他會很自然地以為那些數字是報告產生時的狀態。他可能因此得出「問題已經自己好了」或者「現在還在燒」這種完全相反的結論，而兩個都可能是錯的。
 
-`force_answer` 保證前者不會發生，`rubric_trace` 保證後者會被抓到一次。這兩個 node 都不是為了讓 agent 更聰明，是為了讓它**在表現不好的時候，壞得比較安全**。
+**一個時間戳的成本是二十個字元，一次誤判的成本是一次白跑的處置。**
+
+## 今天沒做的事
+
+沒有把 catalog 裡洩題的那幾段拿掉再跑一次。那才是真正能說明這隻 agent 會不會做根因分析的實驗，而今天只證明了它在開書的情況下會照流程走。
+
+沒有補那個 trace 保留期。目前沒有任何地方宣告「這個 store 記得多久」，所以 agent 會在一個結構上不可能成功的步驟上花預算。要修的話那個資訊該長在契約裡，跟 `freshness` 放在一起。
+
+沒有量那 8835 個字元的效益。注入越多不見得越好，前面講過 signal flood 的問題，而我現在沒有任何數據可以說這幾個區塊各自貢獻了多少。要回答得跑對照組，那是評測那一塊的事。
+
+沒有處理那個「快照是一次性」的問題。調查跑到一半鄰居狀態變了，模型不會知道，而目前也沒有任何機制讓它重新讀。
+
+那則空的注入也沒有補。過去事故庫是空的這件事，其實是這套機制最有價值的部分還沒有被啟動。順便也沒去對齊 runbook trigger 跟告警規則的命名，現在是靠正規化接上的。
 
 ## 小結
 
-總結來說，agent 這個詞被用得很鬆，什麼東西都可以叫 agent。放在這個 repo 裡它的意思很具體：一個會反覆「推理、呼叫工具、看結果」的迴圈，加上一組讓它在異常路徑上不會失控的護欄。
+總結來說，決策鏈的入口在圖的外面。這個發現本身不驚人，但它解釋了為什麼前面七天做的所有東西都是「注入」而不是「工具」。那些東西不需要模型決定要不要用，它們是模型開始想之前就該在桌上的。
 
-而選 LangGraph 而不是自己寫迴圈，換到的東西其實是可讀性。那張圖畫出來之後，「什麼情況會走哪條路」是看得見的，不用去讀縮排。這件事在需要跟別人解釋「為什麼 agent 那次會那樣做」的時候特別有用。
+真的跑一次之後，那條鏈的執行比我預期的好：假設樹有列、預算會省著花、工具報錯會自己修、查不到就說查不到。這幾件事單獨看都值得記一筆。
 
-明天把這張圖跟實際的決策鏈對起來，看看它從哪一步開始讀前面那八天做出來的 context。
+但今天最該記住的是那個開書考。一份為了教 agent 認識環境而寫的 catalog，順手把環境裡唯一那個事故的答案也寫了進去，於是這座 demo 上跑出來的每一個漂亮結果都要打折。**我原本是想看 agent 表現如何，結果先看到的是自己的量尺是壞的。** 這比 agent 那天拿幾分重要得多，因為分數可以再測，量尺壞掉的話測幾次都沒有意義。
 
-> 「這不就是一個 while 迴圈嗎」——這句話我自己講過。
-> 講完之後我回去讀了自己那份縮排七層的 while 迴圈 XD
+> 那份 catalog 是我為了讓 agent 認識環境寫的。
+> 順手把唯一那個事故的答案也寫了進去，然後誇它查得真準 XD

@@ -1,175 +1,126 @@
 ---
-title: "【Day32】過去事故庫沒有活過來：一個 JOIN，兩張表，兩個不同的寫入者"
+title: "【Day32】閉環跑完一次：從告警到修好，再到寫下來"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
 tags: [OpenTelemetry, AIOps, Governance, 鐵人賽]
 ---
 
-# Day32：35 筆標註進去了，過去事故庫還是 0 筆
+# Day32：閉環跑完一次，從告警到修好，再到寫下來
 
-> 這三天我做的事情很像同一件
-> 每個零件單獨看都是對的
-> 也都有測試
-> 壞掉的一直是它們中間那條縫
+> 一個會執行、會驗證
+> 但什麼都沒寫下來的系統
+> 不是迴圈
+> 是一條每次都從頭開始的直線
 
-昨天補了 `grading_mode`，關卡從一個抵銷出來的綠燈退回「還沒量夠」的紅燈。今天要驗收的是另一個本來以為會自己活過來的東西：過去事故庫。
+前面幾天把每一段分開做完了：提案是一列有狀態的資料、演習跟事故在帳上分得開、五道門各自問自己的問題、案例記憶知道誰有資格寫下結論。今天把它們串成一次完整的迴圈，而且是在**會寫進案例記憶的那一半**上跑。
 
 程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day32/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day32)。
 
-## 本來以為不用寫程式的一天
+## 為什麼要挑這個事故
 
-agent 在組 prompt 的時候會呼叫一個 `_past_incident_context()`，把這個服務過去被判定正確的調查撈出來，變成一段「以前發生過這些事」貼進去。它撈的方式是一個 JOIN：
+這座叢集上的第一個示範事故是一次壞掉的部署，處置是回滾。它很適合當第一個，但它有一個性質讓後面每件事都變簡單：**壞的是版本，而回滾這個動作剛好認得版本**。
 
-```sql
-SELECT i.payload FROM investigations i
-JOIN calibration c ON c.run_id = i.fp
-WHERE ... AND c.correct = 1
-```
+第二個事故不是這樣。它的原因是一個旗標被打開，導致 user-service 的驗證每次都掉到冷路徑。這個事故沒有壞掉的版本可以回滾，`rollout_undo` 在這裡不只是不對，是**根本用不上**。
 
-原本的盤算很單純：Day31 把 35 筆標註灌進 `calibration`，`correct = 1` 的有 20 筆，那這個查詢就應該開始有東西了。今天要做的是 A/B，同一組 fixture 跑兩次，一次注入過去事故一次不注入，看分數有沒有差。
+所以要跑通它，得先補兩樣東西。一個是能真的修好它的動作（改 ConfigMap 裡的一個布林值，不重啟 pod），另一個是把「症狀」跟「那個動作」接起來的處置程序。這件事 agent 自己跨不過去：它可以查出旗標被打開了，但「所以要把它關回去」這一跳需要有人事先寫下來。
 
-實際量出來是這樣：
+這也是我後來才想清楚的一件事。runbook 在這套系統裡不是自動化腳本，是**把人的處置知識變成 agent 講得出口的動作**的那座橋。
 
-```
-[1] the real store
-    calibration labeled rows: 35
-    investigations rows:      0
-    retrievable precedent:    0
-```
+## 一次完整的迴圈長什麼樣子
 
-`investigations` 表是空的。JOIN 的另外一半從來沒有人寫過。
-
-## 兩張表，兩個寫入者
-
-追下去的結果是這樣。`calibration` 跟 `investigations` 這兩張表，在正式的告警路徑上是同一個函式接連寫的：`webhook.py` 裡的 `_investigate_and_sink()` 先 `record_run()` 再 `record_investigation()`，兩邊用的是同一個 `fp`，所以 JOIN 對得起來。
-
-而 eval harness 走的是另一條路。它的 docstring 寫得很清楚，受測單元是 `run_headless`，也就是**繞過 webhook 直接叫 agent**。這個設計是對的，eval 要測的是 agent，不是 webhook 的收件邏輯。但副作用是：`record_investigation()` 那一行在 webhook 裡，harness 沒有它。
-
-```mermaid
-flowchart TB
-    W["webhook.handle_alert<br/>正式告警路徑"] --> RH1["run_headless"]
-    W --> C1[("calibration")]
-    W --> I1[("investigations")]
-    H["eval/harness.py<br/>唯一在產出標註的東西"] --> RH2["run_headless"]
-    H --> C2[("calibration")]
-    H -.->|"沒有這一步"| I2[("investigations")]
-    C1 --- J{"JOIN<br/>c.run_id = i.fp"}
-    I1 --- J
-    J --> P["過去事故庫"]
-
-    classDef gap stroke-dasharray:4 3,stroke:#c0392b,color:#78281f
-    class I2 gap
-```
-
-所以事情變成：**唯一會產出標註的流程，剛好是唯一不寫另一半的流程。** 標註灌得再多，JOIN 都是 0。
-
-還有一個更小、但更陰的東西。就算今天直接在 harness 裡補一行 `record_investigation(thread_id, ...)`，JOIN 還是對不起來，因為那兩個 id 不一樣：
-
-```python
-thread_id = f"eval-{fixture.id}-s{seed}-{run_nonce}"      # 給 LangGraph 用的
-run_id    = f"eval-{fixture.id}-seed{seed}-{run_nonce}"   # 寫進 calibration 的
-```
-
-`s0` 跟 `seed0`，差兩個字元。這種東西不會報錯，JOIN 只會安靜地回零筆，而零筆跟「這個服務以前沒出過事」在畫面上長得一模一樣。Day2 講缺情境的時候用的例子是 Prometheus 回 HTTP 200 加空陣列，兩年後我在自己的 SQL 裡又寫了一個一樣的東西 QQ
-
-## 順手把昨天那個欄位用上
-
-修的部分有兩個。第一個是讓 harness 也寫 `investigations`，而且用 `run_id` 當 fp，不是 `thread_id`。
-
-第二個是昨天埋的伏筆。原本那句 `WHERE ... AND c.correct = 1`，在有了 `grading_mode` 之後可以講得精確：
-
-```sql
-WHERE ... AND c.correct = 1 AND c.grading_mode = 'culprit'
-```
-
-為什麼要加這個，昨天算過一次：在 `inconclusive` 那批紀錄上，`correct = 1` 的意思是「它正確地誰都沒有怪」。把那種紀錄當成一次成功解決的過去事故餵給 agent，等於在告訴它「上次這個服務出事，結論是沒出事」，這跟這段 context 想做的事情正好相反。
-
-`grading_mode` 是 `NULL` 的那些也一起排除掉，也就是「有人標了對錯，但沒有人說那個對錯在回答什麼問題」的紀錄。這段輸出是要進 prompt 的，來源不明的東西不進 prompt，這個預設值我覺得沒什麼好猶豫。
-
-## 四個探測
-
-```bash
-# 從範例 repo 的根目錄跑
-python3 ironman-2026/day32/probe_past_incidents.py
-```
+這是那次真的寫進案例記憶的執行（不是排練），從提案到驗證通過三分鐘：
 
 ```
-[2] a graded run with no investigation row (what the harness writes today)
-    retrieved: []
-
-[3] the same run, both tables, same id
-    retrieved: ['both']
-
-[4] rows that must never come back as precedent
-    +hedged-non-incident    (correct=1 but it blamed nobody)
-     retrieved: ['both']  -> excluded
-    +wrong-run              (graded wrong)
-     retrieved: ['both']  -> excluded
-    +unlabeled              (no verdict yet)
-     retrieved: ['both']  -> excluded
-    +unknown-mode           (correct=1, but nobody said what that means)
-     retrieved: ['both']  -> excluded
+15:15:52  proposed      action=k8s.configmap_flag_set  autonomy=propose
+15:15:56  approved      trace_id=f7fc9b0285fb036de6a93d92d4ab8576
+15:15:56  execute       start
+15:15:56  precondition  ok    checked 4
+15:15:56  dry_run       ok    blast_radius: target demo/user-flags,
+                              revision user_session_cache_disabled=True→False
+15:15:58  execute       success
+15:15:58  verify        settle  165s
+15:18:43  verify        pass    value 0 ≤ max_value 0.01
 ```
 
-先解釋一下那個 `both`：它是第三格塞進去的那一列的 id，兩張表都有寫，是唯一一列合格的過去事故。所以後面每加一列髒資料，只要撈回來的還是只有 `both`，就代表那一列被擋掉了。
+這條路徑上每一段都是前面幾天做的東西，串起來之後有兩個地方值得單獨看。
 
-第三格是修好之後該有的樣子。第四格那四列每一列都寫進兩張表、id 也都對得上 JOIN，只差在標註的內容，而四列全部沒有被撈出來。其中 `hedged-non-incident` 那一列，在昨天改之前是會被撈出來的。
+`precondition ok checked 4` 是核准之後、動手之前，把當初那四個症狀又查了一次。核准跟執行中間隔了四秒，這一步看起來多餘；但它擋的是「人核准完離開座位、回來按下去時世界已經不一樣」這種情況，而那正是自動化最容易做錯事的時刻。
 
-這四條也補成了單元測試，因為它們是那種「壞掉不會有人發現」的規則。
+`verify settle 165` 之後才 `pass`，中間那兩分四十五秒是在等驗證查詢的回看窗完全落在修好之後。這件事第一次做的時候我沒等，於是驗證讀到了壞掉時候的資料點、判定失敗、系統照設計自動回滾，**把一個已經修好的東西改了回去**。
 
-## 那個 A/B 今天做不了
+## 迴圈的最後一段：它寫下了什麼
 
-原本今天的主菜是 A/B：同一組 fixture，注入過去事故 vs 不注入，比分數。做不了，理由很實際。
+執行完不等於迴圈閉合。閉合的定義是**下一次會拿到不一樣的東西**。
 
-要跑出過去事故，得先有一輪真的 harness 執行寫進兩張表，而那需要整套 stack 起來加 LLM 呼叫。今天做的是把管線接上跟把規則釘住，接上之後第一次真的跑，才會有第一批可以拿來 A/B 的資料。
+那一輪跑完之後，案例上多了這個：
 
-我本來想用合成資料硬做一個 A/B，想想還是算了。**注入的東西是我自己編的，那量到的就是「編得好不好」，不是「這個機制有沒有用」。** Day23 已經有過一次分數變好但因果證不了的經驗，那次至少資料是真的跑出來的，今天連那個都沒有。
-
-> 講一句我自己的判斷：這種「先把管線接好、實驗留給有真資料的那天」的取捨，在做 eval 的時候比想像中常見。硬要在這一天生一個數字出來，最後那個數字會變成後面每一天都在小心繞開的東西。
-
-## 知識迴圈的另外兩條，也掛在同一組管線上
-
-ARE（Agentic Reliability Engineering，代理式可靠性工程）講持續學習的時候，重點不是模型會不會變聰明，而是**系統有沒有把每一次事故的結論留下來、而且下次真的讀得到**。這個 repo 裡有三條這樣的迴圈，今天可以一起看：
-
-```mermaid
-flowchart LR
-    R["一次調查"] --> L{"被標註"}
-    L -->|"correct=1"| PI["過去事故庫<br/>下次同服務的 prompt 讀得到"]
-    L -->|"correct=1 且<br/>沒有 runbook 命中"| DR["draft_runbook<br/>生一份 SOP 草稿"]
-    L -->|"任何結果"| CE["校準紀錄<br/>治理平面的授權依據"]
-    RB["runbook 被用過之後"] --> FB["runbook_feedback<br/>這份 SOP 到底有沒有用"]
+```
+resolution : {"action": "k8s.configmap_flag_set",
+              "args": {"configmap": "user-flags", "flag": "user_session_cache_disabled", "value": false},
+              "runbook_id": "session-cache-timeout",
+              "request_id": "92690e7562a54af8",
+              "verified": true,
+              "ts": "2026-08-22T15:18:43Z"}
 ```
 
-三條的起點都是同一件事：**有人（或有東西）對那一次調查下了一個判斷。** 沒有那個判斷，三條全部不會動。
+三件事同時被記下來：做了什麼、根據哪一份處置程序、以及**它到底有沒有效**。最後那個布林值是整筆紀錄裡唯一不是宣稱、而是量出來的東西。
 
-`draft_runbook` 那條的觸發條件是「被標成正確、而且當時沒有任何 runbook 命中」，設計得挺好：那正好是「agent 找到了根因，而我們對這個告警還沒有 SOP」的時刻，知識最值得被留下來。而它目前唯一的入口是 plugin 上那顆按鈕，也就是說**它只在有人按的時候才會長出東西**。這句話跟 Day30 那個狀態機的結論是同一句。
+同一輪還在另外兩本帳上各留了一列。執行帳記的是「這個目標被動過」，給熔斷跟頻率上限用：
 
-順帶一提，昨天那個 `grading_mode` 讓這條路順便安全了一點：UI 那條標註路徑現在一律標成 `culprit`，所以不會有「在一個沒出事的告警上按了正確，然後系統認真幫你生一份 SOP 草稿」這種事。這個我不是刻意設計的，是改完之後才發現的。
+```
+{'ts': '2026-08-22T15:18:43Z', 'action': 'k8s.configmap_flag_set',
+ 'target': 'demo/user-flags#user_session_cache_disabled', 'success': 1, 'drill': 0}
+```
 
-## 接縫沒有擁有者
+runbook 的成績單記的是「這一份程序被用過一次，結果 ok」：
 
-平台工程的角度，這三天可以收在同一句話上。
+```
+{'runbook_id': 'session-cache-timeout', 'outcome': 'ok',
+ 'step_desc': 'Re-enable the session cache on user-service ...'}
+```
 
-`webhook.py`、`eval/harness.py`、`governance.py`、`store.py` 這幾支，每一支都有清楚的職責、有 docstring、有測試，而且測試都是綠的。壞掉的每一次都在**兩支檔案中間**：兩個 store 沒有橋、兩張表沒有共同的寫入者、一個欄位被兩種語意共用、一個 id 差兩個字元。
+三本帳、三個不同的讀者。案例記憶給下一次調查，執行帳給熔斷，成績單給那道 runbook 的門。同一件事被記三次不是重複，是因為**這三個讀者問的問題不一樣**，而把它們合成一張表的那一版我試過，結果是每一邊都要對另外兩邊做過濾。
 
-這種東西之所以難抓，是因為它不屬於任何一支檔案的責任範圍。寫 harness 的人（我）沒有理由去想 webhook 寫了哪些表；寫治理的人（也是我）沒有理由去確認校準紀錄是誰產的。**每個人都在自己的邊界內做對的事，而缺陷長在邊界上。**
+## 一件我沒有為了寫文章而做的事
 
-一個團隊要抓到這種東西，靠的不是更嚴格的 code review，是**有沒有一個地方會定期去問「這條路端到端真的通嗎」**。這三天我做的每一件事，本質上都是在手動扮演那個角色，而手動扮演的東西遲早會停。
+今天這篇用的是前一天那次執行的紀錄，不是現跑一輪新的。
 
-> 舉個現實案例，我看過一個團隊每個服務的健康檢查都是綠的，然後整條下單流程掛了兩個小時。那次事後檢討的結論不是「健康檢查寫得不好」，是沒有任何一個東西在檢查「這幾個服務串起來還能不能下單」。今天這個 JOIN 就是同一個形狀，只是規模小很多。
+原因是這條路要走到「寫進案例記憶」那一半，就得關掉排練標記，讓那一輪被系統當成真實事故。而那會在帳上留下一列「這裡發生過一個事故」，實際上是我按的。前面才剛花一整天處理「演習不能污染真實紀錄」，為了讓今天的截圖漂亮而去多寫一列假事故，會是最諷刺的一種自打嘴巴。
+
+排練那一半今天照樣跑得了，也真的跑了一輪，`occurrences` 從 7 變 8。但它的 `resolution` 停在前一天，因為寫入案例記憶的那兩支函式在排練上直接 return。
+
+## 迴圈閉合之後，下一次拿到什麼
+
+這是驗收的地方。同一個服務的同一種告警再來一次，注入到提示裡的東西是這三行：
+
+```
+## Past cases for this service (reference — current evidence wins)
+- order-cancel-rate-high (×8, last 2026-08-23)
+  resolved by: k8s.configmap_flag_set (verified)
+```
+
+短得有點失望，但這三行是有代價的：它要有一個跨版本認得出來的事故 key、一個能被驗證的處置結果、以及一條「這是參考，現在的證據優先」的但書。
+
+而它仍然沒有原因。八次發生、有人修好過、沒有人寫下為什麼。
+
+## 這對值班的人有什麼差別
+
+一個閉合的迴圈跟一個沒閉合的，差別在**第九次**。
+
+沒閉合的話，第九次接手的人拿到的資訊跟第一次一樣多：一個告警、一堆指標、一隻從零開始查的 agent。閉合之後，第九次一開始就知道「這個服務的這種告警發生過八次，上次是把那個旗標關回去解決的，而且驗證過」。
+
+但這裡有一個誠實的但書。這種紀錄會讓人跳過驗證，尤其在半夜。所以召回那段文字第一行就寫著現在的證據優先，而且案例整份可以被作廢——**這句話不是免責聲明，是設計**：一份會自動端到眼前的舊答案，必須同時提供一個把它拿掉的方法。
 
 ## 今天沒做的事
 
-- **A/B 沒有跑。** 管線接上了，但要真的跑一輪 harness 才有資料，那需要整套 stack 加 LLM。
-- **沒有回填 `investigations`。** 六月那 35 筆的調查內容沒有留下來（當時就沒寫），所以補不回去，只能從下一輪開始有。
-- **那兩個 id 的命名沒有統一。** 今天只是在寫入的時候挑對了那一個，`thread_id` 跟 `run_id` 還是兩個不同的字串，下一個人一樣會踩。
-- **`draft_runbook` 沒有非 UI 的入口。** 它還是只在有人按的時候才會動。
-- **沒有任何東西在檢查這條路端到端是通的。** 今天的探測是我手動跑的，它沒有進 CI。
+- **原因欄位還是空的。** 迴圈裡「寫下為什麼」那一格，系統填不了，只有人填得了。
+- **驗證只有一條 PromQL。** `value 0 ≤ 0.01` 證明的是那個指標回到零，不是使用者拿回了正常體驗。
+- **兩個事故都是我注入的。** 這條迴圈在真實世界的事故上還沒有跑過，而真實事故不會這麼配合。
 
 ## 小結
 
-總結來說，今天原本是驗收的一天，結果變成修接縫的一天。過去事故庫沒有自己活過來，因為它是一個 JOIN，而那兩張表在唯一會產出標註的那條路上只有一半有人寫。修完之後它會在下一輪真的跑起來的時候有東西，而昨天那個欄位順便讓它撈不到不該撈的紀錄。
+總結來說，今天把散開的每一段接成了一次完整的迴圈：告警進來、處置程序把症狀接到一個型別化的動作、五道門決定要不要問人、人按了、執行前四道閘門再擋一次、驗證等回看窗、然後三本帳各記一列。
 
-比較有用的收穫是那個 A/B 的取捨。我原本很想生一個數字出來，畢竟四天下來還沒有一個「變好了」的結果。但用自己編的資料去驗證一個檢索機制，量到的只會是自己編得好不好。這種時候把管線接好、把規則釘成測試、然後誠實寫下「還沒跑」，比生一個數字有用。
+而迴圈閉不閉合，判準只有一個：**下一次會不會拿到不一樣的東西**。現在會了，拿到的是三行字，其中一行還是空的。
 
-> 這三天我沒有讓 agent 變聰明一點點，做的全部是把它已經有的東西接起來。
-> 但至少現在那些綠燈，紅的時候是真的紅 :)
+> 「閉環」這個詞聽起來很宏大。
+> 實際做完之後，它就是「有沒有人把這次的事寫在下一個人看得到的地方」而已 :)

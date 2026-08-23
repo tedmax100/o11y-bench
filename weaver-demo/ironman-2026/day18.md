@@ -1,248 +1,216 @@
 ---
-title: "【Day18】40 rps 的假流量：聚合遙測為什麼撐不起決策"
+title: "【Day18】逐項打勾：四項職責裡我只做到一項半"
 series: "2026 鐵人賽：AIOps with OpenTelemetry"
-tags: [OpenTelemetry, AIOps, CEL, 決策級遙測, 鐵人賽]
+tags: [OpenTelemetry, AIOps, CEL, Signal Plane, 鐵人賽]
 ---
 
-# Day18：訊號跟情境的差別，是一個 JSON 欄位的差別
+# Day18：這一階段做到哪裡，沒做到哪裡
 
-> 一個裸值加上一個時間戳
-> 撐得起「發生了什麼」
-> 撐不起「該不該做什麼」
+> 寫一份宣告很便宜
+> 貴的是持續證明它還準
+> 中間那段沒有人做的話
+> 它會慢慢變成一份謊話
 
-昨天讓依賴健康分析順著拓撲走，也發現五個節點裡只有兩個判得動。那是「圖」的覆蓋率問題。今天往下挖一層，問一個更基本的：**就算每個節點都判得動，那些數字本身憑什麼被信任？**
+昨天把 CEL（Context Enrichment Layer，情境豐富層）的三個職責跟溯源攤開來講，也貼了一份決策級遙測該長什麼樣的 JSON，並且說明那個物件現在沒有任何一支程式會吐出來。今天把帳算清楚：這一階段實際蓋出來的東西，對照那四項，逐一打勾或留白。
 
-這是概念日，沒有新的程式碼。但有一段是真的踩到的。
+會這樣收尾是因為概念日很容易變成一種漂亮的空話。講完 enrichment、correlation、projection、grounding，讀者很自然會以為這個 repo 就是照這樣做的。它不是。
 
-## 一段沒有人打的流量
+## 先看蓋了什麼
 
-昨天的事故收拾完之後，flag 關掉、payment 重啟、所有壓力程序停掉，我順手查了一下 payment 的吞吐量，想確認環境真的乾淨了：
-
-```console
-$ curl -sG localhost:9090/api/v1/query --data-urlencode \
-    'query=sum by (status) (rate(payment_charges_total[2m]))'
-{'status': 'error'}       0.0
-{'status': 'authorized'}  40.86
-```
-
-**每秒四十筆授權成功的付款。** 而這個時候本機沒有任何壓力程序在跑，pod 的日誌裡連一筆 `charge requested` 都沒有。
-
-去看原始的 counter：
-
-```console
-$ curl -sG localhost:9090/api/v1/query --data-urlencode 'query=payment_charges_total'
-series count: 2          # 只有 status / reason 的組合，跟 replica 數無關
-labels: [__name__, deployment_environment, git_repo, git_version, job,
-         reason, service_name, service_namespace, service_version, status,
-         telemetry_auto_version, telemetry_sdk_language, telemetry_sdk_name,
-         telemetry_sdk_version]
-
-$ kubectl -n demo get deploy payment-service -o jsonpath='{.spec.replicas}'
-2
-```
-
-兩個 replica，而那份 label 裡沒有任何東西可以分辨它們：沒有 pod、沒有 instance、沒有 `service.instance.id`。**兩個各自獨立累加的計數器，寫進同一條時間序列。**
-
-Prometheus 看到的就是一條上上下下跳的線，因為它一下拿到 A pod 的值、一下拿到 B pod 的值。`rate()` 的職責是處理 counter reset，於是每一次交錯它都當成「重啟了」，然後補上它以為漏掉的量。四十筆從來沒發生過的付款就是這樣長出來的。
-
-這句話不用相信我，把那條 counter 的原始樣本點拉出來看就好，一條「只增不減」的 counter 會這樣：
-
-```console
-$ curl -sG localhost:9090/api/v1/query_range \
-    --data-urlencode 'query=payment_charges_total{status="authorized"}' ...
-104  104  119  100  212  304  42  704  1400  2079  2741
-               ↑ 掉了        ↑ 掉了
-```
-
-一條 counter 不該往下走。每一個往下走的點，`rate()` 都會讀成「這中間重啟過，所以前面累積的量要補回來」，然後在完全沒有流量的情況下憑空生出每秒幾十筆。
-
-這件事重要的不是它是一個 bug。它當然是，而且是遙測管線設定的問題，不是應用程式的問題。重要的是：**那份 JSON 裡沒有任何一個欄位有機會告訴你這件事。**
-
-## 訊號跟情境
-
-[《代理式可靠性工程》（Agentic Reliability Engineering，簡稱 ARE）](https://learning.oreilly.com/library/view/agentic-reliability-engineering/0642572294809/) 這本書的第十章把這個落差講得很清楚。它區分兩個詞：
-
-> *Signals* are facts about the system. *Context* is facts about the system *and the situation*.
-
-`訊號`是關於系統的事實：這個指標現在是這個值、這行 log 在這個時間點被寫出來、這條 trace 的延遲是這麼多。`情境`是關於系統**跟當下處境**的事實：這個指標是這個值，**而且它已經連續上升三十五分鐘，對照的那條基準線本身昨天才移動過**；這行 log 是這一小時裡第七行同類的，**而它來自一個依賴剛剛被 patch 過的服務**。
-
-差別在於情境帶著時間、拓撲、歷史的結構。**光有訊號你只能反應，有情境才能判斷。**
-
-前面那個四十筆假付款正好卡在這條線上。`0.0` 跟 `40.86` 這兩個數字本身是訊號，它們是 Prometheus 誠實計算出來的結果。但要判斷「這個數字能不能用」，需要的東西一個都不在那份回應裡：這條 series 背後有幾個發射源、上一次它的來源集合變過是什麼時候、這個服務二十分鐘前才重啟過。
-
-## 情境豐富層
-
-書裡給這個中間層一個名字：CEL（Context Enrichment Layer，情境豐富層）。它坐在訊號平面跟推理平面中間，職責是把訊號變成情境。
+第二階段的程式碼在 `app/signals/`，八個模組（加一個 `__init__.py`）1545 行，六份對應的測試檔 69 條（這是寫這篇那天數的，後面幾天還會再長）。設計稿把它切成四個階段，代號 s1 到 s4：
 
 ```mermaid
 flowchart TB
-    subgraph SP["訊號平面"]
-        M["metric"]
-        L["log"]
-        T["trace"]
-    end
-    subgraph CEL["情境豐富層"]
-        E["enrichment<br/>補上 baseline / 趨勢<br/>拓撲位置 / 近期變更"]
-        C["correlation<br/>把分開抵達、<br/>其實在講同一件事的訊號聚在一起"]
-        P["projection<br/>短期推估<br/>五分鐘後會是多少、信心區間多寬"]
-    end
-    RP["推理平面<br/>只讀情境，不讀原始訊號"]
-    M --> E
-    L --> E
-    T --> E
-    E --> C --> P --> RP
-    P -.->|"grounding：每一段情境<br/>都走得回原始訊號"| SP
+    S1["s1 拓撲升為第一級 artifact<br/>topology.yaml + 查詢 API<br/>criticality / journey / 上下游"]
+    S2["s2 活的對齊<br/>reconcile.py<br/>宣告的邊 vs Tempo 看到的邊"]
+    S3["s3 訊號契約<br/>contracts.yaml<br/>權威 SLI / 目標值 / 新鮮度 / LogQL"]
+    S4["s4 依賴健康與歸因<br/>health.py<br/>誰是根因、誰只是相鄰"]
+    S1 --> S2 --> S3 --> S4
+    S4 --> OUT["注入 RCA 的三段文字"]
+    S1 --> OUT
 ```
 
-三個職責各自回答一個不同的問題。
+（圖裡那個 SLI 是 Service Level Indicator，服務水準指標，也就是「用哪一句查詢判斷這個服務好不好」；RCA 是 root cause analysis，根因分析，agent 被叫去做的那件事。）
 
-`enrichment`（豐富化）回答「這個值算不算異常」。一個訊號進來，補上它的基準線（這個服務在這個時段的正常長什麼樣）、它的趨勢（正在往哪個方向跑、多快）、它的拓撲位置（誰依賴它）、以及它的變更情境（這附近最近部署過什麼）。昨天那個 `impact` 判斷，也就是「呼叫方的歸因失敗量跟三十分鐘前比有沒有漲」，就是最小版本的 enrichment，它做的正是「補上基準線」這件事。
+四個階段全部唯讀，這是設計稿一開始就定下的鐵律：整個第二階段不能有任何副作用。這個限制回頭看是對的，它讓每一段都可以單獨上線、單獨驗證，而且錯了也只是 context 難看，不會壞掉任何東西。
 
-`correlation`（關聯）回答「這些東西是不是同一件事」。分開抵達的訊號被聚成一組，推理平面讀到的是一幅完整的畫面而不是一堆散落的事件。昨天那個平鋪掃描給出的二十二個候選，裡面有十一條在講同一批 402 回應，那就是一份**沒有做 correlation** 的輸出長什麼樣子。
+## 逐項對照
 
-`projection`（推估）回答「接下來會怎樣」。在底下的訊號支撐得起的時候，給出短期的推估值跟信心區間。這是三個裡面最有野心的一個，也是這個系列不會做到的一個。
+| CEL 的職責 | 這一階段做到的 | 判定 |
+| --- | --- | --- |
+| enrichment：baseline | 只有 `attribution` 那條邊有（s4.2 拿 current 比 offset 前） | 部分 |
+| enrichment：trajectory | 沒有。`signals/` 裡沒有任何算趨勢、斜率的東西 | 缺 |
+| enrichment：topology context | s1 全做到，而且是宣告加對帳兩層 | 有 |
+| enrichment：change context | 沒有。`git_version` 只是一個被搬運的欄位 | 缺 |
+| correlation | 沒有。三段文字各自生成、各自注入 | 缺 |
+| projection | 沒有，一行都沒有 | 缺 |
+| grounding | 權威查詢可以重跑、log 帶著 trace ID；但注入的那段話本身沒有任何識別碼 | 半 |
 
-## 溯源
+四項裡沒有一項是完整的：enrichment 四格只有拓撲那一格做滿，grounding 一半，correlation 跟 projection 整格空白。加起來大概一項半。下面把每一項的證據攤開。
 
-除了三職責之外，書把另一個性質放在同一層，而且講得比三職責還重：
+### enrichment：只有一條邊有 baseline
 
-> Every piece of context the CEL emits is traceable back to the underlying signals that produced it.
+補基準線這件事，`signals/` 裡只有一個地方在做：
 
-`grounding`（溯源）的意思是，CEL 吐出來的每一段情境，都走得回產生它的原始訊號。推理平面提出一個假設的時候，貢獻的情境元素會被附上去，而從那些元素可以回頭找到原始訊號。
-
-書裡對這件事的立場很硬：一個沒有溯源的介入，是事後沒有人有辦法辯護的介入。
-
-而這正是前面那個四十筆假付款真正的教訓。假設有一個 agent 讀到那個數字，說「payment 吞吐量正常」，這句話在當下是無從反駁的，因為**沒有任何路徑可以從那句結論走回去問「你這個數字是從幾個計數器加起來的」**。溯源不是為了追責，是為了讓一個結論可以被檢查。
-
-## 兩種 JSON 的形狀
-
-把上面的東西落到具體的資料形狀上。這是真的從那座 stack 抓下來的聚合遙測：
-
-```json
-{
-  "status": "success",
-  "data": {
-    "resultType": "matrix",
-    "result": [
-      {
-        "metric": { "status": "authorized" },
-        "values": [
-          [1785943222, "1.9540119740520538"],
-          [1785943822, "1.8540353391634758"],
-          [1785944422, "12.476348438426095"],
-          [1785945022, "31.05294953900738"]
-        ]
-      }
-    ]
-  }
-}
+```console
+$ grep -rn "baseline\|trajectory\|trend\|slope\|forecast" app/signals/*.py | cut -d: -f1 | sort -u
+app/signals/health.py
 ```
 
-這份 JSON 是完全誠實的。它沒有說謊，它只是**只回答了一個問題**：你問的那句 PromQL 在這些時間點算出來是多少。
+而且 `health.py` 裡那個 baseline 不是給 SLI 用的，是給 `attribution` 那條邊用的。也就是說「order-service 歸因到 payment 的失敗量比三十分鐘前漲了沒」有基準線，但「payment 的拒絕率 55% 算不算異常」沒有。後者靠的是契約裡宣告的一個固定目標值 `declined_rate < 1%`。
 
-它沒有回答、而且結構上也沒有地方可以回答的東西：這個值正不正常（沒有基準線）、這個服務該多少才算合格（沒有目標值）、它從哪裡來（沒有發射源的身分，所以那兩個 replica 的問題無處可藏）、後面那兩個十倍的跳動是事故還是假象（沒有可信度）、以及誰會被它影響（沒有拓撲）。
+固定目標值跟基準線不是同一件事。目標值回答「這個數字合不合格」，基準線回答「這個數字對這個服務、這個時段來說正不正常」。**一個半夜流量只有白天十分之一的服務，用同一個目標值判斷，白天漏報、半夜誤報。**
 
-`決策級遙測`（decision-grade telemetry，前面借 ARE 這本書的說法介紹過：為了讓 agent 據以行動而打造的遙測資料，不是為了讓人類盯著看而打造的）要換的就是這個形狀。同一個事實，寫成一個帶著自己上下文的物件：
+trajectory 更乾脆，完全沒有。系統現在有辦法說「payment 的拒絕率是 55%」，沒有辦法說「它從 2% 一路爬上來，爬了二十分鐘」。而後面那句話對值班的人來說資訊量大得多，它同時回答了「什麼時候開始的」跟「還在惡化嗎」。
 
-```json
-{
-  "signal": "payment-service.error_rate",
-  "value": 0.557,
-  "unit": "ratio",
-  "observed_at": "2026-08-05T15:15:00Z",
+change context 那格是最尷尬的一格，因為它看起來像有做。`topology.yaml` 每個節點都帶著 `git_version`，看起來就是變更情境。但那個欄位從來沒有被拿去對照任何東西，下一節就是在講這件事。
 
-  "objective": { "target": "declined_rate < 1%", "breaching": true },
-  "baseline": { "window": "30m", "value": 0.002 },
-  "trajectory": { "direction": "rising", "since": "2026-08-05T14:52:00Z" },
+### correlation：三段文字，各自為政
 
-  "topology": {
-    "tier": 1,
-    "journey": "checkout",
-    "upstream": ["api-gateway", "order-service"],
-    "downstream": []
-  },
-  "impact": [
-    { "service": "order-service", "attributed_failures_delta": 0.004,
-      "verdict": "flat", "note": "topologically adjacent, not materially impacted" }
-  ],
+前面那個模組關係圖已經畫出結論了：`context.py`、`health.py`、`dq.py` 三個各自生一段文字，各自注入。沒有任何一個地方問過「這三段講的是不是同一件事」。
 
-  "trust": {
-    "emitters": 2,
-    "series_distinguishes_emitters": false,
-    "freshness_guarantee_seconds": 60,
-    "caveats": ["counter conflated across 2 replicas — rate() unreliable across restarts"]
-  },
+這不是抽象的缺點，它已經咬過兩次。一次是同一條邊在呼叫方跟被呼叫方各出現一個 ⚠，另一次是標題說 100% 而底下掛著兩個警告。**那兩個 bug 我當時是各自修掉的，但它們的成因是同一個：沒有一層負責把散落的判斷收成一個一致的說法。**
 
-  "grounding": {
-    "promql": "(sum(rate(payment_charges_total{status=\"declined\"}[5m])) or vector(0)) / clamp_min(sum(rate(payment_charges_total[5m])) or vector(0), 1)",
-    "logql": "sum by (git_version, reason) (count_over_time({service_name=\"payment-service\"} | event=~\"payment.declined|payment.gateway_error\" [5m]))",
-    "exemplar_trace_id": "47c189ff6a548f1b9910ef14f685fefc"
-  }
-}
+### projection：一行都沒有
+
+沒什麼好講的，這個系列從一開始就沒有打算做。理由是推估要有意義，得先有校準。一個沒有被驗證過準確度的預測，比沒有預測更危險，因為它會讓人採取行動。校準機制是另一個層次的東西，不是這個階段收得完的。
+
+### grounding：一半
+
+這一項比想像中好，但也只有一半。
+
+好的那半是契約帶來的。注入給 agent 的每一條 SLI 都附上權威的 PromQL，log 也附上權威的 LogQL。這代表 agent 講出來的任何結論，都可以有人把那句查詢複製出來重跑一次，看看數字對不對。這是很實用的一種溯源，而且成本幾乎是零。
+
+Loki 那邊更完整。隨手撈一筆 `payment.declined`，它自己就帶著 trace 的識別碼。這裡要注意它在 Loki 裡的形狀跟服務 stdout 印出來的那份 JSON 不一樣：走 OTLP 進來之後，log 的本體只剩一句話，其他全部變成 structured metadata：
+
+```console
+$ curl -sG localhost:3100/loki/api/v1/query_range --data-urlencode \
+    'query={service_name="payment-service"} | event="payment.declined"' ...
+
+body: "declined by new validator"
+  event:        payment.declined
+  reason:       new_validator_odd_cents
+  order_id:     o-25779
+  git_version:  v2.5.0
+  otelTraceID:  e18757726d5af93fe9fabd3d9d82adee
+  span_id:      6a6aeadc9c010352
 ```
 
-**先把話講清楚：這個物件現在沒有任何一支程式會吐出來。** 它是這個系列想收斂到的形狀，不是已經有的東西。裡面的值全部是真的（`0.557` 是昨天量到的、那個 `trace_id` 是 Loki 裡真的一行 `payment.declined` 帶著的），但把它們組成一個物件這件事，目前是手工的。
+（那個欄位叫 `otelTraceID` 不叫 `trace_id`，是 OTLP 進 Loki 之後被改名的，寫查詢的時候會踩到。）從這一行可以直接跳到那一條 trace。這是三種訊號裡唯一一種本來就走得回去的。
 
-值得注意的是這份 JSON 裡面有多少東西**是前面幾天已經做出來的**。`objective` 來自契約、`topology` 那一段來自拓撲、`impact` 是昨天那個 `attribution` 判斷、`grounding` 裡的那兩句查詢就是契約裡宣告的權威查詢。書裡也是這麼講的：
+缺的那半是：**注入的那段話本身沒有身分。** 它是一段散文，裡面的每一個數字都沒有標記它是什麼時候、用哪一句查詢、在哪個視窗算出來的。agent 讀完之後如果說「payment 拒絕率 55%」，沒有任何機制可以從那句話走回產生它的那次查詢。前面那個兩個 replica 疊成一條 series 的坑會沒有人發現，根本原因就在這裡。
 
-> The CEL is not a new system the team has to build. It is a layer assembled from primitives the earlier chapters have already installed.
+## 一個現行的 silent decay
 
-真正還缺的其實只有兩塊：`trust` 那一段（今天那個假流量就是因為沒有它才會沒人發現），跟把這些東西收斂成**一個物件**而不是散在各處。
+[《代理式可靠性工程》（Agentic Reliability Engineering，簡稱 ARE）](https://learning.oreilly.com/library/view/agentic-reliability-engineering/0642572294809/) 第三章列了五種「從 dashboard 上看不見」的失效模式，第一種叫 `silent decay`：宣告當初是對的，然後系統變了，宣告沒跟上，而且沒有任何東西會叫。
 
-## 現在長什麼樣子
+寫這篇的時候我順手對了一下宣告的版本跟實際跑的版本：
 
-那「散在各處」目前具體是什麼樣子？這是同一個服務、現在真的跑出來的東西：
+```console
+$ grep git_version aiops-agent/service/app/signals/topology.yaml
+  git_version: v4.0.0     # api-gateway
+  git_version: v3.1.2     # order-service
+  git_version: v2.4.1     # payment-service
+  git_version: v1.3.0     # user-service
+  git_version: v5.2.0     # webapp
 
+$ curl -sG localhost:9090/api/v1/query --data-urlencode \
+    'query=count by (service_name, git_version) ({__name__=~".+"})'
+  api-gateway      v4.0.0
+  order-service    v3.1.2
+  payment-service  v2.5.0     ← 宣告寫 v2.4.1
+  user-service     v1.3.0
+  webapp           v5.2.0
+  aiops-agent      v0.0.1     ← 它自己也在噴指標，而拓撲裡沒有它
 ```
-## Signal context (topology v1.0.0)
-### payment-service
-- criticality: tier-1 (revenue/edge-critical); journey: checkout (4/4)
-- upstream (callers — degrade if this fails): api-gateway, order-service
-- downstream (dependencies): none (leaf — not blocked by anything downstream)
-- SLI (authoritative — cite these exact queries, don't re-derive):
-    error: (sum(rate(payment_charges_total{status="declined"}[5m])) or vector(0)) / ...
-           [ratio]  target: declined_rate < 1%
-- signal freshness guarantee: ≤60s (older samples are stale)
-- caveat: No up{} for application services (remote_write, not scraped); judge
-  liveness via rate(payment_charges_total[5m]) > 0.
-```
 
-資訊密度其實不低，tier、journey、上下游、權威查詢、目標值、新鮮度，甚至還有兩條 caveat。**但它是一段散文。**
+五個宣告的服務裡四個對得上，payment 對不上。而它是這整個階段所有實測都繞著跑的那個服務。（多出來的 `aiops-agent` 就是前面提過那個「沒被宣告卻活著」的服務，agent 自己。）
 
-它是寫給一個會讀自然語言的消費者看的，這在對象是 LLM 的時候完全說得通，也是目前這個 repo 刻意的選擇。代價是它沒有欄位、沒有型別、沒有辦法被程式檢查有沒有缺東西，而且它跟依賴健康那一段、跟 DQ（Data Quality，資料品質）那一行，是三段各自獨立生出來的文字。
+問題不在那個數字錯了，在於**這一階段有三條對帳路徑，沒有一條覆蓋這個欄位**：
 
 ```mermaid
 flowchart LR
-    A["contracts.yaml"] --> C1["context.py<br/>一段散文"]
-    B["topology.yaml"] --> C1
-    B --> C2["health.py<br/>另一段散文"]
-    A --> C2
-    D["reconcile 結果"] --> C3["dq.py<br/>一行判定"]
-    C1 --> X["三段文字<br/>各自注入"]
-    C2 --> X
-    C3 --> X
-    X --> LLM["agent"]
+    R["reconcile.py"] --> RE["對帳「邊」<br/>宣告 vs Tempo"]
+    W["topology_watch<br/>（獨立腳本，不在 agent 裡）"] --> WS["對帳「服務名單」<br/>宣告 vs 三個 store"]
+    V["weaver.py"] --> VM["對帳「metric 名字」<br/>契約 vs registry"]
+    G["git_version"] --> N["沒有任何人對帳"]
 ```
 
-同一份事實在三個地方各講一次，就是昨天跟前天那兩個問題的來源：重複的 ⚠、以及互相打臉的 100%。**那不是三個各自的 bug，是這個形狀必然會長出來的東西。**
+這裡順帶要補一句：那三條路徑裡只有兩條真的住在 agent 裡（`reconcile.py` 跟 `weaver.py`），對服務名單那一條是隨文附的獨立腳本，agent 執行時完全不會碰到它。所以「三條」這個說法其實已經有點寬容了。
 
-## 誰該負責產生情境
+我去 grep 過整包程式碼，`git_version` 在 `signals/` 底下出現在三個地方，但沒有一個是在讀它：
 
-從平台工程的角度，CEL 這個概念真正的主張其實是一句組織上的話：**豐富化不該發生在消費端。**
+```console
+$ grep -rn "git_version" app/signals/*.py
+app/signals/topology.py:45:    git_version: str = ""          # 定義這個欄位存在
+app/signals/compile.py:56:    git_version: str = ""           # 從各服務的宣告搬進來
+app/signals/compile.py:123:            git_version=f.git_version,
+app/signals/health.py:328: "correlate with git_version (sum by git_version,reason) ..."
+```
 
-如果不做這一層，事情不會消失，只是移位，每一個消費者各自去補。值班的人憑經驗知道「payment 剛重啟過，這個數字先別信」；某個 dashboard 的作者手動加了一條基準線；而 agent 什麼都不知道，於是它拿到什麼就信什麼。**同一份判斷被重複做了三次，品質參差，而且沒有一次被記錄下來。**
+前三筆是定義跟搬運，第四筆是一句寫給 agent 看的文案。**沒有任何一行程式碼把這個宣告的值拿去跟任何東西比對。**
 
-這跟前面講過的那條判準是同一件事的另一面：一個機制的成本會不會隨消費者數量線性成長。把基準線、目標值、可信度做進資料本身，成本付一次；讓每個消費者自己補，成本乘以消費者數量，而且新來的那個消費者通常就是 agent，也就是最沒有能力補的那一個。
+而諷刺的地方在這裡。`health.py` 判定一個服務是根因的時候，結論那句話是這樣寫的：
 
-至於誰來付這一次的成本，前面幾天的分工已經給了答案。宣告歸產品團隊：自己的 SLI（Service Level Indicator，服務水準指標）、自己的目標值、自己打出去的邊，只有他們知道。豐富化則必然歸平台團隊，因為基準線、拓撲位置、跨服務的關聯，都要站在看得到全部服務的位置才做得出來。
+```
+it is the LIKELY ROOT CAUSE, not a symptom. Do NOT dismiss this as normal;
+correlate with git_version (sum by git_version,reason) to find which deploy
+introduced it.
+```
+
+**系統叫 agent 拿 `git_version` 去找是哪次部署造成的，而系統自己宣告的那個 `git_version` 是過期的。** 好在這句話是叫 agent 去查指標上的 label（那個是真的），不是去讀宣告，所以實務上不會出錯。但這個巧合不是設計出來的，是運氣。
+
+這個漂移怎麼發生的也很典型。那個欄位住在 `demo-services/services/payment/signal.yaml`，是服務團隊自己擁有的宣告，手工維護。payment 從 v2.4.1 發到 v2.5.0 的時候，沒有任何一道關卡問過「你的 signal.yaml 要不要跟著改」。
+
+## 訊號斷崖：這個系列沒有實例
+
+五種失效模式裡，前面幾天各自撞到過四種：
+
+| 失效模式 | 這個系列的實例 |
+| --- | --- |
+| silent decay | 上面那個 `git_version`；還有寫好卻從來沒被呼叫過的對帳程式 |
+| stale topology | 宣告了六條邊只觀察到五條；以及沒被宣告卻活著的那個服務 |
+| ambiguous semantics | 大小寫對不上的 `level`、`{service=}` 跟 `{service_name=}` 之爭 |
+| signal flood | 平鋪掃描零事故給二十個候選，事故時十一條在講同一件事 |
+| signal cliff | 沒有 |
+
+`signal cliff`（訊號斷崖）是 flood 的反面：團隊把訊號修剪得太乾淨，砍掉了那些「目前沒有任何決策用得到」的訊號，於是遇到沒見過的失效模式時，agent 手上沒有任何能區分這次跟別次的東西，只能亂做或全部升級。
+
+最接近的候選是 api-gateway 完全沒有 error SLI 這件事。效果確實很像：真的出事的時候，那個節點在依賴健康分析裡是一片空白。
+
+但它不算實例，因為成因反過來了。api-gateway 不是被修剪掉的，是從來沒有裝過。它是一個薄轉發層，寫契約的當下判斷「這裡沒有自訂指標」完全合理。**訊號斷崖真正危險的地方，是那個砍掉訊號的決定在當下看起來是對的**：有人做了「這條指標沒有任何決策在用，砍掉省成本」的判斷，而且他是對的，直到出現一個沒人預料過的失效模式。
+
+我沒有這種案例，因為這個 demo 從頭到尾在加東西，沒有經歷過任何一次「為了降成本砍訊號」的決策。這個反模式要真的長出來，需要的是時間跟成本壓力，不是一座跑了兩個月的 demo。
+
+書裡給的解方也值得抄下來：決策級訊號集要對著 agent **可能**需要做的決策空間去設計，不是只對著它今天在做的決策。留一小批目前沒人用的訊號不是浪費。
+
+## 誰的帳，誰來還
+
+從平台工程的角度，今天這份對照表其實是一份技術債清單，而它有一個共同點：**缺的四項裡有三項，缺的原因不是「難做」，是「沒有人擁有」。**
+
+baseline 跟 trajectory 要有人決定「正常長什麼樣」。這件事不能是產品團隊各自填一個數字，因為那會退化成每個服務一套標準；也不能純靠平台團隊算，因為平台團隊不知道哪些波動是業務性的。correlation 更明顯，它天生只能發生在看得到全部訊號的那一層。
+
+而那個過期的 `git_version` 是同一個問題的另一種形狀：它有人擁有（服務團隊），但沒有人負責檢查。**宣告加對帳是一組的，只做前者等於把「這份宣告還準不準」這個問題丟給未來的自己。** 這一階段對邊、對服務名單、對 metric 名字都寫了對帳，唯獨對版本沒寫，而版本是變得最快的那一個。
+
+補的方式也不用很聰明。三條對帳路徑已經在跑了，多一個欄位進去比對，就是幾行程式碼的事。難的從來不是那幾行，是有人想到要做。
+
+## 今天沒做的事
+
+沒有補那個 `git_version` 對帳。今天只是把它找出來、確認沒有人在檢查它。要修得決定紅燈的定義：宣告落後一版該不該擋，還是只該提醒。
+
+沒有動 correlation。要做得先讓三段文字變成三個物件，那是一次不小的重構，而且會影響注入格式，得配著 agent 那一側一起改。
+
+`trust` 那一段還是沒有。前面那個兩個 replica 疊成一條 series 的坑，現在依然只存在於文章裡，程式碼沒有任何地方會發現它。
+
+也沒有量這一整個階段對 agent 實際表現的影響。從頭到尾都是在看注入的文字本身，沒有跑一次完整的評測去比對加了 Signal Plane 前後的分數差。這件事欠第三次了，而它大概是這一階段最該補的一項。
 
 ## 小結
 
-總結來說，今天那個四十筆假付款不是一個很嚴重的 bug，它甚至沒有影響任何使用者。但它示範了一件事：**一份聚合遙測 JSON，在它自己的格式裡沒有任何位置可以承認自己不可靠。**
+總結來說，這一階段最有用的產出其實不是那 1545 行程式碼，是三條對帳路徑。宣告本身很便宜，任何人都可以寫一份 YAML 說自己的服務長什麼樣；貴的是持續證明那份宣告還準。而今天找到的那個過期版本號正好說明了為什麼：**沒有對帳的宣告，會在沒有人發現的情況下慢慢變成一份謊話。**
 
-訊號跟情境的差別，攤開來就是資料形狀的差別。一個裸值加時間戳，跟一個帶著基準線、目標值、拓撲位置、可信度、以及回頭走得回原始查詢的物件。前者只能支撐「發生了什麼」，後者才撐得起「該不該做什麼」。
+對照表上兩個空白格我不打算粉飾。projection 是刻意不做的，correlation 是還沒做的，這兩件事的性質不一樣，混在一起講會讓讀者以為都是取捨。
 
-而 CEL 三職責裡，這個系列做到哪一步、哪一項是空的，明天逐項對照，不打模糊仗。
+接下來要換一個角度，從「資料準備好了沒」轉到「拿到這些資料的那個 agent 到底怎麼做決定」。
 
-> 那四十筆假付款是我自己壓測留下來的。
-> 環境我以為清乾淨了，圖表比我記得清楚 ^^
+> 逐項打勾這種事，勾到自己那一格是空的時候特別難下筆。
+> 但空著不寫，讀者會以為我做完了 :(
