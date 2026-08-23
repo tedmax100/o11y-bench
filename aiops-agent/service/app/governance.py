@@ -302,6 +302,7 @@ def decide(
         human_labeled = store.cal_count_by_source(
             exclude_sources=_SELF_LABEL_SOURCES,
             modes=tuple(settings.governance_calibration_modes),
+            exclude_drills=True,
             path=path,
         )
     good, cal_note = _calibration_verdict(calib, human_labeled=human_labeled)
@@ -379,6 +380,84 @@ def decide(
         "high confidence, reversible, calibration + data-quality + actuation + "
         "runbook health + fixture record proven-good",
     )
+
+
+def autonomy_status(path=None) -> dict:
+    """Where AUTO stands right now, gate by gate, with the distance left to go.
+
+    `decide()` answers this for one action at the moment it is proposed, which
+    is the only moment it matters and the worst moment to find out. The
+    operational question — "what would have to change for this to act on its
+    own" — had no answer short of reading the code and querying SQLite by hand,
+    and a bar nobody can see is a bar nobody works towards.
+
+    Same functions as the live gate, not a second implementation: whatever this
+    reports is what the next high-confidence proposal will be told. Runbook
+    health is absent on purpose — it is a verdict about one procedure, so there
+    is no global value to report; it is evaluated per runbook at decision time.
+
+    `blockers` is the list a person can act on. Empty does not mean the agent
+    will act: the kill switch (`actions_enabled`) is a separate question, and it
+    is reported alongside rather than folded in, because "policy would allow it"
+    and "this deployment permits it" fail in ways that look identical from
+    outside.
+    """
+    from . import store
+    from .calibration import bin_evidence, compute_calibration, load_records, production_records
+    from .signals.actuation import actuation_verdict
+    from .signals.dq import dq_verdict
+
+    # Drills out, on both halves. The curve and the floor must be computed over
+    # the same rows or the floor is not a floor.
+    calib = compute_calibration(
+        production_records(load_records(path)), modes=tuple(settings.governance_calibration_modes)
+    )
+    human_labeled = store.cal_count_by_source(
+        exclude_sources=_SELF_LABEL_SOURCES,
+        modes=tuple(settings.governance_calibration_modes),
+        exclude_drills=True,
+        path=path,
+    )
+    cal_good, cal_note = _calibration_verdict(calib, human_labeled=human_labeled)
+    ev = bin_evidence(
+        calib,
+        min_bin_count=settings.governance_min_bin_count,
+        band_lo=settings.governance_conf_high,
+    )
+
+    gates = [
+        {"gate": "calibration", "proven_good": cal_good, "note": cal_note},
+        {"gate": "data_quality", **_verdict_fields(dq_verdict())},
+        {"gate": "actuation", **_verdict_fields(actuation_verdict())},
+        {"gate": "fixture_record", **_verdict_fields(regression_verdict(path))},
+    ]
+    return {
+        "granted": all(g["proven_good"] for g in gates),
+        "actions_enabled": settings.actions_enabled,
+        "gates": gates,
+        "blockers": [g for g in gates if not g["proven_good"]],
+        # The numbers behind the calibration gate, so a UI can render "17 of 20"
+        # rather than re-parsing the sentence.
+        "calibration": {
+            "labeled": calib.get("labeled") or 0,
+            "labeled_required": settings.governance_min_labeled_runs,
+            "human_labeled": human_labeled,
+            "human_labeled_required": settings.governance_min_human_labeled_runs,
+            "band_lo": settings.governance_conf_high,
+            "band_n": ev.get("band_n"),
+            "band_n_required": settings.governance_min_bin_count,
+            "band_accuracy": ev.get("band_accuracy"),
+            "band_accuracy_required": settings.governance_min_band_accuracy,
+            "overconfidence": calib.get("overconfidence"),
+            "overconfidence_max": settings.governance_max_overconfidence,
+            "worst_bin_gap": ev.get("max_gap"),
+            "worst_bin_gap_max": settings.governance_max_bin_gap,
+        },
+    }
+
+
+def _verdict_fields(v: dict) -> dict:
+    return {"proven_good": bool(v.get("proven_good")), "note": v.get("note", "")}
 
 
 def propose_remediations(

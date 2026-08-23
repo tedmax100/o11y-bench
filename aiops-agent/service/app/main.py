@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from . import action_requests, actions, agent, audit, breaker, execution, store
+from . import action_requests, actions, agent, audit, breaker, execution, governance, store
 from .agent import lifespan, stream_chat
 from .alerts import AlertProvisioningDisabled, AlertSpec, build_alert_rule, provision_alert
 from .calibration import CULPRIT, label_run
@@ -415,6 +415,48 @@ async def case_forget(case_key: str, body: ActorRequest):
         raise HTTPException(status_code=404, detail="no such case")
     audit.record("case_forget", "ok", fp=case_key, actor=body.actor, detail=result)
     return {"case_key": case_key, **result}
+
+
+@app.get("/todo")
+async def todo(limit: int = 20):
+    """Everything currently waiting on a person, in one call.
+
+    The gap this closes is not a modelling gap. Three of the four things this
+    system is supposed to do are blocked on work only a human can do — label a
+    run, decide on a proposal, say what actually caused an incident — and none
+    of it had an entry point: the proposals expired unread (10 of the first 28),
+    the calibration labels stalled at 7 of 30, and the cases sat unlabelled.
+    Work nobody can see is work nobody does.
+
+    Read-only and best-effort per section: a signal that cannot be computed
+    (no cluster, no store) must not take the whole view down, because the view
+    is what tells you something is wrong.
+    """
+    out: dict[str, Any] = {}
+
+    runs = [r for r in list_investigations(limit=200) if r.get("correct") is None]
+    out["investigations_to_label"] = {"count": len(runs), "items": runs[:limit]}
+
+    pending = action_requests.list_requests(status="proposed", limit=200)
+    expired = action_requests.list_requests(status="expired", limit=200)
+    out["requests_to_decide"] = {
+        "count": len(pending),
+        "items": pending[:limit],
+        # Not a queue — a scoreboard. Every one of these is a proposal a person
+        # was asked about and never answered, and that is a fact about the
+        # process, not about the agent.
+        "expired_unattended": len(expired),
+    }
+
+    cases = store.case_list(unlabeled=True, limit=limit)
+    out["cases_to_label"] = {"count": cases["total"], "items": cases["cases"]}
+
+    try:
+        out["autonomy"] = governance.autonomy_status()
+    except Exception as e:  # a broken gate reading must not hide the queues
+        out["autonomy"] = {"error": f"{type(e).__name__}: {e}"}
+
+    return out
 
 
 @app.get("/actions/readiness")
