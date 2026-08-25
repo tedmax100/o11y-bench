@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from . import store
 from .capability import capability_for_services, resolve_services
 from .config import settings
+from .facts import DiagnosticFact, classify, grounding_check, ledger
 from .runbook import (
     format_diagnostics,
     incident_params,
@@ -531,12 +532,24 @@ TOOLS = [
 ]
 
 
+def _accumulate_facts(old: list, new: list) -> list:
+    """Append, except that an empty list resets — which is how each turn's input
+    clears the ledger. Facts are per-turn for the same reason `tool_calls_used`
+    is: they describe what *this* investigation has in hand, and a ledger that
+    silently carried yesterday's observations would let a turn that measured
+    nothing look grounded."""
+    if not new:
+        return []
+    return (old or []) + new
+
+
 class RcaState(TypedDict):
     """State for the RCA graph. `tool_calls_used` is reset to 0 on each turn's
     input (overwrite reducer), so the budget is per-turn, not per-thread, even
     though `messages` accumulates across the thread (add_messages reducer)."""
 
     messages: Annotated[list, add_messages]
+    facts: Annotated[list[DiagnosticFact], _accumulate_facts]  # machine-typed tool results
     tool_calls_used: int
     budget: int
     rubric_feedback: str  # correction prompt from rubric node; "" means passed
@@ -576,9 +589,15 @@ def _build_graph():
         # `messages`, so re-sending the ~4k prompt every loop is pure waste.
         sys = build_system_prompt() if state["tool_calls_used"] == 0 else CONTINUE_PROMPT
         extra = []
+        # The ledger goes in front of the rubric correction, not after it: it is
+        # the state of the evidence, and a correction is easier to act on when
+        # what is actually in hand is already on the page.
+        book = ledger(state.get("facts") or [])
+        if book:
+            extra.append(HumanMessage(content=book))
         feedback = state.get("rubric_feedback", "")
         if feedback:
-            extra = [HumanMessage(content=feedback)]
+            extra.append(HumanMessage(content=feedback))
         msgs = [SystemMessage(content=sys)] + state["messages"] + extra
         return {
             "messages": [await llm_with_tools.ainvoke(msgs)],
@@ -623,7 +642,19 @@ def _build_graph():
             out = await tool_node.ainvoke({"messages": msgs[:-1] + [sub]})
             out_messages.extend(out["messages"])
         out_messages.extend(dup_results)
-        return {"messages": out_messages, "tool_calls_used": state["tool_calls_used"] + n}
+        # Type each result before the model gets to characterise it. The index
+        # continues across the turn so fact IDs stay stable and citable.
+        base = len(state.get("facts") or [])
+        new_facts = [
+            classify(getattr(m, "name", "") or "unknown", getattr(m, "content", ""), base + i + 1)
+            for i, m in enumerate(out_messages)
+        ]
+        out_state = {"messages": out_messages, "tool_calls_used": state["tool_calls_used"] + n}
+        if new_facts:
+            # Omitted when empty: the reducer reads [] as "reset", which is the
+            # turn input's job, not a no-op tool step's.
+            out_state["facts"] = new_facts
+        return out_state
 
     async def force_answer_node(state: RcaState):
         # Budget exhausted: answer with what we have. No tools bound, so the
@@ -638,7 +669,8 @@ def _build_graph():
                 "which checks you ran.\n\n" + _OUTPUT_CONTRACT
             )
         )
-        msgs = state["messages"] + [nudge]
+        book = ledger(state.get("facts") or [])
+        msgs = state["messages"] + ([HumanMessage(content=book)] if book else []) + [nudge]
         return {"messages": [await llm.ainvoke(msgs)]}
 
     async def rubric_trace_node(state: RcaState):
@@ -659,6 +691,12 @@ def _build_graph():
             # whether the conclusion was already crossed out. Second, because a
             # fabricated citation is the more basic problem.
             ok, retry_prompt = _refutation_check(answer)
+        if ok:
+            # Third: a conclusion drawn from nothing at all. Last because it is
+            # the widest net — it reads the whole turn's evidence rather than one
+            # citation — and the two narrower checks name the problem better when
+            # they fire.
+            ok, retry_prompt = grounding_check(answer, state.get("facts") or [])
         revision = state.get("rubric_revision_count", 0)
         return {
             "rubric_feedback": retry_prompt,
@@ -1355,6 +1393,7 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
         result = await agent.ainvoke(
             {
                 "messages": turn_messages,
+                "facts": [],
                 "tool_calls_used": 0,
                 "budget": settings.webhook_tool_call_budget,
                 "rubric_feedback": "",
@@ -1395,6 +1434,7 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
             result = await agent.ainvoke(
                 {
                     "messages": [{"role": "user", "content": pivot_msg}],
+                    "facts": [],
                     "tool_calls_used": 0,
                     "budget": settings.webhook_tool_call_budget,
                     "rubric_feedback": "",
@@ -1805,6 +1845,7 @@ async def stream_chat(
         # append to the thread history (add_messages reducer).
         {
             "messages": turn_messages,
+            "facts": [],
             "tool_calls_used": 0,
             "budget": settings.tool_call_budget,
             "rubric_feedback": "",
