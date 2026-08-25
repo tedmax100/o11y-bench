@@ -267,11 +267,20 @@ class Settings(BaseSettings):
     draft_runbook_repo: str = ""
 
     # --- Loop engineering (knowledge-loop §4.4) ----------------------------
-    # If the extracted Findings.confidence is below this after a headless run,
-    # re-invoke the agent on the same thread asking it to pivot to a different
-    # hypothesis. Gated by max_hypothesis_loops so it can't loop indefinitely.
-    confidence_loop_threshold: float = 0.6
+    # Whether a headless run keeps investigating is decided by `sufficiency.py`
+    # from the run's own evidence, not by the confidence the model states about
+    # its own work. Both thresholds are 2 for reasons written up in that module;
+    # they are settings so a stack with (say) no change feed can be told so
+    # explicitly, rather than having someone quietly lower the bar in the code.
+    sufficiency_min_sources: int = 2
+    sufficiency_min_causal_roles: int = 2
     max_hypothesis_loops: int = 3
+
+    # Retained for the escalation copy and the calibration record, NOT as a gate:
+    # a run whose evidence never became sufficient is reported as low-confidence
+    # to the on-call, and `Findings.confidence` is still what the CE harness
+    # scores. It no longer decides whether to keep looking.
+    confidence_loop_threshold: float = 0.6
 
     # --- Learn 閉環效度約束 (7b-5 §6.2) ------------------------------------
     # Whether remediation verify outcomes are written back as CE correctness labels.

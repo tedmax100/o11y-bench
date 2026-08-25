@@ -32,6 +32,7 @@ from .signals.context import build_signal_context
 from .signals.envfit import compute_env_fit, get_last_fit
 from .signals.health import evaluate_dependency_health
 from .signals.vocabulary import render_vocabulary
+from .sufficiency import Verdict, evaluate_sufficiency, pivot_instruction
 from .tools import (
     discover_log_fields_tool,
     discover_metrics_tool,
@@ -806,9 +807,10 @@ async def extract_findings(messages: list) -> Findings:
 
 
 # ---- Structured Uncertainty (knowledge-loop §4.6) ----------------------------
-# Emitted when all hypothesis loops are exhausted and confidence is still below
-# threshold. Gives the on-call engineer a structured view of what was tried and
-# what to do next — far more actionable than a vague "I'm not sure" message.
+# Emitted when the loops are exhausted and the evidence never became sufficient
+# (sufficiency.py, not the stated confidence). Gives the on-call engineer a
+# structured view of what was tried and what to do next — far more actionable
+# than a vague "I'm not sure" message.
 
 
 class HypothesisStatus(BaseModel):
@@ -825,10 +827,10 @@ class HypothesisStatus(BaseModel):
 
 
 class StructuredUncertainty(BaseModel):
-    """Emitted when the RCA run ends with confidence below threshold after all
+    """Emitted when the RCA run ends without sufficient evidence after all
     hypothesis loops. Gives the on-call a structured escalation package."""
 
-    confidence: float = Field(description="Overall confidence (always < loop threshold).")
+    confidence: float = Field(description="Overall confidence as the model stated it.")
     summary: str = Field(description="One-line summary of the unresolved situation.")
     hypothesis_status: list[HypothesisStatus] = Field(
         default_factory=list,
@@ -868,8 +870,8 @@ _uncertainty_llm = (
 
 
 async def extract_uncertainty(messages: list, findings: Findings) -> StructuredUncertainty:
-    """Extract a structured uncertainty report when confidence is below threshold
-    after all loops. Seeds `confidence` and `summary` from the final Findings."""
+    """Extract a structured uncertainty report when the evidence never reached
+    sufficiency. Seeds `confidence` and `summary` from the final Findings."""
     result = await _uncertainty_llm.ainvoke([SystemMessage(content=_UNCERTAINTY_PROMPT)] + messages)
     # Override with the authoritative values from Findings so they stay consistent.
     result.confidence = findings.confidence
@@ -1326,6 +1328,19 @@ async def _proposal_footprint(action: str, args: dict) -> dict | None:
     return data
 
 
+def _sufficiency(facts: list[DiagnosticFact], findings: Findings) -> Verdict:
+    """The configured thresholds, in one place, so every call site asks the same
+    question. `findings.evidence` is what the conclusion claims to rest on; the
+    check is only that it cites something, since matching free-text citations
+    back to fact IDs needs the citations to carry IDs, which they do not yet."""
+    return evaluate_sufficiency(
+        facts,
+        findings.evidence,
+        min_sources=settings.sufficiency_min_sources,
+        min_roles=settings.sufficiency_min_causal_roles,
+    )
+
+
 async def run_headless(alert: dict, thread_id: str) -> dict:
     """Run one headless RCA turn for a single firing alert. Returns the final
     prose answer plus structured Findings for the downstream sink."""
@@ -1383,8 +1398,10 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
     agent = await _build_agent()
     config = {"configurable": {"thread_id": thread_id}}
 
-    # Loop engineering (knowledge-loop §4.4): run → extract findings → if
-    # confidence < threshold, pivot to the next untried hypothesis and retry.
+    # Loop engineering (knowledge-loop §4.4): run → extract findings → if the
+    # evidence is not yet sufficient, name the gap and go again. The stopping
+    # rule is computed from the run's own observations (sufficiency.py), not
+    # from the confidence the model states about its own work.
     # Each iteration uses a fresh per-turn budget; MemorySaver preserves the
     # full message history across invocations on the same thread_id, so the
     # agent sees everything it already tried when asked to pivot.
@@ -1406,30 +1423,22 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
     answer = _flatten_content(getattr(messages[-1], "content", None)) if messages else ""
 
     findings = await extract_findings(messages)
+    # Evidence accumulates across pivots even though the per-turn ledger resets:
+    # the question this gate answers is whether *the investigation* established
+    # enough, and turn two building on turn one is the loop working as intended.
+    all_facts: list[DiagnosticFact] = list(result.get("facts") or [])
+    verdict = _sufficiency(all_facts, findings)
 
-    while (
-        findings.confidence < settings.confidence_loop_threshold
-        and loop_count < settings.max_hypothesis_loops
-    ):
+    while not verdict.sufficient and loop_count < settings.max_hypothesis_loops:
         loop_count += 1
         logger.info(
-            "headless loop %d/%d: conf=%.2f < %.2f, pivoting to next hypothesis (fp=%s)",
+            "headless loop %d/%d: %s, pivoting on the gap (fp=%s)",
             loop_count,
             settings.max_hypothesis_loops,
-            findings.confidence,
-            settings.confidence_loop_threshold,
+            verdict.summary(),
             thread_id,
         )
-        pivot_msg = (
-            f"Your previous conclusion had confidence {findings.confidence:.0%}, "
-            f"which is below the required threshold ({settings.confidence_loop_threshold:.0%}). "
-            f"The hypothesis you investigated was: {findings.hypothesis!r}.\n\n"
-            "Do NOT repeat the same investigation. From the 2–3 hypotheses you listed "
-            "at the start, pick a DIFFERENT one you have not yet fully explored. "
-            "Investigate it now, actively seeking both confirming AND refuting evidence. "
-            "Then re-evaluate all three confidence dimensions (signal diversity, "
-            "refutation attempt, hypothesis convergence) before concluding."
-        )
+        pivot_msg = pivot_instruction(verdict, all_facts)
         with now_override(starts_dt):
             result = await agent.ainvoke(
                 {
@@ -1445,11 +1454,14 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
         messages = result.get("messages", [])
         answer = _flatten_content(getattr(messages[-1], "content", None)) if messages else ""
         findings = await extract_findings(messages)
+        all_facts.extend(result.get("facts") or [])
+        verdict = _sufficiency(all_facts, findings)
 
     if loop_count > 0:
         logger.info(
-            "headless loop done after %d pivot(s): final conf=%.2f (fp=%s)",
+            "headless loop done after %d pivot(s): %s, stated conf=%.2f (fp=%s)",
             loop_count,
+            verdict.summary(),
             findings.confidence,
             thread_id,
         )
@@ -1458,16 +1470,12 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
     # and confidence is still below threshold, produce a structured escalation
     # package so the on-call knows exactly what was tried and what to check next.
     uncertainty: StructuredUncertainty | None = None
-    if (
-        loop_count >= settings.max_hypothesis_loops
-        and findings.confidence < settings.confidence_loop_threshold
-    ):
+    if not verdict.sufficient:
         logger.info(
-            "headless: confidence %.2f still below %.2f after %d loops — "
+            "headless: evidence still not sufficient after %d loop(s) (%s) — "
             "extracting structured uncertainty (fp=%s)",
-            findings.confidence,
-            settings.confidence_loop_threshold,
             loop_count,
+            "; ".join(f"{c.name}: {c.detail}" for c in verdict.gaps),
             thread_id,
         )
         try:
@@ -1553,6 +1561,10 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
         "findings": findings,
         "decisions": decisions,
         "uncertainty": uncertainty,
+        # Why this run stopped, in a form that can be re-read without a model.
+        # The eval harness grades against it, and the on-call view shows the
+        # unmet checks instead of a bare "low confidence".
+        "sufficiency": verdict.as_dict(),
         # The full message list of the last invocation. The webhook path ignores
         # it; the eval harness reads it to grade *how* the answer was reached
         # (which tools, in what order, on what evidence) — a verdict-only grade
