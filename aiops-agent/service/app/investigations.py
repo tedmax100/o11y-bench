@@ -30,6 +30,22 @@ from .config import settings
 logger = logging.getLogger("aiops_agent.investigations")
 
 
+class SufficiencyCheck(BaseModel):
+    name: str
+    passed: bool
+    detail: str
+
+
+class SufficiencyRow(BaseModel):
+    """Why the run stopped. Stored whole rather than as a boolean: a future
+    reader needs to know what the investigation was still missing when it gave
+    up, and re-deriving that from the transcript is exactly the work this was
+    supposed to save."""
+
+    sufficient: bool = False
+    checks: list[SufficiencyCheck] = Field(default_factory=list)
+
+
 class DecisionRow(BaseModel):
     action: str
     autonomy: str
@@ -69,6 +85,11 @@ class InvestigationRecord(BaseModel):
     # Which incident this run belongs to: alertname + service, no version. See
     # store.case_key().
     case_key: str | None = None
+    # The deterministic stopping rule's verdict (sufficiency.py). None on rows
+    # written before the gate existed, which is why it is optional rather than
+    # defaulted to a passing verdict — "we did not record this" and "the
+    # evidence was sufficient" must not look the same on screen.
+    sufficiency: SufficiencyRow | None = None
 
 
 def record_investigation(
@@ -108,6 +129,7 @@ def record_investigation(
             source=source,
             run_id=scope.run_id if scope else None,
             case_key=scope.case_key if scope else None,
+            sufficiency=result.get("sufficiency"),
         )
         store.inv_insert(
             rec.fp,

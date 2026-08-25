@@ -13,6 +13,20 @@ type Decision = {
   requires_human: boolean;
 };
 
+// The deterministic stopping rule's verdict (service-side `sufficiency.py`).
+// Absent on rows written before the gate existed, which is why the field is
+// nullable and rendered as nothing rather than as a pass.
+type SufficiencyCheck = {
+  name: string;
+  passed: boolean;
+  detail: string;
+};
+
+type Sufficiency = {
+  sufficient: boolean;
+  checks: SufficiencyCheck[];
+};
+
 type Investigation = {
   fp: string;
   ts: string;
@@ -29,6 +43,7 @@ type Investigation = {
   correct: boolean | null;
   source?: 'alert' | 'chat';
   trace_id?: string | null;
+  sufficiency?: Sufficiency | null;
 };
 
 // What the executor's read-only dry-run predicted, stored with the proposal so
@@ -77,6 +92,16 @@ const ERROR_DIMENSION_OPTIONS = [
   { label: 'Action', value: 'action', description: 'Proposed remediation was wrong' },
   { label: 'Other', value: 'other', description: 'Other issue' },
 ];
+
+// What each check is actually asking, in the words someone on call would use.
+// The service sends machine names so the two sides can disagree about wording
+// without breaking; anything unrecognised falls through to its own name.
+const CHECK_LABEL: Record<string, string> = {
+  observed: '有量到東西',
+  independent_sources: '不只一個來源',
+  causal_roles: '不只一種因果角色',
+  conclusion_cites_evidence: '結論有引用證據',
+};
 
 function confidenceColor(c: number): BadgeColor {
   if (c >= 0.8) {
@@ -259,6 +284,16 @@ function InvestigationsPage({ agentServiceUrl }: Props) {
                   {it.service && <Badge text={it.service} color="blue" />}
                   {it.git_version && <Badge text={it.git_version} color="purple" />}
                   <Badge text={`confidence ${(it.confidence * 100).toFixed(0)}%`} color={confidenceColor(it.confidence)} />
+                  {it.sufficiency && (
+                    <Badge
+                      text={
+                        it.sufficiency.sufficient
+                          ? '證據足夠'
+                          : `證據缺 ${it.sufficiency.checks.filter((c) => !c.passed).length} 項`
+                      }
+                      color={it.sufficiency.sufficient ? 'green' : 'orange'}
+                    />
+                  )}
                   {it.correct === true && <Badge text="verified ✓" color="green" />}
                   {it.correct === false && !reinvestigatingFps.has(it.fp) && <Badge text="wrong ✗" color="red" />}
                   {it.correct === false && reinvestigatingFps.has(it.fp) && <Badge text="re-investigating…" color="orange" />}
@@ -278,6 +313,22 @@ function InvestigationsPage({ agentServiceUrl }: Props) {
               </div>
 
               <div className={styles.summary}>{it.summary || '(no conclusion)'}</div>
+
+              {/* The unmet checks, spelled out. A bare "confidence 40%" tells the
+                  person on call nothing they can act on; "only queried metrics"
+                  tells them where to look next themselves. */}
+              {it.sufficiency && !it.sufficiency.sufficient && (
+                <div className={styles.gaps}>
+                  {it.sufficiency.checks
+                    .filter((c) => !c.passed)
+                    .map((c) => (
+                      <div key={c.name} className={styles.gap}>
+                        <Badge text={CHECK_LABEL[c.name] ?? c.name} color="orange" />
+                        <span className={styles.reason}>{c.detail}</span>
+                      </div>
+                    ))}
+                </div>
+              )}
 
               {it.decisions.length > 0 && (
                 <div className={styles.decisions}>
@@ -506,6 +557,20 @@ const getStyles = (theme: GrafanaTheme2) => ({
     gap: 6px;
     margin-top: 4px;
     padding-left: 8px;
+  `,
+  gaps: css`
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 4px 0;
+    padding-left: 8px;
+    border-left: 2px solid ${theme.colors.warning.border};
+  `,
+  gap: css`
+    display: flex;
+    align-items: center;
+    gap: ${theme.spacing(1)};
+    font-size: ${theme.typography.size.sm};
   `,
   decisions: css`
     display: flex;

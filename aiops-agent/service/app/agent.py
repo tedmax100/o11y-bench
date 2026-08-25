@@ -1726,6 +1726,12 @@ async def _conclude_chat_investigation(
         if not messages:
             return
         findings = await extract_findings(messages)
+        # Same verdict as the headless path, recorded but not enforced: a person
+        # is reading this answer and can ask again, so the gate here is
+        # information rather than control. It still has to be computed, because
+        # "the agent only looked in one place" is worth seeing in Grafana
+        # whoever kicked the run off.
+        verdict = _sufficiency(state.values.get("facts") or [], findings)
     except Exception as e:
         logger.warning("chat findings extraction failed (fp=%s): %s", thread_id, e)
         return
@@ -1749,7 +1755,12 @@ async def _conclude_chat_investigation(
                 "labels": {"service_name": services[0] if services else None},
                 "annotations": {"summary": message[:200]},
             },
-            {"answer": answer, "findings": findings, "decisions": []},
+            {
+                "answer": answer,
+                "findings": findings,
+                "decisions": [],
+                "sufficiency": verdict.as_dict(),
+            },
             source="chat",
         )
     except Exception as e:
