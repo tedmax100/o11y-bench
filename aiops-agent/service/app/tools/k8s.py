@@ -341,3 +341,139 @@ k8s_deployment_status_tool = StructuredTool(
     args_schema=ServiceArg,
     coroutine=get_deployment_status,
 )
+
+
+def _template_fingerprint(rs) -> dict[str, Any]:
+    """The parts of a pod template that change what the process actually runs.
+
+    Deliberately not a full diff: `kubectl rollout restart` writes a timestamp
+    annotation, which makes every field-by-field comparison report a change and
+    tells the reader nothing. What matters for attribution is narrower — the
+    image, the env, and which ConfigMaps/Secrets are mounted.
+    """
+    spec = rs.spec.template.spec if rs.spec and rs.spec.template else None
+    containers = getattr(spec, "containers", None) or []
+    c = containers[0] if containers else None
+    env = {}
+    for e in getattr(c, "env", None) or []:
+        if e.value is not None:
+            env[e.name] = e.value
+    sources = []
+    for v in getattr(spec, "volumes", None) or []:
+        if getattr(v, "config_map", None):
+            sources.append(f"configMap/{v.config_map.name}")
+        if getattr(v, "secret", None):
+            sources.append(f"secret/{v.secret.secret_name}")
+    labels = (rs.spec.template.metadata.labels or {}) if rs.spec and rs.spec.template else {}
+    return {
+        "image": getattr(c, "image", None),
+        "env": env,
+        "mounted_config": sorted(sources),
+        "git_version": labels.get("git_version"),
+    }
+
+
+async def get_change_provenance(service: str, limit: int = 4) -> dict[str, Any]:
+    """Did the last rollout change what runs, or only restart it?
+
+    This exists because of a mistake the agent made four times in a row: an
+    alert carrying a `git_version` label was reported as "a code regression in
+    that version" whether the fault shipped in the pod template or in a
+    ConfigMap the unchanged template mounts. Those two look identical from
+    metrics, and the fix for one does nothing for the other — `rollout undo`
+    restores a template that was never the problem.
+
+    So the answer is not "which version is running" but "what actually changed
+    between the last revisions, and what config is mounted from outside them".
+    """
+    try:
+        _, apps = await asyncio.to_thread(_load_client)
+        rs_list = await asyncio.to_thread(
+            apps.list_namespaced_replica_set,
+            namespace=settings.k8s_namespace,
+            label_selector=f"app={service}",
+        )
+    except RuntimeError as e:
+        return _unavailable(str(e))
+    except Exception as e:
+        logger.warning("get_change_provenance(%s) failed: %s", service, e)
+        return _unavailable(f"k8s API error: {type(e).__name__}: {e}")
+
+    def _rev(rs) -> int:
+        try:
+            return int((rs.metadata.annotations or {}).get("deployment.kubernetes.io/revision", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    revisions = sorted(rs_list.items, key=_rev)[-max(2, limit) :]
+    if not revisions:
+        return {
+            "service": service,
+            "found": False,
+            "note": f"no ReplicaSets labelled app={service} in this namespace",
+        }
+
+    rows, prev = [], None
+    for rs in revisions:
+        fp = _template_fingerprint(rs)
+        changed: list[str] = []
+        if prev is not None:
+            if fp["image"] != prev["image"]:
+                changed.append("image")
+            if fp["env"] != prev["env"]:
+                changed.append("env")
+            if fp["mounted_config"] != prev["mounted_config"]:
+                changed.append("mounted_config")
+            if fp["git_version"] != prev["git_version"]:
+                changed.append("git_version(label only)")
+        rows.append(
+            {
+                "revision": _rev(rs),
+                "git_version": fp["git_version"],
+                "image": fp["image"],
+                "mounted_config": fp["mounted_config"],
+                "changed_vs_previous": changed if prev is not None else None,
+                "created": _age(rs.metadata.creation_timestamp),
+            }
+        )
+        prev = fp
+
+    latest = rows[-1]
+    substantive = [c for c in (latest["changed_vs_previous"] or []) if "label only" not in c]
+    if latest["changed_vs_previous"] is None:
+        verdict = "only one revision known; nothing to compare"
+    elif substantive:
+        verdict = (
+            f"the last rollout changed {', '.join(substantive)} — a rollback restores a "
+            "genuinely different pod template"
+        )
+    else:
+        verdict = (
+            "the last rollout changed nothing the process runs (at most a version label or a "
+            "restart). If behaviour changed, the cause is outside the template — check the "
+            f"mounted config: {', '.join(latest['mounted_config']) or 'none'}"
+        )
+
+    return {
+        "service": service,
+        "namespace": settings.k8s_namespace,
+        "found": True,
+        "revisions": rows,
+        "verdict": verdict,
+    }
+
+
+class ProvenanceArg(BaseModel):
+    service: str = Field(description="Exact service_name, e.g. payment-service.")
+    limit: int = Field(default=4, description="How many recent revisions to compare (min 2).")
+
+
+k8s_change_provenance_tool = StructuredTool(
+    name="k8s_change_provenance",
+    description="What the last rollouts actually changed for a service: image, env and "
+    "mounted ConfigMaps/Secrets per revision. Use BEFORE blaming a deploy: a "
+    "version label changing is not a code change, and a fault that lives in a "
+    "mounted ConfigMap survives any rollback.",
+    args_schema=ProvenanceArg,
+    coroutine=get_change_provenance,
+)

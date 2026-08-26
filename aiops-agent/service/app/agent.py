@@ -39,6 +39,7 @@ from .tools import (
     discover_span_names_tool,
     github_compare,
     github_get_file,
+    k8s_change_provenance_tool,
     k8s_deployment_status_tool,
     k8s_events_tool,
     k8s_pod_status_tool,
@@ -530,6 +531,7 @@ TOOLS = [
     k8s_pod_status_tool,
     k8s_events_tool,
     k8s_deployment_status_tool,
+    k8s_change_provenance_tool,
 ]
 
 
@@ -1492,6 +1494,7 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
         try:
             from .calibration import compute_calibration, load_records, production_records
             from .governance import (
+                inapplicable_by_provenance,
                 propose_remediations,
                 regression_verdict,
                 runbook_health_verdict,
@@ -1521,6 +1524,14 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
             step_by_action = {s.action: s for s in matched_rb.remediation}
             rejected = _prior_rejections(matched_rb.remediation, params)
 
+            # What the change history rules out for this service, regardless of
+            # what the runbook lists. Off the tool budget, like the actuation
+            # refresh above, and it asks the cluster rather than trusting the
+            # run's own prose.
+            inapplicable = await inapplicable_by_provenance(
+                params.get("service_name") or params.get("service")
+            )
+
             decisions = propose_remediations(
                 [s.action for s in matched_rb.remediation],
                 findings.confidence,
@@ -1530,6 +1541,7 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
                 runbook_health_verdict(matched_rb.id) if settings.runbook_health_enabled else None,
                 rejected,
                 regression_verdict(),
+                inapplicable,
             )
 
             # Materialize each AUTO/PROPOSE decision as a tracked ActionRequest the

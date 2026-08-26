@@ -267,6 +267,7 @@ def decide(
     rejected: dict | None = None,
     ev: dict | None = None,
     *,
+    inapplicable: str | None = None,
     path=None,
 ) -> Decision:
     """Policy verdict for one proposed action given the run confidence, the
@@ -344,6 +345,13 @@ def decide(
     # carries less information than the first — it is about our persistence, not
     # about the action. ESCALATE creates no proposal, and the reason carries
     # their words so the escalation is not a mystery.
+    # The cluster says this action cannot fix this incident. That is not a
+    # confidence question and it is not a permission question: proposing a
+    # rollback for a fault that lives in a mounted ConfigMap wastes the one
+    # thing the on-call has least of, and it does it while sounding certain.
+    if inapplicable:
+        return mk(Autonomy.ESCALATE, inapplicable)
+
     if rejected:
         why = (rejected.get("evidence") or "").strip()
         return mk(
@@ -469,6 +477,7 @@ def propose_remediations(
     rb: dict | None = None,
     rejected: dict[str, dict] | None = None,
     ev: dict | None = None,
+    inapplicable: dict[str, str] | None = None,
 ) -> list[Decision]:
     """Map a runbook's remediation step action names to registered actions and run
     each through the gate. Unregistered names are skipped (only the typed,
@@ -481,8 +490,58 @@ def propose_remediations(
         spec = registry.get(name)
         if spec is None:
             continue
-        out.append(decide(spec, confidence, calib, dq, act, rb, (rejected or {}).get(name), ev))
+        out.append(
+            decide(
+                spec,
+                confidence,
+                calib,
+                dq,
+                act,
+                rb,
+                (rejected or {}).get(name),
+                ev,
+                inapplicable=(inapplicable or {}).get(name),
+            )
+        )
     return out
+
+
+async def inapplicable_by_provenance(service: str | None) -> dict[str, str]:
+    """Actions the cluster's own change history says cannot work here.
+
+    One rule so far, and it comes from a mistake that repeated four times: when
+    the last rollouts changed nothing the process runs, the fault is in
+    something mounted from outside the pod template, and `rollout undo` restores
+    a template that was never the problem. The diagnosis being right does not
+    save you here — the agent got the ConfigMap answer right and still proposed
+    the rollback, because the action came from the runbook rather than from what
+    it had just found out.
+
+    Read-only, off the tool budget, and failure-open: if the cluster cannot
+    answer, nothing is marked inapplicable and the normal gates still apply.
+    """
+    if not service:
+        return {}
+    try:
+        from .tools.k8s import get_change_provenance
+
+        prov = await get_change_provenance(service)
+    except Exception as e:  # never let a probe sink the proposal path
+        logger.warning("provenance check failed for %s: %s", service, e)
+        return {}
+    if not prov.get("found") or prov.get("unavailable"):
+        return {}
+    verdict = prov.get("verdict") or ""
+    if "outside the template" not in verdict:
+        return {}
+    mounted = ", ".join((prov.get("revisions") or [{}])[-1].get("mounted_config") or []) or "none"
+    return {
+        "k8s.rollout_undo": (
+            "the cluster says the last rollouts changed nothing the process runs, so a "
+            f"rollback restores an identical pod template; the mounted config ({mounted}) "
+            "is where the change is"
+        )
+    }
 
 
 def runbook_health_verdict(runbook_id: str, path=None) -> dict:
