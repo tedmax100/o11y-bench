@@ -13,7 +13,7 @@ tags: [OpenTelemetry, AIOps, Governance, 鐵人賽]
 
 昨天那輪演習跑完，agent 對同一個事故給的信心是 0.65。前一天的真實那輪，同一個事故、同一份處置程序，它給 0.9。同一件事差了 0.25，而如果自主權是掛在信心門檻上的，這 0.25 就是「要不要叫醒一個人」的差別。
 
-今天處理五道門裡的第一道：**憑什麼相信那個數字**。
+今天處理五道門裡的第一道：**憑什麼相信那個數字**。順便處理一件我寫這篇的時候才發現的事：同一個數字，其實一直在調查迴圈裡當停止條件用。
 
 程式碼在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day29/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day29)。
 
@@ -110,6 +110,94 @@ Calibration over 4 labeled run(s) (of 18 recorded):
 
 所以現在這道門是紅的，而它紅的理由是`區間裡只有兩筆`，不是`正確率不夠`。這兩句話在報表上都是紅燈，但它們要的東西完全不一樣：一個要人去標，一個要 agent 變強。
 
+## 同一個數字，還在更前面決定了另一件事
+
+寫到這裡我才發現一件有點尷尬的事。
+
+這道門的整個立論是「信心分數是推理平面自己講的，治理平面沒有義務相信它」。可是我回頭看調查迴圈的停止條件，它長這樣：抽出 `Findings`，如果 `confidence` 低於門檻，就換一個假設再查一輪。
+
+也就是說，**同一個我不敢拿來開自主權的數字，一直在更前面決定「還要不要繼續查」**。而且那個位置沒有任何人在量它。校準表至少還會把 0.9 跟後來的對錯放在一起對帳；停止條件這邊，它說夠了就是夠了，事後沒有留下任何可以回頭檢查的東西。
+
+更麻煩的是那個分數怎麼來的。它是模型照著 prompt 裡三條規則（訊號夠不夠分散、有沒有試著推翻自己、假設收斂了沒）替自己的工作打的分。考生手上握著考場的鑰匙。
+
+所以停止條件改成不問模型。四條檢查，每一條都能從落盤的紀錄重算一次，不需要再叫一次模型：
+
+| 檢查 | 它在問什麼 |
+| --- | --- |
+| `observed` | 這一輪有沒有任何一次查詢真的量到東西 |
+| `independent_sources` | 說這件事的來源有沒有超過一個 |
+| `causal_roles` | 這些觀測有沒有講到超過一種因果角色 |
+| `conclusion_cites_evidence` | 結論有沒有引用任何具體的值 |
+
+前兩條靠的是 Day34 那層 Fact Adapter：每個工具結果進 context 之前，先被確定性規則判成 observed / empty / unavailable / error / truncated / context，只有 observed 算得上證據，而 discovery 類的查詢永遠是 context。沒有那層，「有沒有量到東西」這句話根本問不出口，因為空陣列跟一筆資料在字串層面長得一樣無辜。
+
+### 門檻為什麼是二
+
+兩個門檻都是 2，這個數字我想過蠻久的。
+
+**一個來源自己同意自己不算佐證。** 兩次 PromQL 查詢是一個來源，不是兩個，所以計數是算 store 不是算呼叫次數。一種因果角色也不夠：只有 mechanism 是一個沒有人受害的機制，只有 impact 是一個沒有解釋的症狀。
+
+那為什麼不是三？三聽起來嚴謹得多。但我們的 Tempo 只留一小時，變更紀錄也不是每次都在。三選三的規則會有很高的比例是敗在 stack 的狀態，而不是敗在調查品質。而一道經常因為錯誤理由亮紅燈的門，結局是可預測的：某個凌晨三點會有人把它偷偷調鬆，然後那個數字再也沒有人敢動。
+
+其實訂一個守得住的門檻，比訂一個看起來很嚴格的門檻有用。兩個門檻都是設定值（`sufficiency_min_sources` / `sufficiency_min_causal_roles`），要調就光明正大地調，而且理由寫在 module 的 docstring 裡。
+
+### 轉向訊息從報分數改成指名缺口
+
+停止條件改了，接在它後面的那句話也得跟著改。
+
+以前不夠的時候，agent 收到的是「你的信心是 0.55，低於門檻，請換一個假設」。這句話實際上是在叫它再猜一次。
+
+現在它收到的是缺口本身：
+
+```
+The evidence for this conclusion is not yet sufficient. What is missing:
+- independent_sources: 1 independent source(s) ['runtime']; needs 2
+- causal_roles: observations speak to ['mechanism']; needs 2 distinct roles
+
+Query a store you have not used yet this incident: logs; traces; the deploy/commit history.
+Establish what changed (a deploy, a rollout, a config or code diff); and what users or
+callers actually saw (error logs, failed requests).
+Do NOT repeat a query that already came back empty - change the selector, the window,
+or the store. When you conclude, cite the concrete values you read, and if the evidence
+still is not there, say so plainly instead of narrowing the claim until it fits.
+```
+
+（這段是餵三筆假的觀測進 `pivot_instruction()` 真的印出來的：兩次 Prometheus 查詢加一次查空的 Loki，所以它算出來只有一個來源、一種因果角色。）
+
+一個只查過 Prometheus 的調查會被指去看 logs 或 traces；一個從頭到尾沒有建立「什麼變了」的調查會被要求去建立它。這是可以照著做的指令，前面那句不是。
+
+還有一個容易漏掉的細節：**證據是跨轉向累積的**。每一輪的台帳照樣重置（那是給模型看的當輪 context），但這道門問的是整場調查，第一輪查到的 metric 不會因為第二輪換了假設就消失。不然這道門會逼著 agent 在每一輪裡各自湊滿兩個來源，那是另一種形式的浪費。
+
+### 兩個方向都會不同意
+
+把舊規則跟新規則放在同一批 run 上並排（`probe_sufficiency.py` 的第三節，四組 run 都是手工組出來的 fact，因為整條規則的重點就是它可以從落盤的紀錄重算）：
+
+```
+run                                           conf  old       new
+one store, one role, sounds certain           0.90  stop      pivot      <-- disagree
+three stores, two roles, sounds unsure        0.55  pivot     stop       <-- disagree
+everything came back empty                    0.65  pivot     pivot
+solid evidence, conclusion cites none of it   0.80  stop      pivot      <-- disagree
+```
+
+（那幾個信心分數是舉例用的，不是量出來的。這張表要看的是兩條規則各自做了什麼決定。）
+
+第一列是新規則比較嚴：一場只查過 Prometheus 的調查，模型給自己 0.9，舊規則就收工了。
+
+第二列反過來，是新規則比較鬆。那是一場四筆觀測、三個 store、有 trigger 也有 impact 的完整調查，只因為模型對自己沒把握，舊規則會叫它再跑一輪。**一道只會變嚴格的門，久了會被當成稅來繞。**
+
+### 那 confidence 呢
+
+留著，而且治理平面照樣讀。
+
+它是這條校準曲線唯一的原料，丟掉等於把整篇文章前半段做的事一起丟掉。它也還在升級給人看的文案裡（「我有八成把握是這個」對值班的人是有意義的一句話）。
+
+**改變的只有一件事：它不再單獨決定任何事。**
+
+> 這個改動我拖了很久才動手，因為舊的那行 `if confidence < threshold` 看起來實在太合理了。
+> 直到我在寫這道校準門的時候發現，我一邊在文章裡說「不要相信那個數字」，
+> 一邊在程式裡拿它決定要不要收工 XD
+
 ## 這對值班的人有什麼差別
 
 沒有校準的信心分數，值班的人只能用經驗值去折算。「它說 0.9 大概等於七成吧」這種折算每個人心裡的係數都不一樣，而且沒有辦法交接。
@@ -123,10 +211,13 @@ Calibration over 4 labeled run(s) (of 18 recorded):
 - **只有四筆。** 剩下的路很清楚：去標。目前有十幾筆非排練的高信心調查躺著等人看，而它們才是能動這個數字的東西。
 - **另外四道門還沒接。** 校準只回答「它準不準」，不回答「它讀的資料是不是真的」「它現在還動得了東西嗎」，那些留給後面。
 - **`inconclusive` 那批還沒有自己的門。** 那把尺已經分出來了，但還沒有人用它訂過任何門檻。
+- **沒有量過那四條檢查值不值得。** 停止條件換成確定性規則之後，調查品質有沒有變好，我沒有跑過前後對照。要跑那個對照需要一份不會隨時間流動的題目，而現在的題目吃的是活的資料。
 
 ## 小結
 
 總結來說，今天這道門要的不是一個更高的分數，是**一個可以被查證的分數**。校準做的事情就是把「它說幾分」跟「它後來對不對」放在同一張表上，然後老實承認現在那張表只有四列。
+
+而那個分數在調查迴圈裡的位子也讓出來了。停止條件現在問的是「有沒有量到東西、幾個來源說的、講到幾種因果角色、結論有沒有引用」，這四件事我隨時可以從落盤的紀錄重算一次，不必再問模型一次它覺得自己做得怎麼樣。
 
 那四列裡最有意思的是負的過度自信。這套系統目前的問題不是它太敢講，是**沒有人在它講完之後告訴它對不對**。
 
