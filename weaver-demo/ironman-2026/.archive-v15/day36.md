@@ -77,7 +77,7 @@ flowchart TD
 
 所以拿來分類的診斷步驟不帶 `check`，只用 `output_contains` 分岔。這句話寫進了 `select_remediation()` 的 docstring、runbook 的註解，還有一條測試——因為三個月後的我一定會想「這條加個 check 更嚴謹吧」。
 
-## 第二條分支我沒讓它可執行
+## 第二條分支，本來我沒讓它可執行
 
 ConfigMap 那條分支，我原本理所當然要接上 `k8s.configmap_flag_set`——那個動作早就寫好了，session-cache 那個劇本用的就是它。
 
@@ -87,9 +87,25 @@ ConfigMap 那條分支，我原本理所當然要接上 `k8s.configmap_flag_set`
 
 而 `k8s.configmap_flag_set` 不會重啟任何東西（user-service 是每個 request 重讀，所以同一個動作在那個劇本裡是真的有效的）。也就是說，如果我把它接上去，agent 會做出一個「診斷完全正確、但執行了也不會有任何變化」的提議——**那正是昨天整天在修的那個錯誤，換了一件衣服**。
 
-所以那條分支的 action 寫成 `manual.configmap_flag_set_and_restart`，一個**沒有註冊在 registry 裡**的名字。未註冊的動作本來就會被提議流程跳過，所以這是靠結構擋的，不是靠我記得。值班的人會看到完整的步驟敘述（翻 flag，然後重啟 payment，因為 flag 是開機才讀的），但系統一個字都不會提議去執行。
+所以第一版那條分支的 action 寫成 `manual.configmap_flag_set_and_restart`，一個**沒有註冊在 registry 裡**的名字。未註冊的動作本來就會被提議流程跳過，所以這是靠結構擋的，不是靠我記得。值班的人看得到完整的步驟敘述，但系統一個字都不會提議去執行。
 
-等哪天那個動作學會順手 `rollout restart`，這條分支再接上去。在那之前，誠實地少做一件事。
+然後當天稍晚，我還是把那個動作補完了——因為「等哪天」通常就是永遠。
+
+補的東西很小：`k8s.configmap_flag_set` 多一個 `restart_deployment` 參數，patch 完 ConfigMap 之後，用 `kubectl.kubernetes.io/restartedAt` 這個註記把 Deployment 滾一次。刻意用註記而不是砍 pod，rollout 會照 `maxUnavailable` 走，服務不會斷；也刻意用 kubectl 用的同一個註記，這樣事後有人手動 `kubectl rollout restart`，歷史上看到的是一套機制不是兩套。
+
+`session-cache-timeout` 那份**沒有**這個參數，而且有一條測試釘住它：user-service 每個 request 重讀，重啟它是白買的爆炸半徑。**同一個動作，兩個服務，該不該重啟的答案不一樣**——這件事沒有辦法從動作的名字推出來，只能從服務怎麼讀設定推出來，所以它屬於 runbook，不屬於動作的預設值。
+
+爆炸半徑也得跟著改。沒有重啟的時候，一個 ConfigMap patch 不換掉任何一個 pod；有重啟的時候會，而那正是人按下核准時真正在批准的東西。對真實叢集乾跑一次：
+
+```
+payment-service | pods 2 | singleton False
+   - restarts payment-service (2 pod(s)) after the flip
+order-service   | pods 2 | singleton True
+   - restarts order-service (1 pod(s)) after the flip
+   - 'order-service' does not mount this ConfigMap — restarting it will not make it read the new value
+```
+
+最後那一句是給打錯字的人看的：那兩個參數只差一個服務名，而重啟一個根本沒掛這份 ConfigMap 的服務，翻了 flag 也不會有任何東西去讀它——又是一次「執行成功、症狀不動」。
 
 ## 分支往「開」的方向壞
 
@@ -110,8 +126,8 @@ the provenance query errored                     2 (both branches)
 ## Runbook remediation branch
 - [NOT FOR THIS INCIDENT] Roll back payment-service to the previous version — `k8s.rollout_undo`
   (provenance does not say 'restores a genuinely different pod template')
-- [APPLIES] Set payment_use_new_validator=false in the payment-flags ConfigMap, then restart
-  payment-service (the flag is read at process start, so the flip alone does nothing)
+- [APPLIES] Turn the new payment validator back off and restart payment-service
+  (the change is in the mounted config, not in the image)
 ```
 
 「我們沒有回滾，因為上幾次 rollout 根本沒改到跑起來的東西」是一句關於這次事故的事實，值班的人讀完會知道這是哪一種故障。一份被默默縮短的清單什麼都沒教到人。
@@ -182,7 +198,7 @@ overconfidence           0.1667  （上限 0.1，紅）
 
 ## 還沒做的
 
-- 那條 ConfigMap 分支還是人工的。要讓它可執行，得先讓 `k8s.configmap_flag_set` 學會在需要的時候順手重啟 deployment——而「什麼時候需要」本身就是另一個要寫進契約的事實。
+- 那條 ConfigMap 分支現在可執行了，但**還沒有人按過**。乾跑對過、測試 6 條，而這個系列反覆講的就是「沒被按過的按鈕不算數」。
 - `when` 只讀 Tier 1 診斷的輸出字串。比對的是 `output_contains`，如果哪天 provenance 那句 verdict 的措辭改了，分支會安靜地不成立。那句話現在同時是人看的訊息跟機器的判斷依據，這遲早要拆開。
 - 標註仍然只有 6 筆，離 20 還很遠，而那條路只有一個走法：更多真實事故的 run，也就是更多事故劇本。
 - ~~那個 4.75 沒有查。~~ 當天稍晚查了，結論比猜的更乾脆：**這座叢集上每一個服務的
