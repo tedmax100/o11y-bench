@@ -1,5 +1,5 @@
 ---
-title: "2026鐵人賽_Outline v12"
+title: "2026鐵人賽_Outline v15"
 tags: 2026鐵人賽
 date: 2026-07-24
 ---
@@ -348,6 +348,33 @@ pod template 裡還是在 template 掛載的 ConfigMap 裡。三筆是 bad-confi
 
 **程式碼**：`ironman-2026/day34/`（`probe_facts.py` 一支探測 ＋ README），
 服務端是新增 `app/facts.py`、改 `app/agent.py` 的圖、`tests/test_facts.py` 25 條。
+
+### v15：加 Day36，「讓診斷去挑處置」單獨寫一天
+
+**動機。** Day35 收在「提議之前先問叢集，不適用的動作擋掉」，但那道檢查的形狀是補丁：
+runbook 對每一張 decline-rate 告警都只給 `rollout undo`，然後在最後一刻把它劃掉。
+真正該修的是**一份 runbook 只能給一個答案**。這一天把分岔搬進 runbook 本身
+（`Step.when`，條件讀已經跑完的 Tier 1 診斷），錯的處置從頭到尾不會被提議。
+
+**為什麼不併進 Day35。** Day35 的主軸是「叢集知道、agent 不知道」，這一天的主軸是
+**「知道了之後，這個知識該放在哪一層」**——放在提議前的檢查裡是補丁，放在 runbook 的
+資料結構裡才是設計。而且這一天真正的發現是一個差點自己埋的雷：`execution.py` 在核准後
+會重跑診斷、**任何一條 `check` 失敗就中止執行**，所以拿來分類事故的診斷不能帶 `check`
+（否則另一條分支上「本來就該失敗」的 check 會中止這條分支上正確的處置）。
+`check`（前提）跟 `when`（哪一種事故）長得像、放在同一層 YAML，搞混的代價是一個
+被核准的正確處置在最後一秒被無聲擋掉——這要有那段 execution 的程式碼在旁邊才講得清楚。
+
+下半場是標註：六月那筆的逐字稿顯示**同一個 fp 跑了八次、其中一次查對了又被說服回去**，
+以及待標清單裡三筆 chat 根本標不了（chat 不寫 calibration 表）＋唯一的標註入口把
+`grading_mode` 寫死成 culprit（信心 0.0 的正確拒答會被算成 1.0 的校準誤差）。
+收在 `band accuracy` 從 1.0 掉到 0.5——先前的 1.0 是「還沒遇到高信心的錯例」。
+
+**天數**：35→**36 天**（Series 2 從 10 天變 11 天）。前面的日號一個都不動。
+
+**程式碼**：`ironman-2026/day36/`（`probe_branch.py` 一支探測 ＋ README），
+服務端是 `app/runbook.py` 新增 `Condition`／`Step.when`／`select_remediation()`、
+`app/agent.py` 分岔後才提議、`app/calibration.py` 的 backfill 與 `default_grading_mode()`、
+`tests/test_runbook_branch.py` 10 條 ＋ `tests/test_label_modes.py` 5 條。
 
 ---
 
