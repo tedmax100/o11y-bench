@@ -126,6 +126,62 @@ def record_run(
         return None
 
 
+def _backfill_from_investigation(fp: str, path: Path | None = None) -> str | None:
+    """Give a run that was never recorded for calibration a row to be labeled in.
+
+    Chat runs are written to `investigations` and never to `calibration`, so the
+    Todo queue listed them as work waiting on a person and every attempt to do
+    that work 404'd. A queue whose items cannot be actioned trains people to
+    stop reading the queue.
+
+    The row is created pending (correct=NULL) and the caller's verdict lands on
+    it in the usual way, so nothing here decides anything — it only makes the
+    verdict expressible.
+    """
+    try:
+        from .investigations import get_investigation
+
+        inv = get_investigation(fp, path)
+    except Exception as e:
+        logger.warning("label_run: investigation lookup failed for %s: %s", fp, e)
+        return None
+    if inv is None:
+        return None
+    store.cal_insert(
+        run_id=fp,
+        ts=inv.ts,
+        confidence=float(inv.confidence or 0.0),
+        summary=inv.summary or "",
+        hypothesis=inv.hypothesis or "",
+        suspected_version=inv.suspected_version,
+        services=list(inv.services or []),
+        fp=fp,
+        path=path,
+    )
+    logger.info("label_run: backfilled a calibration row for %s (source=%s)", fp, inv.source)
+    return fp
+
+
+def default_grading_mode(fp: str, path: Path | None = None) -> str:
+    """Which ruler this run should be judged with, decided from the run itself.
+
+    A run that named no suspect did not blame anyone, so "was the blame right"
+    has no answer for it — grading it in culprit mode is how a 0.0-confidence
+    refusal becomes a calibration gap of 1.0 (Day29). Deterministic on purpose:
+    the last time this was left to whoever was clicking, the whole pool moved.
+    """
+    try:
+        from .investigations import get_investigation
+
+        inv = get_investigation(fp, path)
+    except Exception:
+        return CULPRIT
+    if inv is None:
+        return CULPRIT
+    blamed = bool(inv.suspected_version) or bool(inv.services)
+    return CULPRIT if blamed else INCONCLUSIVE
+
+
 def label_run(
     run_id: str,
     correct: bool,
@@ -146,6 +202,8 @@ def label_run(
     # The caller may be holding a run_id (the eval harness, the executor now)
     # or a fingerprint (the plugin's endpoint). Resolve it once, out loud.
     resolved = store.cal_resolve_run_id(run_id, path)
+    if resolved is None:
+        resolved = _backfill_from_investigation(run_id, path)
     if resolved is None:
         logger.warning("label_run: no record for %s", run_id)
         return False
@@ -447,13 +505,33 @@ def _main(argv: list[str] | None = None) -> int:
     g.add_argument("--wrong", action="store_true")
     pl.add_argument("--score", type=float, default=None)
     pl.add_argument("--source", default="manual")
+    # Without these the CLI could only ever say "the blame was right", so every
+    # verdict it produced was a culprit verdict — including the ones about runs
+    # that never blamed anybody. That is the Day29 MCE 1.0 trap with a shell
+    # prompt in front of it.
+    pl.add_argument(
+        "--grading-mode",
+        choices=[CULPRIT, INCONCLUSIVE],
+        default=None,
+        help=f"{CULPRIT}: was the blame right. {INCONCLUSIVE}: was declining to blame right.",
+    )
+    pl.add_argument("--dimension", default=None, help="root_cause | scope | action | other")
+    pl.add_argument("--note", default=None, help="why — read back when the label is questioned")
 
     args = parser.parse_args(argv)
     if args.cmd == "report":
         print(format_report(compute_calibration(load_records())))
         return 0
     if args.cmd == "label":
-        ok = label_run(args.run_id, correct=args.correct, score=args.score, source=args.source)
+        ok = label_run(
+            args.run_id,
+            correct=args.correct,
+            score=args.score,
+            source=args.source,
+            grading_mode=args.grading_mode,
+            error_dimension=args.dimension,
+            correction_note=args.note,
+        )
         print("updated" if ok else f"no record for run_id={args.run_id}")
         return 0 if ok else 1
     return 2

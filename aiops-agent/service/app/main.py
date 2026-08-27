@@ -13,7 +13,7 @@ from sse_starlette.sse import EventSourceResponse
 from . import action_requests, actions, agent, audit, breaker, execution, governance, store
 from .agent import lifespan, stream_chat
 from .alerts import AlertProvisioningDisabled, AlertSpec, build_alert_rule, provision_alert
-from .calibration import CULPRIT, label_run
+from .calibration import CULPRIT, INCONCLUSIVE, default_grading_mode, label_run
 from .config import settings
 from .investigations import get_investigation, list_investigations
 from .traces import analyze_trace, get_trace, list_traces, stream_trace_chat
@@ -102,6 +102,9 @@ class LabelRequest(BaseModel):
     correct: bool
     error_dimension: str | None = None  # root_cause | scope | action | other
     correction_note: str | None = None
+    # Which ruler the verdict is on. Omitted means "decide it from the run" —
+    # see calibration.default_grading_mode. A caller may still say it outright.
+    grading_mode: str | None = None
 
 
 # Strong refs for re-investigation and draft-runbook background tasks.
@@ -115,15 +118,23 @@ async def investigations_label(fp: str, req: LabelRequest):
     from the UI). When correct=False, kicks off a re-investigation in the same
     thread with the human correction injected as context. When correct=True and
     no active runbook covers the alert, synthesizes a draft runbook (閉環二)."""
+    if req.grading_mode not in (None, CULPRIT, INCONCLUSIVE):
+        raise HTTPException(status_code=400, detail=f"unknown grading_mode {req.grading_mode!r}")
+    # A human pressing correct/wrong on an investigation that blamed something is
+    # judging whether the blame was right — the reading the calibration math
+    # assumes. But the same two buttons sit under chat answers that blamed
+    # nobody, and "correct" there means "it was right to not blame anyone",
+    # which is a different question and a different pool. Deciding it from the
+    # run rather than from the button is what keeps a 0.0-confidence refusal out
+    # of the culprit curve, where it would score a full 1.0 of calibration gap.
+    mode = req.grading_mode or default_grading_mode(fp)
     ok = label_run(
         fp,
         correct=req.correct,
         source="ui",
         error_dimension=req.error_dimension,
         correction_note=req.correction_note,
-        # A human pressing correct/wrong on an investigation is judging whether
-        # the blame was right — the one reading the calibration math assumes.
-        grading_mode=CULPRIT,
+        grading_mode=mode,
     )
     if not ok:
         raise HTTPException(status_code=404, detail=f"no calibration record for fingerprint {fp}")
