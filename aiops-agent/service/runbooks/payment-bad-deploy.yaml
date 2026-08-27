@@ -79,26 +79,47 @@ remediation:
   # The other shape of the same page: nothing shipped, someone flipped a flag in
   # the mounted ConfigMap and the pods restarted. `rollout undo` is a no-op here;
   # the flag is the change, so putting it back is the fix.
-  # `manual.` is not a registered action, on purpose. payment-service reads its
-  # flags once at process start, so flipping the ConfigMap without restarting the
-  # pods changes nothing that is running — and `k8s.configmap_flag_set` does not
-  # restart anything (user-service re-reads per request, which is why the same
-  # action *is* executable in session-cache-timeout). Proposing it here would be
+  # payment-service reads its flags once at process start, so the flip alone
+  # changes nothing that is running — `restart_deployment` is what makes this
+  # fix a fix. (user-service re-reads per request, which is why the same action
+  # carries no restart in session-cache-timeout.) Without it this branch would be
   # today's mistake wearing the other hat: the right diagnosis, an action that
-  # cannot take effect. Until the action can restart the deployment, this branch
-  # is written out for the on-call and executes nothing.
+  # cannot take effect.
   - desc: >-
-      Set payment_use_new_validator=false in the payment-flags ConfigMap, then restart
-      payment-service (the flag is read at process start, so the flip alone does nothing)
-    action: manual.configmap_flag_set_and_restart
+      Turn the new payment validator back off and restart payment-service
+      (the change is in the mounted config, not in the image)
+    action: k8s.configmap_flag_set
     args:
       configmap: payment-flags
       namespace: demo
       key: flags.json
       flag: payment_use_new_validator
       value: false
+      restart_deployment: payment-service
     when:
       diagnostic: provenance
       output_contains: "the cause is outside the template"
     reversible: true
     requires_approval: true
+    # The undo restarts too. A rollback that puts the flag back but leaves the
+    # pods running the value they were started with returns the system to a
+    # third state — the file saying one thing and the process doing another —
+    # which is worse than either of the two states anybody has seen.
+    rollback:
+      action: k8s.configmap_flag_set
+      args:
+        configmap: payment-flags
+        namespace: demo
+        key: flags.json
+        flag: payment_use_new_validator
+        value: true
+        restart_deployment: payment-service
+    # Verified against the decline rate, after the pods have come back. The
+    # settle window has to outlast the rollout here, unlike the flag-only case.
+    verify:
+      action: query_prometheus
+      args:
+        expr: 'sum(rate(payment_charges_total{status="declined"}[2m]))'
+        queryType: instant
+      check:
+        max_value: 0.01

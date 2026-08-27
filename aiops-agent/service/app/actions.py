@@ -125,8 +125,10 @@ registry.register(
     ActionSpec(
         name="k8s.configmap_flag_set",
         description=(
-            "Set one boolean flag inside a JSON document in a ConfigMap "
-            "(e.g. turn a degraded feature off). No pod restart."
+            "Set one boolean flag inside a JSON document in a ConfigMap (e.g. turn a "
+            "degraded feature off). Pass restart_deployment to roll that Deployment "
+            "afterwards — required for a service that reads its flags at process start, "
+            "where the patch alone changes nothing that is running."
         ),
         reversible=True,
         requires_approval=True,

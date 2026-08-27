@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -320,7 +321,7 @@ async def impl_configmap_flag_set(args: dict) -> dict:
     )
 
     logger.warning("configmap_flag_set: %s/%s %s.%s %s→%s", ns, name, key, flag, previous, value)
-    return {
+    result = {
         "action": "configmap_flag_set",
         "configmap": name,
         "namespace": ns,
@@ -329,3 +330,39 @@ async def impl_configmap_flag_set(args: dict) -> dict:
         "previous_value": previous,
         "new_value": value,
     }
+
+    # Some services read their flags once, at process start. For those the patch
+    # above changes a file nothing re-reads, so the action would report success
+    # and the symptom would not move — the exact shape of "right diagnosis, fix
+    # that cannot work" this system spent two days learning to refuse. Restarting
+    # is therefore part of the action, not a follow-up somebody remembers.
+    restart = args.get("restart_deployment")
+    if restart:
+        result["restarted"] = await _rollout_restart(str(restart), ns)
+    return result
+
+
+async def _rollout_restart(deployment: str, ns: str) -> dict:
+    """`kubectl rollout restart`: stamp the pod template so the Deployment rolls
+    its pods. Deliberately the annotation patch and not a delete of the pods —
+    the rollout honours maxUnavailable, so the service stays up.
+
+    The stamp is the same annotation kubectl uses, so a human running
+    `kubectl rollout restart` afterwards sees one history, not two mechanisms.
+    """
+    stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    apps_w = await asyncio.to_thread(_load_write_api)
+    await asyncio.to_thread(
+        apps_w.patch_namespaced_deployment,
+        name=deployment,
+        namespace=ns,
+        body={
+            "spec": {
+                "template": {
+                    "metadata": {"annotations": {"kubectl.kubernetes.io/restartedAt": stamp}}
+                }
+            }
+        },
+    )
+    logger.warning("configmap_flag_set: restarted %s/%s at %s", ns, deployment, stamp)
+    return {"deployment": deployment, "namespace": ns, "restarted_at": stamp}

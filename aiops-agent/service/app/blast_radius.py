@@ -322,6 +322,26 @@ async def dry_run_configmap_flag_set(args: dict) -> BlastRadius:
     if current is not None and bool(current) == target_value:
         notes.append(f"'{flag}' is already {target_value}; the flip would change nothing")
 
+    # A flag flip with a restart is a different-sized action than one without,
+    # and the difference is exactly the thing the on-call is approving: pods get
+    # replaced. Count them, and say when the deployment being restarted is not
+    # one of the workloads that reads the map — that combination is almost
+    # always a typo, and it produces a restart that fixes nothing.
+    restart = args.get("restart_deployment")
+    restarted_pods = 0
+    if restart:
+        dep = next((d for d in deps.items if d.metadata.name == str(restart)), None)
+        if dep is None:
+            notes.append(f"restart target '{restart}' is not a Deployment in {namespace}")
+        else:
+            restarted_pods = dep.spec.replicas or 0 if dep.spec is not None else 0
+            notes.append(f"restarts {restart} ({restarted_pods} pod(s)) after the flip")
+            if str(restart) not in reader_names:
+                notes.append(
+                    f"'{restart}' does not mount this ConfigMap — restarting it will not "
+                    "make it read the new value"
+                )
+
     return BlastRadius(
         action="k8s.configmap_flag_set",
         target=target,
@@ -329,9 +349,11 @@ async def dry_run_configmap_flag_set(args: dict) -> BlastRadius:
         current_revision=None if current is None else f"{flag}={current}",
         target_revision=f"{flag}={target_value}",
         affected_pods=pods,
-        # No pod is replaced, so "one replica" carries none of the usual
-        # single-point-of-failure meaning here.
-        singleton=False,
+        # Without a restart no pod is replaced, so "one replica" carries none of
+        # the usual single-point-of-failure meaning. With one it carries all of
+        # it: a single-replica deployment being rolled is a moment with no
+        # healthy pod behind the service.
+        singleton=bool(restart) and restarted_pods == 1,
         cross_namespace=False,
         in_protected_namespace=namespace in settings.protected_namespaces,
         notes=notes,

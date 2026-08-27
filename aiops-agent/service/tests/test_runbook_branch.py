@@ -158,4 +158,4 @@ def test_shipped_payment_runbook_branches_both_ways():
         return [c.step.action for c in select_remediation(rb, [res], {}) if c.applicable]
 
     assert chosen(TEMPLATE_CHANGED) == ["k8s.rollout_undo"]
-    assert chosen(CONFIG_CHANGED) == ["manual.configmap_flag_set_and_restart"]
+    assert chosen(CONFIG_CHANGED) == ["k8s.configmap_flag_set"]
