@@ -524,3 +524,35 @@ def test_case_runs_keeps_the_unlabelled_run(tmp_path, monkeypatch):
     store.cal_label("r2", correct=True, score=1.0, source="human", path=p)
     runs = store.case_runs(key, path=p)
     assert [(r["run_id"], r["correct"]) for r in runs] == [("r2", 1), ("r1", None)]
+
+
+def test_inv_query_similar_never_serves_a_rehearsal_as_precedent(tmp_path):
+    """A drill answer names a version invented for the drill, so recalling it
+    hands the model a culprit that never existed outside the rehearsal. This is
+    the A/B control arm: a control fed rehearsals measures nothing."""
+    path = tmp_path / "aiops.db"
+    store.init(path)
+    payload = json.dumps(
+        {
+            "fp": "drillfp",
+            "service": "payment-service",
+            "alertname": "payment-decline-rate-high",
+            "summary": "code regression in v2.5.1-drill-055519",
+            "confidence": 0.95,
+        }
+    )
+    store.inv_insert("drillfp", "2026-08-16T05:57:05Z", payload, path)
+    store.cal_insert(
+        run_id="drillfp",
+        ts="2026-08-16T05:57:05Z",
+        confidence=0.95,
+        summary="s",
+        hypothesis="h",
+        suspected_version="v2.5.1-drill-055519",
+        services=["payment-service"],
+        grading_mode=store.CULPRIT,
+        drill=True,
+        path=path,
+    )
+    store.cal_label("drillfp", True, score=1.0, source="grader-truth", path=path)
+    assert not store.inv_query_similar("payment-service", path=path)

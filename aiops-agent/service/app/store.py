@@ -624,7 +624,10 @@ def inv_query_similar(
     limit: int = 5,
     path: str | Path | None = None,
 ) -> list[dict[str, Any]]:
-    """Return up to `limit` past investigations for this service that were
+    """The pre-case-memory recall, kept only as the A/B control arm for
+    `case_recall` (see `_legacy_past_incident_context`). Not the live path.
+
+    Return up to `limit` past investigations for this service that were
     labeled correct=True (joined with calibration by fp=run_id), most-recent
     first. `alertname` narrows to the same alert; a chat question has no
     alertname, so leaving it out matches any past investigation of the service.
@@ -634,7 +637,19 @@ def inv_query_similar(
     means "it rightly blamed nobody" — retrieving that as a solved past incident
     would feed the agent a non-incident as precedent, which is the opposite of
     what this context is for. Rows with no recorded mode are excluded too: this
-    output goes into a prompt, so unknown provenance fails closed."""
+    output goes into a prompt, so unknown provenance fails closed.
+
+    Rehearsals are excluded for the same reason they are excluded from the
+    calibration curve, and one worse: a drill answer names a version that was
+    invented for the drill (`v2.5.1-drill-055519`), so serving it as precedent
+    hands the model a culprit that never existed outside the rehearsal. On the
+    day36 snapshot two of the three verdicts qualifying rows here were drills.
+
+    The `fp` fan-out this JOIN has is *not* fixed here — one verdict still
+    speaks for every run sharing the fingerprint. That defect is the reason
+    `case_recall` exists, and a control arm has to keep the behaviour it is a
+    control for. Excluding drills is different: a control arm fed rehearsals
+    does not measure the thing the experiment is about."""
     where = "json_extract(i.payload, '$.service') = ?"
     params: list[Any] = [service]
     if alertname:
@@ -646,7 +661,7 @@ def inv_query_similar(
             f"""
             SELECT i.payload FROM investigations i
             JOIN calibration c ON c.run_id = i.fp
-            WHERE {where} AND c.correct = 1 AND c.grading_mode = ?
+            WHERE {where} AND c.correct = 1 AND c.grading_mode = ? AND COALESCE(c.drill, 0) = 0
             ORDER BY i.id DESC LIMIT ?
             """,
             params,
