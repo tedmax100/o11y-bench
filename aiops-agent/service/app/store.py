@@ -906,6 +906,19 @@ def case_query_similar(
     something was actually wrong. `false_positive` cases are kept but never
     returned here: they are useful context about the alert, not precedent about
     a cause.
+
+    `alertname` **ranks, it does not filter**. Same alert first, then the rest of
+    the service's history, and each row says which it is (`same_alert`) so the
+    caller can label it rather than pass it off as the same incident.
+
+    It filtered once, on a bare string equality, and that had two edges. The
+    small one is spelling: `OrderAuthFailureRateHigh` and `order-cancel-rate-high`
+    are compared here after `norm_alertname`, the same way runbook triggers are,
+    because that comparison already drifted once in this codebase. The large one
+    is the cliff — rename an alert rule and every case under the old name goes
+    silently unreachable, on the one path that needs them, while the chat path
+    (which passes no alertname) kept seeing all of them. Two rulers for the same
+    memory, and the stricter one was aimed at the incident.
     """
     # A case is worth recalling if it knows *something*: why it happened, or
     # what made it stop. Requiring a root cause meant an incident somebody had
@@ -914,9 +927,6 @@ def case_query_similar(
     # rolling back" is the more actionable half of the two.
     where = "service = ? AND (root_cause IS NOT NULL OR resolution IS NOT NULL)"
     params: list[Any] = [service]
-    if alertname:
-        where += " AND alertname = ?"
-        params.append(alertname)
     # An incident nobody has seen in months is history, not a prior. The row
     # stays; it just stops being offered as what is probably happening now.
     where += " AND last_ts >= ?"
@@ -932,13 +942,35 @@ def case_query_similar(
     )
     params.extend(TRUSTED_ROOT_CAUSE_SOURCES)
     params.extend(_CASE_NEVER_RECALL_STATUSES)
-    params.append(limit)
+    # Over-fetch: the ranking that decides the top `limit` is the same-alert
+    # split below, which SQL cannot compute (norm_alertname lives in Python).
+    params.append(max(limit * 5, 20))
     with _connect(path) as conn:
         rows = conn.execute(
             f"SELECT * FROM cases WHERE {where} ORDER BY occurrences DESC, last_ts DESC LIMIT ?",
             params,
         ).fetchall()
-    return [_case_row(r) for r in rows]
+
+    from .runbook import norm_alertname
+
+    want = norm_alertname(alertname) if alertname else ""
+    out = []
+    for r in rows:
+        d = _case_row(r)
+        got = norm_alertname(d.get("alertname"))
+        d["same_alert"] = bool(want) and got == want
+        if d["same_alert"] and alertname and d.get("alertname") != alertname:
+            logger.info(
+                "case %s matched alertname %r only after normalization (case says %r)",
+                d.get("case_key"),
+                alertname,
+                d.get("alertname"),
+            )
+        out.append(d)
+    # Same alert first; within each group the SQL order (occurrences, recency)
+    # already holds, and Python's sort is stable.
+    out.sort(key=lambda d: not d["same_alert"])
+    return out[:limit]
 
 
 def case_list(

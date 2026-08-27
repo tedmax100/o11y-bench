@@ -169,7 +169,10 @@
   alert:
     labels:
       service_name: order-service
-      alertname: OrderAuthFailureRateHigh
+      # The alert rule this environment actually fires. It used to be an
+      # invented name, which made the fixture structurally unable to reach the
+      # case library no matter what recall did.
+      alertname: order-cancel-rate-high
     annotations:
       summary: "order-service orders failing the auth check"
       description: >-

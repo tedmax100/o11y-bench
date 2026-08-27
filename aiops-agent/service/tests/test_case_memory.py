@@ -839,3 +839,60 @@ def test_a_later_fix_replaces_an_earlier_one(monkeypatch, tmp_path):
             path=p,
         )
     assert store.case_get(sc.case_key, p)["resolution"]["action"] == "k8s.restart"
+
+
+# ---- alertname ranks, it does not filter (day36) ----------------------------
+
+
+def test_a_renamed_alert_no_longer_empties_the_memory(monkeypatch, tmp_path):
+    """The cliff: an exact-string filter meant renaming an alert rule made every
+    case under the old name unreachable on the one path that needs them, while
+    the chat path (no alertname) kept seeing all of them."""
+    p = _cfg(monkeypatch, tmp_path)
+    _confirmed_case(p, alertname="PaymentDeclineRateHigh")
+    hits = store.case_query_similar("payment-service", alertname="SomeNewRuleName", path=p)
+    assert len(hits) == 1
+    assert hits[0]["same_alert"] is False
+
+
+def test_spelling_of_the_same_alert_still_counts_as_the_same_alert(monkeypatch, tmp_path):
+    """Compared after norm_alertname, like runbook triggers — that comparison
+    already drifted once in this codebase."""
+    p = _cfg(monkeypatch, tmp_path)
+    _confirmed_case(p, alertname="PaymentDeclineRateHigh")
+    hits = store.case_query_similar(
+        "payment-service", alertname="payment-decline-rate-high", path=p
+    )
+    assert len(hits) == 1 and hits[0]["same_alert"] is True
+
+
+def test_the_same_alert_outranks_the_rest_of_the_services_history(monkeypatch, tmp_path):
+    p = _cfg(monkeypatch, tmp_path)
+    # the other alert is the more frequent one, so only the ranking can put the
+    # matching alert first
+    _confirmed_case(p, alertname="SomethingElse", occurrences=9)
+    _confirmed_case(p, alertname="PaymentDeclineRateHigh", occurrences=1)
+    hits = store.case_query_similar("payment-service", alertname="PaymentDeclineRateHigh", path=p)
+    assert [h["same_alert"] for h in hits] == [True, False]
+    assert hits[0]["alertname"] == "PaymentDeclineRateHigh"
+
+
+def test_no_alertname_means_nothing_is_the_same_alert(monkeypatch, tmp_path):
+    """A chat question has no alert. Every case is history, none of it is 'this
+    alert again', and the injected text must not imply otherwise."""
+    p = _cfg(monkeypatch, tmp_path)
+    _confirmed_case(p, alertname="PaymentDeclineRateHigh")
+    hits = store.case_query_similar("payment-service", path=p)
+    assert [h["same_alert"] for h in hits] == [False]
+
+
+def test_a_case_from_another_alert_is_labelled_in_the_prompt(monkeypatch, tmp_path):
+    p = _cfg(monkeypatch, tmp_path)
+    _confirmed_case(p, alertname="PaymentDeclineRateHigh")
+    same = agent._past_incident_context("payment-service", "PaymentDeclineRateHigh")
+    other = agent._past_incident_context("payment-service", "SomeNewRuleName")
+    assert "different alert on this service" not in same
+    assert "different alert on this service" in other
+    # both still carry the cause; the label weakens the claim, it does not hide it
+    assert "new_validator rejects odd cents" in same
+    assert "new_validator rejects odd cents" in other

@@ -1106,7 +1106,12 @@ def _past_incident_context(service: str, alertname: str | None = None) -> str:
     for c in cases:
         seen = f"×{c['occurrences']}" if c["occurrences"] > 1 else "once"
         by = f", confirmed by {c['root_cause_source']}" if c["root_cause"] else ""
-        lines.append(f"- {c['alertname']} ({seen}, last {(c['last_ts'] or '')[:10]}{by})")
+        # A case from a different alert on the same service is history worth
+        # having and a weaker claim than the same alert firing again. It is
+        # labelled rather than filtered out, so neither the model nor the person
+        # reading this has to assume the two are the same incident.
+        kind = "" if c.get("same_alert", True) else "different alert on this service; "
+        lines.append(f"- {c['alertname']} ({kind}{seen}, last {(c['last_ts'] or '')[:10]}{by})")
         if c["root_cause"]:
             lines.append(f"  root cause: {c['root_cause']}")
         resolution = c.get("resolution")
