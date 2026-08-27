@@ -23,10 +23,12 @@ from .config import settings
 from .facts import DiagnosticFact, classify, grounding_check, ledger
 from .runbook import (
     format_diagnostics,
+    format_remediation_choices,
     incident_params,
     match_runbook,
     render_runbook,
     run_diagnostics,
+    select_remediation,
 )
 from .signals.context import build_signal_context
 from .signals.envfit import compute_env_fit, get_last_fit
@@ -1274,15 +1276,24 @@ def _runbook_track_record(runbook_id: str) -> str:
     )
 
 
+class _NoApplicableRemediation(Exception):
+    """Every remediation step in the matched runbook was branched away."""
+
+    def __init__(self, runbook_id: str) -> None:
+        super().__init__(runbook_id)
+        self.runbook_id = runbook_id
+
+
 async def _inject_runbook(turn_messages: list, labels: dict, annotations: dict):
     """Match a runbook to the alert; inject its rendered guidance (Tier 0) and,
     if enabled, the results of auto-running its read-only diagnostics (Tier 1).
-    Returns the matched Runbook (or None) so the caller can run the governance
-    gate over its remediation steps. Best-effort — never blocks the run."""
+    Returns `(runbook, diagnostic_results)` — or `(None, None)` — so the caller
+    can run the governance gate over the remediation steps *this diagnosis*
+    selects. Best-effort — never blocks the run."""
     try:
         rb = match_runbook(labels, annotations)
         if rb is None:
-            return None
+            return None, None
         params = incident_params(labels, annotations)
         block = render_runbook(rb, params)
         # What happened the last few times this procedure was actually run. A
@@ -1292,14 +1303,21 @@ async def _inject_runbook(turn_messages: list, labels: dict, annotations: dict):
         if settings.runbook_health_enabled:
             block += _runbook_track_record(rb.id)
         turn_messages.append(SystemMessage(content=block))
+        results = None
         if settings.runbook_run_diagnostics and rb.diagnostics:
             tool_map = {t.name: t for t in TOOLS}  # all read-only
             results = await run_diagnostics(rb, params, tool_map)
             turn_messages.append(SystemMessage(content=format_diagnostics(rb, results)))
-        return rb
+            # Which fix the diagnostics just chose, and which one they ruled out.
+            # Injected as well as acted on: the answer should be able to say why
+            # the obvious remediation is not the one being proposed.
+            branch = format_remediation_choices(select_remediation(rb, results, params))
+            if branch:
+                turn_messages.append(SystemMessage(content=branch))
+        return rb, results
     except Exception as e:
         logger.warning("runbook injection failed: %s", e)
-        return None
+        return None, None
 
 
 async def _proposal_footprint(action: str, args: dict) -> dict | None:
@@ -1380,10 +1398,10 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
     # the agent knows "last time this fired, the root cause was X". Best-effort.
     _inject_past_incidents(turn_messages, service, labels.get("alertname"))
 
-    matched_rb = None
+    matched_rb, rb_diagnostics = None, None
     with now_override(starts_dt):
         if settings.runbook_enabled:
-            matched_rb = await _inject_runbook(turn_messages, labels, annotations)
+            matched_rb, rb_diagnostics = await _inject_runbook(turn_messages, labels, annotations)
         # Dependency health (s4) under the pinned incident clock, so neighbour
         # SLIs are read at the incident time, not real now.
         if service:
@@ -1521,8 +1539,20 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
             # per (action, target) rather than per action: "don't restart
             # payment" is not a statement about restarting anything else.
             params = incident_params(labels, annotations)
-            step_by_action = {s.action: s for s in matched_rb.remediation}
-            rejected = _prior_rejections(matched_rb.remediation, params)
+            # The branch: only the steps whose `when` matches what the Tier 1
+            # diagnostics found are eligible to be proposed. A runbook with no
+            # conditions selects everything, as before.
+            choices = select_remediation(matched_rb, rb_diagnostics, params)
+            eligible = [c.step for c in choices if c.applicable]
+            for c in choices:
+                if not c.applicable:
+                    logger.info(
+                        "runbook %s: not proposing %s — %s", matched_rb.id, c.step.action, c.reason
+                    )
+            if not eligible:
+                raise _NoApplicableRemediation(matched_rb.id)
+            step_by_action = {s.action: s for s in eligible}
+            rejected = _prior_rejections(eligible, params)
 
             # What the change history rules out for this service, regardless of
             # what the runbook lists. Off the tool budget, like the actuation
@@ -1533,7 +1563,7 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
             )
 
             decisions = propose_remediations(
-                [s.action for s in matched_rb.remediation],
+                [s.action for s in eligible],
                 findings.confidence,
                 calib,
                 dq_verdict(),
@@ -1565,6 +1595,11 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
                         params=params,
                         blast_radius=await _proposal_footprint(d.action, action_args),
                     )
+        except _NoApplicableRemediation as e:
+            # Not a failure: the runbook has fixes, and none of them is for this
+            # incident. Saying nothing is the correct proposal, and it must not
+            # be logged as the gate breaking.
+            logger.info("runbook %s: no remediation applies to this diagnosis", e.runbook_id)
         except Exception as e:
             logger.warning("governance gate failed: %s", e)
 
