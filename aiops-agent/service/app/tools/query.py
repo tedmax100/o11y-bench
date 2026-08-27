@@ -374,6 +374,17 @@ async def _loki_empty_note(logql: str, start: datetime, end: datetime) -> dict[s
     used = set(_LOKI_SELECTOR_KEY_RE.findall(selector))
     unknown = sorted(k for k in used if k not in labels)
     if not unknown:
+        # The selector is fine, so the emptiness comes from further down the
+        # pipeline — and the most common reason is a filter on a field these
+        # services never emit. Saying only "no lines in this window" reads as
+        # "nothing happened then", which is the opposite of the truth and is
+        # exactly how a run talks itself into a dead end: three of four eval
+        # runs on the session-cache incident ended at "logs returned no data",
+        # one of them filtering `level="error"` against services that emit no
+        # level at all.
+        pipeline = await _loki_unknown_pipeline_fields(logql, selector, labels, start, end)
+        if pipeline:
+            return pipeline
         return {"note": "The stream selector is valid but matched no lines in this window."}
     case_memory.remember_dead_end(
         "query",
@@ -387,6 +398,85 @@ async def _loki_empty_note(logql: str, start: datetime, end: datetime) -> dict[s
         "hint": "Everything else (event, trace_id, business fields) is structured "
         'metadata — filter it AFTER the selector with `| field="..."`. '
         "discover_log_fields(service) lists the fields this service emits.",
+    }
+
+
+# `| json | event="cache.miss"` — a field filter after the selector. Line filters
+# (`|=`, `!~` on a bare string) and stage keywords carry no field name and so
+# never match this.
+_LOKI_PIPELINE_FIELD_RE = re.compile(r"\|\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*(?:=~|!~|!=|=)\s*[\"`]")
+# Stages that look like `| name` but name a parser or formatter, not a field.
+_LOKI_STAGE_WORDS = {
+    "json",
+    "logfmt",
+    "pattern",
+    "regexp",
+    "unpack",
+    "line_format",
+    "label_format",
+    "unwrap",
+    "decolorize",
+    "drop",
+    "keep",
+    "distinct",
+}
+
+
+async def _loki_unknown_pipeline_fields(
+    logql: str, selector: str, labels: set[str], start: datetime, end: datetime
+) -> dict[str, Any] | None:
+    """Which fields the query filters on after the selector that this stream
+    does not actually emit.
+
+    The mirror of the Prometheus metric-name check, and it was missing: that one
+    tells you the name does not exist here; this side only ever checked the
+    `{...}` keys, so a filter on a nonexistent field came back as a plain empty
+    result with a note about the time window.
+
+    Window-scoped, and says so — see the comment on the return.
+
+    Fail-open in every direction — no detected fields, an unreachable Loki, a
+    query we cannot parse — because a false "that field does not exist" would
+    send a run away from the one query that works.
+    """
+    used = {
+        k
+        for k in _LOKI_PIPELINE_FIELD_RE.findall(logql)
+        if k not in _LOKI_STAGE_WORDS and k not in labels
+    }
+    if not used:
+        return None
+    try:
+        data = await _get_json(
+            settings.loki_url,
+            "/loki/api/v1/detected_fields",
+            {"query": selector, "start": _epoch_ns(start), "end": _epoch_ns(end)},
+        )
+    except ToolException:
+        return None
+    fields = data.get("fields") if isinstance(data, dict) else None
+    if not fields:
+        return None
+    known = {f.get("label") for f in fields if isinstance(f, dict) and f.get("label")}
+    if not known:
+        return None
+    unknown = sorted(k for k in used if k not in known)
+    if not unknown:
+        return None
+    # Deliberately **not** remembered as a dead end, unlike the metric-name
+    # branch above. That one asks Prometheus for every name it knows, which is a
+    # statement about the environment. `detected_fields` is scoped to this
+    # window and these lines, so on a quiet window it returns only the OTel
+    # envelope — measured on the live stack: 15 fields, none of them `event` —
+    # and a dead end saying "event is not a field" would outlive the quiet hour
+    # and push later runs off the one query that works. The note below is worth
+    # saying now; it is not worth remembering.
+    return {
+        "note": f"Not a field on the lines in this window: {', '.join(unknown)}. "
+        f"Present here: {', '.join(sorted(known)) or 'none detected'}.",
+        "hint": "The result is empty because of the filter, not because nothing "
+        "happened — unless this window holds no lines from this service at all. "
+        "discover_log_fields(service) lists what it emits.",
     }
 
 
