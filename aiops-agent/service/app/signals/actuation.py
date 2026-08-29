@@ -43,9 +43,11 @@ Verdict shape is `{proven_good, score, note}`, identical to `dq_verdict()` and
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from ..config import settings
 from ..tools.k8s_write import in_cluster_write_creds, load_write_authz_api
@@ -88,7 +90,61 @@ class ActuationFit:
 _last: ActuationFit | None = None
 
 
-def get_last_actuation() -> ActuationFit | None:
+def _from_row(row: dict) -> ActuationFit:
+    """Rebuild a probe from its stored row.
+
+    `computed_ts` is not a column: the table keeps the human-readable `ts`, and
+    the verdict only needs it to compute an age in seconds. Parsing it back is
+    cheaper than a migration, and a row we cannot parse is treated as no row at
+    all rather than as a probe with a bogus age.
+    """
+    ts = datetime.strptime(row["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    ns = [n for n in (row["namespaces"] or "").split(",") if n]
+    return ActuationFit(
+        computed_ts=ts.timestamp(),
+        reachable=bool(row["reachable"]),
+        in_cluster=bool(row["in_cluster"]),
+        missing=list(json.loads(row["missing"] or "[]")),
+        excess=list(json.loads(row["excess"] or "[]")),
+        namespaces=ns,
+        error=row["error"] or None,
+    )
+
+
+def get_last_actuation(path=None) -> ActuationFit | None:
+    """The last probe, from memory or from the store.
+
+    The fallback matters for the same reason it does on the environment-fit
+    gate: without it the answer is per-process rather than per-credential, so a
+    restart puts readiness back to "never checked" even though the probe history
+    is sitting right there in the table. Every probe was already being persisted
+    — only the read side was missing, which is the quietest possible version of
+    this bug, because the write side looks completely healthy.
+
+    Unreadable storage reads as no probe: unproven, never ready.
+    """
+    global _last
+    if _last is not None:
+        return _last
+    try:
+        from .. import store
+
+        rows = store.actuation_probe_recent(limit=1, path=path)
+    except Exception as e:
+        logger.warning("actuation probe not readable from store: %s", e)
+        return None
+    if not rows:
+        return None
+    try:
+        _last = _from_row(rows[0])
+    except Exception as e:  # a malformed row is not a readiness claim
+        logger.warning("stored actuation probe unreadable: %s", e)
+        return None
+    logger.info(
+        "actuation readiness loaded from store: ok=%s (%ds old)",
+        _last.ok,
+        int(time.time() - _last.computed_ts),
+    )
     return _last
 
 
@@ -200,22 +256,22 @@ async def can_still_write(namespaces: list[str] | None = None, *, path=None) -> 
     return True, "write credentials still valid"
 
 
-async def refresh_actuation() -> None:
+async def refresh_actuation(path=None) -> None:
     """Re-probe when nobody has, or the last probe went stale. Best-effort — a
     failure leaves readiness unproven, which the verdict treats as "do not grant
     autonomy"."""
     if not settings.actuation_check_enabled:
         return
     try:
-        last = get_last_actuation()
+        last = get_last_actuation(path=path)
         age = time.time() - last.computed_ts if last else None
         if last is None or age is None or age > settings.actuation_max_age_seconds:
-            await check_actuation(source="loop")
+            await check_actuation(source="loop", path=path)
     except Exception as e:
         logger.warning("actuation refresh failed: %s", e)
 
 
-def actuation_verdict() -> dict:
+def actuation_verdict(path=None) -> dict:
     """{proven_good, score, note} — the shape governance already reads.
 
     `score` is the fraction of required rules that came back allowed, so a
@@ -226,7 +282,7 @@ def actuation_verdict() -> dict:
             "score": None,
             "note": "actuation readiness checking is disabled; readiness unproven",
         }
-    fit = get_last_actuation()
+    fit = get_last_actuation(path=path)
     if fit is None:
         return {
             "proven_good": False,

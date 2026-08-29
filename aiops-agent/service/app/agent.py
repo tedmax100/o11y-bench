@@ -804,10 +804,69 @@ _findings_llm = (
 )
 
 
+async def _reconcile_version_with_provenance(findings: Findings) -> None:
+    """Drop `suspected_version` when the cluster says the template never changed.
+
+    The prose half of this was fixed by giving the agent the provenance tool: a
+    fresh ConfigMap incident now says "configuration regression in the
+    payment-flags ConfigMap" and the gate strikes `rollout_undo`. The
+    *structured* half was not — the same investigation still carried
+    `suspected_version: v2.5.0`, because the alert label says so and the
+    extractor reads the transcript, not the cluster. Prose and field disagreeing
+    is worse than either being wrong alone: it only shows up when someone reads
+    both, and everything downstream of the row (webhook tags, case memory,
+    grading) reads the field.
+
+    So the field is settled the same way the action is: by asking the cluster.
+    Off the tool budget, read-only, and failure-open — if provenance cannot
+    answer, or if any implicated service really did ship a new template, the
+    extracted version stands.
+    """
+    if not findings.suspected_version or not findings.services:
+        return
+    from .tools.k8s import get_change_provenance
+
+    mounted: list[str] = []
+    unchanged = False
+    for service in findings.services[:3]:
+        try:
+            prov = await get_change_provenance(service)
+        except Exception as e:  # a probe must never sink the extraction
+            logger.warning("provenance reconcile failed for %s: %s", service, e)
+            return
+        if not prov.get("found") or prov.get("unavailable"):
+            return
+        if "outside the template" not in (prov.get("verdict") or ""):
+            return  # something implicated here genuinely changed; keep the version
+        unchanged = True
+        mounted.extend((prov.get("revisions") or [{}])[-1].get("mounted_config") or [])
+
+    if not unchanged:
+        return
+
+    dropped = findings.suspected_version
+    sources = ", ".join(sorted(set(mounted))) or "none"
+    findings.suspected_version = None
+    findings.evidence.append(
+        f"k8s_change_provenance: the rollouts around {dropped} changed nothing the process "
+        f"runs, so that version is not the culprit; the mounted config ({sources}) is where "
+        "the change is. suspected_version cleared."
+    )
+    logger.info(
+        "findings: cleared suspected_version=%s for %s — provenance says the pod template "
+        "is unchanged (mounted config: %s)",
+        dropped,
+        ", ".join(findings.services[:3]),
+        sources,
+    )
+
+
 async def extract_findings(messages: list) -> Findings:
     """Distill a finished run's messages into a structured Findings. Used by the
     headless (alert webhook) path; not wired into chat."""
-    return await _findings_llm.ainvoke([SystemMessage(content=_FINDINGS_PROMPT)] + messages)
+    findings = await _findings_llm.ainvoke([SystemMessage(content=_FINDINGS_PROMPT)] + messages)
+    await _reconcile_version_with_provenance(findings)
+    return findings
 
 
 # ---- Structured Uncertainty (knowledge-loop §4.6) ----------------------------

@@ -10,10 +10,12 @@ from types import SimpleNamespace as NS
 
 from app.eval.process import (
     ProcessSpec,
+    ToolCall,
     check_discover_before_retry,
     check_evidence_or_hedge,
     check_grounded,
     check_queried,
+    check_used_tools,
     classify_result,
     extract_calls,
     grade_process,
@@ -200,3 +202,34 @@ def test_grade_process_reports_the_failing_check():
     )
     failed = {c.name for c in results if not c.passed}
     assert failed == {"queried", "discover_before_retry", "evidence_or_hedge"}
+
+
+# ---- reach: was the tool called at all --------------------------------------
+
+
+def test_used_tools_is_a_measurable_rate_not_an_anecdote():
+    calls = [
+        ToolCall("query_prometheus", {}, "{'result': [1]}", "ok"),
+        ToolCall("k8s_change_provenance", {}, "{'verdict': '...'}", "ok"),
+    ]
+    passed, detail = check_used_tools(calls, ["k8s_change_provenance"])
+    assert passed and "k8s_change_provenance" in detail
+
+
+def test_a_tool_never_reached_for_fails_and_names_itself():
+    calls = [ToolCall("query_prometheus", {}, "{'result': [1]}", "ok")]
+    passed, detail = check_used_tools(calls, ["k8s_change_provenance"])
+    assert not passed and "never called: k8s_change_provenance" in detail
+
+
+def test_reach_counts_even_when_the_tool_answered_nothing():
+    """The question is whether the model reached for it, not whether the cluster
+    happened to answer — otherwise a flaky store reads as a model that ignored
+    the tool."""
+    calls = [ToolCall("k8s_change_provenance", {}, "", "empty")]
+    assert check_used_tools(calls, ["k8s_change_provenance"])[0]
+
+
+def test_unset_used_tools_runs_no_check():
+    out = grade_process(ProcessSpec(), [], "", 0.5)
+    assert not [c for c in out if c.name == "used_tools"]

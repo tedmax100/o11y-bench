@@ -11,7 +11,13 @@ from app.signals.envfit import EnvFit, compute_env_fit, fit_verdict, get_last_fi
 
 
 @pytest.fixture(autouse=True)
-def _clear_cache():
+def _clear_cache(monkeypatch, tmp_path):
+    # The fit is now persisted as well as cached, so isolating the memory alone
+    # is no longer enough: a pathless compute would write into the real store and
+    # the next "never measured" case would read it back.
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "store_path", str(tmp_path / "envfit.db"))
     envfit_mod._last = None
     yield
     envfit_mod._last = None
@@ -103,3 +109,68 @@ def _async(value):
         return value
 
     return _f
+
+
+# ---- the gate's evidence has to outlive the process -------------------------
+# The bug this pins: env fit lived only in a module-level variable, so measuring
+# a perfect score from one process left the serving process' gate red — it had
+# never asked. A rollout erased the evidence for a gate whose whole argument is
+# that evidence must be durable.
+
+
+def _all_stores_answer_yes(monkeypatch) -> None:
+    """Every store knows everything the catalog names — the 1.0 case."""
+    from app.signals.contract import get_contracts
+    from app.signals.topology import get_topology
+
+    contracts = get_contracts().contracts
+    metrics = {b for c in contracts for b in c.metric_basenames()}
+    values = {
+        c.logs.selector.strip("{}").partition("=")[2].strip().strip('"')
+        for c in contracts
+        if c.logs and c.logs.selector
+    }
+    keys = {
+        c.logs.selector.strip("{}").partition("=")[0].strip()
+        for c in contracts
+        if c.logs and c.logs.selector
+    }
+    monkeypatch.setattr(envfit_mod, "_live_metric_names", _async(metrics))
+    monkeypatch.setattr(envfit_mod, "_loki_indexable", _async(keys))
+    monkeypatch.setattr(envfit_mod, "_loki_label_values", _async(values))
+    monkeypatch.setattr(envfit_mod, "_tempo_service_names", _async(set(get_topology().names())))
+
+
+@pytest.mark.asyncio
+async def test_fit_is_persisted_and_readable_by_another_process(monkeypatch, tmp_path):
+    db = tmp_path / "s.db"
+    _all_stores_answer_yes(monkeypatch)
+    measured = await compute_env_fit(path=db)
+    assert measured.score == 1.0
+
+    envfit_mod._last = None  # a fresh process: nothing in memory
+    fit = get_last_fit(path=db)
+    assert fit is not None, "the measurement did not survive the process"
+    assert fit.score == 1.0
+    assert fit.by_store == measured.by_store
+    assert fit_verdict(path=db)["proven_good"] is True
+
+
+def test_unmeasured_environment_still_reads_as_unproven(tmp_path):
+    envfit_mod._last = None
+    assert get_last_fit(path=tmp_path / "empty.db") is None
+    assert fit_verdict(path=tmp_path / "empty.db")["proven_good"] is False
+
+
+def test_storage_failure_leaves_the_fit_unproven_not_fitting(monkeypatch, tmp_path):
+    """An unreadable store is "we do not know", which the verdict must treat the
+    same as never measured — never as a pass."""
+    from app import store
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(store, "env_fit_latest", _boom)
+    envfit_mod._last = None
+    assert get_last_fit(path=tmp_path / "s.db") is None
+    assert fit_verdict(path=tmp_path / "s.db")["proven_good"] is False

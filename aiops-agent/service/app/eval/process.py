@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from ..rubric import _TRACE_ID_RE as TRACE_ID_RE  # one definition of "a trace ID"
@@ -162,6 +162,26 @@ def check_evidence_or_hedge(
     return ok, f"no non-empty result, confidence {confidence:.2f} (ceiling {ceiling:.2f})"
 
 
+def check_used_tools(calls: list[ToolCall], wanted: list[str]) -> tuple[bool, str]:
+    """A named tool has to actually get called on this fixture.
+
+    Every other check here reads what the agent did with the tools it chose.
+    This one exists because "the model sometimes reaches for that tool and
+    sometimes doesn't" was a claim resting on two observed runs, which is not a
+    rate — it is two anecdotes. A per-fixture check turns it into a number the
+    suite reports on every pass, so `--repeat N` measures the frequency instead
+    of leaving it to memory.
+
+    Calling the tool counts, whatever it returned: this is about reach, not
+    about whether the cluster answered.
+    """
+    used = {c.name for c in calls}
+    missing = [t for t in wanted if t not in used]
+    if missing:
+        return False, f"never called: {', '.join(missing)}"
+    return True, f"called {', '.join(wanted)}"
+
+
 @dataclass
 class ProcessSpec:
     """Per-fixture process expectations. All optional; unset checks don't run."""
@@ -170,6 +190,7 @@ class ProcessSpec:
     grounded: bool = False
     discover_before_retry: bool = False
     evidence_or_hedge_ceiling: float | None = None
+    used_tools: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -196,4 +217,7 @@ def grade_process(
     if spec.evidence_or_hedge_ceiling is not None:
         passed, detail = check_evidence_or_hedge(calls, confidence, spec.evidence_or_hedge_ceiling)
         out.append(CheckResult("evidence_or_hedge", passed, detail))
+    if spec.used_tools:
+        passed, detail = check_used_tools(calls, spec.used_tools)
+        out.append(CheckResult("used_tools", passed, detail))
     return out

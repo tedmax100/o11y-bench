@@ -74,6 +74,9 @@ class Fixture(BaseModel):
     # cannot catch this on a fixture whose alert names the *right* service: an
     # agent that inherits a past case's culprit blames the correct service for
     # the wrong reason, and the service check waves it through.
+    # Read in BOTH modes: inconclusive fixtures use it to catch an inherited
+    # culprit, culprit fixtures to catch the config-vs-deploy confusion (right
+    # service, wrong kind of cause).
     forbid_versions: list[str] = Field(default_factory=list)
     # Process expectations graded from the transcript (see process.py). A
     # fixture can assert on *how* the answer was reached even when the verdict
@@ -160,6 +163,31 @@ def _dimension_hits(findings: Any, truth: dict[str, Any]) -> tuple[bool, bool | 
     return service_hit, want_ver.lower() in got_ver.lower()
 
 
+def blames_forbidden_version(findings: Any, forbid: list[str]) -> str:
+    """The forbidden version this answer pins the cause on, or "" if none.
+
+    Reads the prose as well as the field, and that is the whole point. Measured
+    over 20 live passes on the ConfigMap incident: `suspected_version` came back
+    None 20/20 — the provenance reconcile cleared it every time — while 20/20
+    summaries still opened with "Code regression in payment-service v2.5.0".
+    A judge that reads only the field scores that a clean sweep, and the person
+    on call reads the sentence.
+
+    So the failure did not go away when the field was fixed; it moved. Checking
+    one surface is what let it move without the number noticing.
+    """
+    surfaces = [
+        getattr(findings, "suspected_version", None) or "",
+        getattr(findings, "summary", "") or "",
+        getattr(findings, "hypothesis", "") or "",
+    ]
+    text = " ".join(surfaces).lower()
+    for v in forbid:
+        if v and v.lower() in text:
+            return v
+    return ""
+
+
 def grade_run(findings: Any, fixture: Fixture) -> tuple[bool, bool, bool | None]:
     """Grade one run → (correct, service_hit, version_hit). version_hit is None
     when the fixture doesn't grade a version (or is inconclusive-mode)."""
@@ -167,14 +195,24 @@ def grade_run(findings: Any, fixture: Fixture) -> tuple[bool, bool, bool | None]
         conf = float(getattr(findings, "confidence", 0.0) or 0.0)
         blamed = {s.lower() for s in (getattr(findings, "services", []) or [])}
         named_forbidden = any(s.lower() in blamed for s in fixture.forbid_services)
-        suspected = (getattr(findings, "suspected_version", None) or "").lower()
-        version_forbidden = any(v.lower() in suspected for v in fixture.forbid_versions if v)
+        version_forbidden = bool(blames_forbidden_version(findings, fixture.forbid_versions))
         correct = conf <= fixture.max_confidence and not named_forbidden and not version_forbidden
         # service_hit mirrors correctness (the "did it hedge" signal); no version.
         return correct, correct, None
 
     correct = grade_against_truth(findings, fixture.truth)
     service_hit, version_hit = _dimension_hits(findings, fixture.truth)
+    # `forbid_versions` used to be read only in inconclusive mode, which quietly
+    # made it dead config on every culprit fixture that declared it. It matters
+    # most exactly there: a config-type incident has a right service AND a
+    # version that must not be blamed, and grading only the service waves
+    # through the failure this whole path was built for — the alert carries a
+    # `git_version` label, the fault is in a ConfigMap the pod template mounts,
+    # and the answer pins it on the version anyway. See
+    # `blames_forbidden_version` for why it reads the prose and not just the
+    # field: fixing the field moved the failure, it did not remove it.
+    if blames_forbidden_version(findings, fixture.forbid_versions):
+        correct = False
     return correct, service_hit, version_hit
 
 

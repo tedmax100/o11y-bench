@@ -28,6 +28,7 @@ answer all land as "unproven" — never as "fits".
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -62,8 +63,51 @@ class EnvFit:
 _last: EnvFit | None = None
 
 
-def get_last_fit() -> EnvFit | None:
-    """The cached fit, or None when nobody has measured this environment yet."""
+def _from_row(row: dict) -> EnvFit:
+    by_store = {k: tuple(v) for k, v in json.loads(row["by_store"] or "{}").items()}
+    return EnvFit(
+        checked=int(row["checked"]),
+        resolved=int(row["resolved"]),
+        by_store=by_store,
+        unresolved=list(json.loads(row["unresolved"] or "[]")),
+        computed_ts=float(row["computed_ts"]),
+        complete=bool(row["complete"]),
+    )
+
+
+def get_last_fit(path=None) -> EnvFit | None:
+    """The last fit measured *for this environment*, from memory or from the store.
+
+    The fallback is the whole point. This used to be the module-level variable
+    alone, which made the measurement per-process rather than per-environment: a
+    full-score run from a second process in the same pod left the serving
+    process' gate red, because that process had never asked. A gate whose
+    evidence dies with the process is not evidence — and this system spends the
+    rest of its argument insisting exactly that about everyone else's.
+
+    Reading falls back to unmeasured on any storage error: unproven, never
+    "fits".
+    """
+    global _last
+    if _last is not None:
+        return _last
+    try:
+        from .. import store
+
+        row = store.env_fit_latest(path=path)
+    except Exception as e:
+        logger.warning("env fit not readable from store: %s", e)
+        return None
+    if not row:
+        return None
+    _last = _from_row(row)
+    logger.info(
+        "env fit loaded from store: %s (%d/%d, %ds old)",
+        _last.score,
+        _last.resolved,
+        _last.checked,
+        int(time.time() - _last.computed_ts),
+    )
     return _last
 
 
@@ -106,7 +150,7 @@ async def _tempo_service_names() -> set[str]:
     return {v.get("value") for v in vals if isinstance(v, dict) and v.get("value")}
 
 
-async def compute_env_fit() -> EnvFit:
+async def compute_env_fit(path=None) -> EnvFit:
     """Measure the catalog against the three stores and cache the result."""
     global _last
     fit = EnvFit(computed_ts=time.time())
@@ -168,6 +212,21 @@ async def compute_env_fit() -> EnvFit:
     fit.resolved = sum(h for h, _ in fit.by_store.values())
     fit.checked = sum(t for _, t in fit.by_store.values())
     _last = fit
+    try:
+        from .. import store
+
+        store.env_fit_insert(
+            computed_ts=fit.computed_ts,
+            checked=fit.checked,
+            resolved=fit.resolved,
+            complete=fit.complete,
+            score=fit.score,
+            by_store=fit.by_store,
+            unresolved=fit.unresolved,
+            path=path,
+        )
+    except Exception as e:  # a storage failure must not discard a good measurement
+        logger.warning("env fit not recorded: %s", e)
     logger.info(
         "env fit %s (%d/%d resolved, complete=%s)",
         fit.score,
@@ -178,9 +237,9 @@ async def compute_env_fit() -> EnvFit:
     return fit
 
 
-def fit_verdict() -> dict:
+def fit_verdict(path=None) -> dict:
     """{proven_good, score, note} — the shape governance already reads."""
-    fit = get_last_fit()
+    fit = get_last_fit(path=path)
     if fit is None:
         return {
             "proven_good": False,

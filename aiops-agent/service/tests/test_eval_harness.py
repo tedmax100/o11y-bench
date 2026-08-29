@@ -314,3 +314,91 @@ def test_the_report_states_the_spread_as_the_floor():
 def test_a_single_pass_report_says_nothing_about_spread():
     merged = harness.merge_passes([[_summary("f", [1])]])
     assert "between passes" not in harness.format_report(merged, [], store_path=Path("x.db"))
+
+
+# ---- config regression: right service, wrong kind of cause -------------------
+# `forbid_versions` was read only in inconclusive mode, which made it dead config
+# on every culprit fixture that declared one. That is the mode where it matters
+# most: a ConfigMap incident has a correct service and a version that must not be
+# blamed, and grading the service alone passes the exact failure the provenance
+# work exists to stop.
+
+
+def test_a_culprit_fixture_can_forbid_the_version_the_label_handed_it():
+    fx = _fixture(truth={"service": "payment-service"}, forbid_versions=["v2.5.0"])
+    correct, svc, _ = grade_run(
+        _findings(services=["payment-service"], version="v2.5.0"),
+        fx,
+    )
+    assert correct is False, "right service, but it blamed a template that never changed"
+    assert svc is True, "the service dimension really was hit; only the cause is wrong"
+
+
+def test_the_same_fixture_passes_when_no_version_is_pinned():
+    fx = _fixture(truth={"service": "payment-service"}, forbid_versions=["v2.5.0"])
+    correct, _, _ = grade_run(_findings(services=["payment-service"], version=None), fx)
+    assert correct is True
+
+
+def test_a_culprit_fixture_without_forbid_versions_is_unaffected():
+    fx = _fixture(truth={"service": "payment-service"})
+    correct, _, _ = grade_run(_findings(services=["payment-service"], version="v2.5.0"), fx)
+    assert correct is True
+
+
+def test_the_live_suite_parses_and_asks_the_cluster_what_changed():
+    """The cluster-only fixtures are a separate file on purpose: `--stack` has no
+    Deployments to ask, so grading them there would fail for the environment."""
+    from pathlib import Path
+
+    live = Path(__file__).resolve().parents[1] / "app" / "eval" / "fixtures_live.yaml"
+    fx = {f.id: f for f in load_fixtures(live)}["payment-config-regression"]
+    assert fx.expect == "culprit"
+    assert fx.truth == {"service": "payment-service"}, "there is no culprit version here"
+    assert fx.forbid_versions == ["v2.5.0"]
+    assert fx.process.used_tools == ["k8s_change_provenance"]
+    assert fx.alert["labels"]["git_version"] == "v2.5.0", "the label that does the damage"
+
+
+# ---- the failure moved from the field to the prose ---------------------------
+# 20 live passes on the ConfigMap incident: `suspected_version` was None 20/20
+# (the provenance reconcile cleared it every time) while 20/20 summaries still
+# said "Code regression in payment-service v2.5.0". A judge reading only the
+# field called that a clean sweep. The on-call reads the sentence.
+
+
+def test_a_forbidden_version_in_the_prose_is_still_blaming_it():
+    fx = _fixture(truth={"service": "payment-service"}, forbid_versions=["v2.5.0"])
+    findings = _findings(
+        services=["payment-service"],
+        version=None,  # the field is clean…
+        summary="Code regression in payment-service v2.5.0 introduced a new validator.",
+    )
+    correct, _, _ = grade_run(findings, fx)
+    assert correct is False, "the field was cleared; the sentence still blames the version"
+
+
+def test_the_hypothesis_field_counts_as_prose_too():
+    fx = _fixture(truth={"service": "payment-service"}, forbid_versions=["v2.5.0"])
+    f = _findings(services=["payment-service"], version=None, summary="declines are elevated")
+    f.hypothesis = "a code regression shipped in v2.5.0"
+    assert grade_run(f, fx)[0] is False
+
+
+def test_an_answer_that_names_no_forbidden_version_anywhere_passes():
+    fx = _fixture(truth={"service": "payment-service"}, forbid_versions=["v2.5.0"])
+    f = _findings(
+        services=["payment-service"],
+        version=None,
+        summary="configuration regression in the payment-flags ConfigMap",
+    )
+    f.hypothesis = "new_validator was enabled in the mounted ConfigMap"
+    assert grade_run(f, fx)[0] is True
+
+
+def test_blames_forbidden_version_names_which_one():
+    from app.eval.harness import blames_forbidden_version
+
+    f = _findings(services=[], version=None, summary="regression in v2.5.0")
+    assert blames_forbidden_version(f, ["v2.4.1", "v2.5.0"]) == "v2.5.0"
+    assert blames_forbidden_version(f, ["v2.4.1"]) == ""

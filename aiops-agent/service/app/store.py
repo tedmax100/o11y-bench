@@ -174,6 +174,25 @@ CREATE TABLE IF NOT EXISTS actuation_probes (
 );
 CREATE INDEX IF NOT EXISTS idx_actuation_ts ON actuation_probes(ts);
 
+-- Environment-fit probe history. Same reason as the readiness probes above, and
+-- one more: the fit verdict is a *gate input*, and it lived only in a
+-- module-level variable. Measuring a perfect score from a second process in the
+-- same pod left the gate red, because the serving process had never asked. A
+-- system whose whole argument is "evidence has to land somewhere durable" was
+-- keeping one of its own gates' evidence in RAM, where a rollout erased it.
+CREATE TABLE IF NOT EXISTS env_fit_probes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         TEXT NOT NULL,
+    computed_ts REAL NOT NULL,           -- epoch seconds; the age the verdict reads
+    checked    INTEGER NOT NULL,
+    resolved   INTEGER NOT NULL,
+    complete   INTEGER NOT NULL,         -- 0 = some store did not answer
+    score      REAL,
+    by_store   TEXT NOT NULL DEFAULT '{}',  -- json {store: [hit, total]}
+    unresolved TEXT NOT NULL DEFAULT '[]'   -- json list
+);
+CREATE INDEX IF NOT EXISTS idx_env_fit_ts ON env_fit_probes(ts);
+
 -- Human verdict on one executed action: did it actually resolve the incident.
 -- This is the authoritative AE-SLO numerator and it is deliberately NOT the
 -- verify step's opinion. `verify` asks a query the runbook author wrote months
@@ -1840,6 +1859,49 @@ def actuation_probe_recent(limit: int = 50, path: str | Path | None = None) -> l
             "SELECT * FROM actuation_probes ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---- environment fit probe history -----------------------------------------
+
+
+def env_fit_insert(
+    *,
+    computed_ts: float,
+    checked: int,
+    resolved: int,
+    complete: bool,
+    score: float | None,
+    by_store: dict,
+    unresolved: list[str],
+    path: str | Path | None = None,
+) -> None:
+    """Append one env-fit measurement, so the verdict survives a restart."""
+    from datetime import UTC, datetime
+
+    ts = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _write_lock, _connect(path) as conn:
+        conn.execute(
+            "INSERT INTO env_fit_probes "
+            "(ts, computed_ts, checked, resolved, complete, score, by_store, unresolved) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (
+                ts,
+                computed_ts,
+                checked,
+                resolved,
+                int(complete),
+                score,
+                json.dumps({k: list(v) for k, v in by_store.items()}),
+                json.dumps(unresolved),
+            ),
+        )
+
+
+def env_fit_latest(path: str | Path | None = None) -> dict | None:
+    """The most recent measurement, or None if nobody has ever measured."""
+    with _connect(path) as conn:
+        row = conn.execute("SELECT * FROM env_fit_probes ORDER BY id DESC LIMIT 1").fetchone()
+    return dict(row) if row else None
 
 
 # ---- action outcome grading (AE-SLO numerator) -----------------------------

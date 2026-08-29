@@ -1,0 +1,65 @@
+# Fixtures that need a real Kubernetes cluster, not the baked stack.
+#
+# `--stack` boots a container of pre-recorded telemetry: there are no Deployments,
+# no ReplicaSets and no ConfigMaps in it, so a fixture whose whole subject is
+# *what changed in the cluster* cannot be graded there. Keeping these in the
+# default suite would mean a fixture that fails for the environment rather than
+# for the agent — the same confusion Tempo's one-hour retention already creates
+# elsewhere, and it reads as a model regression every time.
+#
+# Run against a live k3d stack with the incident triggered:
+#
+#   demo-services/scripts/incident.sh start bad-validator   # flip the flag, restart payment
+#   python -m app.eval --fixtures app/eval/fixtures_live.yaml \
+#       --no-record --store /tmp/eval-live.db
+#
+# `--no-record` by default here: the committed fixture record is the autonomy
+# gate's evidence, and evidence gathered against a cluster whose state nobody
+# else can reproduce should not vouch for anything.
+
+# ---- config regression, not a deploy regression -----------------------------
+# The failure this exists for happened four times in a row: the alert carries a
+# `git_version` label, the agent reports "a code regression in v2.5.0", and the
+# fault is in the `payment-flags` ConfigMap that an *unchanged* pod template
+# mounts. Revisions 68-71 all run the same image. `rollout undo` restores a
+# template that was never the problem, and the diagnosis being right about the
+# service does not save you.
+#
+# So this fixture grades three separate things that a service-only check cannot
+# tell apart:
+#
+#   truth.service     it still has to land on payment-service
+#   forbid_versions   …without pinning it on the version the label handed it
+#   used_tools        …having actually asked the cluster what changed
+#
+# The third is the one that turns "the model sometimes reaches for that tool"
+# into a number. Two observed runs is not a rate; `--repeat 20` is. The check
+# counts the call, not its answer, so a cluster that fails to reply reads as an
+# environment problem rather than as a model that ignored the tool.
+- id: payment-config-regression
+  alert:
+    labels:
+      service_name: payment-service
+      alertname: PaymentHighDeclineRate
+      # The label that does the damage. It is a label on a pod template, not a
+      # statement about what changed — the tool exists to tell those apart.
+      git_version: v2.5.0
+    annotations:
+      summary: "payment-service decline rate elevated"
+      description: >-
+        Charge decline ratio for payment-service is above the SLO threshold.
+        Establish what actually changed before attributing it to anything.
+    startsAt: now
+  truth:
+    service: payment-service
+    # Deliberately no `version`. There is no culprit version here; the template
+    # never changed.
+  forbid_versions:
+    - v2.5.0
+  process:
+    queried_min: 1
+    grounded: true
+    discover_before_retry: true
+    evidence_or_hedge_ceiling: 0.4
+    used_tools:
+      - k8s_change_provenance

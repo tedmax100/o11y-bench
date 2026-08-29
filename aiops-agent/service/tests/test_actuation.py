@@ -6,10 +6,21 @@ what gets asserted is the thing that actually failed in production — that ever
 way of *not knowing* whether the credential works produces `proven_good=False`.
 """
 
+import asyncio
 import time
+
+import pytest
 
 import app.signals.actuation as act
 from app.signals.actuation import ActuationFit, actuation_verdict
+
+
+@pytest.fixture(autouse=True)
+def _isolate_store(monkeypatch, tmp_path):
+    """Readiness now falls back to the probe history when memory is empty, so
+    clearing `_last` is no longer enough to simulate "never checked" — without
+    this the tests read whatever the real store happens to hold."""
+    monkeypatch.setattr(act.settings, "store_path", str(tmp_path / "probes.db"))
 
 
 def _fit(**kw):
@@ -175,3 +186,70 @@ def test_live_credential_allows_rollback(monkeypatch, tmp_path):
     monkeypatch.setattr(act, "_probe", lambda ns: _fit())
     ok, why = asyncio.run(act.can_still_write(["demo"], path=tmp_path / "s.db"))
     assert ok and "still valid" in why
+
+
+# ---- readiness has to outlive the process -----------------------------------
+# Every probe was already being persisted; only the read side was missing. That
+# is the quietest version of this bug — the write path looks perfectly healthy,
+# and the gate still says "never checked" after every restart.
+
+
+def test_a_probe_survives_the_process_that_took_it(monkeypatch, tmp_path):
+    db = tmp_path / "s.db"
+    monkeypatch.setattr(act, "_probe", lambda ns: _fit(namespaces=ns))
+    monkeypatch.setattr(act.settings, "actuation_check_enabled", True)
+    monkeypatch.setattr(act.settings, "actuation_max_age_seconds", 900)
+    asyncio.run(act.check_actuation(["demo"], path=db))
+
+    monkeypatch.setattr(act, "_last", None)  # a fresh process
+    fit = act.get_last_actuation(path=db)
+    assert fit is not None, "the probe did not survive the process"
+    assert fit.reachable and fit.namespaces == ["demo"]
+    assert actuation_verdict(path=db)["proven_good"] is True
+
+
+def test_a_stored_denial_comes_back_as_a_denial(monkeypatch, tmp_path):
+    """Not just the happy path: a credential that was missing a verb must still
+    be missing it after a restart, or the gate reopens on its own."""
+    db = tmp_path / "s.db"
+    monkeypatch.setattr(
+        act, "_probe", lambda ns: _fit(namespaces=ns, missing=["patch apps/deployments in demo"])
+    )
+    monkeypatch.setattr(act.settings, "actuation_check_enabled", True)
+    monkeypatch.setattr(act.settings, "actuation_max_age_seconds", 900)
+    asyncio.run(act.check_actuation(["demo"], path=db))
+
+    monkeypatch.setattr(act, "_last", None)
+    v = actuation_verdict(path=db)
+    assert v["proven_good"] is False and "denied" in v["note"]
+
+
+def test_an_empty_store_is_still_never_checked(monkeypatch, tmp_path):
+    _set(monkeypatch, None)
+    assert act.get_last_actuation(path=tmp_path / "empty.db") is None
+    v = actuation_verdict(path=tmp_path / "empty.db")
+    assert v["proven_good"] is False and "never checked" in v["note"]
+
+
+def test_unreadable_storage_is_unproven_not_ready(monkeypatch, tmp_path):
+    from app import store
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(store, "actuation_probe_recent", _boom)
+    _set(monkeypatch, None)
+    assert act.get_last_actuation(path=tmp_path / "s.db") is None
+    assert actuation_verdict(path=tmp_path / "s.db")["proven_good"] is False
+
+
+def test_a_malformed_row_is_not_a_readiness_claim(monkeypatch, tmp_path):
+    """A row we cannot parse must read as no probe, not as a probe with a bogus
+    age — the second one would look fresh and green."""
+    from app import store
+
+    monkeypatch.setattr(
+        store, "actuation_probe_recent", lambda *a, **k: [{"ts": "not-a-timestamp"}]
+    )
+    _set(monkeypatch, None)
+    assert act.get_last_actuation(path=tmp_path / "s.db") is None
