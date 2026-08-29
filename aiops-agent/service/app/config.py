@@ -180,6 +180,16 @@ class Settings(BaseSettings):
     # flapping alert.
     actuation_probe_interval_seconds: int = 300
 
+    # How often to re-measure the other two DQ gate inputs. Both verdicts go
+    # stale after dq_max_*_age_seconds (an hour), and until now nothing re-took
+    # either measurement on its own: env fit was computed only on the RCA path,
+    # and the topology reconcile only when somebody ran it by hand. So DQ could
+    # be green only during the hour after an alert, and red the rest of the time
+    # with nothing wrong. Well under the staleness ceiling on purpose — a probe
+    # that expires between probes is the failure it exists to prevent.
+    signals_probe_enabled: bool = True
+    signals_probe_interval_seconds: int = 900
+
     # --- Verify + rollback (step 7 後半 7b-4) ---------------------------------
     verify_delay_seconds: int = 60  # floor for the settle window; the query can raise it
     # Added on top of a verify query's own lookback window before checking it, to

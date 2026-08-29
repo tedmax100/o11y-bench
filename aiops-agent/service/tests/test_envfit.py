@@ -174,3 +174,55 @@ def test_storage_failure_leaves_the_fit_unproven_not_fitting(monkeypatch, tmp_pa
     envfit_mod._last = None
     assert get_last_fit(path=tmp_path / "s.db") is None
     assert fit_verdict(path=tmp_path / "s.db")["proven_good"] is False
+
+
+@pytest.mark.asyncio
+async def test_the_signals_loop_takes_both_measurements(monkeypatch):
+    """`data_quality` reads two verdicts that both expire after an hour, and
+    until this loop existed nothing re-took either one: env fit was computed
+    only inside an RCA turn, the topology reconcile only by hand. The gate could
+    be green for an hour after an alert and red the rest of the time with
+    nothing wrong."""
+    import asyncio as _asyncio
+
+    from app import agent
+
+    took: list[str] = []
+
+    async def _fit():
+        took.append("env fit")
+
+    async def _rec():
+        took.append("reconcile")
+        raise _asyncio.CancelledError  # end the loop after one full pass
+
+    monkeypatch.setattr("app.signals.envfit.compute_env_fit", _fit)
+    monkeypatch.setattr("app.signals.reconcile.reconcile", _rec)
+    with pytest.raises(_asyncio.CancelledError):
+        await agent._signals_loop()
+    assert took == ["env fit", "reconcile"]
+
+
+@pytest.mark.asyncio
+async def test_one_failing_probe_does_not_stop_the_other(monkeypatch):
+    """A store that will not answer leaves its own verdict unproven — which the
+    gate already treats as 'no autonomy'. It must not also silence the probe
+    next to it."""
+    import asyncio as _asyncio
+
+    from app import agent
+
+    took: list[str] = []
+
+    async def _fit():
+        raise RuntimeError("prometheus unreachable")
+
+    async def _rec():
+        took.append("reconcile")
+        raise _asyncio.CancelledError
+
+    monkeypatch.setattr("app.signals.envfit.compute_env_fit", _fit)
+    monkeypatch.setattr("app.signals.reconcile.reconcile", _rec)
+    with pytest.raises(_asyncio.CancelledError):
+        await agent._signals_loop()
+    assert took == ["reconcile"]

@@ -1893,6 +1893,36 @@ async def _actuation_loop() -> None:
             await asyncio.sleep(settings.actuation_probe_interval_seconds)
 
 
+async def _signals_loop() -> None:
+    """Re-measure the two DQ gate inputs on a timer, for the life of the process.
+
+    The same argument `_actuation_loop` above already won for the third one: a
+    gate input is a standing signal with an age, and it has to have an answer
+    before an incident asks. That decision was made for write credentials and
+    never made for these two — env fit was refreshed only from inside an RCA
+    turn, and the topology reconcile was called by nothing at all. Both verdicts
+    expire after an hour, so `data_quality` could only be green in the hour
+    following an alert and went red on its own the rest of the time, with
+    nothing whatsoever wrong with the environment.
+
+    Best-effort per iteration and per probe: a store that will not answer leaves
+    that verdict unproven, which the gate already treats as "do not grant
+    autonomy". One failing probe must not stop the other from being taken.
+    """
+    from .signals.envfit import compute_env_fit
+    from .signals.reconcile import reconcile
+
+    while True:
+        for name, probe in (("env fit", compute_env_fit), ("reconcile", reconcile)):
+            try:
+                await probe()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("%s probe failed; leaving it unproven: %s", name, e)
+        await asyncio.sleep(settings.signals_probe_interval_seconds)
+
+
 @asynccontextmanager
 async def lifespan(app):
     from . import store
@@ -1904,6 +1934,8 @@ async def lifespan(app):
         tasks.append(asyncio.create_task(_reconcile_loop()))
     if settings.actuation_check_enabled:
         tasks.append(asyncio.create_task(_actuation_loop()))
+    if settings.signals_probe_enabled:
+        tasks.append(asyncio.create_task(_signals_loop()))
     try:
         yield
     finally:
