@@ -13,6 +13,42 @@
 #   python -m app.eval --fixtures app/eval/fixtures_live.yaml \
 #       --no-record --store /tmp/eval-live.db
 #
+# CLOSED BOOK. `--store` only says where the *verdicts* go; case recall reads the
+# service's default store, so by default this fixture runs with whatever the
+# production case library already knows — and for payment-service that library
+# contains a confirmed case whose root cause is this incident, injected in full
+# before the run issues a single query. Which is the product working as designed,
+# and useless as a measure of the RCA. To measure without it, point the whole
+# service at an empty store:
+#
+#   STORE_PATH=/tmp/closedbook.db python -m app.eval \
+#       --fixtures app/eval/fixtures_live.yaml --no-record --store /tmp/eval-closed.db
+#
+# Measured 2026-08-29, 20 passes each, incident live:
+#
+#                          open book        closed book
+#   service                20/20            20/20
+#   names the ConfigMap    20/20            20/20
+#   prose blames v2.5.0     3/20             1/20
+#   suspected_version set    0/20             0/20
+#   mean confidence         0.96             0.83
+#   model calls the tool   12/20            19/20
+#   overall `correct`        30%              15%
+#
+# The answer does not come from the recalled case — it survives the library being
+# emptied. What the recall was actually buying is *process*: `discover_before_retry`
+# failed 7 times open-book and 17 times closed-book, which is the whole of the drop
+# in `correct`. That is the dead-end half of case memory doing its documented job —
+# spending the budget on a query that can work here instead of re-issuing one that
+# cannot. Worth stating plainly, because the obvious reading of "30% vs 15%" is that
+# recall knows the answer, and it does not.
+#
+# The tool-reach row is the uncomfortable one. Handed a confirmed case that names
+# the cause, the model asks the cluster what changed 12 times in 20; with the
+# library empty it asks 19 times in 20. Recall does not make it wrong here, but it
+# does make it stop looking — which is the failure mode to watch for on the day the
+# recalled case is the *wrong* prior.
+#
 # `--no-record` by default here: the committed fixture record is the autonomy
 # gate's evidence, and evidence gathered against a cluster whose state nobody
 # else can reproduce should not vouch for anything.
