@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -697,9 +698,15 @@ def _build_graph():
             # fabricated citation is the more basic problem.
             ok, retry_prompt = _refutation_check(answer)
         if ok:
-            # Third: a conclusion drawn from nothing at all. Last because it is
+            # Third: the prose half of the version question. Before grounding,
+            # because "blames a version the cluster cleared" is a named, specific
+            # fault and the grounding net would either miss it (the claim *is*
+            # cited, just to the wrong thing) or describe it vaguely.
+            ok, retry_prompt = _provenance_check(answer)
+        if ok:
+            # Fourth: a conclusion drawn from nothing at all. Last because it is
             # the widest net — it reads the whole turn's evidence rather than one
-            # citation — and the two narrower checks name the problem better when
+            # citation — and the narrower checks name the problem better when
             # they fire.
             ok, retry_prompt = grounding_check(answer, state.get("facts") or [])
         revision = state.get("rubric_revision_count", 0)
@@ -1255,6 +1262,80 @@ async def _inject_dependency_health(turn_messages: list, services: list[str]) ->
         logger.warning("dependency health injection failed for %s: %s", services, e)
 
 
+# What the cluster said about each implicated service's last rollout, for the
+# runs where it said "this changed nothing the process runs". Set once by the
+# injection step and read by the rubric check that will not let the answer blame
+# that version anyway — same evidence, no second round-trip to the API server.
+_provenance_unchanged: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar(
+    "provenance_unchanged", default={}
+)
+
+
+async def _inject_change_provenance(turn_messages: list, services: list[str]) -> None:
+    """Ask the cluster what the last rollouts actually changed, before the run
+    reasons about a version at all.
+
+    `k8s_change_provenance` existed as a tool for exactly this, and measuring
+    the tool actually got called put it at 1/20: nineteen runs out of twenty
+    never thought to ask, and the two anecdotes I had happened to be the one
+    that did. A capability the model reaches for one time in twenty is not a
+    capability of the system. So this is a step, not an offer — the same shape
+    as the runbook diagnostics and dependency health above: read-only, off the
+    tool budget, fail-open, and it happens whether or not anybody remembers it.
+
+    It runs before the prompt because that is the only place it can settle the
+    prose. The post-hoc reconcile (`_reconcile_version_with_provenance`) already
+    fixes the `suspected_version` *field*, and the effect of fixing only the
+    field was that twenty runs out of twenty had a clean field and twenty out of
+    twenty still said "code regression in v2.5.0" in the sentence a person
+    reads. Handing the verdict over up front is what stops the sentence being
+    written.
+    """
+    from .tools.k8s import get_change_provenance
+
+    lines: list[str] = []
+    unchanged: dict[str, str] = {}
+    for service in services[:3]:
+        try:
+            prov = await get_change_provenance(service)
+        except Exception as e:  # enrichment must never sink the run
+            logger.warning("provenance injection failed for %s: %s", service, e)
+            continue
+        if not prov.get("found") or prov.get("unavailable") or not prov.get("verdict"):
+            continue
+        latest = (prov.get("revisions") or [{}])[-1]
+        mounted = ", ".join(latest.get("mounted_config") or []) or "none"
+        if "outside the template" in prov["verdict"] and latest.get("git_version"):
+            unchanged[service] = str(latest["git_version"])
+        lines.append(
+            f"- {service}: {prov['verdict']}\n"
+            f"  (running {latest.get('image') or 'unknown image'}, "
+            f"version label {latest.get('git_version') or 'unset'}, "
+            f"mounted config: {mounted})"
+        )
+    _provenance_unchanged.set(unchanged)
+    if unchanged:
+        logger.info(
+            "provenance step: cluster says the template is unchanged for %s",
+            ", ".join(f"{k} ({v})" for k, v in sorted(unchanged.items())),
+        )
+    if not lines:
+        return
+    turn_messages.append(
+        SystemMessage(
+            content=(
+                "CHANGE PROVENANCE (measured from the cluster's ReplicaSet history, "
+                "not from the alert labels):\n"
+                + "\n".join(lines)
+                + "\n\nA version label changing is not a code change. Where the verdict "
+                "says the rollout changed nothing the process runs, do not describe this "
+                "incident as a regression in that version — in prose or in any field — "
+                "and do not propose a rollback; the change is in the mounted config."
+            )
+        )
+    )
+
+
 async def _refresh_env_fit() -> None:
     """Re-measure whether the injected catalog resolves against the stores we
     are actually pointed at (s6). Read-only, off the agent budget, and cached:
@@ -1268,6 +1349,48 @@ async def _refresh_env_fit() -> None:
             await compute_env_fit()
     except Exception as e:
         logger.warning("env fit refresh failed: %s", e)
+
+
+def _provenance_check(answer: str) -> tuple[bool, str]:
+    """(passed, retry prompt). Does the answer still blame a version the cluster
+    says never shipped?
+
+    The measurement that produced this: after the field was settled from
+    provenance, twenty runs out of twenty carried an empty `suspected_version`
+    and twenty out of twenty still opened with "Code regression in
+    payment-service v2.5.0". The error had not gone away, it had moved from the
+    field to the sentence — and the criterion that forbids blaming that version
+    only read the field, so it passed all twenty while all twenty said the
+    forbidden thing in words. A check that reads one face lets the failure walk
+    between faces.
+
+    Fail-open: no provenance verdict for this run means no opinion here.
+    """
+    unchanged = _provenance_unchanged.get()
+    if not unchanged or not answer:
+        return True, ""
+    named = {svc: ver for svc, ver in unchanged.items() if ver and ver in answer}
+    if not named:
+        # Said out loud, because "the check passed" and "the check never ran"
+        # are the pair this codebase keeps confusing itself with — a silent
+        # fail-open reads exactly like a clean sweep.
+        logger.info(
+            "rubric: provenance verdict held for %s and the answer does not blame it",
+            ", ".join(sorted(unchanged)),
+        )
+        return True, ""
+    lines = ", ".join(f"{svc} {ver}" for svc, ver in sorted(named.items()))
+    # Logged because this is the number the change exists to move: how often the
+    # prose still had to be corrected after the cluster had already answered.
+    logger.info("rubric: answer blames a version the cluster cleared (%s) — retrying", lines)
+    return False, (
+        f"Your answer names {lines} as the cause, but the cluster's ReplicaSet history "
+        "says those rollouts changed nothing the process runs — at most a version label "
+        "or a restart. A rollback would restore an identical pod template. Rewrite the "
+        "answer so it does not attribute this incident to that version, and say where the "
+        "change actually is (the mounted config named in the provenance block above), or "
+        "say plainly that you have not established what changed."
+    )
 
 
 def _refutation_check(answer: str) -> tuple[bool, str]:
@@ -1470,6 +1593,7 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
         # SLIs are read at the incident time, not real now.
         if service:
             await _inject_dependency_health(turn_messages, [service])
+            await _inject_change_provenance(turn_messages, [service])
 
     turn_messages.append(
         {"role": "user", "content": _alert_to_prompt(labels, annotations, starts_dt)}
@@ -1941,6 +2065,7 @@ async def stream_chat(
     if resolved:
         _inject_signal_context(turn_messages, resolved)
         await _inject_dependency_health(turn_messages, resolved)
+        await _inject_change_provenance(turn_messages, resolved)
     # Closed loop: what did we conclude last time someone asked about this
     # service? Free (a store read), and it is the one piece of context a human
     # colleague would definitely have.

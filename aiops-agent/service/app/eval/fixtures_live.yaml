@@ -29,13 +29,22 @@
 # tell apart:
 #
 #   truth.service     it still has to land on payment-service
-#   forbid_versions   …without pinning it on the version the label handed it
-#   used_tools        …having actually asked the cluster what changed
+#   forbid_versions   …without pinning it on the version the label handed it,
+#                     read across the field AND the prose, because that is where
+#                     the error went when only the field was fixed
+#   used_tools        …and how often the *model* reaches for the tool on its own
 #
-# The third is the one that turns "the model sometimes reaches for that tool"
-# into a number. Two observed runs is not a rate; `--repeat 20` is. The check
-# counts the call, not its answer, so a cluster that fails to reply reads as an
-# environment problem rather than as a model that ignored the tool.
+# The third one measured 1/20: nineteen runs never thought to ask the cluster,
+# and the two anecdotes behind "it sometimes uses that tool" had happened to be
+# the one that did. So provenance stopped being an offer and became a step every
+# alert run takes (`agent._inject_change_provenance`), off the tool budget.
+#
+# That deliberately does NOT make this check pass. It still counts explicit tool
+# calls, so it keeps reporting model reach — which is now a curiosity rather than
+# the system's capability, and worth watching precisely because nothing depends
+# on it any more. What the run must not do is blame the cleared version, and that
+# is `forbid_versions`, enforced by a rubric check that reads the same verdict
+# the step injected.
 - id: payment-config-regression
   alert:
     labels:
