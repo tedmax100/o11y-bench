@@ -599,10 +599,53 @@ def _is_metric_logql(logql: str) -> bool:
     return bool(_METRIC_LOGQL_RE.search(logql))
 
 
-def _loki_fallback(selector: str) -> str:
+# Stages that cannot appear inside `count_over_time(...)`, or that change what a
+# line *is* rather than which lines survive. Everything else — line filters
+# (`|=`, `!~`), label filters (`| event="x"`), parsers (`| json`) — narrows the
+# set of lines and so belongs in the count.
+_LOKI_UNCOUNTABLE_STAGES = ("line_format", "label_format", "unwrap")
+
+
+def _loki_pipeline(logql: str, selector: str) -> str:
+    """The part of the query after the stream selector, when it can be counted.
+
+    "" when there is none, or when it contains a stage that has no meaning
+    inside `count_over_time` — the caller then falls back to counting the
+    selector alone and says so.
+    """
+    idx = logql.find(selector)
+    if idx < 0:
+        return ""
+    rest = logql[idx + len(selector) :]
+    # A metric-shaped query carries its own range and closing parens; taking its
+    # tail would produce nonsense, and its result was small enough not to be here.
+    rest = rest.split("[")[0].strip().rstrip(")").strip()
+    if not rest.startswith("|"):
+        return ""
+    if any(stage in rest for stage in _LOKI_UNCOUNTABLE_STAGES):
+        return ""
+    return rest
+
+
+def _loki_fallback(selector: str, pipeline: str = "") -> str:
+    """Count what the caller actually asked about, bucketed.
+
+    The pipeline used to be dropped here, and that made the summary answer a
+    different question from the one asked: `{service_name="payment-service"}
+    |= "declined"` came back as counts of every event on the service, top bucket
+    `payment.authorized`, under a key that said `original_query`. It is labelled
+    `truncated`, so it is not a lie — but "I asked for declines and read back a
+    number for authorisations" is a mistake nobody would notice.
+
+    `detected_level` rather than `level`: Loki synthesises the former for every
+    stream, while the latter is whatever the application happened to name its
+    field — here, nothing, so the old grouping bucketed on a label that does not
+    exist and the hint told the model to filter by it.
+    """
+    body = f"{selector} {pipeline}".strip()
     return (
-        "topk(20, sum by (service_name, level, event, git_version) "
-        f"(count_over_time({selector} [5m])))"
+        "topk(20, sum by (service_name, detected_level, event, git_version) "
+        f"(count_over_time({body} [5m])))"
     )
 
 
@@ -692,33 +735,65 @@ async def _query_loki_logs(
             "original_query": logql,
             "hint": "Rewrite with an explicit stream selector, then re-query.",
         }
-    fb = _loki_fallback(selector)
+    pipeline = _loki_pipeline(logql, selector)
+    fb = _loki_fallback(selector, pipeline)
     step = max((_epoch_s(e) - _epoch_s(s)) // 100, 1)
-    try:
+
+    async def _aggregate(query: str):
         agg = await _get_json(
             settings.loki_url,
             "/loki/api/v1/query_range",
-            {"start": _epoch_ns(s), "end": _epoch_ns(e), "query": fb, "step": step},
+            {"start": _epoch_ns(s), "end": _epoch_ns(e), "query": query, "step": step},
         )
-        agg = agg.get("data", agg) if isinstance(agg, dict) else agg
+        return agg.get("data", agg) if isinstance(agg, dict) else agg
+
+    dropped = ""
+    try:
+        agg = await _aggregate(fb)
     except ToolException as exc:
-        return {
-            "truncated": True,
-            "original_query": logql,
-            "fallback_query": fb,
-            "fallback_error": str(exc),
-        }
-    return {
+        if not pipeline:
+            return {
+                "truncated": True,
+                "original_query": logql,
+                "fallback_query": fb,
+                "fallback_error": str(exc),
+            }
+        # The pipeline did not survive being counted. Falling back to the
+        # selector alone is still useful, but it answers a wider question than
+        # the one asked, so that has to be said rather than left to be inferred
+        # from a query string.
+        dropped = str(exc)
+        fb = _loki_fallback(selector)
+        try:
+            agg = await _aggregate(fb)
+        except ToolException as exc2:
+            return {
+                "truncated": True,
+                "original_query": logql,
+                "fallback_query": fb,
+                "fallback_error": str(exc2),
+            }
+    out = {
         "truncated": True,
         "reason": f"Raw Loki output > {LOKI_CAP_BYTES}B; auto-aggregated.",
         "original_query": logql,
         "fallback_query": fb,
         "fallback_aggregation": agg,
         "hint": (
-            "Aggregated by (service_name, level, event, git_version). Pick a "
-            "bucket and re-query with it as an extra filter, or shorten the window."
+            "Aggregated by (service_name, detected_level, event, git_version), "
+            "keeping your filters. Pick a bucket and re-query with it as an extra "
+            "filter, or shorten the window."
         ),
     }
+    if dropped:
+        out["filters_dropped"] = pipeline
+        out["hint"] = (
+            f"Your filters ({pipeline}) could not be counted, so these numbers are "
+            "for the whole stream selector and NOT for what you asked about. "
+            f"Loki said: {dropped}. Aggregated by (service_name, detected_level, "
+            "event, git_version); shorten the window to see the filtered lines."
+        )
+    return out
 
 
 # ---- Tempo -----------------------------------------------------------------

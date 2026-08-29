@@ -543,3 +543,45 @@ def test_metric_names_keeps_both_sides_of_a_join():
 
     expr = "sum(rate(a_total[5m])) / on(job) group_left(pod) sum(rate(b_total[5m]))"
     assert _metric_names(expr) == {"a_total", "b_total"}
+
+
+# ---- truncation fallback ----------------------------------------------------
+
+
+def test_fallback_keeps_the_filter_that_was_asked_about():
+    """The bug: `|= "declined"` came back as counts of every event on the service,
+    top bucket `payment.authorized`, under a key labelled `original_query`."""
+    logql = '{service_name="payment-service"} |= "declined"'
+    sel = q._selector(logql)
+    pipe = q._loki_pipeline(logql, sel)
+    assert pipe == '|= "declined"'
+    fb = q._loki_fallback(sel, pipe)
+    assert '|= "declined"' in fb
+    assert "detected_level" in fb
+    assert " level," not in fb  # the field these services never emitted
+
+
+def test_fallback_keeps_a_label_filter_too():
+    logql = '{service_name="payment-service"} | event="payment.declined"'
+    sel = q._selector(logql)
+    assert q._loki_pipeline(logql, sel) == '| event="payment.declined"'
+
+
+def test_a_stage_that_cannot_be_counted_is_left_out():
+    """`line_format` rewrites the line rather than selecting lines; counting it
+    is meaningless, so the caller falls back to the selector and says so."""
+    logql = '{service_name="x"} | json | line_format "{{.msg}}"'
+    sel = q._selector(logql)
+    assert q._loki_pipeline(logql, sel) == ""
+
+
+def test_a_bare_selector_has_no_pipeline():
+    logql = '{service_name="x"}'
+    assert q._loki_pipeline(logql, q._selector(logql)) == ""
+
+
+def test_a_metric_query_contributes_no_pipeline_tail():
+    """Its range and closing parens are not a filter; taking them would be
+    nonsense — and its result was small enough never to reach here anyway."""
+    logql = 'sum(count_over_time({service_name="x"} | event="e" [5m]))'
+    assert q._loki_pipeline(logql, q._selector(logql)) == '| event="e"'
