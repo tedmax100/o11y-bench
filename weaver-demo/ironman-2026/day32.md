@@ -225,19 +225,213 @@ order-service   | pods 2 | singleton True
 
 反過來說，那句 escalate 的理由、還有那張留著沒被選上的分支清單，都是可以直接讀的。它們沒有替人做決定，但把人省下來的那一步指出來了。
 
+## 後來我真的去量了那個「機率」
+
+上面那句「它拿不拿是機率問題」，我寫的時候很滿意。過幾天重看，覺得哪裡怪怪的。
+
+機率是一個關於比例的說法，而我手上只有兩次跑。兩次不是比例，是兩則軼事。我把一個
+看起來很聰明的結論，架在一個連樣本數都稱不上的東西上面，而這系列裡不只這一個結論
+是這樣來的。
+
+要量它，缺的東西其實很小。process 那一層的檢查已經有「有沒有真的查」「有沒有拿空
+結果瞎重試」「數字是不是憑空生的」，就是沒有最直白的那一個：**這支工具到底有沒有被
+呼叫過**。
+
+```python
+def check_used_tools(calls: list[ToolCall], wanted: list[str]) -> tuple[bool, str]:
+    """A named tool has to actually get called on this fixture.
+
+    Calling the tool counts, whatever it returned: this is about reach, not
+    about whether the cluster answered.
+    """
+    used = {c.name for c in calls}
+    missing = [t for t in wanted if t not in used]
+    if missing:
+        return False, f"never called: {', '.join(missing)}"
+    return True, f"called {', '.join(wanted)}"
+```
+
+只算「有沒有伸手」，不算「叢集有沒有回話」。這個界線要先劃清楚，不然 k8s API 抽風的
+那天，量到的會是叢集的健康度，而不是模型的行為。
+
+### 這題不能跟其他題放在一起跑
+
+平常那套 fixture 可以跑在一個把遙測資料烤進去的 container 上，好處是每次查到的資料
+都一樣。問題是那裡面沒有 Deployment、沒有 ReplicaSet，也沒有 ConfigMap。一個主題
+就是「叢集裡到底改了什麼」的題目，放進去只會因為環境而紅。
+
+其實這跟 Tempo 那個一小時保存期是同一種麻煩：**環境造成的失敗，長得跟模型退步一模
+一樣。** 值班的人看到報表上一片紅，第一個念頭是模型爛掉了，然後花半天去調 prompt，
+而真正的原因是他要查的那段時間根本沒有資料。
+
+所以另開一份只給真叢集跑的 fixture，一次量三件從服務名稱上分不出來的事：
+
+```yaml
+  truth:
+    service: payment-service      # 還是要落在對的服務
+  forbid_versions:
+    - v2.5.0                      # 但不能被 alert 上那個 git_version label 牽著走
+  process:
+    used_tools:
+      - k8s_change_provenance     # 而且要真的去問過叢集
+```
+
+`truth` 裡刻意沒有寫版本。這題沒有兇手版本，template 從頭到尾沒變過。
+
+### 起環境比我想的麻煩，而這件事本身就是內容
+
+要跑的時候，叢集是開著的，flag 也還是 `true`，provenance 照樣回它那句
+「the last rollouts changed nothing the process runs」。看起來一切就緒。
+
+我順手查了一下 Prometheus，然後發現 `payment_charges_total` 這個指標**根本不存在**。
+Loki 裡最近十分鐘一行 payment-service 的日誌都沒有。整座叢集活著，但沒有人在用它。
+
+更好笑的是接下來這件事。壓測腳本 `load.sh` 打的訂單金額永遠是偶數，而這個事故的觸發
+條件是奇數分。也就是說，**我把壓測開到滿，也永遠觸發不了它** XD 要看到事故，得另外
+寫一支直接對 payment 灌奇數分的驅動。
+
+```
+sum by (status) (rate(payment_charges_total[5m]))
+  declined    1.62
+  authorized  1.05      ← 拒付率 61%，遠超 SLO
+```
+
+> 一個「已經觸發」的事故，跟一個「資料裡看得到」的事故，其實是兩件事。
+> 中間隔著一支只會送偶數金額的壓測腳本。
+> 我如果沒先去查那個指標存不存在就直接跑二十趟，
+> 會拿到一份很漂亮的失敗報表，然後把它讀成模型的問題 QQ
+
+### 二十趟
+
+```
+aiops-agent eval — 1 fixture(s), 20 run(s), overall correct 5%
+
+  fixture                        correct   service   version   conf  err
+  ----------------------------------------------------------------------
+  payment-config-regression        5% (1/20)    100%    n/a   0.69    0
+
+  failed process checks (the answer may still read fine):
+    x used_tools: never called: k8s_change_provenance     ← 19 次
+```
+
+**5%。** 不是「有時候會有時候不會」，是二十次裡有十九次它根本沒想到要去問。我當初那
+兩次跑，剛好抽中了那個 1/20，然後我拿它寫了一句關於機率的話。
+
+服務歸因倒是 100%，平均信心 0.69。它每次都知道是 payment-service，只是從來不查到底
+改了什麼。這兩件事的落差就是那支工具存在的理由，現在它有數字了。
+
+### 然後我發現，錯誤只是換了個地方站
+
+二十筆的 `suspected_version` 全部是 `None`。第一眼看起來像大獲全勝，上面那個「今天
+沒做的事」裡欠的那筆好像也還掉了。
+
+但同一批的 summary 是這樣寫的：
+
+```
+Code regression in payment-service v2.5.0 introduced a new validation rule
+that rejects payments with an odd number of cents.
+```
+
+二十筆的正文，全部都在說 v2.5.0 的 code regression。
+
+我一開始不確定那個欄位空掉是誰的功勞。是抽取器根本沒填，還是那道確定性的對帳把它清
+掉的？這兩件事的意義差很多，所以另外跑了一趟開 INFO log 的：
+
+```
+extractor said -> after reconcile: [('v2.5.0', None), ('v2.5.0', None)]
+INFO findings: cleared suspected_version=v2.5.0 for payment-service
+     — provenance says the pod template is unchanged (mounted config: configMap/payment-flags)
+```
+
+抽取器每次都填了 `v2.5.0`，是對帳每次都把它清掉的。在模型十九次沒去問叢集的情況下，
+那道檢查自己去問了。
+
+三個數字擺在一起才是完整的：
+
+| 量的是什麼 | 幾次 |
+| --- | --- |
+| 模型自己伸手去問叢集 | 1/20 |
+| 確定性對帳清掉錯的版本欄位 | 20/20 |
+| 正文仍然說「v2.5.0 的 code regression」 | 20/20 |
+
+所以修好那個欄位，並沒有讓錯誤消失，只是讓它換了個地方站。之前是正文對、欄位錯，
+現在是欄位對、正文錯。
+
+```mermaid
+flowchart LR
+    E["抽取器<br/>suspected_version = v2.5.0"] --> R["provenance 對帳<br/>template 沒變 → 清掉"]
+    R --> F["結構化欄位<br/>None ✅"]
+    E --> P["summary / hypothesis<br/>'code regression in v2.5.0' ❌"]
+    F --> J["判分器只讀欄位<br/>20/20 通過"]
+    P --> H["值班的人讀的是句子"]
+```
+
+### 而我的判分器正好瞎在那一側
+
+`forbid_versions` 這條判準只讀 `suspected_version`。所以它二十趟全過，同時二十趟的
+答案都用白話說著那個被禁止的版本。**判分的看欄位，值班的看句子。**
+
+修法是讓它三個面一起讀，並且回傳被指到的是哪一個版本，這樣報表講得出話：
+
+```python
+def blames_forbidden_version(findings, forbid: list[str]) -> str:
+    """回傳這個答案指到的那個被禁版本，沒有就回空字串。"""
+    text = " ".join([
+        getattr(findings, "suspected_version", None) or "",
+        getattr(findings, "summary", "") or "",
+        getattr(findings, "hypothesis", "") or "",
+    ]).lower()
+```
+
+拿原本那二十筆離線重算，不用再花一次 token：
+
+```
+runs=20  blames a forbidden version somewhere: 20/20
+```
+
+這題誠實的分數是 0/20，不是 1/20。連那唯一一次「對」的也不例外，它只是剛好是有呼叫
+工具的那一次，而舊的判準抓不到它。
+
+修的過程裡還挖出一個更難看的東西。`forbid_versions` 這條判準以前**只在「這題應該答不
+出來」的那種題目上被讀**，另一種題目的判分函式根本沒碰它。所以我在這題的設定檔裡寫的
+那行判準，通過了格式驗證、在 code review 裡看起來完全正常，而且從來沒有執行過一次。
+
+這種缺口我覺得是最難自己抓到的。它不會報錯，不會讓任何測試變紅，也不會讓分數看起來
+奇怪，因為那條判準只是安靜地不參與計算。要發現它，你得剛好在另一種題型上需要它，
+然後才會問一句「欸，它為什麼沒擋」。
+
+回頭看，當初那條判準的測試三條全都走同一種題型，因為寫它的時候就只想到那一種用法。
+**測試覆蓋的是我想到的用法，不是這個欄位可以出現的地方。**
+
+> 我花了一整天把一個欄位修對，然後量出來發現分數從 5% 掉到 0%。
+> 這種時候很難跟人解釋你今天過得還不錯 ^^
+
+### 這件事真正的教訓
+
+我當初寫下的是「加工具只是機率」。那句話方向對，但它讓我停在一個很舒服的位置：好像
+該做的都做了，剩下的是模型的事。
+
+實際上有三件我那天沒看見。第一，那個機率是 5%，而「有時候」這個詞在沒有數字的時候
+會自己往中間靠，聽起來像五五開。第二，確定性那條路徑做完了模型沒做的事，而且是在
+95% 的情況下做的，它的價值比我原本估的高得多。第三，也是最沒預料到的：修好一個結構
+化欄位，可能只是把錯誤趕進正文裡，而如果判分器只讀欄位，你會看著分數上升，值班的人
+繼續讀到那句錯的話。
+
+一個只檢查一個面的判準，會讓失敗在幾個面之間搬家，而數字全程不會察覺。
+
 ## 今天沒做的事
 
 - **那條 ConfigMap 分支可執行了，但還沒有人按過。** 乾跑對過、測試有，而這個系列反覆講的就是沒被按過的按鈕不算數。
 - **`when` 只讀診斷輸出的字串。** 哪天 provenance 那句 verdict 的措辭改了，分支會安靜地不成立。那句話現在同時是人看的訊息跟機器的判斷依據，這遲早要拆開。
 - **適用性規則只有一條。** scale 遇到不是資源問題的事故、flag 改寫遇到根本沒有那個 flag 的服務，都還沒有對應的檢查。
-- **兩次跑不是一個樣本數。** 「模型有時候會用那個工具、有時候不會」這件事我只看到兩次，沒有量過比例。
-- **`suspected_version` 那個欄位還是 v2.5.0。** 就算它在正文裡說對了是 ConfigMap，結構化欄位還是填了版本號。下游要是有人只讀那個欄位，一樣會被誤導。
+- **量到了比例，但只在一題上。** 那個 5% 是這一題、這個叢集、這個時間點的數字。別的事故形狀會不會一樣低，還沒問過。
+- **正文還是在說 v2.5.0。** 欄位修好了，判分器也追上去讀正文了，但答案本身沒有變好。真正要修的是讓那句話一開始就不會這樣寫，而那件事還沒動。
 
 ## 小結
 
 今天做的三件事其實是同一句話的三個版本：把「這個處置有沒有可能有用」從模型手上拿走。
 
-第一次是加一支唯讀工具，把答案放在它拿得到的地方——結果證明它拿不拿是機率問題。第二次是在提議之前直接問叢集，兩次都成立。第三次是隔天早上發現前面那道檢查的形狀是補丁，於是把分岔搬進 runbook 的資料結構裡，讓錯的處置從頭到尾不會出現在清單上。
+第一次是加一支唯讀工具，把答案放在它拿得到的地方，後來量出來它二十次裡只伸手一次。第二次是在提議之前直接問叢集，兩次都成立。第三次是隔天早上發現前面那道檢查的形狀是補丁，於是把分岔搬進 runbook 的資料結構裡，讓錯的處置從頭到尾不會出現在清單上。
 
 **能被驗證的規則要放在確定性那一層，不要指望勸模型。** 這句話這三十幾天講過三次了，一次是空結果不能當證據，一次是停止條件不能問模型，這是第三次。
 
