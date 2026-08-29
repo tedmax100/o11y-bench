@@ -217,7 +217,7 @@ def grade_run(findings: Any, fixture: Fixture) -> tuple[bool, bool, bool | None]
 
 
 async def telemetry_preflight(alert: dict[str, Any]) -> str:
-    """"" if the stores have something to reason about in this alert's window,
+    """ "" if the stores have something to reason about in this alert's window,
     else why they do not.
 
     Grading a run against empty stores measures the environment, not the agent,

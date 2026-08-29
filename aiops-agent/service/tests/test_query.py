@@ -218,8 +218,9 @@ def test_selector_found_inside_a_metric_query():
     """`sum(count_over_time({...} [5m]))` is the shape the schema catalog teaches,
     and anchoring at the start of the string excluded all of it — which silently
     disabled every empty-result diagnostic on exactly that shape."""
-    sel = q._selector('sum(count_over_time({service_name="payment-service"} '
-                      '| event="payment.declined" [5m]))')
+    sel = q._selector(
+        'sum(count_over_time({service_name="payment-service"} | event="payment.declined" [5m]))'
+    )
     assert sel == '{service_name="payment-service"}'
 
 
