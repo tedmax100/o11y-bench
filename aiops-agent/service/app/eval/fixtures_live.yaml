@@ -43,6 +43,20 @@
 # cannot. Worth stating plainly, because the obvious reading of "30% vs 15%" is that
 # recall knows the answer, and it does not.
 #
+# Re-measured the same evening, closed book, after `_selector()` was taught to
+# find the stream selector inside a metric-shaped LogQL query (the shape that had
+# been silently exempt from every empty-result diagnostic):
+#
+#                     before   after
+#   discover_before_retry failures   16       2
+#   overall `correct`               20%     65%
+#   service / ConfigMap / field   unchanged (20/20, 20/20, 0/20)
+#
+# The verdict did not move at all; what moved was whether an empty result told
+# the run anything. 16 → 2 on a failure count is well outside the between-pass
+# spread, which is 100% on the headline percentage and makes that 20% → 65% the
+# less trustworthy half of the same result.
+#
 # The tool-reach row is the uncomfortable one. Handed a confirmed case that names
 # the cause, the model asks the cluster what changed 12 times in 20; with the
 # library empty it asks 19 times in 20. Recall does not make it wrong here, but it
