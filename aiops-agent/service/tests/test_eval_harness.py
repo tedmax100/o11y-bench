@@ -7,6 +7,8 @@ regression diff, baseline round-trip, and `startsAt: now` resolution.
 from pathlib import Path
 from types import SimpleNamespace as NS
 
+import pytest
+
 import app.eval.harness as harness
 from app.eval.harness import (
     DEFAULT_FIXTURES,
@@ -402,3 +404,54 @@ def test_blames_forbidden_version_names_which_one():
     f = _findings(services=[], version=None, summary="regression in v2.5.0")
     assert blames_forbidden_version(f, ["v2.4.1", "v2.5.0"]) == "v2.5.0"
     assert blames_forbidden_version(f, ["v2.4.1"]) == ""
+
+
+@pytest.mark.asyncio
+async def test_an_idle_window_is_an_environment_error_not_a_wrong_answer(monkeypatch):
+    """The 2026-08-29 shape: an unattended 20-pass run landed in a 45-minute gap
+    with no ingestion, and its process checks booked that as the model failing to
+    discover — in a window where discovery would also have found nothing."""
+    from app.eval import harness
+
+    async def _empty(*a, **k):
+        return {"data": {"result": []}}
+
+    monkeypatch.setattr("app.tools.query._get_json", _empty)
+    alert = {
+        "labels": {"service_name": "payment-service"},
+        "startsAt": "2026-08-29T10:30:00Z",
+    }
+    why = await harness.telemetry_preflight(alert)
+    assert "no telemetry for payment-service" in why
+
+
+@pytest.mark.asyncio
+async def test_a_live_window_runs_normally(monkeypatch):
+    from app.eval import harness
+
+    async def _busy(*a, **k):
+        return {"data": {"result": [{"values": [["1787997101", "6"]]}]}}
+
+    monkeypatch.setattr("app.tools.query._get_json", _busy)
+    alert = {
+        "labels": {"service_name": "payment-service"},
+        "startsAt": "2026-08-29T10:30:00Z",
+    }
+    assert await harness.telemetry_preflight(alert) == ""
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_prometheus_does_not_block_the_run(monkeypatch):
+    """Fail-open: a store we cannot reach is not evidence the window was empty.
+    Refusing there trades a false model failure for a false environment one."""
+    from app.eval import harness
+
+    async def _boom(*a, **k):
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr("app.tools.query._get_json", _boom)
+    alert = {
+        "labels": {"service_name": "payment-service"},
+        "startsAt": "2026-08-29T10:30:00Z",
+    }
+    assert await harness.telemetry_preflight(alert) == ""

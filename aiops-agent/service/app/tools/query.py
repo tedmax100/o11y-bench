@@ -122,9 +122,25 @@ def _approx_size(value: Any) -> int:
 
 
 def _selector(query: str) -> str | None:
-    """First `{...}` stream/span selector. The post-selector pipeline is what
-    blows the cap, so we re-aggregate on the selector alone."""
-    m = re.match(r"\s*(\{[^}]*\})", query)
+    """First `{...}` stream/span selector, wherever in the expression it sits.
+    The post-selector pipeline is what blows the cap, so we re-aggregate on the
+    selector alone.
+
+    It used to anchor at the start of the string, which quietly excluded every
+    metric-shaped LogQL query — `sum(count_over_time({...} | event="x" [5m]))`
+    begins with `sum(`, not with `{`. That mattered far more than the truncation
+    path it was written for: the empty-result diagnostics all hang off this
+    function, so the one query shape the schema catalog actually demonstrates
+    was the one shape that came back as a bare empty result with no note about
+    a bad label, a bad field, or an idle window. Measured 2026-08-29 against the
+    live stack: a bogus selector and a bogus field both returned `result: []`
+    and nothing else, while the stream-shaped versions of the same two mistakes
+    each got a full diagnostic.
+
+    The stream selector is always the first `{...}` in a LogQL expression, so
+    searching rather than anchoring stays correct for both callers.
+    """
+    m = re.search(r"(\{[^}]*\})", query)
     return m.group(1) if m else None
 
 

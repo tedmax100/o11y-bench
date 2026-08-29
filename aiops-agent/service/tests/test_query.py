@@ -214,6 +214,20 @@ def test_selector_extracts_first_braces_with_pipeline():
     assert sel == '{service_name="x"}'
 
 
+def test_selector_found_inside_a_metric_query():
+    """`sum(count_over_time({...} [5m]))` is the shape the schema catalog teaches,
+    and anchoring at the start of the string excluded all of it — which silently
+    disabled every empty-result diagnostic on exactly that shape."""
+    sel = q._selector('sum(count_over_time({service_name="payment-service"} '
+                      '| event="payment.declined" [5m]))')
+    assert sel == '{service_name="payment-service"}'
+
+
+def test_selector_found_inside_a_grouped_metric_query():
+    sel = q._selector('sum by (git_version) (count_over_time({service_name="x"}[5m]))')
+    assert sel == '{service_name="x"}'
+
+
 def test_selector_none_when_no_braces():
     assert q._selector("not a logql expression") is None
 

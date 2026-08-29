@@ -144,7 +144,15 @@ def check_discover_before_retry(calls: list[ToolCall]) -> tuple[bool, str]:
         if nxt is None or nxt.name.startswith(DISCOVER_PREFIX):
             continue  # stopped querying, or discovered first — both fine
         if call.kind == "empty":
-            return False, f"{call.name} came back empty, retried {nxt.name} without discovering"
+            # Both are failures of the same rule, but they are not the same
+            # mistake and the counts move for different reasons: re-asking the
+            # store that just said nothing is the budget-burning loop this rule
+            # was written for, while pivoting to another store at least changes
+            # the question. Measured 2026-08-29, closed-book: 14 of 17 were the
+            # first kind. Saying which keeps that split readable without
+            # softening the rule — you still have to discover first.
+            same = "re-queried" if nxt.name == call.name else "pivoted to"
+            return False, (f"{call.name} came back empty, {same} {nxt.name} without discovering")
         if nxt.name == call.name and nxt.args == call.args:
             return False, f"{call.name} errored and was re-sent unchanged"
     return True, "no blind retry after an empty result"

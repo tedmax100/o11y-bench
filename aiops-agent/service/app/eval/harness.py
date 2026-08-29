@@ -216,6 +216,66 @@ def grade_run(findings: Any, fixture: Fixture) -> tuple[bool, bool, bool | None]
     return correct, service_hit, version_hit
 
 
+async def telemetry_preflight(alert: dict[str, Any]) -> str:
+    """"" if the stores have something to reason about in this alert's window,
+    else why they do not.
+
+    Grading a run against empty stores measures the environment, not the agent,
+    and it does not fail in a way anybody notices: the run dutifully queries,
+    gets nothing, and the process checks book it as "came back empty, retried
+    without discovering" — a model defect, in a window where discovery would
+    also have found nothing. That is the same shape as Tempo's retention, which
+    this file already warns about in prose while still running the fixture.
+
+    Measured 2026-08-29: an unattended 20-pass run landed in a 45-minute gap
+    with no ingestion at all, and 14 of its 17 process failures came from it.
+
+    Prometheus is the probe, on a bare label matcher rather than a metric name,
+    so this stays true of any environment: `count({service_name="x"})` is "did
+    anything at all write series for this service in that window". Fail-open —
+    an unreachable store is not evidence that the window was empty, and refusing
+    to run on it would trade a false model failure for a false environment one.
+    """
+    from ..config import settings as _settings
+    from ..tools.query import _epoch_s, _get_json
+
+    labels = alert.get("labels") or {}
+    service = labels.get("service_name") or labels.get("service")
+    starts = _parse_starts_at_safe(alert.get("startsAt"))
+    if not service or starts is None:
+        return ""
+    try:
+        series = await _get_json(
+            _settings.prometheus_url,
+            "/api/v1/query_range",
+            {
+                "query": f'count({{service_name="{service}"}})',
+                "start": _epoch_s(starts - timedelta(minutes=30)),
+                "end": _epoch_s(starts + timedelta(minutes=5)),
+                "step": "300",
+            },
+        )
+    except Exception:
+        return ""
+    result = ((series or {}).get("data") or {}).get("result") or []
+    if any(float(v[1]) > 0 for r in result for v in (r.get("values") or [])):
+        return ""
+    return (
+        f"no telemetry for {service} in the 30 minutes before "
+        f"{starts:%Y-%m-%dT%H:%M:%SZ} — the stores were idle, so this run would "
+        "grade the environment, not the agent"
+    )
+
+
+def _parse_starts_at_safe(raw: Any) -> datetime | None:
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(UTC)
+    except ValueError:
+        return None
+
+
 async def run_one(
     fixture: Fixture,
     seed: int,
@@ -228,8 +288,25 @@ async def run_one(
     so one bad run never sinks the batch."""
     # Unique thread_id so MemorySaver never shares state across seeds or runs.
     thread_id = f"eval-{fixture.id}-s{seed}-{run_nonce}"
+    alert = fixture.resolved_alert(scenario_time)
+    idle = await telemetry_preflight(alert)
+    if idle:
+        # Counted as an error, not as a wrong answer. `err` in the report is the
+        # column that says "do not read the score above this line".
+        return RunResult(
+            fixture_id=fixture.id,
+            seed=seed,
+            correct=False,
+            service_hit=False,
+            version_hit=None,
+            confidence=0.0,
+            services=[],
+            suspected_version=None,
+            summary="",
+            error=idle,
+        )
     try:
-        result = await run_headless(fixture.resolved_alert(scenario_time), thread_id=thread_id)
+        result = await run_headless(alert, thread_id=thread_id)
     except Exception as e:  # the harness must survive any agent error
         return RunResult(
             fixture_id=fixture.id,
