@@ -169,6 +169,82 @@ BY_RUN: dict[str, tuple[bool, str, str | None, str]] = {
     ),
 }
 
+# 2026-08-29: eight alerts fired through the production webhook (not the eval
+# harness) at the live ConfigMap incident, to measure the day's tool fixes on the
+# pool the autonomy gate actually reads. Distinct alertnames because the
+# fingerprint is alertname|service|git_version and the cooldown is ten minutes.
+#
+# All eight named the payment-flags flag flip and none filled in
+# `suspected_version`. Two of them (runs 6 and 7) also mention that the code
+# shipped in v2.5.0 — and they are the two best answers in the batch, because
+# they separate the mechanism (the validation block exists in the image, behind
+# a flag that defaults off) from the trigger (somebody flipped the flag). The
+# eval harness's `blames_forbidden_version` is a substring match and would score
+# both of them wrong. It is not being loosened — a blunt judge that cannot be
+# argued with is worth more than a clever one — but the disagreement is recorded
+# here rather than resolved by quietly picking whichever ruler reads better.
+#
+# The rule applied: a run is correct when it puts the cause in the flag flip.
+# "The rule shipped in v2.5.0 and the ConfigMap turned it on" does that; "a code
+# regression in v2.5.0" does not, because rolling back to v2.4.1 leaves the flag
+# on and the declines running.
+#
+# Caveat that belongs next to the numbers: these eight were triggered and graded
+# by the same hand, and they are one incident shape. They make the pool bigger,
+# not more varied.
+POOL_20260829: dict[str, tuple[bool, str, str | None, str]] = {
+    "4f565435eac86c5e-20260829T132050-359ac0": (
+        True,
+        "culprit",
+        None,
+        "named configMap/payment-flags and the new validation rule; no version blamed",
+    ),
+    "092b23ffebc0ee43-20260829T132115-29b704": (
+        True,
+        "culprit",
+        None,
+        "named the payment-flags ConfigMap and new_validator; no version blamed",
+    ),
+    "1bb50a76d3eb1567-20260829T132135-47fd2e": (
+        True,
+        "culprit",
+        None,
+        "named the mounted payment-flags ConfigMap and the new_validator rule",
+    ),
+    "3227a084609e0280-20260829T132200-b629e7": (
+        True,
+        "culprit",
+        None,
+        "named the new validation rule in the payment-flags ConfigMap",
+    ),
+    "371c477636340870-20260829T132215-bf534c": (
+        True,
+        "culprit",
+        None,
+        "named the payment-flags ConfigMap and new_validator; no version blamed",
+    ),
+    "89ae9bd7a0990287-20260829T132235-9240e5": (
+        True,
+        "culprit",
+        None,
+        "separated mechanism from trigger: the rule ships in the v2.5.0 image "
+        "behind a flag that defaults off, and the ConfigMap turned it on",
+    ),
+    "a563fb9a2ee9e173-20260829T132255-6ccdc3": (
+        True,
+        "culprit",
+        None,
+        "said outright that the root cause is the change in the payment-flags "
+        "ConfigMap, with v2.5.0 named only as where the code lives",
+    ),
+    "3769baa7fb46770b-20260829T132315-49d009": (
+        True,
+        "culprit",
+        None,
+        "named the payment-flags ConfigMap and new_validator; no version blamed",
+    ),
+}
+
 # Named so the report says why they are being skipped rather than silently
 # dropping them.
 UNVERIFIABLE = {
@@ -226,7 +302,7 @@ def main() -> int:
     # pending on, and the store is the only thing that knows they exist.
     from app import store as _store
 
-    for run_id, (correct, mode, dim, why) in BY_RUN.items():
+    for run_id, (correct, mode, dim, why) in {**BY_RUN, **POOL_20260829}.items():
         row = _store.cal_latest(run_id)
         if row is None:
             print(f"{run_id:<38} {'-':>5}  no calibration row; skipped")
