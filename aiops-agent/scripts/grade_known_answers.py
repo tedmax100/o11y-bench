@@ -94,6 +94,81 @@ TRUTH: dict[str, tuple[bool, str, str | None, str]] = {
     ),
 }
 
+# Runs that carry their own `run_id` and never reached the Todo queue, because
+# nothing wrote an investigation row for them. The fp-keyed table above cannot
+# reach these: they all share one fingerprint that already has its verdict, and
+# `cal_label` updates the latest row per run_id — which is the whole reason runs
+# stopped being identified by fingerprint. One verdict per run, addressed by run.
+#
+# Same discipline as TRUTH: each entry is what was done to the cluster, not an
+# opinion about the answer. The order-service incident is the confirmed case
+# `ffa6ab9638c72564` — `user_session_cache_disabled` was set true on
+# user-service, so every auth check fell through to the slow session store. The
+# payment ones are the `payment-flags` ConfigMap flip, template unchanged.
+#
+# The rule applied to the version field is the one already used above for
+# `2b0a13c99c8f670a`: naming the right cause and *also* pinning it on a version
+# is wrong, because a rollback to that version's predecessor clears nothing. It
+# is the same failure whether the version sits in the field or in the sentence.
+BY_RUN: dict[str, tuple[bool, str, str | None, str]] = {
+    "2b0a13c99c8f670a-20260820T162600-ff9a6d": (
+        False,
+        "inconclusive",
+        "root_cause",
+        "called the alert a false positive on a non-existent metric, at the "
+        "incident's own start time; the session-cache incident was real",
+    ),
+    "2b0a13c99c8f670a-20260820T163500-564d0a": (
+        True,
+        "culprit",
+        None,
+        "named user-service session store timeouts and cache misses, and pinned "
+        "it on no version — the right cause and the right kind of cause",
+    ),
+    "2b0a13c99c8f670a-20260820T164501-fac7f1": (
+        False,
+        "culprit",
+        "root_cause",
+        "blamed business-logic outcomes and stated the user-service session "
+        "store was NOT timing out, which is the opposite of the cause",
+    ),
+    "2b0a13c99c8f670a-20260822T151536-98241e": (
+        False,
+        "culprit",
+        "root_cause",
+        "right cause, wrong kind of cause: pinned the session-cache flag on "
+        "user-service v1.3.0, and rolling that back clears nothing",
+    ),
+    "2b0a13c99c8f670a-20260822T152640-6a767f": (
+        False,
+        "culprit",
+        "root_cause",
+        "right cause, pinned on order-service v3.1.2 — the exact version this "
+        "incident's truth note says was not it",
+    ),
+    "2b0a13c99c8f670a-20260822T154008-8478b4": (
+        False,
+        "culprit",
+        "root_cause",
+        "right cause, pinned on order-service v3.1.2 — same as the run before it",
+    ),
+    "2c386e950a3fc8f5-20260828T165907-93c37d": (
+        False,
+        "culprit",
+        "root_cause",
+        "said configuration regression in the payment-flags ConfigMap and still "
+        "carried suspected_version v2.5.0; the prose and the field named "
+        "different causes and only one of them was right",
+    ),
+    "d99732674e74e0eb-20260829T104550-46ffbc": (
+        True,
+        "culprit",
+        None,
+        "named the payment-flags ConfigMap and the new_validator_odd_cents rule, "
+        "with no version in the field or the prose",
+    ),
+}
+
 # Named so the report says why they are being skipped rather than silently
 # dropping them.
 UNVERIFIABLE = {
@@ -139,6 +214,34 @@ def main() -> int:
 
             ok = label_run(
                 fp,
+                correct,
+                source="grader-truth",
+                grading_mode=mode,
+                error_dimension=dim,
+                correction_note=why,
+            )
+            print(f"{'':<38} {'':>5}  -> {'labeled' if ok else 'NO RECORD'}")
+
+    # The run-keyed half. No Todo lookup: these rows have no investigation to be
+    # pending on, and the store is the only thing that knows they exist.
+    from app import store as _store
+
+    for run_id, (correct, mode, dim, why) in BY_RUN.items():
+        row = _store.cal_latest(run_id)
+        if row is None:
+            print(f"{run_id:<38} {'-':>5}  no calibration row; skipped")
+            continue
+        if row.get("correct") is not None:
+            print(f"{run_id:<38} {'-':>5}  already labeled; skipped")
+            continue
+        verdict = "correct" if correct else "WRONG"
+        print(f"{run_id:<38} {row['confidence']:>5}  {verdict:<8} {why}")
+        graded += 1
+        if apply:
+            from app.calibration import label_run
+
+            ok = label_run(
+                run_id,
                 correct,
                 source="grader-truth",
                 grading_mode=mode,
