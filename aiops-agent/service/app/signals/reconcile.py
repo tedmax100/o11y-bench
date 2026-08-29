@@ -26,6 +26,7 @@ import time
 
 from pydantic import BaseModel, Field
 
+from .. import store
 from ..config import settings
 from ..tools.query import _epoch_s, _get_json, _parse_dt
 from .topology import Edge, Topology, get_topology
@@ -128,13 +129,42 @@ _last_drift: TopologyDrift | None = None
 
 
 def get_last_drift() -> TopologyDrift | None:
-    """The most recent reconcile result, or None if reconcile hasn't run."""
-    return _last_drift
+    """The most recent reconcile result, or None if nobody has ever reconciled.
+
+    In-process first, then the store. The cache alone was a gate input living in
+    RAM: reconcile from a CLI or a second process and the serving process still
+    reported "topology not reconciled", and a rollout erased the answer even
+    when the same process had computed it. Same hole, same fix as env fit.
+    """
+    if _last_drift is not None:
+        return _last_drift
+    try:
+        row = store.topology_drift_latest()
+    except Exception as e:
+        logger.warning("could not read the last reconcile from the store: %s", e)
+        return None
+    if not row:
+        return None
+    try:
+        return TopologyDrift.model_validate_json(row["drift"])
+    except Exception as e:
+        logger.warning("stored reconcile row is unreadable: %s", e)
+        return None
 
 
 def set_last_drift(drift: TopologyDrift) -> None:
+    """Cache it for this process and land it where the next process can read it."""
     global _last_drift
     _last_drift = drift
+    try:
+        store.topology_drift_insert(
+            computed_ts=drift.computed_ts,
+            dq_score=drift.dq_score,
+            traces_sampled=drift.traces_sampled,
+            drift=drift.model_dump(),
+        )
+    except Exception as e:
+        logger.warning("reconcile computed but not persisted: %s", e)
 
 
 # ---- live observation (network; off the RCA hot path) ----------------------

@@ -221,3 +221,44 @@ def test_context_no_drift_no_annotation(monkeypatch):
     ctx = build_signal_context(["payment-service"])
     assert "⚠" not in ctx
     assert "data-quality" not in ctx
+
+
+def test_the_reconcile_verdict_outlives_the_process(monkeypatch, tmp_path):
+    """The DQ gate reads this. Held only in a module global, it came back
+    "never reconciled" on every rollout — the same hole env fit had."""
+    from app import store
+    from app.signals import reconcile
+
+    p = tmp_path / "aiops.db"
+    monkeypatch.setattr(store.settings, "store_path", str(p))
+    store.init(p)
+    monkeypatch.setattr(reconcile, "_last_drift", None)
+
+    drift = reconcile.TopologyDrift(
+        topology_version="1",
+        traces_sampled=42,
+        declared_count=5,
+        observed_count=5,
+        dq_score=1.0,
+        computed_ts=1787997101.0,
+    )
+    reconcile.set_last_drift(drift)
+
+    # a fresh process: the cache is empty, the answer is not
+    monkeypatch.setattr(reconcile, "_last_drift", None)
+    back = reconcile.get_last_drift()
+    assert back is not None
+    assert back.traces_sampled == 42
+    assert back.dq_score == 1.0
+    assert back.computed_ts == 1787997101.0
+
+
+def test_no_reconcile_ever_still_reads_as_none(monkeypatch, tmp_path):
+    from app import store
+    from app.signals import reconcile
+
+    p = tmp_path / "aiops.db"
+    monkeypatch.setattr(store.settings, "store_path", str(p))
+    store.init(p)
+    monkeypatch.setattr(reconcile, "_last_drift", None)
+    assert reconcile.get_last_drift() is None

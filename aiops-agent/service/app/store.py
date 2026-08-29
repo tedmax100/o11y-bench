@@ -193,6 +193,22 @@ CREATE TABLE IF NOT EXISTS env_fit_probes (
 );
 CREATE INDEX IF NOT EXISTS idx_env_fit_ts ON env_fit_probes(ts);
 
+-- Topology-reconcile history. The same hole as env_fit_probes above, in the
+-- other half of the same gate: `reconcile.set_last_drift` wrote to a
+-- module-level variable, so "topology not reconciled against live traces" came
+-- back on every rollout no matter how many times somebody had reconciled it.
+-- The drift snapshot is stored whole because the DQ verdict reads several
+-- fields of it and the next reader will want the edges, not just the score.
+CREATE TABLE IF NOT EXISTS topology_drift_probes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          TEXT NOT NULL,
+    computed_ts REAL NOT NULL,           -- epoch seconds; the age the verdict reads
+    dq_score    REAL,                    -- NULL = no traffic observed, cannot judge
+    traces_sampled INTEGER NOT NULL DEFAULT 0,
+    drift       TEXT NOT NULL DEFAULT '{}'  -- json TopologyDrift
+);
+CREATE INDEX IF NOT EXISTS idx_topology_drift_ts ON topology_drift_probes(ts);
+
 -- Human verdict on one executed action: did it actually resolve the incident.
 -- This is the authoritative AE-SLO numerator and it is deliberately NOT the
 -- verify step's opinion. `verify` asks a query the runbook author wrote months
@@ -1901,6 +1917,36 @@ def env_fit_latest(path: str | Path | None = None) -> dict | None:
     """The most recent measurement, or None if nobody has ever measured."""
     with _connect(path) as conn:
         row = conn.execute("SELECT * FROM env_fit_probes ORDER BY id DESC LIMIT 1").fetchone()
+    return dict(row) if row else None
+
+
+# ---- topology reconcile history --------------------------------------------
+
+
+def topology_drift_insert(
+    *,
+    computed_ts: float,
+    dq_score: float | None,
+    traces_sampled: int,
+    drift: dict,
+    path: str | Path | None = None,
+) -> None:
+    """Append one reconcile result, so the DQ verdict survives a restart."""
+    ts = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _write_lock, _connect(path) as conn:
+        conn.execute(
+            "INSERT INTO topology_drift_probes "
+            "(ts, computed_ts, dq_score, traces_sampled, drift) VALUES (?,?,?,?,?)",
+            (ts, computed_ts, dq_score, traces_sampled, json.dumps(drift)),
+        )
+
+
+def topology_drift_latest(path: str | Path | None = None) -> dict | None:
+    """The most recent reconcile, or None if nobody has ever reconciled."""
+    with _connect(path) as conn:
+        row = conn.execute(
+            "SELECT * FROM topology_drift_probes ORDER BY id DESC LIMIT 1"
+        ).fetchone()
     return dict(row) if row else None
 
 

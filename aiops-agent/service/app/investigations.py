@@ -164,6 +164,23 @@ def get_investigation(fp: str, path: Path | None = None) -> InvestigationRecord 
     return matches[-1] if matches else None
 
 
+def get_investigation_for(ref: str, path: Path | None = None) -> InvestigationRecord | None:
+    """Look a run up by whichever id the caller happens to be holding.
+
+    `fp` groups by alert instance, so several runs share it and
+    `get_investigation` deliberately returns the newest of them. A caller that
+    already resolved a specific `run_id` — the labeling path does — must not be
+    handed a sibling run's evidence, so run_id is tried first and fp is only
+    the fallback.
+    """
+    records = _load(path)
+    by_run = [r for r in records if r.run_id and r.run_id == ref]
+    if by_run:
+        return by_run[-1]
+    by_fp = [r for r in records if r.fp == ref]
+    return by_fp[-1] if by_fp else None
+
+
 def list_investigations(limit: int = 50, path: Path | None = None) -> list[dict[str, Any]]:
     """Most-recent-first list, with the CE correctness verdict merged in. The
     same fp can appear once per run; we keep the latest per fp."""

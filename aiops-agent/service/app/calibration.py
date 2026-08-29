@@ -182,6 +182,24 @@ def default_grading_mode(fp: str, path: Path | None = None) -> str:
     return CULPRIT if blamed else INCONCLUSIVE
 
 
+def _evidence_sufficient(ref: str, path: Path | None = None) -> bool | None:
+    """Did the stopping rule think this run had established anything?
+
+    None when nothing was recorded — rows predate the gate, or the lookup
+    failed — and that must stay distinguishable from False, because the case
+    layer only refuses to build precedent on an explicit False.
+    """
+    try:
+        from .investigations import get_investigation_for
+
+        inv = get_investigation_for(ref, path)
+    except Exception:
+        return None
+    if inv is None or inv.sufficiency is None:
+        return None
+    return bool(inv.sufficiency.sufficient)
+
+
 def label_run(
     run_id: str,
     correct: bool,
@@ -240,6 +258,7 @@ def label_run(
             root_cause=row.get("summary") or row.get("hypothesis") or "",
             run_id=run_id,
             correction_note=row.get("correction_note"),
+            evidence_sufficient=_evidence_sufficient(run_id, path),
             path=path,
         )
         logger.info("case %s after label(%s): %s", row["case_key"], source, verdict)

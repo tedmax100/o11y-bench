@@ -167,11 +167,12 @@ def confirm_from_label(
     run_id: str,
     resolution: dict | None = None,
     correction_note: str | None = None,
+    evidence_sufficient: bool | None = None,
     path=None,
 ) -> str:
     """Turn one labeled run into what the case now knows. Returns what it did
-    ('confirmed' / 'false_positive' / 'disproved' / 'ignored') so callers can
-    log it.
+    ('confirmed' / 'false_positive' / 'disproved' / 'insufficient_evidence' /
+    'ignored') so callers can log it.
 
     The split matters more than it looks. A `culprit`-graded correct run is
     precedent. An `inconclusive`-graded correct run means "it rightly blamed
@@ -205,6 +206,24 @@ def confirm_from_label(
         if grading_mode != store.CULPRIT:
             # Unknown provenance fails closed: this text ends up in a prompt.
             return "ignored"
+        if evidence_sufficient is False:
+            # The stopping rule already said this run did not establish its
+            # conclusion. A person pressing Correct on it is agreeing with a
+            # guess, and a guess is not precedent — the case stays unlabelled
+            # so somebody can state the cause outright, on the endpoint that
+            # says so. Found the hard way: a run whose own summary opened with
+            # "the investigation is inconclusive" became the top recalled prior
+            # for the next payment incident, because it had filled in
+            # `suspected_version` and so was graded on the culprit ruler.
+            # `None` (nothing recorded) is not `False`: rows written before the
+            # gate existed still confirm.
+            logger.info(
+                "case %s not confirmed from %s: sufficiency gate says the run's "
+                "evidence was insufficient",
+                case_key,
+                run_id,
+            )
+            return "insufficient_evidence"
         ok = store.case_confirm(
             case_key,
             root_cause=root_cause,

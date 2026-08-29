@@ -896,3 +896,69 @@ def test_a_case_from_another_alert_is_labelled_in_the_prompt(monkeypatch, tmp_pa
     # both still carry the cause; the label weakens the claim, it does not hide it
     assert "new_validator rejects odd cents" in same
     assert "new_validator rejects odd cents" in other
+
+
+def _inv_row_with_sufficiency(p, *, fp, run_id, summary, sufficient, case_key=None):
+    rec = investigations.InvestigationRecord(
+        fp=fp,
+        run_id=run_id,
+        ts="2026-08-28T16:46:18Z",
+        alertname="PaymentDeclineRateHigh",
+        service="payment-service",
+        summary=summary,
+        suspected_version="v2.5.0",
+        services=["payment-service"],
+        sufficiency={"sufficient": sufficient, "checks": []},
+    )
+    store.inv_insert(fp, rec.ts, rec.model_dump_json(), p, run_id=run_id, case_key=case_key)
+
+
+def _cal_row(p, *, run_id, fp, summary, case_key):
+    store.cal_insert(
+        run_id=run_id,
+        ts="2026-08-28T16:46:18Z",
+        confidence=0.4,
+        summary=summary,
+        hypothesis="h",
+        suspected_version="v2.5.0",
+        services=["payment-service"],
+        grading_mode=store.CULPRIT,
+        fp=fp,
+        case_key=case_key,
+        path=p,
+    )
+
+
+def test_a_run_the_gate_called_insufficient_never_becomes_precedent(monkeypatch, tmp_path):
+    """The live shape: a run whose own summary opened with "the investigation is
+    inconclusive" still filled in `suspected_version`, so it was graded on the
+    culprit ruler, somebody pressed Correct, and that sentence became the top
+    recalled prior for the next payment incident. Agreeing with a guess is not
+    precedent."""
+    p = _cfg(monkeypatch, tmp_path)
+    with _scope() as sc:
+        case_memory.observe(sc, path=p)
+    summary = "The investigation is inconclusive; telemetry stores are empty."
+    _inv_row_with_sufficiency(
+        p, fp="fp1", run_id="fp1-run-a", summary=summary, sufficient=False, case_key=sc.case_key
+    )
+    _cal_row(p, run_id="fp1-run-a", fp="fp1", summary=summary, case_key=sc.case_key)
+
+    assert calibration.label_run("fp1-run-a", correct=True, source="ui", path=p) is True
+    assert store.case_get(sc.case_key, p)["root_cause"] is None
+    assert store.case_query_similar("payment-service", path=p) == []
+
+
+def test_a_sufficient_run_still_confirms(monkeypatch, tmp_path):
+    """The guard reads the gate's verdict, not the presence of a verdict."""
+    p = _cfg(monkeypatch, tmp_path)
+    with _scope() as sc:
+        case_memory.observe(sc, path=p)
+    summary = "new_validator rejects odd cents"
+    _inv_row_with_sufficiency(
+        p, fp="fp1", run_id="fp1-run-a", summary=summary, sufficient=True, case_key=sc.case_key
+    )
+    _cal_row(p, run_id="fp1-run-a", fp="fp1", summary=summary, case_key=sc.case_key)
+
+    assert calibration.label_run("fp1-run-a", correct=True, source="ui", path=p) is True
+    assert store.case_get(sc.case_key, p)["root_cause"] == summary
