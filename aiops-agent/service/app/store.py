@@ -1991,10 +1991,121 @@ def action_outcome_put(
         )
 
 
+# Terminal states in which something actually touched the cluster, so there is a
+# real outcome for a person to grade. REFUSED / ABORTED / REJECTED / EXPIRED are
+# excluded on purpose: nothing ran, so "did the fix work" has no referent, and
+# counting them would quietly pad the AE-SLO denominator with non-events.
+#
+# This lives here rather than in the API layer because the *denominator* is a
+# storage question: the set of things that ran is a join away from the set of
+# things that were graded, and the gap between them was invisible for as long as
+# only the request handler knew which statuses counted.
+GRADABLE_STATUSES = frozenset(
+    {
+        "succeeded",
+        "failed",
+        "verify_failed",
+        "rolled_back",
+        "rollback_failed",
+    }
+)
+
+# SQL-side mirror of `action_requests.is_drill`, which reads the alert's own
+# labels. Duplicated deliberately and narrowly: importing action_requests here
+# would be a cycle, and the alternative — pulling every row into Python to ask
+# one boolean — makes the coverage query scan-and-discard.
+_DRILL_SQL = "LOWER(COALESCE(json_extract(r.params, '$.drill'), '')) IN ('true','1','yes')"
+
+
+def ungraded_actions(limit: int = 50, path: str | Path | None = None) -> list[dict]:
+    """Actions that really ran and that nobody has passed a verdict on.
+
+    The backlog this returns is the AE-SLO's missing numerator. Nine actions had
+    executed and three had been graded — and because `ae_slo` divided by the
+    graded set, the other six were not a low score, they were not visible at all.
+    An ungraded execution is an open question, so it needs an address the way
+    `cases_to_label` gives unlabelled runs one.
+    """
+    marks = ",".join("?" * len(GRADABLE_STATUSES))
+    with _connect(path) as conn:
+        rows = conn.execute(
+            "SELECT r.request_id, r.fp, r.action, r.args, r.status, r.created_ts, "
+            f"       r.actor, r.outcome, {_DRILL_SQL} AS drill "
+            "FROM action_requests r "
+            "LEFT JOIN action_outcomes o ON o.request_id = r.request_id "
+            f"WHERE r.status IN ({marks}) AND o.request_id IS NULL "
+            "ORDER BY r.created_ts DESC LIMIT ?",
+            (*sorted(GRADABLE_STATUSES), limit),
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["args"] = json.loads(d["args"] or "{}")
+        d["drill"] = bool(d["drill"])
+        out.append(d)
+    return out
+
+
+def _grading_coverage(path: str | Path | None = None) -> dict:
+    """How much of what ran has actually been graded, split the same way the
+    ratio is split, so a drill cannot cover for a production execution."""
+    marks = ",".join("?" * len(GRADABLE_STATUSES))
+    with _connect(path) as conn:
+        rows = conn.execute(
+            f"SELECT {_DRILL_SQL} AS is_drill, COUNT(*) AS ran, "
+            "       SUM(CASE WHEN o.request_id IS NULL THEN 0 ELSE 1 END) AS graded "
+            "FROM action_requests r "
+            "LEFT JOIN action_outcomes o ON o.request_id = r.request_id "
+            f"WHERE r.status IN ({marks}) GROUP BY {_DRILL_SQL}",
+            tuple(sorted(GRADABLE_STATUSES)),
+        ).fetchall()
+    by = {"incidents": {"ran": 0, "graded": 0}, "drills": {"ran": 0, "graded": 0}}
+    for r in rows:
+        key = "drills" if r["is_drill"] else "incidents"
+        by[key] = {"ran": r["ran"], "graded": int(r["graded"] or 0)}
+    for v in by.values():
+        v["ungraded"] = v["ran"] - v["graded"]
+    return by
+
+
 def action_outcomes(path: str | Path | None = None) -> list[dict]:
     with _connect(path) as conn:
         rows = conn.execute("SELECT * FROM action_outcomes ORDER BY ts DESC").fetchall()
     return [dict(r) for r in rows]
+
+
+def proposal_disposition(path: str | Path | None = None) -> dict:
+    """What happened to the proposals, counted separately from what happened to
+    the actions.
+
+    These rows are deliberately outside the AE-SLO — nothing ran, so "did the fix
+    work" has no referent. But they are not nothing either: `expired` means the
+    agent proposed something and no human ever pressed anything before the TTL
+    ran out, and that count went 10 -> 13 over a week. A rising expiry rate is a
+    statement about the operators' trust or attention, not about the remediation,
+    and it needs somewhere to be read that is not the effectiveness ratio.
+    """
+    with _connect(path) as conn:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS n FROM action_requests GROUP BY status"
+        ).fetchall()
+    by_status = {r["status"]: r["n"] for r in rows}
+    decided = sum(n for st, n in by_status.items() if st != "proposed")
+    expired = by_status.get("expired", 0)
+    return {
+        "by_status": by_status,
+        "open": by_status.get("proposed", 0),
+        "expired": expired,
+        "expiry_rate": round(expired / decided, 3) if decided else None,
+        "note": (
+            "no proposal has reached a terminal state yet"
+            if not decided
+            else f"{expired} of {decided} decided proposals expired unanswered — "
+            "nobody pressed anything before the approval TTL elapsed"
+            if expired
+            else "every decided proposal got an answer before its TTL"
+        ),
+    }
 
 
 def ae_slo(min_n: int = 5, path: str | Path | None = None) -> dict:
@@ -2009,23 +2120,45 @@ def ae_slo(min_n: int = 5, path: str | Path | None = None) -> dict:
        omitted entirely rather than rendered small.
     2. **Drills never join the incident ratio.** They are reported beside it, so
        a rehearsal cannot flatter (or ruin) the number that describes production.
+
+    And one added on 2026-08-30, for a way of being wrong that neither of those
+    catches: **the ratio's denominator is what was graded, not what ran.** Nine
+    actions had touched the cluster and three had a verdict, so the SLO was
+    describing a third of its own subject and saying nothing about the rest. An
+    ungraded execution is not a failure and must not be counted as one — but it
+    is also not absent, so `coverage` now travels beside every ratio, and a
+    ratio that covers less than half of what ran is reported with the warning
+    attached rather than on its own.
     """
     rows = action_outcomes(path)
+    coverage = _grading_coverage(path)
 
-    def summarize(subset: list[dict]) -> dict:
+    def summarize(subset: list[dict], cov: dict) -> dict:
         n = len(subset)
         effective = sum(1 for r in subset if r["resolved"] and not r["side_effect"])
         out = {"n": n, "effective": effective, "raw": f"{effective}/{n}"}
         out["rate"] = round(effective / n, 3) if n >= min_n else None
+        out["coverage"] = {
+            **cov,
+            "fraction": round(cov["graded"] / cov["ran"], 3) if cov["ran"] else None,
+        }
+        notes = []
         if n < min_n:
-            out["note"] = f"n={n} below the reporting floor of {min_n}; ratio withheld"
+            notes.append(f"n={n} below the reporting floor of {min_n}; ratio withheld")
+        if cov["ungraded"]:
+            notes.append(
+                f"{cov['ungraded']} of {cov['ran']} executed actions have no verdict; "
+                "this ratio describes only the graded ones"
+            )
+        if notes:
+            out["note"] = "; ".join(notes)
         return out
 
     graded = [r for r in rows if r["verify_said"] is not None]
     disagreements = [r for r in graded if bool(r["verify_said"]) != bool(r["resolved"])]
     return {
-        "incidents": summarize([r for r in rows if not r["drill"]]),
-        "drills": summarize([r for r in rows if r["drill"]]),
+        "incidents": summarize([r for r in rows if not r["drill"]], coverage["incidents"]),
+        "drills": summarize([r for r in rows if r["drill"]], coverage["drills"]),
         "verify_agreement": {
             "graded": len(graded),
             "disagreed": len(disagreements),

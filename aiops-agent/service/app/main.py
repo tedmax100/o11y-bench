@@ -206,19 +206,10 @@ async def alerts_provision(spec: AlertSpec):
 # Strong refs to in-flight executor tasks so the loop doesn't GC them mid-run.
 _executor_tasks: set[asyncio.Task] = set()
 
-# Terminal states in which something actually touched the cluster, so there is a
-# real outcome for a person to grade. REFUSED / ABORTED / REJECTED / EXPIRED are
-# excluded on purpose: nothing ran, so "did the fix work" has no referent, and
-# counting them would quietly pad the AE-SLO denominator with non-events.
-_GRADABLE_STATUSES = frozenset(
-    {
-        "succeeded",
-        "failed",
-        "verify_failed",
-        "rolled_back",
-        "rollback_failed",
-    }
-)
+# Which terminal states really touched the cluster. The definition moved into
+# the store, because the same set decides both who may be graded and what the
+# AE-SLO's denominator is, and two copies would have let those drift apart.
+_GRADABLE_STATUSES = store.GRADABLE_STATUSES
 
 
 def _spawn_executor(request_id: str) -> None:
@@ -462,6 +453,15 @@ async def todo(limit: int = 20):
     cases = store.case_list(unlabeled=True, limit=limit)
     out["cases_to_label"] = {"count": cases["total"], "items": cases["cases"]}
 
+    # The fourth queue, added once the AE-SLO's denominator was looked at: nine
+    # actions had run and three had a verdict, and the six without one appeared
+    # on no list at all. "Did the incident actually end" is the one question in
+    # this system that only a person can answer, and it was the only piece of
+    # human work with no entry point — which is the same reason the other three
+    # queues exist.
+    ungraded = store.ungraded_actions(limit=200)
+    out["actions_to_grade"] = {"count": len(ungraded), "items": ungraded[:limit]}
+
     try:
         out["autonomy"] = governance.autonomy_status()
     except Exception as e:  # a broken gate reading must not hide the queues
@@ -593,11 +593,29 @@ async def actions_grade_outcome(request_id: str, body: ActionOutcomeRequest):
 
 @app.get("/actions/ae-slo")
 async def actions_ae_slo():
-    """Action Effectiveness SLO, drills reported separately from incidents and no
-    percentage below the reporting floor."""
+    """Action Effectiveness SLO, drills reported separately from incidents, no
+    percentage below the reporting floor, and every ratio carrying the share of
+    executed actions it was actually computed from."""
     from . import store as _store
 
-    return _store.ae_slo()
+    slo = _store.ae_slo()
+    slo["proposals"] = _store.proposal_disposition()
+    return slo
+
+
+@app.get("/actions/outcomes/pending")
+async def actions_outcomes_pending(limit: int = 50):
+    """The grading backlog: actions that ran and that nobody has judged.
+
+    Without this list the missing verdicts had no address — the SLO divided by
+    the graded rows, so an execution nobody looked at was indistinguishable from
+    an execution that never happened. Same role `cases_to_label` plays for the
+    calibration pool.
+    """
+    from . import store as _store
+
+    rows = _store.ungraded_actions(limit=limit)
+    return {"count": len(rows), "pending": rows}
 
 
 @app.get("/actions/fix-efficacy")

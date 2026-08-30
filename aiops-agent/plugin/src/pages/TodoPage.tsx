@@ -40,6 +40,20 @@ type PendingRequest = {
   expires_ts: string;
 };
 
+// An action that really ran and that nobody has passed a verdict on. This is
+// the AE-SLO's missing numerator: nine had executed, three had been graded, and
+// because the ratio divided by the graded rows the other six were not a low
+// score — they were not on any screen at all.
+type UngradedAction = {
+  request_id: string;
+  fp: string;
+  action: string;
+  status: string;
+  created_ts: string;
+  drill: boolean;
+  outcome: string;
+};
+
 type Gate = { gate: string; proven_good: boolean; note: string };
 
 type Autonomy = {
@@ -69,6 +83,7 @@ type Todo = {
   investigations_to_label: { count: number; items: PendingRun[] };
   requests_to_decide: { count: number; items: PendingRequest[]; expired_unattended: number };
   cases_to_label: { count: number; items: Case[] };
+  actions_to_grade: { count: number; items: UngradedAction[] };
   autonomy: Autonomy;
 };
 
@@ -117,6 +132,7 @@ function TodoPage({ agentServiceUrl }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [decidingId, setDecidingId] = useState<string | null>(null);
   const [labelingFp, setLabelingFp] = useState<string | null>(null);
+  const [gradingId, setGradingId] = useState<string | null>(null);
   const [wrongModal, setWrongModal] = useState<WrongModalState | null>(null);
 
   const load = useCallback(async () => {
@@ -170,6 +186,32 @@ function TodoPage({ agentServiceUrl }: Props) {
   // and the way to clear it were two clicks and one context switch apart. The
   // endpoint is the same one — a verdict from here is not a different kind of
   // verdict.
+  // "Did the incident actually end" is a different question from "was the root
+  // cause right", and it has a different endpoint on purpose — grading a wrong
+  // remediation by clicking Wrong on the investigation would put the mistake in
+  // the culprit calibration curve, which is not what that curve measures.
+  const grade = useCallback(
+    async (requestId: string, resolved: boolean, sideEffect: boolean) => {
+      setGradingId(requestId);
+      try {
+        const res = await fetch(`${agentServiceUrl}/actions/requests/${requestId}/outcome`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ resolved, side_effect: sideEffect, actor: 'oncall' }),
+        });
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+        await load();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setGradingId(null);
+      }
+    },
+    [agentServiceUrl, load]
+  );
+
   const label = useCallback(
     async (fp: string, correct: boolean, errorDimension?: string, correctionNote?: string) => {
       setLabelingFp(fp);
@@ -331,6 +373,55 @@ function TodoPage({ agentServiceUrl }: Props) {
                       onClick={() => setWrongModal({ fp: r.fp, errorDimension: 'root_cause', correctionNote: '' })}
                     >
                       Wrong
+                    </Button>
+                  </Stack>
+                </div>
+              ))}
+            </div>
+
+            <div className={styles.card}>
+              <Stack direction="row" gap={1} alignItems="center">
+                <h4 className={styles.h4}>Actions waiting on a verdict</h4>
+                <Badge
+                  text={String(todo.actions_to_grade.count)}
+                  color={todo.actions_to_grade.count ? 'orange' : 'green'}
+                />
+                <span className={styles.reason}>
+                  these ran; until somebody says whether the incident ended, they are missing from
+                  the effectiveness ratio rather than counted against it
+                </span>
+              </Stack>
+              {todo.actions_to_grade.items.map((a) => (
+                <div key={a.request_id} className={styles.row}>
+                  <code>{a.action}</code>
+                  <Badge text={a.status} color={a.status === 'succeeded' ? 'blue' : 'red'} />
+                  {/* A rehearsal is graded too, but into its own ratio. */}
+                  {a.drill && <Badge text="drill" color="purple" />}
+                  <span className={styles.reason}>ran {a.created_ts}</span>
+                  <Stack direction="row" gap={1}>
+                    <Button
+                      size="sm"
+                      variant="primary"
+                      disabled={gradingId === a.request_id}
+                      onClick={() => grade(a.request_id, true, false)}
+                    >
+                      Incident ended
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      disabled={gradingId === a.request_id}
+                      onClick={() => grade(a.request_id, true, true)}
+                    >
+                      Ended, broke something
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="destructive"
+                      disabled={gradingId === a.request_id}
+                      onClick={() => grade(a.request_id, false, false)}
+                    >
+                      Still open
                     </Button>
                   </Stack>
                 </div>

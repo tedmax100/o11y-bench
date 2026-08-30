@@ -21,6 +21,20 @@ const TODO = {
   },
   requests_to_decide: { count: 0, items: [], expired_unattended: 10 },
   cases_to_label: { count: 1, items: [] },
+  actions_to_grade: {
+    count: 1,
+    items: [
+      {
+        request_id: 'req1',
+        fp: 'fp1',
+        action: 'k8s.configmap_flag_set',
+        status: 'succeeded',
+        created_ts: '2026-08-22T15:15:52Z',
+        drill: false,
+        outcome: '',
+      },
+    ],
+  },
   autonomy: {
     granted: false,
     actions_enabled: false,
@@ -46,6 +60,13 @@ const TODO = {
 
 function mockFetch(body: unknown, ok = true) {
   global.fetch = jest.fn().mockResolvedValue({ ok, status: ok ? 200 : 500, json: async () => body }) as jest.Mock;
+}
+
+function outcomeCall() {
+  const calls = (global.fetch as jest.Mock).mock.calls;
+  // The grade handler reloads /todo straight after posting, so "the last call"
+  // is the GET, not the verdict.
+  return calls.filter((c) => String(c[0]).endsWith('/outcome')).at(-1)!;
 }
 
 describe('TodoPage', () => {
@@ -114,5 +135,39 @@ describe('TodoPage', () => {
     mockFetch({}, false);
     render(<TodoPage agentServiceUrl="http://agent" />);
     await waitFor(() => expect(screen.getByText('Could not load the queue')).toBeInTheDocument());
+  });
+
+  it('an executed action nobody graded is a queue, and grading it posts the outcome', async () => {
+    // The bug: the AE-SLO divided by the graded rows, so this row was not a bad
+    // score anywhere — it was on no screen at all.
+    mockFetch(TODO);
+    render(<TodoPage agentServiceUrl="http://agent" />);
+
+    await waitFor(() => expect(screen.getByText('k8s.configmap_flag_set')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('Incident ended'));
+
+    await waitFor(() =>
+      expect(global.fetch).toHaveBeenCalledWith(
+        'http://agent/actions/requests/req1/outcome',
+        expect.objectContaining({ method: 'POST' })
+      )
+    );
+    const body = JSON.parse(outcomeCall()[1].body);
+    expect(body).toEqual({ resolved: true, side_effect: false, actor: 'oncall' });
+  });
+
+  it('"ended but broke something" is not the same verdict as "ended"', async () => {
+    // The SLO asks about effectiveness, so a fix with a side effect has to be
+    // recordable as one rather than rounded to success.
+    mockFetch(TODO);
+    render(<TodoPage agentServiceUrl="http://agent" />);
+
+    await waitFor(() => expect(screen.getByText('Ended, broke something')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('Ended, broke something'));
+
+    await waitFor(() => expect(outcomeCall()).toBeDefined());
+    const body = JSON.parse(outcomeCall()[1].body);
+    expect(body.resolved).toBe(true);
+    expect(body.side_effect).toBe(true);
   });
 });

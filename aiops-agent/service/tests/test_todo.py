@@ -100,3 +100,29 @@ def test_autonomy_reports_the_distance_left(monkeypatch, tmp_path):
     # Every blocker carries the sentence that says why, so the UI never has to
     # invent one.
     assert all(g["note"] for g in auto["blockers"])
+
+
+def test_an_executed_action_nobody_graded_is_on_the_list(monkeypatch, tmp_path):
+    """The AE-SLO divided by the graded rows, so an execution nobody judged was
+    indistinguishable from one that never happened — including here, the one
+    place that is supposed to show what a person still owes."""
+    c, p = _client(monkeypatch, tmp_path)
+    ran = create_from_decision("fp1", _decision(), args={}, path=p)
+    store.ar_transition(ran.request_id, "proposed", "succeeded", path=p)
+    judged = create_from_decision("fp2", _decision(), args={}, path=p)
+    store.ar_transition(judged.request_id, "proposed", "succeeded", path=p)
+    store.action_outcome_put(request_id=judged.request_id, resolved=True, actor="oncall", path=p)
+
+    body = c.get("/todo").json()["actions_to_grade"]
+    assert body["count"] == 1
+    assert [r["request_id"] for r in body["items"]] == [ran.request_id]
+
+
+def test_a_proposal_nobody_ran_is_not_something_to_grade(monkeypatch, tmp_path):
+    """It belongs in `requests_to_decide`. Grading it would put a verdict in the
+    ledger for something that never touched the cluster."""
+    c, p = _client(monkeypatch, tmp_path)
+    create_from_decision("fp1", _decision(), args={}, path=p)
+    body = c.get("/todo").json()
+    assert body["actions_to_grade"]["count"] == 0
+    assert body["requests_to_decide"]["count"] == 1
