@@ -7,15 +7,27 @@ journeys: [checkout]
 git_version: v4.0.0
 freshness_seconds: 60
 supported_decisions: [rca]
-slis: []          # no custom RED metrics; relies on auto HTTP + Loki
+slis:
+  # Attempts, not inbound requests. These two numbers are equal until the
+  # gateway starts retrying, and the gap between them is the only place a
+  # retry storm is visible as a cause rather than as a symptom.
+  - kind: throughput
+    promql: 'sum by (upstream) (rate(gateway_upstream_attempts_total[5m]))'
+    objective: "roughly equal to inbound request rate"
+    unit: rps
+  - kind: error
+    promql: '(sum(rate(gateway_upstream_attempts_total{retry="true"}[5m])) or vector(0)) / clamp_min(sum(rate(gateway_upstream_attempts_total[5m])) or vector(0), 1)'
+    objective: "retry_share < 1%"
+    unit: ratio
 logs:
   selector: '{service_name="api-gateway"}'
-  error_events: [http.request_failed]
+  error_events: [http.request_failed, http.request_retried]
   error_query: 'sum by (upstream, status) (count_over_time({service_name="api-gateway"} | event="http.request_failed" [5m]))'
-  note: "http.request_failed carries upstream + status + reason. Selector key is service_name (NOT service); the `upstream` field points at the failing downstream."
+  note: "http.request_failed carries upstream + status + reason. Selector key is service_name (NOT service); the `upstream` field points at the failing downstream. event=\"http.request_retried\" is a separate event carrying upstream + status + attempt — it is emitted only when the gateway sends the same inbound request downstream again."
 exclusions:
-  - "No custom application metrics: derive latency/throughput from the auto HTTP server histogram (discover_metrics for the exact name), and errors from Loki event=http.request_failed (carries upstream + status)."
+  - "Inbound latency has no custom metric: derive it from the auto HTTP server histogram (discover_metrics for the exact name). Inbound errors come from Loki event=http.request_failed (carries upstream + status). The one custom metric here, gateway_upstream_attempts_total, counts OUTBOUND attempts and is not an inbound request count."
   - "It's a thin proxy — a failure here is usually a *symptom* of a failing downstream (user/order/payment), not an api-gateway bug."
+  - "One caveat to the line above: the gateway may send the same inbound request downstream more than once. A retried call is indistinguishable from a real one at the callee, so downstream call and error counts include the gateway's retries. `gateway_upstream_attempts_total{retry=\"true\"}` and Loki event=\"http.request_retried\" are the only signals that separate them."
 depends_on:
   - {callee: user-service}
   - {callee: order-service}

@@ -15,10 +15,12 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from o11y_shared import (
     BizEvent,
+    FeatureFlags,
     get_logger,
     log_event,
     setup_stdout_json_logging,
 )
+from opentelemetry import metrics
 
 USER_SERVICE_URL = os.environ.get("USER_SERVICE_URL", "http://user-service.demo.svc:8000")
 ORDER_SERVICE_URL = os.environ.get("ORDER_SERVICE_URL", "http://order-service.demo.svc:8000")
@@ -27,6 +29,23 @@ PAYMENT_SERVICE_URL = os.environ.get("PAYMENT_SERVICE_URL", "http://payment-serv
 setup_stdout_json_logging(level=os.environ.get("LOG_LEVEL", "INFO"))
 
 _log = get_logger("api_gateway")
+_flags = FeatureFlags(file_path=os.environ.get("FEATURE_FLAGS_PATH"))
+
+# How many times a single inbound request may be sent downstream when the retry
+# flag is on. 4 attempts, no backoff — the shape of a retry policy written to
+# make a dashboard look better.
+_RETRY_ATTEMPTS = int(os.environ.get("GATEWAY_RETRY_ATTEMPTS", "4"))
+
+_meter = metrics.get_meter("api_gateway")
+# Attempts, not requests. The whole point of this metric is that it can diverge
+# from the inbound request count: when it does, the gateway is generating load
+# that nobody asked for, and no downstream metric can tell you that — from over
+# there an amplified call is indistinguishable from a real one.
+_upstream_attempts = _meter.create_counter(
+    "gateway_upstream_attempts_total",
+    description="Downstream call attempts made by the gateway, including retries",
+)
+
 app = FastAPI(title="api-gateway")
 _log.info("api-gateway started")
 
@@ -50,29 +69,72 @@ async def health() -> dict:
     return {"ok": True}
 
 
+def _upstream_name(url: str) -> str:
+    """`http://user-service.demo.svc:8000/users` -> `user-service`. Low
+    cardinality on purpose: this is a metric label."""
+    host = url.split("//", 1)[-1].split("/", 1)[0]
+    return host.split(".", 1)[0].split(":", 1)[0]
+
+
 async def _proxy(method: str, url: str, request: Request) -> Any:
     assert _client is not None
     body = await request.body()
-    try:
-        resp = await _client.request(
-            method,
-            url,
-            content=body or None,
-            params=dict(request.query_params),
-            headers={"content-type": request.headers.get("content-type", "application/json")}
-            if body
-            else None,
+    upstream = _upstream_name(url)
+
+    # `gateway_retry_all_errors` retries every non-2xx, not just the ones that
+    # might succeed on a second try. A 404 for a product that does not exist is
+    # deterministic, so retrying it is pure amplification: the same inbound
+    # request becomes four downstream calls, and the downstream's error *count*
+    # quadruples while its error *ratio* does not move at all. That gap is the
+    # only honest way to tell the amplifier from the fault, because from the
+    # downstream's side a retried call looks exactly like a real one.
+    attempts = _RETRY_ATTEMPTS if _flags.bool("gateway_retry_all_errors", False) else 1
+
+    resp = None
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = await _client.request(
+                method,
+                url,
+                content=body or None,
+                params=dict(request.query_params),
+                headers={"content-type": request.headers.get("content-type", "application/json")}
+                if body
+                else None,
+            )
+        except httpx.HTTPError as exc:
+            _upstream_attempts.add(1, {"upstream": upstream, "outcome": "network_error"})
+            log_event(
+                _log,
+                BizEvent.REQUEST_FAILED,
+                f"upstream unreachable: {url} ({exc.__class__.__name__})",
+                upstream=url,
+                reason="network",
+            )
+            raise HTTPException(status_code=502, detail="upstream unreachable") from exc
+
+        _upstream_attempts.add(
+            1,
+            {
+                "upstream": upstream,
+                "outcome": "ok" if resp.status_code < 400 else "error",
+                # `retry` is the label that makes the amplification visible from
+                # the gateway's own metrics without joining anything.
+                "retry": str(attempt > 1).lower(),
+            },
         )
-    except httpx.HTTPError as exc:
+        if resp.status_code < 400 or attempt == attempts:
+            break
         log_event(
             _log,
-            BizEvent.REQUEST_FAILED,
-            f"upstream unreachable: {url} ({exc.__class__.__name__})",
+            BizEvent.REQUEST_RETRIED,
+            f"retrying {url} after {resp.status_code} (attempt {attempt} of {attempts})",
             upstream=url,
-            reason="network",
+            status=resp.status_code,
+            attempt=attempt,
         )
-        raise HTTPException(status_code=502, detail="upstream unreachable") from exc
 
+    assert resp is not None
     if resp.status_code >= 500:
         log_event(
             _log,

@@ -131,3 +131,62 @@
     evidence_or_hedge_ceiling: 0.4
     used_tools:
       - k8s_change_provenance
+
+# ---- the amplifier is not the fault ------------------------------------------
+# The two scenarios that existed before this one both put the truth DOWNSTREAM of
+# the symptom: bad-validator keeps cause and symptom in the same service,
+# session-cache moves the cause one hop upstream of the alert. Following the
+# signal gets you there in both. So the case library, the calibration pool and
+# the committed fixture record were all one shape, and re-running any of them
+# only recorded that shape again.
+#
+# This one reverses the arrow. `incident.sh start retry-storm` flips a single
+# flag on api-gateway: it begins retrying every non-2xx four times, including
+# the deterministic 404s the load generator produces on purpose. Nothing
+# downstream changes. But a retried call is indistinguishable from a real one at
+# the callee, so every downstream's error COUNT climbs while its error RATIO
+# does not move, and the services that look worst are the ones that did nothing.
+#
+# Measured on the live cluster at 13:31Z on 2026-08-30, ~4 minutes after the
+# flip, 5 rps of load:
+#
+#   retry share of all outbound attempts     12.4%
+#   gateway attempts → order-service         4.01/s
+#   gateway attempts → user-service          1.07/s
+#   order-service error RATIO                0.0     (unmoved)
+#
+# NOT YET MEASURED over 20 passes, and the numbers above are one sample of the
+# amplification, not of the agent. Nothing here has graded a run yet — the
+# fixture is committed so the next session grades rather than re-derives.
+#
+# `forbid_services` is the check that matters and it was DEAD CONFIG on culprit
+# fixtures until this one needed it (same hole `forbid_versions` had, in the
+# other field). Naming api-gateway while also blaming its victims is not a right
+# answer with a cosmetic flaw — it is the failure this scenario exists to catch.
+- id: gateway-retry-amplification
+  alert:
+    labels:
+      service_name: order-service
+      alertname: OrderServiceErrorVolumeHigh
+      git_version: v3.1.2
+    annotations:
+      summary: "order-service error volume elevated"
+      description: >-
+        Error-event volume on order-service has climbed sharply. Establish
+        whether order-service's own failure rate changed before attributing it.
+    startsAt: now
+  truth:
+    service: api-gateway
+    # No version. The pod template did not change; a flag file did.
+  forbid_versions:
+    - v3.1.2
+  forbid_services:
+    - order-service
+    - user-service
+    - payment-service
+  process:
+    queried_min: 1
+    grounded: true
+    discover_before_retry: true
+    used_tools:
+      - k8s_change_provenance

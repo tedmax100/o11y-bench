@@ -67,13 +67,15 @@ class Fixture(BaseModel):
     alert: dict[str, Any]
     truth: dict[str, Any] = Field(default_factory=dict)
     expect: Literal["culprit", "inconclusive"] = "culprit"
-    # inconclusive-mode knobs (ignored for culprit fixtures):
-    max_confidence: float = 0.6  # appropriately-hedged ceiling
+    max_confidence: float = 0.6  # inconclusive only: appropriately-hedged ceiling
+    # Read in BOTH modes. Inconclusive fixtures use it to catch a confidently
+    # blamed bystander; culprit fixtures to catch an answer that names the right
+    # service and drags its victims along with it.
     forbid_services: list[str] = Field(default_factory=list)
-    # …and never pins it on a version it was primed to suspect. `forbid_services`
-    # cannot catch this on a fixture whose alert names the *right* service: an
-    # agent that inherits a past case's culprit blames the correct service for
-    # the wrong reason, and the service check waves it through.
+    # …and never pins it on a version it was primed to suspect. The service
+    # check cannot catch this on a fixture whose alert names the *right*
+    # service: an agent that inherits a past case's culprit blames the correct
+    # service for the wrong reason, and the service check waves it through.
     # Read in BOTH modes: inconclusive fixtures use it to catch an inherited
     # culprit, culprit fixtures to catch the config-vs-deploy confusion (right
     # service, wrong kind of cause).
@@ -212,6 +214,20 @@ def grade_run(findings: Any, fixture: Fixture) -> tuple[bool, bool, bool | None]
     # `blames_forbidden_version` for why it reads the prose and not just the
     # field: fixing the field moved the failure, it did not remove it.
     if blames_forbidden_version(findings, fixture.forbid_versions):
+        correct = False
+    # The same hole `forbid_versions` had, in the other field, found by writing
+    # the first fixture that needs it: a culprit-mode fixture could declare
+    # `forbid_services` and have it silently ignored. It is not decoration on
+    # this kind of incident — for a retry storm the whole question is whether
+    # the answer blames the services whose error counts moved, and naming
+    # api-gateway *while also* blaming its victims is not a right answer with a
+    # cosmetic flaw. Only `services` is read, not the prose: unlike a version
+    # string, a service name legitimately appears in a correct explanation of
+    # what broke downstream, so substring-matching prose would fail the best
+    # answers. See [[aiops-provenance-is-a-step]] for why the blunt version of
+    # that check was kept over a cleverer one.
+    blamed = {s.lower() for s in (getattr(findings, "services", []) or [])}
+    if any(s.lower() in blamed for s in fixture.forbid_services):
         correct = False
     return correct, service_hit, version_hit
 

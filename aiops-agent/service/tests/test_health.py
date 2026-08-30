@@ -71,10 +71,12 @@ async def test_query_none_is_unavailable(monkeypatch):
 
 
 async def test_neighbor_without_contract_is_unjudgeable_not_dropped(monkeypatch):
-    # api-gateway declares no SLIs. Dropping it silently used to let the verdict
-    # line claim it was healthy, so it now comes back as an explicit verdict.
+    # webapp declares no SLIs. Dropping it silently used to let the verdict line
+    # claim it was healthy, so it now comes back as an explicit verdict. (This
+    # was api-gateway until it grew a retry-share SLI for the retry-storm
+    # scenario — the subject is "a service with no error SLI", not the gateway.)
     monkeypatch.setattr(health, "_instant_scalar", _fake_scalar({}))
-    h = await health._evaluate("api-gateway", "upstream")
+    h = await health._evaluate("webapp", "upstream")
     assert h is not None
     assert h.verdict == "unjudgeable"
 
@@ -144,20 +146,20 @@ async def test_downstream_unhealthy_impact_rising_is_symptom(monkeypatch):
 
 
 async def test_downstream_unhealthy_no_attribution_falls_back(monkeypatch):
-    # api-gateway declares no attribution edges, so impact can't be measured →
-    # fall back to s4.1 cautious wording (confirm before claiming symptom).
+    # webapp declares no attribution edges, so impact can't be measured → fall
+    # back to s4.1 cautious wording (confirm before claiming symptom).
     monkeypatch.setattr(
         health,
         "_instant_scalar",
         _fake_scalar(
             {
-                "payment_charges_total": 0.12,  # payment unhealthy
+                "gateway_upstream_attempts_total": 0.12,  # api-gateway unhealthy
             }
         ),
     )
-    block = await evaluate_dependency_health(["api-gateway"])
-    assert "downstream payment-service: error 12.0% — UNHEALTHY" in block
-    # api-gateway has no SLI of its own: the verdict must NOT claim it is healthy.
+    block = await evaluate_dependency_health(["webapp"])
+    assert "downstream api-gateway: error 12.0% — UNHEALTHY" in block
+    # webapp has no SLI of its own: the verdict must NOT claim it is healthy.
     assert "HEALTHY SLIs themselves" not in block
     assert "could NOT be judged from metrics" in block
     assert "CONFIRM they actually see failures attributed to that dependency" in block
@@ -201,7 +203,6 @@ async def test_service_without_sli_is_stated_not_dropped(monkeypatch):
     block = await evaluate_dependency_health(["webapp"])
     assert block is not None
     assert "this service webapp: no error SLI declared — CANNOT be judged" in block
-    assert "downstream api-gateway: no error SLI declared — CANNOT be judged" in block
 
 
 async def test_root_cause_verdict_does_not_clear_unjudgeable_deps(monkeypatch):

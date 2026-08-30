@@ -14,6 +14,14 @@
 #                   store. The alert fires on ORDER-service; the cause is one
 #                   hop upstream. Nothing about it is visible from order-service
 #                   metrics alone — that is what it is for.
+#   retry-storm     api-gateway starts retrying every non-2xx four times. Both
+#                   scenarios above put the truth downstream of the symptom, so
+#                   following the signal gets you there. This one reverses it:
+#                   the services with the worst numbers (user/order, whose error
+#                   COUNTS quadruple) did not change, and the service that did
+#                   change looks like a victim. The discriminator is rate vs
+#                   ratio — every downstream error ratio is flat — plus the
+#                   gateway's own retry attempts, which no downstream can see.
 set -euo pipefail
 
 NS="${NAMESPACE:-demo}"
@@ -38,6 +46,16 @@ case "${ACTION}:${SCENARIO}" in
   stop:session-cache)
     flag user-flags user_session_cache_disabled false
     ;;
+  start:retry-storm)
+    flag gateway-flags gateway_retry_all_errors true
+    echo "[incident] api-gateway now retries every non-2xx up to 4 times."
+    echo "[incident] The flag file is projected from the ConfigMap, so it takes"
+    echo "[incident] up to ~60s to land. No restart, on purpose — a rollout in"
+    echo "[incident] the same minute would give the charts a second explanation."
+    ;;
+  stop:retry-storm)
+    flag gateway-flags gateway_retry_all_errors false
+    ;;
   start:bad-validator)
     flag payment-flags payment_use_new_validator true
     kubectl -n "${NS}" rollout restart deployment/payment-service
@@ -48,13 +66,13 @@ case "${ACTION}:${SCENARIO}" in
     kubectl -n "${NS}" rollout restart deployment/payment-service
     ;;
   status:*)
-    for cm in payment-flags user-flags; do
+    for cm in payment-flags user-flags gateway-flags; do
       printf '%-16s %s\n' "${cm}" \
         "$(kubectl -n "${NS}" get configmap "${cm}" -o jsonpath='{.data.flags\.json}' 2>/dev/null || echo '(missing)')"
     done
     ;;
   *)
-    echo "usage: $0 {start|stop} {session-cache|bad-validator} | $0 status" >&2
+    echo "usage: $0 {start|stop} {session-cache|bad-validator|retry-storm} | $0 status" >&2
     exit 2
     ;;
 esac

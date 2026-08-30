@@ -105,3 +105,23 @@ groups:
     attributes:
       - ref: app.outcome
         requirement_level: required
+
+  - id: metric.app.gateway.upstream.attempts.count
+    type: metric
+    metric_name: app.gateway.upstream.attempts.count
+    stability: development
+    brief: Downstream call attempts made by the gateway, retries included.
+    note: >-
+      Current code metric: `gateway_upstream_attempts_total`. Attempts, not
+      inbound requests: the two are equal until the gateway retries, and the gap
+      between them is the only signal that separates amplified load from real
+      load — at the callee the two are indistinguishable.
+    instrument: counter
+    unit: "{attempt}"
+    attributes:
+      - ref: app.upstream
+        requirement_level: required
+      - ref: app.outcome
+        requirement_level: required
+      - ref: app.retry
+        requirement_level: required

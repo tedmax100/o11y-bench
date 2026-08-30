@@ -455,3 +455,34 @@ async def test_an_unreachable_prometheus_does_not_block_the_run(monkeypatch):
         "startsAt": "2026-08-29T10:30:00Z",
     }
     assert await harness.telemetry_preflight(alert) == ""
+
+
+def test_forbid_services_is_read_on_a_culprit_fixture():
+    """It was dead config outside inconclusive mode — the same hole
+    `forbid_versions` had, in the other field. Naming the right service while
+    dragging its victims along is not a right answer with a cosmetic flaw."""
+    from app.eval.harness import Fixture, grade_run
+
+    fx = Fixture(
+        id="f",
+        alert={},
+        truth={"service": "api-gateway"},
+        forbid_services=["order-service"],
+    )
+    findings = NS(services=["api-gateway", "order-service"], confidence=0.9)
+    correct, service_hit, _ = grade_run(findings, fx)
+    assert service_hit is True  # it did land on the right service…
+    assert correct is False  # …and that is not enough
+
+
+def test_naming_only_the_culprit_still_passes():
+    from app.eval.harness import Fixture, grade_run
+
+    fx = Fixture(
+        id="f",
+        alert={},
+        truth={"service": "api-gateway"},
+        forbid_services=["order-service"],
+    )
+    findings = NS(services=["api-gateway"], confidence=0.9)
+    assert grade_run(findings, fx)[0] is True

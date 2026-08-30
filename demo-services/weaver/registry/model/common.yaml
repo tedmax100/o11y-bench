@@ -79,6 +79,14 @@ groups:
               value: http.request_failed
               brief: An upstream HTTP call failed or returned 5xx.
               stability: development
+            - id: http_request_retried
+              value: http.request_retried
+              brief: >-
+                An edge/proxy service sent the same inbound request downstream
+                again. Deliberately not a failure event: the retry is a decision
+                the caller made, and it is invisible from the callee, where a
+                retried call is indistinguishable from a real one.
+              stability: development
             - id: cache_miss
               value: cache.miss
               brief: A cache lookup missed.
@@ -197,6 +205,24 @@ groups:
               value: user_session
               brief: The user-service session cache in front of the session store.
               stability: development
+
+      - id: app.upstream
+        stability: development
+        brief: >-
+          The downstream service an edge/proxy call was addressed to. Service
+          name only — never a URL or a path, which would make this unbounded.
+        note: "Flat key in current code: `upstream`."
+        type: string
+        examples: [payment-service, order-service, user-service]
+
+      - id: app.retry
+        stability: development
+        brief: >-
+          Whether this outbound attempt was a retry of an earlier one. The
+          attribute exists so retry-amplified load can be separated from real
+          load at the caller, which is the only place that distinction survives.
+        note: "Flat key in current code: `retry` (string \"true\"/\"false\")."
+        type: boolean
 
       - id: app.user.operation
         stability: development
