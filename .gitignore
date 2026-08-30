@@ -31,3 +31,24 @@ tasks-level2/
 .cache
 .agents
 environment/gcx
+
+# Runtime SQLite stores. These are the agent's three ledgers plus their WAL
+# sidecars, rewritten on every run and worth nothing to anyone else — the
+# evidence that has to survive lives in fixture_record.jsonl, which IS tracked.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+# …except this one, which is a committed fixture: a frozen probe snapshot that
+# a test reads. It predates the rule above and must stay visible to git status.
+!aiops-agent/service/app/eval/clock-probe.db
+
+# Screenshots dropped in the repo root by the desktop capture tool.
+Selection_*.jpg
+Selection_*.png
+
+# A separate git repo that lives here for convenience. Adding it would make it
+# an embedded repository: clones of this repo would get an empty directory and
+# no way to fetch the contents.
+demo-services/story-to-handdrawn-video/
