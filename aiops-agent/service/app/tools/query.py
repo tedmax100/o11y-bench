@@ -656,6 +656,28 @@ def _loki_query_hint(logql: str, exc: ToolException) -> ToolException:
     msg = str(exc)
     if "parse error" not in msg and "returned 400" not in msg and "unexpected" not in msg:
         return exc
+    # `count_over_time({...} | event="x" [15m])` with nothing around it is one
+    # series per label combination, and this stack has more than 500 of them, so
+    # Loki refuses the whole query. The generic hint below does mention sum(),
+    # but measured on the home-field bench the model read the 400, apologised,
+    # and asked the user for narrowing advice instead — three rounds out of
+    # three. The missing edit is one function call, and we can write it out.
+    if "maximum of series" in msg or "reached for a single query" in msg:
+        stripped = logql.strip()
+        wrapped = f"sum({stripped})" if _is_metric_logql(stripped) else None
+        lines = [
+            f"{msg}\nHINT: this query returns one series per label combination and "
+            "this environment has more than the limit. Aggregate it away — that is "
+            "an edit to the query, not a reason to narrow the question."
+        ]
+        lines.append(
+            f"Send `{wrapped}` for the single total, or `sum by (<label>) ({stripped})` "
+            "if you want the breakdown."
+            if wrapped
+            else "Wrap the count in `sum(...)`: "
+            "`sum(count_over_time({...} | <filters> [<window>]))`."
+        )
+        return ToolException("\n".join(lines))
     if _selector(logql) is None:
         return ToolException(
             f'{msg}\nHINT: LogQL must START with a stream selector `{{label="..."}}` '

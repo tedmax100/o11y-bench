@@ -284,6 +284,30 @@ def test_tempo_hint_keeps_the_original_error_text():
     assert hint.startswith("connection refused")
 
 
+# ---- the Loki series limit ------------------------------------------------
+
+
+def test_loki_series_limit_hint_writes_the_sum_wrapper():
+    """A count with no sum() around it is one series per label combination.
+
+    The generic pipeline hint already contains the word sum(), and it was not
+    enough: on the home-field bench the model read the 400, apologised, and
+    asked the user how to narrow the question -- three rounds out of three. So
+    the limit gets its own branch, with the rewritten query in it.
+    """
+    exc = ToolException("returned 400: maximum of series (500) reached for a single query")
+    logql = 'count_over_time({service_name="payment-service"} | event="payment.declined"[15m])'
+    hint = str(q._loki_query_hint(logql, exc))
+    assert f"sum({logql})" in hint
+    assert "sum by (<label>)" in hint
+
+
+def test_loki_series_limit_hint_falls_back_when_there_is_nothing_to_wrap():
+    exc = ToolException("returned 400: maximum of series (500) reached for a single query")
+    hint = str(q._loki_query_hint('{service_name="payment-service"}', exc))
+    assert "sum(count_over_time(" in hint
+
+
 # ---- a Tempo call whose filters came in as keywords ------------------------
 
 

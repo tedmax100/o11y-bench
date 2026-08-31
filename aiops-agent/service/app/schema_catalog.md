@@ -122,26 +122,19 @@ sum by (service_name) (count_over_time({deployment_environment="demo"} | event="
 { resource.service.name = "<service>" && status = error }
 ```
 
-### Count vs rate, and where to read git_version
+### Where the identifying fields live
 
-- **"How many / total / volume over the last Nh"** → make the query **metric-shaped**:
-  `sum(count_over_time({...}[Nh]))`, and leave the Loki tool's `queryType` on its
-  default `auto`. A metric-shaped LogQL runs as an instant query and returns the
-  single total; a range query would return one windowed count per step, and those
-  must **not** be averaged/lasted into a total (that yields a per-step number, not
-  the count). Do **not** force `queryType="instant"` yourself: on a raw stream
-  selector (no `count_over_time`/`sum` around it) Loki rejects an instant query
-  outright, and the shape check the tool already runs picks the right one either
-  way. Use range only for trends/charts/raw lines. Same for Prometheus:
-  `sum(increase(<counter>[Nh]))` for a windowed total; `rate(...)` only for a
-  per-second rate or a share.
-- **trace_id, level, event, business fields are structured metadata** — they need
-  a `{...}` stream selector first: `{service_name="x"} | trace_id="y"`, never
-  `trace_id="y"` alone (that's a LogQL parse error).
-- **git_version is everywhere** — a label on every metric and log, and on a trace's
-  resource as `service.version`. To get the version a failing trace ran on, read
-  `resource.service.version` from the trace you already fetched; do **not** go to
-  Loki to "look it up". Never cite a git_version or trace_id that isn't in a tool result.
+This section says where things ARE, not how to call a tool. Rules about which
+arguments to pass live in the tools themselves, which check the call and answer a
+wrong one with the rewrite — a rule repeated here would be a second opinion the
+model follows over the tool's, and measurably was.
+
+- **Stream labels vs structured metadata (Loki).** Indexable stream labels here
+  are `service_name`, `git_repo`, `git_version`, `deployment_environment`.
+  `trace_id`, `level`, `event` and the business fields are structured metadata,
+  not stream labels.
+- **git_version is everywhere** — a label on every metric and every log line, and
+  on a trace's resource as `service.version` (trace searches return it).
 
 ## Feature flags
 
