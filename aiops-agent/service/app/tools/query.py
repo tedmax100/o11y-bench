@@ -685,6 +685,26 @@ async def _query_loki_logs(
     # then average a per-step count series into a wrong total.
     if queryType == "auto":
         queryType = "instant" if _is_metric_logql(logql) else "range"
+    # A forced 'instant' on a raw stream selector is not a query Loki can run at
+    # all — it 400s with "log queries are not supported as an instant query
+    # type". The model reaches for it anyway, because every instruction about
+    # windowed totals says the word "instant"; measured on the home-field bench,
+    # that mis-pick cost a whole task in 6/6 runs and no prompt wording stopped
+    # it.
+    #
+    # Silently demoting it to a range query is worse than the 400: a raw range
+    # query returns at most `limit` lines, so counting them yields a confidently
+    # low number (263 against a true 487, measured) instead of a visible error.
+    # What the caller wanted is a windowed total, and the shape that gives one is
+    # decidable here — so fail with the rewrite instead of guessing.
+    if queryType == "instant" and not _is_metric_logql(logql):
+        raise ToolException(
+            "An instant Loki query needs metric-shaped LogQL; a raw stream selector "
+            "can only run as a range query, and counting its (capped) lines is not a "
+            "total.\nHINT: wrap the selector to get the windowed total in one value: "
+            f"`sum(count_over_time({logql.strip()} [<window>]))` with queryType='instant'. "
+            "Use queryType='range' only when you want to read the lines themselves."
+        )
     try:
         if queryType == "instant":
             # Single value at `end` — the right shape for a windowed total/count.

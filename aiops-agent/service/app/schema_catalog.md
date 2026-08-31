@@ -124,13 +124,17 @@ sum by (service_name) (count_over_time({deployment_environment="demo"} | event="
 
 ### Count vs rate, and where to read git_version
 
-- **"How many / total / volume over the last Nh"** → an **instant** query of
-  `sum(count_over_time({...}[Nh]))` (Loki tool: `queryType="instant"`). It returns
-  the single total. A **range** query returns one windowed count per step — do
-  **not** average/last those into a total (that yields a per-step number, not the
-  count). Use range only for trends/charts/raw lines. Same for Prometheus:
-  `sum(increase(<counter>[Nh]))` instant for a windowed total; `rate(...)` only
-  for a per-second rate or a share.
+- **"How many / total / volume over the last Nh"** → make the query **metric-shaped**:
+  `sum(count_over_time({...}[Nh]))`, and leave the Loki tool's `queryType` on its
+  default `auto`. A metric-shaped LogQL runs as an instant query and returns the
+  single total; a range query would return one windowed count per step, and those
+  must **not** be averaged/lasted into a total (that yields a per-step number, not
+  the count). Do **not** force `queryType="instant"` yourself: on a raw stream
+  selector (no `count_over_time`/`sum` around it) Loki rejects an instant query
+  outright, and the shape check the tool already runs picks the right one either
+  way. Use range only for trends/charts/raw lines. Same for Prometheus:
+  `sum(increase(<counter>[Nh]))` for a windowed total; `rate(...)` only for a
+  per-second rate or a share.
 - **trace_id, level, event, business fields are structured metadata** — they need
   a `{...}` stream selector first: `{service_name="x"} | trace_id="y"`, never
   `trace_id="y"` alone (that's a LogQL parse error).

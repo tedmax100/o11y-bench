@@ -443,6 +443,36 @@ async def test_query_loki_raw_uses_range(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_query_loki_forced_instant_on_raw_selector_is_refused_with_a_rewrite(monkeypatch):
+    """Loki cannot run a raw stream selector as an instant query, and demoting it
+    to a range query silently caps the line count — so the tool refuses and hands
+    back the metric-shaped rewrite that answers the question it was really asked."""
+    mock = AsyncMock()
+    monkeypatch.setattr(q, "_get_json", mock)
+
+    with pytest.raises(ToolException) as exc:
+        await q._query_loki_logs(
+            '{service_name="payment-service"} | event="payment.declined"', queryType="instant"
+        )
+    assert "count_over_time" in str(exc.value)
+    mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_query_loki_forced_instant_kept_for_metric_logql(monkeypatch):
+    fake_resp = {
+        "status": "success",
+        "data": {"resultType": "vector", "result": [{"metric": {}, "value": [1000, "5"]}]},
+    }
+    mock = AsyncMock(return_value=fake_resp)
+    monkeypatch.setattr(q, "_get_json", mock)
+
+    await q._query_loki_logs('sum(count_over_time({service_name="x"} [5m]))', queryType="instant")
+    _, path, _ = mock.call_args[0]
+    assert path == "/loki/api/v1/query"
+
+
+@pytest.mark.asyncio
 async def test_query_loki_parse_error_gets_hint(monkeypatch):
     monkeypatch.setattr(
         q,
