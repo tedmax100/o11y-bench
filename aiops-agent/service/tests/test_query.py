@@ -284,6 +284,47 @@ def test_tempo_hint_keeps_the_original_error_text():
     assert hint.startswith("connection refused")
 
 
+# ---- a Tempo call whose filters came in as keywords ------------------------
+
+
+@pytest.mark.asyncio
+async def test_tempo_kwarg_filters_are_answered_with_the_traceql_they_meant():
+    """The model calls this tool the way the Loki one takes filters.
+
+    A required `traceql` field would make pydantic reject the call before any of
+    our code sees it, and "traceql: Field required" ended the task every time it
+    happened on the away-field bench. So the call is accepted and answered with
+    the query it was trying to write.
+    """
+    with pytest.raises(ToolException) as excinfo:
+        await q._query_tempo_traces(service_name="order-service", limit=1)
+    msg = str(excinfo.value)
+    assert 'traceql="{ resource.service.name="order-service" }"' in msg
+    assert "`service_name`" in msg
+
+
+@pytest.mark.asyncio
+async def test_tempo_kwarg_filters_are_joined_not_guessed_at():
+    with pytest.raises(ToolException) as excinfo:
+        await q._query_tempo_traces(service="payment-service", status="error")
+    assert 'resource.service.name="payment-service" && status=error' in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_tempo_missing_traceql_with_no_filters_falls_back_to_the_syntax_hint():
+    with pytest.raises(ToolException) as excinfo:
+        await q._query_tempo_traces(traceql="  ")
+    assert "TraceQL predicates go inside braces" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_tempo_args_schema_accepts_the_mis_shaped_call(monkeypatch):
+    """The rewrite is only reachable if the args schema lets the call through."""
+    args = q.TempoArgs(service_name="order-service")
+    assert args.traceql is None
+    assert args.model_dump()["service_name"] == "order-service"
+
+
 # ---- empty-result notes ----------------------------------------------------
 
 

@@ -28,7 +28,7 @@ from typing import Any
 
 import httpx
 from langchain_core.tools import StructuredTool, ToolException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .. import case_memory
 from ..config import settings
@@ -820,14 +820,73 @@ async def _query_loki_logs(
 
 
 class TempoArgs(BaseModel):
-    traceql: str = Field(
+    # `traceql` is what this tool runs on, but it is declared optional and extra
+    # keys are accepted on purpose. The model regularly calls this the way the
+    # Loki tool takes its filters — `service_name="order-service"` as a keyword
+    # — and a required field would turn that into a pydantic validation error
+    # raised before any of our code runs, so the only thing the model gets back
+    # is "traceql: Field required". Measured on the away-field bench, one such
+    # reply ended the task: the model did not retry, and all three trace
+    # questions scored zero in every arm. Taking the call and answering it with
+    # the rewrite is what the other two tools already do.
+    model_config = ConfigDict(extra="allow")
+
+    traceql: str | None = Field(
+        default=None,
         description="TraceQL, e.g. "
         '{ resource.service.name="order-service" && status=error }. '
-        "Tempo attrs use dotted names."
+        "Tempo attrs use dotted names. Filters go inside this string — there are "
+        "no per-field arguments on this tool.",
     )
     start: str = Field(default="now-1h", description="RFC3339 or now-shorthand.")
     end: str = Field(default="now", description="RFC3339 or now-shorthand.")
     limit: int = Field(default=20, description="Max traces returned.")
+
+
+# Keyword arguments the model invents for this tool, mapped to the TraceQL
+# predicate that means the same thing. Used only to write the rewrite into the
+# error message — never to run a query the caller did not ask for.
+_TEMPO_KWARG_PREDICATES = {
+    "service_name": 'resource.service.name="{}"',
+    "service": 'resource.service.name="{}"',
+    "resource.service.name": 'resource.service.name="{}"',
+    "name": 'name="{}"',
+    "span_name": 'name="{}"',
+    "operation": 'name="{}"',
+    "status": "status={}",
+    "http_route": 'span.http.route="{}"',
+    "route": 'span.http.route="{}"',
+    "http_status_code": "span.http.status_code={}",
+    "min_duration": "duration > {}",
+    "duration": "duration > {}",
+}
+
+
+def _missing_traceql_hint(extra: dict[str, Any]) -> ToolException:
+    """Answer a call that carried filters as keywords with the query it meant.
+
+    Guessing the query for them would be worse than the error: `service_name`
+    plus `status` is two predicates whose conjunction we would be inventing, and
+    a trace search that quietly answers a different question is the failure this
+    series keeps trying to remove. So the caller still has to send the query —
+    but it is written out here, not left as an exercise.
+    """
+    predicates = [
+        _TEMPO_KWARG_PREDICATES[k].format(v)
+        for k, v in extra.items()
+        if k in _TEMPO_KWARG_PREDICATES and v is not None
+    ]
+    lines = [
+        "query_tempo_traces takes the whole search as one `traceql` string; it has "
+        "no per-field arguments."
+    ]
+    if extra:
+        lines.append("Ignored argument(s): " + ", ".join(f"`{k}`" for k in sorted(extra)) + ".")
+    if predicates:
+        lines.append(f'HINT: call it again with traceql="{{ {" && ".join(predicates)} }}".')
+    else:
+        lines.append(f"HINT: {_TEMPO_BASE_HINT}")
+    return ToolException("\n".join(lines))
 
 
 # Attribute names that are right in Prometheus/Loki and wrong in Tempo. The
@@ -875,8 +934,14 @@ def _tempo_query_hint(traceql: str, exc: ToolException) -> ToolException:
 
 
 async def _query_tempo_traces(
-    traceql: str, start: str = "now-1h", end: str = "now", limit: int = 20
+    traceql: str | None = None,
+    start: str = "now-1h",
+    end: str = "now",
+    limit: int = 20,
+    **extra: Any,
 ) -> Any:
+    if not traceql or not traceql.strip():
+        raise _missing_traceql_hint(extra)
     s, e = _parse_dt(start), _parse_dt(end)
     # Surface the deployed version on each matched span so deploy-correlation
     # questions ("which git_version was this trace running?") can be answered
