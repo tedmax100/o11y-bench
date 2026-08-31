@@ -41,7 +41,7 @@ flowchart LR
     J --> P["還是壓在一個人的腦子裡"]
 ```
 
-[《代理式可靠性工程》（Agentic Reliability Engineering，簡稱 ARE）](https://learning.oreilly.com/library/view/agentic-reliability-engineering/0642572294809/)那本書開頭有個說法我覺得講得很準：SRE（Site Reliability Engineering）這個角色長期卡住的地方，從來不是技術或流程不夠成熟，而是一個持續擴大的`認知瓶頸`——系統已經成長到超出人類能在即時狀態下可靠推理的範圍，而再多的自動化都移不掉它。書裡那句標語是這樣寫的：**它擴展的是執行力，不是判斷力**。
+[《代理式可靠性工程》（Agentic Reliability Engineering，簡稱 ARE）](https://tedmax100.github.io/agentic-reliability-engineering-zh-tw/)那本書開頭有個說法我覺得講得很準：SRE（Site Reliability Engineering）這個角色長期卡住的地方，從來不是技術或流程不夠成熟，而是一個持續擴大的`認知瓶頸`——系統已經成長到超出人類能在即時狀態下可靠推理的範圍，而再多的自動化都移不掉它。書裡那句標語是這樣寫的：**它擴展的是執行力，不是判斷力**。
 
 上面那張圖就是這句話的形狀。過去十年可觀測性領域做的每一件事，本質上都在讓左半邊變快，但右半邊那個判斷的動作從頭到尾沒有被搬走過。告警疲勞是這個天花板最直接的症狀：閾值設定的依據往往不是「怎樣的閾值能做出最好的決策」，而是「一個人一個晚上能承受幾次被吵醒」。那是為了保護人的注意力預算而妥協出來的數字。
 

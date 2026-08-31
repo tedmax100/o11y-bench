@@ -102,7 +102,7 @@ body: "declined by new validator"
 
 ## 一個現行的 silent decay
 
-[《代理式可靠性工程》（Agentic Reliability Engineering，簡稱 ARE）](https://learning.oreilly.com/library/view/agentic-reliability-engineering/0642572294809/) 第三章列了五種「從 dashboard 上看不見」的失效模式，第一種叫 `silent decay`：宣告當初是對的，然後系統變了，宣告沒跟上，而且沒有任何東西會叫。
+[《代理式可靠性工程》（Agentic Reliability Engineering，簡稱 ARE）](https://tedmax100.github.io/agentic-reliability-engineering-zh-tw/) 的[第三章：代理式可觀測性的基礎](https://tedmax100.github.io/agentic-reliability-engineering-zh-tw/ch03.html)列了五種「從 dashboard 上看不見」的失效模式，第一種叫 `silent decay`：宣告當初是對的，然後系統變了，宣告沒跟上，而且沒有任何東西會叫。
 
 寫這篇的時候我順手對了一下宣告的版本跟實際跑的版本：
 

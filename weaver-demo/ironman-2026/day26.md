@@ -23,7 +23,7 @@ tags: [OpenTelemetry, AIOps, Governance, 鐵人賽]
 
 我把接縫寫出來，是因為它不寫出來就只是語氣變了，讀者會覺得這系列後面「怎麼不太一樣」。而這兩組問題最後會在最後一天接回同一句話：卡住這套系統的東西，多半不在模型那一格。
 
-架構語言的來源是 [《代理式可靠性工程》（Agentic Reliability Engineering，簡稱 ARE）](https://learning.oreilly.com/library/view/agentic-reliability-engineering/0642572294809/) 第六章。前面我只零星借過它幾個詞（`決策級遙測`、`silent decay`），沒有整套搬進來，因為那時候用不到。現在用得到了。
+架構語言的來源是 [《代理式可靠性工程》（Agentic Reliability Engineering，簡稱 ARE）](https://tedmax100.github.io/agentic-reliability-engineering-zh-tw/) 的[第六章：代理式可靠性架構](https://tedmax100.github.io/agentic-reliability-engineering-zh-tw/ch06.html)。前面我只零星借過它幾個詞（`決策級遙測`、`silent decay`），沒有整套搬進來，因為那時候用不到。現在用得到了。
 
 ## 四個平面，跟「平面」這個詞為什麼不是「層」
 

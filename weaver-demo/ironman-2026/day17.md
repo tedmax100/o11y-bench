@@ -60,7 +60,7 @@ $ curl -sG localhost:9090/api/v1/query_range \
 
 ## 訊號跟情境
 
-[《代理式可靠性工程》（Agentic Reliability Engineering，簡稱 ARE）](https://learning.oreilly.com/library/view/agentic-reliability-engineering/0642572294809/) 這本書的第十章把這個落差講得很清楚。它區分兩個詞：
+[《代理式可靠性工程》（Agentic Reliability Engineering，簡稱 ARE）](https://tedmax100.github.io/agentic-reliability-engineering-zh-tw/) 這本書的[第十章：可觀測性強化與事前情報](https://tedmax100.github.io/agentic-reliability-engineering-zh-tw/ch10.html)把這個落差講得很清楚。它區分兩個詞：
 
 > *Signals* are facts about the system. *Context* is facts about the system *and the situation*.
 
@@ -142,7 +142,11 @@ flowchart TB
 
 它沒有回答、而且結構上也沒有地方可以回答的東西：這個值正不正常（沒有基準線）、這個服務該多少才算合格（沒有目標值）、它從哪裡來（沒有發射源的身分，所以那兩個 replica 的問題無處可藏）、後面那兩個十倍的跳動是事故還是假象（沒有可信度）、以及誰會被它影響（沒有拓撲）。
 
-`決策級遙測`（decision-grade telemetry，前面借 ARE 這本書的說法介紹過：為了讓 agent 據以行動而打造的遙測資料，不是為了讓人類盯著看而打造的）要換的就是這個形狀。同一個事實，寫成一個帶著自己上下文的物件：
+`決策級遙測`（decision-grade telemetry，前面借 ARE 這本書的說法介紹過：為了讓 agent 據以行動而打造的遙測資料，不是為了讓人類盯著看而打造的）要換的就是這個形狀。那本書的[第三章](https://tedmax100.github.io/agentic-reliability-engineering-zh-tw/ch03.html)給了一條很好用的判準：
+
+> 如果代理必須解析一個字串才能對訊號採取行動，這個訊號就不是決策級的。
+
+書裡講的是字串，而上面那條 `0.557` 是同一件事的另一個形狀：一個裸的浮點數，要拿它做任何事都得先去別的地方問「這個服務多少才算合格」，而那個答案現在只存在某個人的腦子裡。**判準其實是同一句——訊號要能單獨被據以行動，需要外部知識才解得開的就不算。** 同一個事實，寫成一個帶著自己上下文的物件：
 
 ```json
 {
