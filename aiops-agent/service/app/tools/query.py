@@ -884,6 +884,66 @@ _TEMPO_KWARG_PREDICATES = {
 }
 
 
+# TraceQL intrinsics -- these are not attributes and must never be scoped.
+_TEMPO_INTRINSICS = {
+    "status", "statusMessage", "name", "kind", "duration", "rootName",
+    "rootServiceName", "traceDuration", "parent", "childCount", "nestedSetLeft",
+    "nestedSetRight", "nestedSetParent",
+}
+_TEMPO_SCOPES = ("resource.", "span.", "event.", "link.", "instrumentation.")
+# A dotted attribute name, outside quotes: http.status_code, service.version, ...
+_DOTTED_ATTR = re.compile(r"(?<![.\w\"])([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)")
+_QUOTED = re.compile(r"\"[^\"]*\"|\'[^\']*\'")
+
+
+def _normalize_traceql(traceql: str) -> tuple[str, list[str]]:
+    """Fix the two ways a TraceQL query is wrong without being wrong.
+
+    Both come straight off the away-field transcripts, both are 400s, and both
+    ended the task on the first call:
+
+    - `status = error` with no braces. Every TraceQL query is `{ ... }`; a bare
+      predicate has exactly one valid rendering, so wrapping it is not a guess
+      about intent, it is the same query spelled legally.
+    - `http.route = "/api/orders"`. Tempo rejects an unscoped dotted name with
+      "unknown identifier: http". Prefixing it with `.` is TraceQL's own
+      unscoped lookup -- checked against a live Tempo, `{ .http.route = "..." }`
+      returns exactly the traces `span.http.route` does.
+
+    Anything that changes WHICH traces come back is not done here; that is what
+    the hint in `_tempo_query_hint` is for. Every edit made is reported back to
+    the caller so a rewritten query never happens silently.
+    """
+    notes: list[str] = []
+    query = traceql.strip()
+
+    # Scope bare dotted attributes, skipping anything inside quotes (an event
+    # value like "payment.declined" looks exactly like an attribute name).
+    spans: list[tuple[int, int]] = [m.span() for m in _QUOTED.finditer(query)]
+
+    def _in_quotes(pos: int) -> bool:
+        return any(lo <= pos < hi for lo, hi in spans)
+
+    scoped, last, out = False, 0, []
+    for m in _DOTTED_ATTR.finditer(query):
+        name = m.group(1)
+        if _in_quotes(m.start()) or name.startswith(_TEMPO_SCOPES) or name in _TEMPO_INTRINSICS:
+            continue
+        out.append(query[last : m.start()])
+        out.append(f".{name}")
+        last, scoped = m.end(), True
+    if scoped:
+        out.append(query[last:])
+        query = "".join(out)
+        notes.append("scoped bare attribute names with `.` (TraceQL's unscoped lookup)")
+
+    if not query.startswith("{"):
+        query = f"{{ {query} }}"
+        notes.append("wrapped the predicate in braces")
+
+    return query, notes
+
+
 def _missing_traceql_hint(extra: dict[str, Any]) -> ToolException:
     """Answer a call that carried filters as keywords with the query it meant.
 
@@ -955,6 +1015,63 @@ def _tempo_query_hint(traceql: str, exc: ToolException) -> ToolException:
     return ToolException("\n".join(lines))
 
 
+# How far back to look when a narrow trace search comes back empty. A generator
+# stack writes its history at boot and then goes quiet, so "the last hour" can be
+# genuinely empty while the day is full -- and the model, asked for "recent"
+# traces, reaches for an hour.
+_TEMPO_PROBE_WINDOW = timedelta(hours=24)
+
+
+async def _tempo_empty_note(
+    traceql: str, start: datetime, end: datetime, limit: int
+) -> dict[str, Any]:
+    """Tell an empty trace search apart from a wrong one, by asking again wider.
+
+    Zero traces reads as "this did not happen", and that is the Day1 failure in
+    its purest form: the same empty answer covers "nothing matched in this
+    hour" and "nothing matches this query at all". The difference is one more
+    request, and it decides what the model should do next -- widen, or rewrite.
+    Measured on the away-field bench, two trace questions were lost to a
+    `now-1h` window over a stack whose telemetry was hours old.
+    """
+    if end - start >= _TEMPO_PROBE_WINDOW:
+        return {
+            "note": f"No traces matched in the last {_humanize(end - start)}, "
+            "and that window is already wide — so this is the query, not the range. "
+            f"HINT: {_TEMPO_BASE_HINT}"
+        }
+    probe_start = end - _TEMPO_PROBE_WINDOW
+    try:
+        data = await _get_json(
+            settings.tempo_url,
+            "/api/search",
+            {"q": traceql, "start": _epoch_s(probe_start), "end": _epoch_s(end), "limit": limit},
+        )
+    except ToolException:
+        return {"note": "No traces matched in this window."}
+    wider = data.get("traces", []) if isinstance(data, dict) else []
+    if not wider:
+        return {
+            "note": f"No traces matched in the last {_humanize(end - start)}, and none in the "
+            "last 24h either — so widening will not help; the query itself matches nothing. "
+            f"HINT: {_TEMPO_BASE_HINT}"
+        }
+    return {
+        "note": f"Zero traces in the last {_humanize(end - start)}, but the SAME query over the "
+        f"last 24h returns {len(wider)}. This window is empty, the query is fine — the telemetry "
+        "here is simply older than the range you asked for. Re-run with `start=\"now-24h\"` "
+        "before concluding anything about whether these requests happened."
+    }
+
+
+def _humanize(delta: timedelta) -> str:
+    minutes = int(delta.total_seconds() // 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes / 60
+    return f"{hours:.0f}h" if hours < 48 else f"{hours / 24:.0f}d"
+
+
 async def _query_tempo_traces(
     traceql: str | None = None,
     start: str = "now-1h",
@@ -964,6 +1081,7 @@ async def _query_tempo_traces(
 ) -> Any:
     if not traceql or not traceql.strip():
         raise _missing_traceql_hint(extra)
+    traceql, normalized = _normalize_traceql(traceql)
     s, e = _parse_dt(start), _parse_dt(end)
     # Surface the deployed version on each matched span so deploy-correlation
     # questions ("which git_version was this trace running?") can be answered
@@ -980,8 +1098,13 @@ async def _query_tempo_traces(
     except ToolException as exc:
         raise _tempo_query_hint(traceql, exc) from exc
     traces = data.get("traces", []) if isinstance(data, dict) else []
+    if not traces:
+        return {"traces": [], "count": 0, **(await _tempo_empty_note(q, s, e, limit))}
+    note = (
+        {"normalized_query": traceql, "normalized": "; ".join(normalized)} if normalized else {}
+    )
     if _approx_size(traces) <= TEMPO_CAP_BYTES:
-        return {"traces": traces, "count": len(traces)}
+        return {"traces": traces, "count": len(traces), **note}
     # Trace summaries are already compact; if still oversize, return id+service+duration only.
     slim = [
         {

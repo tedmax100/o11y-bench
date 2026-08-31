@@ -284,6 +284,84 @@ def test_tempo_hint_keeps_the_original_error_text():
     assert hint.startswith("connection refused")
 
 
+# ---- an empty trace search, and which kind of empty it is -------------------
+
+
+@pytest.mark.asyncio
+async def test_tempo_empty_window_says_the_query_was_fine(monkeypatch):
+    """Zero traces has two meanings and only one extra request tells them apart."""
+    calls = []
+
+    async def mock_get_json(base, path, params):
+        calls.append(params)
+        # first call is the model's narrow window, second is the 24h probe
+        return {"traces": [] if len(calls) == 1 else [{"traceID": "abc"}]}
+
+    monkeypatch.setattr(q, "_get_json", mock_get_json)
+    result = await q._query_tempo_traces('{ resource.service.name="order-service" }', start="now-1h")
+    assert result["count"] == 0
+    assert "the query is fine" in result["note"]
+    assert 'start="now-24h"' in result["note"]
+
+
+@pytest.mark.asyncio
+async def test_tempo_empty_everywhere_points_at_the_query(monkeypatch):
+    async def mock_get_json(base, path, params):
+        return {"traces": []}
+
+    monkeypatch.setattr(q, "_get_json", mock_get_json)
+    result = await q._query_tempo_traces('{ resource.service.name="nope" }', start="now-1h")
+    assert "widening will not help" in result["note"]
+
+
+@pytest.mark.asyncio
+async def test_tempo_wide_empty_window_is_not_probed_again(monkeypatch):
+    """No point re-asking 24h when the caller already asked for a week."""
+    calls = []
+
+    async def mock_get_json(base, path, params):
+        calls.append(params)
+        return {"traces": []}
+
+    monkeypatch.setattr(q, "_get_json", mock_get_json)
+    result = await q._query_tempo_traces("{ status=error }", start="now-7d")
+    assert len(calls) == 1
+    assert "already wide" in result["note"]
+
+
+# ---- TraceQL that is wrong without being wrong -----------------------------
+
+
+def test_traceql_bare_predicate_gets_braces():
+    """`status = error` is a 400, and it ended the task in every round."""
+    query, notes = q._normalize_traceql("status = error")
+    assert query == "{ status = error }"
+    assert notes
+
+
+def test_traceql_bare_dotted_attributes_are_scoped():
+    """Tempo answers an unscoped `http.route` with "unknown identifier: http".
+
+    `.http.route` is TraceQL's own unscoped lookup and returns the same traces
+    as `span.http.route` -- checked against a live Tempo, not assumed.
+    """
+    query, notes = q._normalize_traceql('{http.method="POST" && http.status_code=500}')
+    assert query == '{.http.method="POST" && .http.status_code=500}'
+    assert notes
+
+
+def test_traceql_already_scoped_and_intrinsics_are_left_alone():
+    original = '{ resource.service.name="payment" && span.http.route="/x" && status=error }'
+    assert q._normalize_traceql(original) == (original, [])
+
+
+def test_traceql_values_inside_quotes_are_not_mistaken_for_attributes():
+    """`"payment.declined"` looks exactly like a dotted attribute name."""
+    original = '{ resource.service.name="p" && span.event.name="payment.declined" }'
+    query, _ = q._normalize_traceql(original)
+    assert '"payment.declined"' in query
+
+
 # ---- the Loki series limit ------------------------------------------------
 
 
