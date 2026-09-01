@@ -36,6 +36,14 @@ from .signals.envfit import compute_env_fit, get_last_fit
 from .signals.health import evaluate_dependency_health
 from .signals.vocabulary import render_vocabulary
 from .sufficiency import Verdict, evaluate_sufficiency, pivot_instruction
+from .telemetry import (
+    Investigation,
+    investigation_span,
+    record_budget,
+    record_chat_turn,
+    record_decisions,
+    record_tool_result,
+)
 from .tools import (
     discover_log_fields_tool,
     discover_metrics_tool,
@@ -655,6 +663,9 @@ def _build_graph():
             classify(getattr(m, "name", "") or "unknown", getattr(m, "content", ""), base + i + 1)
             for i, m in enumerate(out_messages)
         ]
+        for f in new_facts:
+            record_tool_result(f.tool, f.disposition)
+        record_budget(state["tool_calls_used"] + n, state["budget"])
         out_state = {"messages": out_messages, "tool_calls_used": state["tool_calls_used"] + n}
         if new_facts:
             # Omitted when empty: the reducer reads [] as "reset", which is the
@@ -1550,7 +1561,18 @@ def _sufficiency(facts: list[DiagnosticFact], findings: Findings) -> Verdict:
 
 async def run_headless(alert: dict, thread_id: str) -> dict:
     """Run one headless RCA turn for a single firing alert. Returns the final
-    prose answer plus structured Findings for the downstream sink."""
+    prose answer plus structured Findings for the downstream sink.
+
+    The whole turn runs inside one `aiops.investigation` span, so every model
+    call, tool call and datastore round-trip below hangs off a single trace —
+    the one whose id gets stored beside the conclusion."""
+    labels = alert.get("labels") or {}
+    service_hint = labels.get("service_name") or labels.get("service")
+    with investigation_span("alert", service_hint) as inv:
+        return await _run_headless(alert, thread_id, inv)
+
+
+async def _run_headless(alert: dict, thread_id: str, inv: Investigation) -> dict:
     labels = alert.get("labels") or {}
     annotations = alert.get("annotations") or {}
     service = labels.get("service_name") or labels.get("service")
@@ -1674,6 +1696,13 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
             thread_id,
         )
 
+    inv.record(
+        sufficient=verdict.sufficient,
+        pivots=loop_count,
+        confidence=findings.confidence,
+        gaps=[c.name for c in verdict.gaps],
+    )
+
     # Structured Uncertainty (knowledge-loop §4.6): when all loops are exhausted
     # and confidence is still below threshold, produce a structured escalation
     # package so the on-call knows exactly what was tried and what to check next.
@@ -1790,6 +1819,8 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
             logger.info("runbook %s: no remediation applies to this diagnosis", e.runbook_id)
         except Exception as e:
             logger.warning("governance gate failed: %s", e)
+
+    record_decisions(decisions, service)
 
     return {
         "answer": answer,
@@ -2055,6 +2086,8 @@ async def stream_chat(
     except Exception as e:
         logger.warning("Intent gate failed, refusing (fail-closed): %s", e)
         intent = IntentResult(in_scope=False)
+
+    record_chat_turn(intent.in_scope)
 
     if not intent.in_scope:
         yield {"type": "token", "text": REFUSAL_TEXT}

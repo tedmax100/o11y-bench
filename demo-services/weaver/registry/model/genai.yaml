@@ -198,6 +198,231 @@ groups:
         brief: Hard per-turn tool-call ceiling enforced by the RCA graph.
         examples: [4]
 
+      - id: aiops.tool.disposition
+        stability: development
+        brief: >-
+          How `facts.classify` typed the tool's result. A tool that answered and
+          a tool that returned nothing are both HTTP 200; this is the split that
+          separates them.
+        type:
+          members:
+            - id: observed
+              value: observed
+              brief: Real data came back and can be cited.
+              stability: development
+            - id: truncated
+              value: truncated
+              brief: Real but capped — usable, but not for totals or rates.
+              stability: development
+            - id: empty
+              value: empty
+              brief: The query was well-formed and matched nothing.
+              stability: development
+            - id: unavailable
+              value: unavailable
+              brief: The store could not be reached.
+              stability: development
+            - id: error
+              value: error
+              brief: The call failed or the payload could not be read.
+              stability: development
+            - id: context
+              value: context
+              brief: Catalog/discovery output — background, not an observation.
+              stability: development
+
+      - id: aiops.investigation.trigger
+        stability: development
+        brief: What started the investigation.
+        type:
+          members:
+            - id: alert
+              value: alert
+              brief: A firing alert arrived on the webhook (headless run).
+              stability: development
+            - id: chat
+              value: chat
+              brief: A person asked a question in the assistant.
+              stability: development
+
+      - id: aiops.investigation.sufficient
+        type: boolean
+        stability: development
+        brief: >-
+          Whether the sufficiency gate (sufficiency.py) judged the evidence
+          adequate. Computed from the run's own observations, never from the
+          confidence the model states about itself.
+
+      - id: aiops.investigation.pivots
+        type: int
+        stability: development
+        brief: How many times the gate sent the run back for more evidence.
+        examples: [0, 1, 2]
+
+      - id: aiops.investigation.confidence
+        type: double
+        stability: development
+        brief: >-
+          The confidence the run stated in its own conclusion. Recorded, not
+          trusted — it is the input to the calibration curve, not a gate.
+        examples: [0.4, 0.85]
+
+      - id: aiops.investigation.gaps
+        type: string[]
+        stability: development
+        brief: >-
+          Names of the sufficiency checks that did not pass. Span-only: the set
+          varies per run and would mint a time series per phrasing as a metric
+          dimension.
+        examples: [["independent_domains", "causal_roles"]]
+
+      - id: aiops.subject.service
+        stability: development
+        type: string
+        brief: >-
+          The service being investigated. Not `service.name` — that resource
+          attribute is the agent itself, and conflating the two makes the
+          agent's own telemetry look like the incident's.
+        examples: ["payment", "orders"]
+
+      - id: aiops.action.name
+        stability: development
+        type: string
+        brief: The remediation action a runbook step proposes.
+        examples: ["restart_deployment", "set_configmap_flag"]
+
+      - id: aiops.governance.autonomy
+        stability: development
+        brief: What the governance gate decided may happen to a proposed action.
+        type:
+          members:
+            - id: auto
+              value: auto
+              brief: Policy permits autonomous execution.
+              stability: development
+            - id: propose
+              value: propose
+              brief: Surface to a human to confirm.
+              stability: development
+            - id: escalate
+              value: escalate
+              brief: Hand back to a human; do not even pre-fill an action.
+              stability: development
+
+  # ---------------------------------------------------------------------------
+  # aiops.* metrics + spans — emitted manually by app/telemetry.py
+  # ---------------------------------------------------------------------------
+  - id: metric.aiops.investigation.duration
+    type: metric
+    metric_name: aiops.investigation.duration
+    stability: development
+    brief: End-to-end duration of one RCA investigation, pivots included.
+    instrument: histogram
+    unit: s
+    attributes:
+      - ref: aiops.investigation.trigger
+        requirement_level: required
+      - ref: aiops.investigation.sufficient
+        requirement_level: recommended
+      - ref: aiops.subject.service
+        requirement_level: recommended
+
+  - id: metric.aiops.investigation.pivots
+    type: metric
+    metric_name: aiops.investigation.pivots
+    stability: development
+    brief: >-
+      How many times the sufficiency gate sent a run back for more evidence.
+      The loop working is pivots > 0 ending sufficient; the loop failing is
+      pivots at the ceiling and still insufficient.
+    instrument: histogram
+    unit: "{pivot}"
+    attributes:
+      - ref: aiops.investigation.trigger
+        requirement_level: required
+      - ref: aiops.investigation.sufficient
+        requirement_level: recommended
+      - ref: aiops.subject.service
+        requirement_level: recommended
+
+  - id: metric.aiops.investigation.confidence
+    type: metric
+    metric_name: aiops.investigation.confidence
+    stability: development
+    brief: Distribution of the confidence runs state in their own conclusions.
+    instrument: histogram
+    unit: "1"
+    attributes:
+      - ref: aiops.investigation.trigger
+        requirement_level: required
+      - ref: aiops.investigation.sufficient
+        requirement_level: recommended
+      - ref: aiops.subject.service
+        requirement_level: recommended
+
+  - id: metric.aiops.tool.calls
+    type: metric
+    metric_name: aiops.tool.calls
+    stability: development
+    brief: RCA tool calls, split by how the result was typed.
+    instrument: counter
+    unit: "{call}"
+    attributes:
+      - ref: aiops.tool.name
+        requirement_level: required
+      - ref: aiops.tool.disposition
+        requirement_level: required
+
+  - id: metric.aiops.chat.turns
+    type: metric
+    metric_name: aiops.chat.turns
+    stability: development
+    brief: Interactive chat turns, split by the intent gate's verdict.
+    instrument: counter
+    unit: "{turn}"
+    attributes:
+      - ref: aiops.intent.in_scope
+        requirement_level: required
+
+  - id: metric.aiops.governance.decisions
+    type: metric
+    metric_name: aiops.governance.decisions
+    stability: development
+    brief: >-
+      Remediation proposals leaving the governance gate. The autonomy split is
+      the point: a flat zero on `auto` is the gate refusing, not the gate idle.
+    instrument: counter
+    unit: "{decision}"
+    attributes:
+      - ref: aiops.action.name
+        requirement_level: required
+      - ref: aiops.governance.autonomy
+        requirement_level: required
+      - ref: aiops.subject.service
+        requirement_level: recommended
+
+  - id: span.aiops.investigation
+    type: span
+    span_kind: internal
+    stability: development
+    brief: >-
+      One whole RCA investigation. Parent of every model call, tool call and
+      datastore round-trip in the run — the trace an investigation's stored
+      `trace_id` points at.
+    attributes:
+      - ref: aiops.investigation.trigger
+        requirement_level: required
+      - ref: aiops.subject.service
+        requirement_level: recommended
+      - ref: aiops.investigation.sufficient
+        requirement_level: recommended
+      - ref: aiops.investigation.pivots
+        requirement_level: recommended
+      - ref: aiops.investigation.confidence
+        requirement_level: recommended
+      - ref: aiops.investigation.gaps
+        requirement_level: opt_in
+
   # ---------------------------------------------------------------------------
   # GenAI metrics (official OTel `gen_ai.client.*`)
   # ---------------------------------------------------------------------------
