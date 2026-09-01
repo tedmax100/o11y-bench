@@ -20,6 +20,17 @@ RUN uv sync --frozen --no-dev 2>/dev/null \
 
 ENV PATH="/app/.venv/bin:${PATH}"
 
+# Stable HTTP semantic conventions: `http.server.request.duration` /
+# `http.client.request.duration` in seconds, with the spec's explicit bucket
+# boundaries. The default (old) mode emits the pre-stable names in
+# milliseconds against the SDK's default buckets (0, 5, 10, 25, ...) — the
+# source of the constant p95 = 4.75 we chased for days, which measured the
+# bucket layout rather than any latency. `http` = new names only; `http/dup`
+# emits both, which is what a migration with live dashboards would use.
+# The Deployment sets this too; keeping it here means a plain `docker run`
+# of this image reports the same names as the cluster does.
+ENV OTEL_SEMCONV_STABILITY_OPT_IN=http
+
 EXPOSE 8000
 
 CMD ["opentelemetry-instrument", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
