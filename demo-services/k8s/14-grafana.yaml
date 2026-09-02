@@ -60,6 +60,30 @@ data:
             spanEndTimeShift: 1m
             filterByTraceID: true
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  namespace: demo
+data:
+  # Points Grafana at the dashboards ConfigMap mounted below. The JSON itself
+  # lives in k8s/dashboards/ and is turned into the `grafana-dashboards`
+  # ConfigMap by up.sh — editing a dashboard means editing that file, not
+  # clicking Save in the UI (provisioned dashboards are read-only there).
+  dashboards.yaml: |
+    apiVersion: 1
+
+    providers:
+      - name: 'aiops'
+        orgId: 1
+        folder: 'AIOps'
+        type: file
+        disableDeletion: false
+        allowUiUpdates: false
+        options:
+          path: /var/lib/grafana/dashboards/aiops
+          foldersFromFilesStructure: false
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -107,6 +131,12 @@ spec:
             - name: aiops-provisioning
               mountPath: /etc/grafana/provisioning/plugins
               readOnly: true
+            - name: dashboard-provider
+              mountPath: /etc/grafana/provisioning/dashboards
+              readOnly: true
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards/aiops
+              readOnly: true
       volumes:
         - name: datasources
           configMap:
@@ -118,6 +148,12 @@ spec:
         - name: aiops-provisioning
           configMap:
             name: aiops-plugin-provisioning
+        - name: dashboard-provider
+          configMap:
+            name: grafana-dashboard-provider
+        - name: dashboards
+          configMap:
+            name: grafana-dashboards
 ---
 apiVersion: v1
 kind: Service
