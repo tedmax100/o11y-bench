@@ -192,3 +192,29 @@ async def test_unavailable_when_config_missing(monkeypatch):
     out = await k8s.get_pod_status("payment-service")
     assert out["unavailable"] is True
     assert "config not available" in out["detail"]
+
+
+# ---- k8s_enabled=false: away-field runs must not touch the client at all --
+
+
+async def test_all_four_tools_short_circuit_when_disabled(monkeypatch):
+    """Away-field runs point at a stack whose telemetry doesn't belong to the
+    local kubeconfig's cluster. k8s_enabled=false must make every k8s_* tool
+    report unavailable WITHOUT calling `_load_client()` — a call that would
+    silently answer against the wrong cluster."""
+
+    def _boom():
+        raise AssertionError("_load_client() must not be called when k8s_enabled=False")
+
+    monkeypatch.setattr(k8s, "_load_client", _boom)
+    monkeypatch.setattr(k8s.settings, "k8s_enabled", False)
+
+    for coro in (
+        k8s.get_pod_status("payment-service"),
+        k8s.get_k8s_events("payment-service"),
+        k8s.get_deployment_status("payment-service"),
+        k8s.get_change_provenance("payment-service"),
+    ):
+        out = await coro
+        assert out["unavailable"] is True
+        assert "k8s_enabled=false" in out["detail"]

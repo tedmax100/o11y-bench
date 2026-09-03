@@ -168,8 +168,18 @@ def _summarize_pod(pod) -> dict[str, Any]:
     }
 
 
+_DISABLED = _unavailable(
+    "kubernetes tools disabled for this run (k8s_enabled=false) — the local "
+    "kubeconfig/in-cluster context does not belong to the environment being "
+    "investigated, so k8s findings would silently attribute to the wrong "
+    "cluster"
+)
+
+
 async def get_pod_status(service: str) -> dict[str, Any]:
     """Pod phase / readiness / restart counts / crash reasons for a service."""
+    if not settings.k8s_enabled:
+        return _DISABLED
     try:
         core, _ = await asyncio.to_thread(_load_client)
         resp = await asyncio.to_thread(
@@ -199,6 +209,8 @@ async def get_k8s_events(service: str, limit: int = 20) -> dict[str, Any]:
     """Recent *interesting* k8s events for a service's objects (pods / rs /
     deployment). Routine Normal events are filtered out — only the reasons that
     explain a failure (OOM, BackOff, FailedScheduling, Unhealthy, …) are kept."""
+    if not settings.k8s_enabled:
+        return _DISABLED
     try:
         core, _ = await asyncio.to_thread(_load_client)
         resp = await asyncio.to_thread(core.list_namespaced_event, namespace=settings.k8s_namespace)
@@ -255,6 +267,8 @@ async def get_deployment_status(service: str) -> dict[str, Any]:
     """Deployment replica health + rollout conditions + current revision. A
     rollout stuck (ProgressDeadlineExceeded) or replicas not Available points at
     a deploy that never became healthy — distinct from a code regression."""
+    if not settings.k8s_enabled:
+        return _DISABLED
     try:
         _, apps = await asyncio.to_thread(_load_client)
         dep = await asyncio.to_thread(
@@ -386,6 +400,8 @@ async def get_change_provenance(service: str, limit: int = 4) -> dict[str, Any]:
     So the answer is not "which version is running" but "what actually changed
     between the last revisions, and what config is mounted from outside them".
     """
+    if not settings.k8s_enabled:
+        return _DISABLED
     try:
         _, apps = await asyncio.to_thread(_load_client)
         rs_list = await asyncio.to_thread(

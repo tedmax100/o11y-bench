@@ -26,6 +26,13 @@ class Settings(BaseSettings):
     # clean "unavailable" result rather than crashing the turn.
     k8s_namespace: str = "demo"
     k8s_label_key: str = "app"
+    # Away-field runs (agent on host, telemetry from a *different* stack than
+    # the local kubeconfig's cluster) must not let these tools quietly answer
+    # against the wrong cluster — the agent has no way to tell "empty because
+    # nothing's there" from "empty because this is the home cluster, not the
+    # one the incident is in". Set false to make all four k8s_* tools report
+    # `unavailable` without ever touching the kubernetes client.
+    k8s_enabled: bool = True
 
     # Hard ceiling on tool calls per turn, enforced by the RCA graph's budget
     # guard (not just the system prompt). Matches the prompt's stated ceiling.
