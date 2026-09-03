@@ -639,6 +639,7 @@ def _build_graph():
                 dup_results.append(
                     ToolMessage(
                         tool_call_id=tc.get("id", ""),
+                        name=tc.get("name", ""),
                         content=(
                             "You already ran this exact query this turn and it did not help. "
                             "Do NOT repeat it. Change the stream selector / matcher / syntax "

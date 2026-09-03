@@ -303,3 +303,19 @@ async def test_the_ledger_does_not_carry_across_turns(monkeypatch):
     # (still empty) observation.
     out, _ = await _run(monkeypatch, [_CALL, AIMessage(content="no evidence")], thread="carry")
     assert len(out["facts"]) == 1
+
+
+async def test_identical_retry_result_keeps_the_tool_name(monkeypatch):
+    # A small model re-sends the exact same (name, args) tool call; tools_node
+    # short-circuits it with a directive ToolMessage instead of re-running it.
+    # That message must still carry `name=`, or the fact layer files it under
+    # "unknown" and it can never be attributed to the tool that produced it.
+    # Two distinct AIMessage objects (LangGraph's message reducer dedupes by
+    # id, so reusing the same object wouldn't exercise the dup-retry branch).
+    same_call = AIMessage(
+        content="", tool_calls=[{"name": "query_prometheus", "args": {"expr": "up"}, "id": "c2"}]
+    )
+    out, _ = await _run(monkeypatch, [_CALL, same_call, AIMessage(content="no evidence")])
+    facts = out["facts"]
+    assert [f.tool for f in facts] == ["query_prometheus", "query_prometheus"]
+    assert facts[-1].disposition == "error"
