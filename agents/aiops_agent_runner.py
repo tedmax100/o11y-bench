@@ -95,21 +95,25 @@ def _build_trajectory(
         this_calls = [next(call_iter, None) for _ in range(n)]
         this_calls = [c for c in this_calls if c is not None]
         step_id += 1
-        steps.append(
-            {
-                "step_id": step_id,
-                "timestamp": datetime.now(UTC).isoformat(),
-                "source": "agent",
-                "message": _message_text(ai.content) or "(tool use)",
-                "tool_calls": [{"function_name": c.name, "arguments": c.args} for c in this_calls]
-                or None,
-                "observation": {
-                    "results": [{"content": c.result, "kind": c.kind} for c in this_calls]
-                }
-                if this_calls
-                else None,
+        # `_parse_atif_steps` in the grading library does
+        # `step.get("tool_calls", [])` / iterates `observation["results"]`
+        # unconditionally — a key present with value `None` breaks that (it's
+        # not a missing key, so the default never kicks in). Omit rather than
+        # null these out.
+        step: dict[str, Any] = {
+            "step_id": step_id,
+            "timestamp": datetime.now(UTC).isoformat(),
+            "source": "agent",
+            "message": _message_text(ai.content) or "(tool use)",
+        }
+        if this_calls:
+            step["tool_calls"] = [
+                {"function_name": c.name, "arguments": c.args} for c in this_calls
+            ]
+            step["observation"] = {
+                "results": [{"content": c.result, "kind": c.kind} for c in this_calls]
             }
-        )
+        steps.append(step)
 
     for m in messages:
         if isinstance(m, AIMessage):
