@@ -2108,6 +2108,49 @@ def proposal_disposition(path: str | Path | None = None) -> dict:
     }
 
 
+def override_rate(path: str | Path | None = None) -> dict:
+    """Two trust signals from ARE ch11.5: Override Rate (share of dispatched
+    proposals a human rejected) and dispatch rate (share of all proposals a
+    human ever touched at all).
+
+    The denominator matters more than the ratio here. `aborted` rows are a
+    pre-execution gate refusing (`blast_radius` dry-run, `actor='system'` in
+    the audit trail), not a human overriding, so they must not be counted as
+    either a dispatch or a rejection. Folding them into "human decisions"
+    would inflate OR into something that looks healthy for the wrong reason:
+    the gate working, not a human scrutinizing.
+    """
+    with _connect(path) as conn:
+        rows = conn.execute("SELECT status, actor FROM action_requests").fetchall()
+        system_aborts = conn.execute(
+            "SELECT COUNT(DISTINCT request_id) AS n FROM audit "
+            "WHERE verdict='abort' AND actor='system'"
+        ).fetchone()["n"]
+
+    total = len(rows)
+    dispatched = [r for r in rows if r["actor"]]
+    rejected = [r for r in dispatched if r["status"] == "rejected"]
+    n_dispatched, n_rejected = len(dispatched), len(rejected)
+
+    return {
+        "total": total,
+        "dispatched": n_dispatched,
+        "dispatch_rate": round(n_dispatched / total, 3) if total else None,
+        "rejected": n_rejected,
+        "override_rate": round(n_rejected / n_dispatched, 3) if n_dispatched else None,
+        "system_aborts_excluded_from_denominator": system_aborts,
+        "note": (
+            "no proposal has ever been dispatched to a human"
+            if not n_dispatched
+            else "zero rejections — either a very well-calibrated agent, or "
+            "nobody has said no yet; below the reporting floor this can't "
+            "tell the two apart"
+            if n_rejected == 0
+            else f"{n_rejected} of {n_dispatched} dispatched proposals rejected"
+        ),
+    }
+
+
 def ae_slo(min_n: int = 5, path: str | Path | None = None) -> dict:
     """Action Effectiveness: of the actions we executed, how many actually ended
     the incident — graded by a person, counted separately for drills.
