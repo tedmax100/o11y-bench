@@ -28,7 +28,9 @@ Day33 已經用「我們下個系列見」收尾了，這篇不算在三十三�
 }
 ```
 
-信心 0.9，講得斬釘截鐵。但那句「p95 維持在約 4.75 ms」，我一眼就認得。它背後那條 PromQL 是 `histogram_quantile(0.95, sum by (le) (rate(http_server_duration_milliseconds_bucket[5m])))`，而 `http_server_duration_milliseconds` 這個 histogram 用的是 auto-instrumentation 的預設桶，只要資料量集中在最小的那個桶裡，`histogram_quantile` 不管真實分佈長什麼樣，算出來的 p95 永遠收斂在同一個值。這件事我在系列前面已經量過一次，構造出來的假象數值就是 **4.75**。這次它不是被我構造出來的，是這隻 agent 自己在真實環境裡撞上，而且用 0.9 的信心把它講給我聽。
+信心 0.9，講得斬釘截鐵。但那句「p95 維持在約 4.75 ms」，我一眼就認得。它背後那條 PromQL 是 `histogram_quantile(0.95, sum by (le) (rate(http_server_duration_milliseconds_bucket[5m])))`，而 `http_server_duration_milliseconds` 這個 histogram 用的是 auto-instrumentation 的預設桶，只要資料量集中在最小的那個桶裡，`histogram_quantile` 不管真實分佈長什麼樣，算出來的 p95 永遠收斂在同一個值。
+
+這件事我在系列前面已經量過一次，構造出來的假象數值就是 **4.75**。這次它不是被我構造出來的，是這隻 agent 自己在真實環境裡撞上，而且用 0.9 的信心把它講給我聽。
 
 系統自己的充分性判定（`sufficiency.sufficient`）確實抓到了問題，但抓到的理由是「因果角色不夠」，不是「這個數字是假的」，**判準攔住了它，但攔錯了理由**。而且這筆案子到現在都還沒有人標記對錯：它就安靜地躺在 `/todo` 裡，跟其他真的答對的調查長得一模一樣，都是一筆等著人按 Correct 或 Wrong 的紀錄。
 
@@ -76,7 +78,9 @@ flowchart LR
 
 ![AIOps Agent 表現 dashboard，調查次數 2、證據充足率 100%、p95 48.8 秒、平均 pivot 2.5、平均信心 0.45，空手率 58%，下方有一筆真實的 aiops.investigation trace](img/day34-dashboard.png)
 
-左上那排現在全部有數字：調查次數 2、證據充足率 100%、p95 時長 48.8 秒、平均 pivot 2.5 次、平均信心只有 0.45。這個信心數字不是我編的，是這兩次真的調查各自算出來的（payment-service 那次 0.30、order-service 那次 0.60，平均剛好 0.45）。payment-service 那次的過程比數字有意思。它一開始把原因怪到 `v2.5.0` 這個版本上，但 `k8s_change_provenance` 那支工具查出「這次 rollout 沒動過 pod template」，內建的 rubric 判定當場攔下來重跑，log 裡真的印著 `rubric: answer blames a version the cluster cleared — retrying`，連續攔了兩次，第三輪才把結論改成「是掛載的 ConfigMap，不是版本」。三次 pivot，就是這樣被榨出來的。**信心 0.45 看起來不高，但它是「講錯話被攔下來重講」換來的分數，比一次就講對、卻沒人攔的 0.9 更值得信任。**
+左上那排現在全部有數字：調查次數 2、證據充足率 100%、p95 時長 48.8 秒、平均 pivot 2.5 次、平均信心只有 0.45。這個信心數字不是我編的，是這兩次真的調查各自算出來的（payment-service 那次 0.30、order-service 那次 0.60，平均剛好 0.45）。
+
+payment-service 那次的過程比數字有意思。它一開始把原因怪到 `v2.5.0` 這個版本上，但 `k8s_change_provenance` 那支工具查出「這次 rollout 沒動過 pod template」，內建的 rubric 判定當場攔下來重跑，log 裡真的印著 `rubric: answer blames a version the cluster cleared — retrying`，連續攔了兩次，第三輪才把結論改成「是掛載的 ConfigMap，不是版本」。三次 pivot，就是這樣被榨出來的。**信心 0.45 看起來不高，但它是「講錯話被攔下來重講」換來的分數，比一次就講對、卻沒人攔的 0.9 更值得信任。**
 
 空手率也從單看 `/chat` 的 33% 變成兩條路徑疊起來的 58%，因為 headless 那兩次調查動用了更多工具（`k8s_deployment_status`、`k8s_events`、`query_loki_logs`、`query_tempo_traces`、`github_compare`），有的查到、有的落空，甚至有三次工具呼叫連名字都沒留下、直接被分類成 `unknown` 的 `error`。這也是誠實的一部分：這篇核對到這裡才發現，這隻 agent 偶爾會有工具呼叫連自己的名字都沒能記錄下來就先出錯了，這件事本身也還沒被我修。
 
@@ -114,7 +118,9 @@ le=10     count=12
 le=+Inf   count=12
 ```
 
-十二次 LLM 呼叫全部落在 `(0, 5]` 這一個桶裡。`histogram_quantile(0.95, ...)` 對著只有一個桶有樣本的分佈做線性內插，算出來是 `0.95 × 5 = 4.75`。而我從 Tempo 上把這幾次呼叫真正的 span 時長挖出來，十三筆分別是 `1.78 / 1.13 / 0.74 / 1.05 / 1.88 / 1.51 / 1.08 / 1.17 / 1.16 / 0.72 / 1.15 / 1.74 / 0.34` 秒，真正的 p95 大概落在 1.8 秒附近。**面板上寫的 4.75，是真實 p95 的兩倍半以上**，不是因為系統變慢了，是因為 OTel SDK 給的預設桶邊界（`0, 5, 10, 25, 50...`）對這種次秒級的呼叫太粗，樣本全擠在最窄的那個桶裡，`histogram_quantile` 在裡面猜一個數字出來，猜出來的東西看起來很精確，其實只是內插公式的副產品。這跟前面那個 `http_server_duration` 的 4.75 是同一個病，只是這次病灶換了一個 metric。
+十二次 LLM 呼叫全部落在 `(0, 5]` 這一個桶裡。`histogram_quantile(0.95, ...)` 對著只有一個桶有樣本的分佈做線性內插，算出來是 `0.95 × 5 = 4.75`。而我從 Tempo 上把這幾次呼叫真正的 span 時長挖出來，十三筆分別是 `1.78 / 1.13 / 0.74 / 1.05 / 1.88 / 1.51 / 1.08 / 1.17 / 1.16 / 0.72 / 1.15 / 1.74 / 0.34` 秒，真正的 p95 大概落在 1.8 秒附近。
+
+**面板上寫的 4.75，是真實 p95 的兩倍半以上**，不是因為系統變慢了，是因為 OTel SDK 給的預設桶邊界（`0, 5, 10, 25, 50...`）對這種次秒級的呼叫太粗，樣本全擠在最窄的那個桶裡，`histogram_quantile` 在裡面猜一個數字出來，猜出來的東西看起來很精確，其實只是內插公式的副產品。這跟前面那個 `http_server_duration` 的 4.75 是同一個病，只是這次病灶換了一個 metric。
 
 > 兩個地方各自撞出同一個數字，我第一次看到的時候還以為自己複製貼上錯了。
 > 後來才想通：只要「真實分佈全擠在第一個桶裡」這個前提成立，任何一個用預設桶的 histogram 都會吐出同一種形狀的假象，數字不是巧合，是這個 bug 家族的共同症狀。
