@@ -15,6 +15,8 @@ tags: [OpenTelemetry, AIOps, CEL, Signal Plane, 鐵人賽]
 
 會這樣收尾是因為概念日很容易變成一種漂亮的空話。講完 enrichment、correlation、projection、grounding，讀者很自然會以為這個 repo 就是照這樣做的。它不是。
 
+因為今天盤點的是整個第二階段，程式碼放的是完整一份服務原始碼快照，在範例 repo [`OTel_AIOps_Agent`](https://github.com/tedmax100/OTel_AIOps_Agent) 的 [`ironman-2026/day18/`](https://github.com/tedmax100/OTel_AIOps_Agent/tree/main/ironman-2026/day18)，Signal Plane 那八個模組在 `aiops-agent/service/app/signals/`。底下每一條 `grep`、每一張對帳圖都可以自己重跑一次。
+
 ## 先看蓋了什麼
 
 第二階段的程式碼在 `app/signals/`，八個模組（加一個 `__init__.py`）1545 行，六份對應的測試檔 69 條（這是寫這篇那天數的，後面幾天還會再長）。設計稿把它切成四個階段，代號 s1 到 s4：
@@ -36,6 +38,10 @@ flowchart TB
 
 ## 逐項對照
 
+先說清楚要對照的是哪四項：昨天講的 CEL 三職責 `enrichment`、`correlation`、`projection`，加上書裡跟三職責放同一層、份量講得還更重的 `grounding`。這篇的帳就是對著這四項算的。
+
+下面這張表把 `enrichment` 那一項再拆成四格來看（baseline、趨勢、拓撲位置、變更情境），所以表裡有七列，但頂上的帳還是只有四項。後面提到「enrichment 四格」指的是這張表 enrichment 的四列，「四項」指的是 enrichment / correlation / projection / grounding 這四個，兩個不要混。
+
 | CEL 的職責 | 這一階段做到的 | 判定 |
 | --- | --- | --- |
 | enrichment：baseline | 只有 `attribution` 那條邊有（s4.2 拿 current 比 offset 前） | 部分 |
@@ -46,7 +52,7 @@ flowchart TB
 | projection | 沒有，一行都沒有 | 缺 |
 | grounding | 權威查詢可以重跑、log 帶著 trace ID；但注入的那段話本身沒有任何識別碼 | 半 |
 
-四項裡沒有一項是完整的：enrichment 四格只有拓撲那一格做滿，grounding 一半，correlation 跟 projection 整格空白。加起來大概一項半。下面把每一項的證據攤開。
+這四項沒有一項是完整的：enrichment 底下四格只有拓撲那一格做滿，grounding 一半，correlation 跟 projection 整項空白。加起來大概一項半。下面把每一項的證據攤開。
 
 ### enrichment：只有一條邊有 baseline
 
