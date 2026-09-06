@@ -1,6 +1,9 @@
+import asyncio
+import contextvars
 import json
 import logging
 import os
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -18,21 +21,36 @@ from pydantic import BaseModel, Field
 from . import store
 from .capability import capability_for_services, resolve_services
 from .config import settings
+from .facts import DiagnosticFact, classify, grounding_check, ledger
 from .runbook import (
     format_diagnostics,
+    format_remediation_choices,
     incident_params,
     match_runbook,
     render_runbook,
     run_diagnostics,
+    select_remediation,
 )
 from .signals.context import build_signal_context
+from .signals.envfit import compute_env_fit, get_last_fit
 from .signals.health import evaluate_dependency_health
+from .signals.vocabulary import render_vocabulary
+from .sufficiency import Verdict, evaluate_sufficiency, pivot_instruction
+from .telemetry import (
+    Investigation,
+    investigation_span,
+    record_budget,
+    record_chat_turn,
+    record_decisions,
+    record_tool_result,
+)
 from .tools import (
     discover_log_fields_tool,
     discover_metrics_tool,
     discover_span_names_tool,
     github_compare,
     github_get_file,
+    k8s_change_provenance_tool,
     k8s_deployment_status_tool,
     k8s_events_tool,
     k8s_pod_status_tool,
@@ -261,11 +279,11 @@ histogram_quantile(0.95, sum by (le) (rate(http_server_duration_milliseconds_buc
 
 Format example (incident with multiple signals):
 ```
-payment-service 在 14:05 後 decline 率從 0% 跳到 18%，全集中在 v2.5.0、
-reason 是 `new_validator_odd_cents`。看起來跟新部署的 validator 有關。
+order-service 在 14:05 後 5xx 從 0.2% 跳到 12%，全集中在 <the version you
+read off the breakdown>，reason 是 <the reason value you read>。跟那個時間點的部署對得上。
 
 ` ` `promql
-sum by (git_version, reason) (rate(payment_charges_total{{status="declined"}}[5m]))
+sum by (git_version, reason) (rate(<the counter you found>{{status="error"}}[5m]))
 ` ` `
 ```
 
@@ -291,6 +309,11 @@ The JSON must match this shape (only `title` / `expr` / `threshold` are required
 ``` ````
 
 Rules:
+- **NEVER emit a Prometheus-style rule (```` ```yaml ```` with `alert:` / `expr:` /
+  `for:` / `labels:`).** It looks right and is useless here: the plugin only
+  renders the ```` ```alert ```` JSON block as a card with the button, so a YAML
+  rule leaves the user with text they have to copy somewhere by hand. This is the
+  single most common way to get this wrong.
 - `expr` is a PromQL query evaluated as an **instant** value and compared to
   `threshold`; write a ratio/rate that reduces to one number, not a range vector.
 - `comparison` is `"gt"` or `"lt"`; `for_duration` is a Go duration (`"30s"` /
@@ -368,7 +391,7 @@ with GitHub deploys. In-scope intents include:
 - Reading or aggregating logs, metrics, or traces.
 - Root-cause analysis, deploy correlation, "what changed", "why is X slow".
 - **Comparing the code between two deployed versions of a service** ("diff
-  v2.4.1 vs v2.5.0", "what changed in the new version", "show the code the new
+  v1.2.3 vs v1.3.0", "what changed in the new version", "show the code the new
   deploy introduced"). The assistant has GitHub diff tools (`github_compare`,
   `github_get_file`) for exactly this — it is deploy correlation, IN scope.
 - Questions about the telemetry data, dashboards, or the observability stack itself.
@@ -519,7 +542,19 @@ TOOLS = [
     k8s_pod_status_tool,
     k8s_events_tool,
     k8s_deployment_status_tool,
+    k8s_change_provenance_tool,
 ]
+
+
+def _accumulate_facts(old: list, new: list) -> list:
+    """Append, except that an empty list resets — which is how each turn's input
+    clears the ledger. Facts are per-turn for the same reason `tool_calls_used`
+    is: they describe what *this* investigation has in hand, and a ledger that
+    silently carried yesterday's observations would let a turn that measured
+    nothing look grounded."""
+    if not new:
+        return []
+    return (old or []) + new
 
 
 class RcaState(TypedDict):
@@ -528,6 +563,7 @@ class RcaState(TypedDict):
     though `messages` accumulates across the thread (add_messages reducer)."""
 
     messages: Annotated[list, add_messages]
+    facts: Annotated[list[DiagnosticFact], _accumulate_facts]  # machine-typed tool results
     tool_calls_used: int
     budget: int
     rubric_feedback: str  # correction prompt from rubric node; "" means passed
@@ -567,9 +603,15 @@ def _build_graph():
         # `messages`, so re-sending the ~4k prompt every loop is pure waste.
         sys = build_system_prompt() if state["tool_calls_used"] == 0 else CONTINUE_PROMPT
         extra = []
+        # The ledger goes in front of the rubric correction, not after it: it is
+        # the state of the evidence, and a correction is easier to act on when
+        # what is actually in hand is already on the page.
+        book = ledger(state.get("facts") or [])
+        if book:
+            extra.append(HumanMessage(content=book))
         feedback = state.get("rubric_feedback", "")
         if feedback:
-            extra = [HumanMessage(content=feedback)]
+            extra.append(HumanMessage(content=feedback))
         msgs = [SystemMessage(content=sys)] + state["messages"] + extra
         return {
             "messages": [await llm_with_tools.ainvoke(msgs)],
@@ -597,6 +639,7 @@ def _build_graph():
                 dup_results.append(
                     ToolMessage(
                         tool_call_id=tc.get("id", ""),
+                        name=tc.get("name", ""),
                         content=(
                             "You already ran this exact query this turn and it did not help. "
                             "Do NOT repeat it. Change the stream selector / matcher / syntax "
@@ -614,7 +657,22 @@ def _build_graph():
             out = await tool_node.ainvoke({"messages": msgs[:-1] + [sub]})
             out_messages.extend(out["messages"])
         out_messages.extend(dup_results)
-        return {"messages": out_messages, "tool_calls_used": state["tool_calls_used"] + n}
+        # Type each result before the model gets to characterise it. The index
+        # continues across the turn so fact IDs stay stable and citable.
+        base = len(state.get("facts") or [])
+        new_facts = [
+            classify(getattr(m, "name", "") or "unknown", getattr(m, "content", ""), base + i + 1)
+            for i, m in enumerate(out_messages)
+        ]
+        for f in new_facts:
+            record_tool_result(f.tool, f.disposition)
+        record_budget(state["tool_calls_used"] + n, state["budget"])
+        out_state = {"messages": out_messages, "tool_calls_used": state["tool_calls_used"] + n}
+        if new_facts:
+            # Omitted when empty: the reducer reads [] as "reset", which is the
+            # turn input's job, not a no-op tool step's.
+            out_state["facts"] = new_facts
+        return out_state
 
     async def force_answer_node(state: RcaState):
         # Budget exhausted: answer with what we have. No tools bound, so the
@@ -629,7 +687,8 @@ def _build_graph():
                 "which checks you ran.\n\n" + _OUTPUT_CONTRACT
             )
         )
-        msgs = state["messages"] + [nudge]
+        book = ledger(state.get("facts") or [])
+        msgs = state["messages"] + ([HumanMessage(content=book)] if book else []) + [nudge]
         return {"messages": [await llm.ainvoke(msgs)]}
 
     async def rubric_trace_node(state: RcaState):
@@ -645,6 +704,23 @@ def _build_graph():
         except Exception as e:
             logger.warning("rubric_trace_node: check failed (%s) — passing through", e)
             ok, retry_prompt = True, ""
+        if ok:
+            # Trace IDs are about whether the evidence exists; this is about
+            # whether the conclusion was already crossed out. Second, because a
+            # fabricated citation is the more basic problem.
+            ok, retry_prompt = _refutation_check(answer)
+        if ok:
+            # Third: the prose half of the version question. Before grounding,
+            # because "blames a version the cluster cleared" is a named, specific
+            # fault and the grounding net would either miss it (the claim *is*
+            # cited, just to the wrong thing) or describe it vaguely.
+            ok, retry_prompt = _provenance_check(answer)
+        if ok:
+            # Fourth: a conclusion drawn from nothing at all. Last because it is
+            # the widest net — it reads the whole turn's evidence rather than one
+            # citation — and the narrower checks name the problem better when
+            # they fire.
+            ok, retry_prompt = grounding_check(answer, state.get("facts") or [])
         revision = state.get("rubric_revision_count", 0)
         return {
             "rubric_feedback": retry_prompt,
@@ -747,16 +823,76 @@ _findings_llm = (
 )
 
 
+async def _reconcile_version_with_provenance(findings: Findings) -> None:
+    """Drop `suspected_version` when the cluster says the template never changed.
+
+    The prose half of this was fixed by giving the agent the provenance tool: a
+    fresh ConfigMap incident now says "configuration regression in the
+    payment-flags ConfigMap" and the gate strikes `rollout_undo`. The
+    *structured* half was not — the same investigation still carried
+    `suspected_version: v2.5.0`, because the alert label says so and the
+    extractor reads the transcript, not the cluster. Prose and field disagreeing
+    is worse than either being wrong alone: it only shows up when someone reads
+    both, and everything downstream of the row (webhook tags, case memory,
+    grading) reads the field.
+
+    So the field is settled the same way the action is: by asking the cluster.
+    Off the tool budget, read-only, and failure-open — if provenance cannot
+    answer, or if any implicated service really did ship a new template, the
+    extracted version stands.
+    """
+    if not findings.suspected_version or not findings.services:
+        return
+    from .tools.k8s import get_change_provenance
+
+    mounted: list[str] = []
+    unchanged = False
+    for service in findings.services[:3]:
+        try:
+            prov = await get_change_provenance(service)
+        except Exception as e:  # a probe must never sink the extraction
+            logger.warning("provenance reconcile failed for %s: %s", service, e)
+            return
+        if not prov.get("found") or prov.get("unavailable"):
+            return
+        if "outside the template" not in (prov.get("verdict") or ""):
+            return  # something implicated here genuinely changed; keep the version
+        unchanged = True
+        mounted.extend((prov.get("revisions") or [{}])[-1].get("mounted_config") or [])
+
+    if not unchanged:
+        return
+
+    dropped = findings.suspected_version
+    sources = ", ".join(sorted(set(mounted))) or "none"
+    findings.suspected_version = None
+    findings.evidence.append(
+        f"k8s_change_provenance: the rollouts around {dropped} changed nothing the process "
+        f"runs, so that version is not the culprit; the mounted config ({sources}) is where "
+        "the change is. suspected_version cleared."
+    )
+    logger.info(
+        "findings: cleared suspected_version=%s for %s — provenance says the pod template "
+        "is unchanged (mounted config: %s)",
+        dropped,
+        ", ".join(findings.services[:3]),
+        sources,
+    )
+
+
 async def extract_findings(messages: list) -> Findings:
     """Distill a finished run's messages into a structured Findings. Used by the
     headless (alert webhook) path; not wired into chat."""
-    return await _findings_llm.ainvoke([SystemMessage(content=_FINDINGS_PROMPT)] + messages)
+    findings = await _findings_llm.ainvoke([SystemMessage(content=_FINDINGS_PROMPT)] + messages)
+    await _reconcile_version_with_provenance(findings)
+    return findings
 
 
 # ---- Structured Uncertainty (knowledge-loop §4.6) ----------------------------
-# Emitted when all hypothesis loops are exhausted and confidence is still below
-# threshold. Gives the on-call engineer a structured view of what was tried and
-# what to do next — far more actionable than a vague "I'm not sure" message.
+# Emitted when the loops are exhausted and the evidence never became sufficient
+# (sufficiency.py, not the stated confidence). Gives the on-call engineer a
+# structured view of what was tried and what to do next — far more actionable
+# than a vague "I'm not sure" message.
 
 
 class HypothesisStatus(BaseModel):
@@ -773,10 +909,10 @@ class HypothesisStatus(BaseModel):
 
 
 class StructuredUncertainty(BaseModel):
-    """Emitted when the RCA run ends with confidence below threshold after all
+    """Emitted when the RCA run ends without sufficient evidence after all
     hypothesis loops. Gives the on-call a structured escalation package."""
 
-    confidence: float = Field(description="Overall confidence (always < loop threshold).")
+    confidence: float = Field(description="Overall confidence as the model stated it.")
     summary: str = Field(description="One-line summary of the unresolved situation.")
     hypothesis_status: list[HypothesisStatus] = Field(
         default_factory=list,
@@ -816,8 +952,8 @@ _uncertainty_llm = (
 
 
 async def extract_uncertainty(messages: list, findings: Findings) -> StructuredUncertainty:
-    """Extract a structured uncertainty report when confidence is below threshold
-    after all loops. Seeds `confidence` and `summary` from the final Findings."""
+    """Extract a structured uncertainty report when the evidence never reached
+    sufficiency. Seeds `confidence` and `summary` from the final Findings."""
     result = await _uncertainty_llm.ainvoke([SystemMessage(content=_UNCERTAINTY_PROMPT)] + messages)
     # Override with the authoritative values from Findings so they stay consistent.
     result.confidence = findings.confidence
@@ -931,9 +1067,59 @@ Follow this RCA method (in order; stop once you can state a confident cause; min
    dominant reason, the supporting numbers, a trace id, and a calibrated confidence."""
 
 
-def _past_incident_context(service: str, alertname: str) -> str:
-    """Build a markdown block of past correct investigations for the same
-    service+alertname. Returns an empty string when there are no matches."""
+def _investigation_instructions(services: list[str]) -> str:
+    """The chat equivalent of what `_alert_to_prompt` hands the headless run:
+    the same RCA method, as a system message.
+
+    Until this existed the two entry points were not the same agent. An alert
+    arrived with a hypothesis tree, a five-step method and a confidence rule; a
+    human asking the same thing in Grafana got none of it, and the difference
+    showed up as the agent answering *a* question instead of investigating it.
+
+    It goes in a system message, not appended to the question, for one concrete
+    reason: an English instruction block glued onto a Chinese question makes the
+    model answer half in English. The user's message stays the user's message.
+    """
+    lines = ["## This turn is a root-cause investigation, not a lookup", ""]
+    if services:
+        lines.append(f"Service(s) in question: {', '.join(services)}.")
+    lines.append(
+        "Work through the method below **internally**. Do NOT print the "
+        "hypothesis tree, do not narrate which step you are on, and do not print "
+        "the step-5 checklist — fold all of it into the answer. The reply keeps "
+        "the normal answer style: lead with the conclusion, numbers with units, "
+        "and the matching fenced query blocks so the panels render. Finish with "
+        "ONE short line giving your confidence and what you could not rule out."
+    )
+    lines.append(_RCA_PLAYBOOK)
+    # Last line wins on recency, and this is the rule the model drops first when
+    # a block of English instructions lands on top of a Chinese question.
+    lines.append(
+        "\n**Answer in the same language as the user's question** — a question "
+        "in Chinese gets a Chinese answer, including the confidence line."
+    )
+    return "\n".join(lines)
+
+
+# The heading the recall block leads with. Named here because `leakcheck.py`
+# keys on it: this block is the one place where handing the model the previous
+# answer is the *intent*, so a leak scan has to be able to tell it apart from an
+# accident rather than either failing on it or silently passing it.
+PAST_CASES_HEADING = "## Past cases for this service (reference — current evidence wins)"
+
+
+def _legacy_past_incident_context(service: str, alertname: str | None = None) -> str:
+    """The pre-case-memory recall, kept as the A/B control arm.
+
+    Retained rather than deleted because Day32 already produced one "the score
+    moved but the causation is unprovable" result; swapping the recall source
+    with nothing to compare against would produce a second one.
+
+    Its defect is structural: the JOIN is on `fp`, so one verdict on the latest
+    row is inherited by every run that shared the fingerprint — on the day36
+    snapshot that returned ten "precedents" from two human verdicts, three of
+    which had concluded there was no incident.
+    """
     try:
         rows = store.inv_query_similar(service=service, alertname=alertname, limit=5)
     except Exception as e:
@@ -954,9 +1140,89 @@ def _past_incident_context(service: str, alertname: str) -> str:
     return "\n".join(lines)
 
 
+def _past_incident_context(service: str, alertname: str | None = None) -> str:
+    """What this service's history says, as a prior and a list of dead ends.
+
+    Two halves, ranked differently on purpose. A root cause is worth recalling
+    because it keeps happening; a dead end because it was disproved *recently* —
+    the environment it was disproved in is more likely to still be this one.
+
+    The dead ends are the half that changes behaviour without changing the
+    answer: they spend the budget the run would otherwise burn re-issuing a
+    query that cannot work here.
+    """
+    if not settings.case_recall_enabled:
+        return _legacy_past_incident_context(service, alertname)
+    try:
+        cases = store.case_query_similar(service=service, alertname=alertname, limit=3)
+        # The dead ends of *this* incident, not only of the incidents that
+        # reached a confirmed root cause. A refuted hypothesis and a declined
+        # action are the whole record a case has before anyone gets it right,
+        # and keying the lookup off the recalled cases meant that record was
+        # unreachable in exactly the situation it was collected for.
+        keys = {c["case_key"] for c in cases}
+        if alertname:
+            keys.add(store.case_key(alertname, service))
+        dead_ends = [
+            d
+            for d in store.case_ruled_out_for(sorted(keys), limit=8)
+            # Refuted hypotheses are deliberately absent. Day39 measured what
+            # happens when they are here: naming the branch made the model take
+            # it, three seeds out of three, at lower confidence than the arm
+            # that never saw it. They are checked against the answer afterwards
+            # instead (`refutation.py`). What stays is the half a machine can
+            # enforce — a query that cannot work here, an action a person
+            # declined, which the governance gate refuses on its own.
+            if d["kind"] != "hypothesis"
+        ]
+    except Exception as e:
+        logger.warning("past case recall failed: %s", e)
+        return ""
+    if not cases and not dead_ends:
+        return ""
+    lines = [PAST_CASES_HEADING]
+    for c in cases:
+        seen = f"×{c['occurrences']}" if c["occurrences"] > 1 else "once"
+        by = f", confirmed by {c['root_cause_source']}" if c["root_cause"] else ""
+        # A case from a different alert on the same service is history worth
+        # having and a weaker claim than the same alert firing again. It is
+        # labelled rather than filtered out, so neither the model nor the person
+        # reading this has to assume the two are the same incident.
+        kind = "" if c.get("same_alert", True) else "different alert on this service; "
+        lines.append(f"- {c['alertname']} ({kind}{seen}, last {(c['last_ts'] or '')[:10]}{by})")
+        if c["root_cause"]:
+            lines.append(f"  root cause: {c['root_cause']}")
+        resolution = c.get("resolution")
+        if isinstance(resolution, dict) and resolution.get("action"):
+            # Kept on its own line, and never merged into the cause. A fix that
+            # worked is not proof the diagnosis was right — a restart clears a
+            # great many things it does not explain.
+            lines.append(f"  resolved by: {resolution['action']} (verified)")
+    if dead_ends:
+        lines.append("")
+        lines.append("### Already ruled out here — do not spend budget re-checking")
+        for d in dead_ends:
+            evidence = f" ({d['evidence']})" if d["evidence"] else ""
+            # Who refuted it is part of the claim. A tool result means the query
+            # cannot work here; a person means it was looked at and rejected,
+            # and the model should weigh those differently instead of seeing one
+            # undifferentiated list of things not to do. When it was refuted is
+            # part of it too: these are facts about an environment, and the
+            # cutoff that drops the stale ones is a blunt line, not a promise
+            # that everything above it is still true.
+            by = " — ruled out by a person" if d["disproved_by"] == "human" else ""
+            when = f" [{(d['ts'] or '')[:10]}]" if d.get("ts") else ""
+            lines.append(f"- [{d['kind']}] {d['subject']}{evidence}{by}{when}")
+    return "\n".join(lines)
+
+
 def _inject_past_incidents(turn_messages: list, service: str | None, alertname: str | None) -> None:
-    """Inject past-incident context into the turn messages. Fail-open."""
-    if not service or not alertname:
+    """Inject past-incident context into the turn messages. Fail-open.
+
+    A chat question has no alertname; matching on the service alone is still
+    worth it, because "last time someone investigated this service, the cause
+    was X" is exactly what a human would say to a colleague."""
+    if not service:
         return
     try:
         ctx = _past_incident_context(service, alertname)
@@ -964,6 +1230,24 @@ def _inject_past_incidents(turn_messages: list, service: str | None, alertname: 
             turn_messages.append(SystemMessage(content=ctx))
     except Exception as e:
         logger.warning("past incident injection failed: %s", e)
+
+
+def _inject_label_vocabulary(turn_messages: list) -> None:
+    """Append the Weaver registry's label names for this environment.
+
+    Unconditional, unlike the rest of the Signal Plane injections: those are
+    keyed on a resolved service, and the question that most needs the right
+    label ("RED for every service") is exactly the one that resolves to no
+    single service — so gating this on `services` would withhold it precisely
+    when it matters. It is also small (a few hundred tokens) and static.
+
+    Fail-open: no compiled vocabulary means no block, never a broken turn."""
+    try:
+        block = render_vocabulary()
+        if block:
+            turn_messages.append(SystemMessage(content=block))
+    except Exception as e:
+        logger.warning("label vocabulary injection failed: %s", e)
 
 
 def _inject_signal_context(turn_messages: list, services: list[str]) -> None:
@@ -990,30 +1274,306 @@ async def _inject_dependency_health(turn_messages: list, services: list[str]) ->
         logger.warning("dependency health injection failed for %s: %s", services, e)
 
 
+# What the cluster said about each implicated service's last rollout, for the
+# runs where it said "this changed nothing the process runs". Set once by the
+# injection step and read by the rubric check that will not let the answer blame
+# that version anyway — same evidence, no second round-trip to the API server.
+_provenance_unchanged: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar(
+    "provenance_unchanged", default={}
+)
+
+
+async def _inject_change_provenance(turn_messages: list, services: list[str]) -> None:
+    """Ask the cluster what the last rollouts actually changed, before the run
+    reasons about a version at all.
+
+    `k8s_change_provenance` existed as a tool for exactly this, and measuring
+    the tool actually got called put it at 1/20: nineteen runs out of twenty
+    never thought to ask, and the two anecdotes I had happened to be the one
+    that did. A capability the model reaches for one time in twenty is not a
+    capability of the system. So this is a step, not an offer — the same shape
+    as the runbook diagnostics and dependency health above: read-only, off the
+    tool budget, fail-open, and it happens whether or not anybody remembers it.
+
+    It runs before the prompt because that is the only place it can settle the
+    prose. The post-hoc reconcile (`_reconcile_version_with_provenance`) already
+    fixes the `suspected_version` *field*, and the effect of fixing only the
+    field was that twenty runs out of twenty had a clean field and twenty out of
+    twenty still said "code regression in v2.5.0" in the sentence a person
+    reads. Handing the verdict over up front is what stops the sentence being
+    written.
+    """
+    from .tools.k8s import get_change_provenance
+
+    lines: list[str] = []
+    unchanged: dict[str, str] = {}
+    for service in services[:3]:
+        try:
+            prov = await get_change_provenance(service)
+        except Exception as e:  # enrichment must never sink the run
+            logger.warning("provenance injection failed for %s: %s", service, e)
+            continue
+        if not prov.get("found") or prov.get("unavailable") or not prov.get("verdict"):
+            continue
+        latest = (prov.get("revisions") or [{}])[-1]
+        mounted = ", ".join(latest.get("mounted_config") or []) or "none"
+        if "outside the template" in prov["verdict"] and latest.get("git_version"):
+            unchanged[service] = str(latest["git_version"])
+        lines.append(
+            f"- {service}: {prov['verdict']}\n"
+            f"  (running {latest.get('image') or 'unknown image'}, "
+            f"version label {latest.get('git_version') or 'unset'}, "
+            f"mounted config: {mounted})"
+        )
+    _provenance_unchanged.set(unchanged)
+    if unchanged:
+        logger.info(
+            "provenance step: cluster says the template is unchanged for %s",
+            ", ".join(f"{k} ({v})" for k, v in sorted(unchanged.items())),
+        )
+    if not lines:
+        return
+    turn_messages.append(
+        SystemMessage(
+            content=(
+                "CHANGE PROVENANCE (measured from the cluster's ReplicaSet history, "
+                "not from the alert labels):\n"
+                + "\n".join(lines)
+                + "\n\nA version label changing is not a code change. Where the verdict "
+                "says the rollout changed nothing the process runs, do not describe this "
+                "incident as a regression in that version — in prose or in any field — "
+                "and do not propose a rollback; the change is in the mounted config."
+            )
+        )
+    )
+
+
+async def _refresh_env_fit() -> None:
+    """Re-measure whether the injected catalog resolves against the stores we
+    are actually pointed at (s6). Read-only, off the agent budget, and cached:
+    only re-run when nobody has measured this environment or the measurement has
+    gone stale. Best-effort — a failure leaves the fit unproven, which the DQ
+    verdict already treats as "do not grant autonomy"."""
+    try:
+        fit = get_last_fit()
+        age = time.time() - fit.computed_ts if fit else None
+        if fit is None or age is None or age > settings.dq_max_env_fit_age_seconds:
+            await compute_env_fit()
+    except Exception as e:
+        logger.warning("env fit refresh failed: %s", e)
+
+
+def _provenance_check(answer: str) -> tuple[bool, str]:
+    """(passed, retry prompt). Does the answer still blame a version the cluster
+    says never shipped?
+
+    The measurement that produced this: after the field was settled from
+    provenance, twenty runs out of twenty carried an empty `suspected_version`
+    and twenty out of twenty still opened with "Code regression in
+    payment-service v2.5.0". The error had not gone away, it had moved from the
+    field to the sentence — and the criterion that forbids blaming that version
+    only read the field, so it passed all twenty while all twenty said the
+    forbidden thing in words. A check that reads one face lets the failure walk
+    between faces.
+
+    Fail-open: no provenance verdict for this run means no opinion here.
+    """
+    unchanged = _provenance_unchanged.get()
+    if not unchanged or not answer:
+        return True, ""
+    named = {svc: ver for svc, ver in unchanged.items() if ver and ver in answer}
+    if not named:
+        # Said out loud, because "the check passed" and "the check never ran"
+        # are the pair this codebase keeps confusing itself with — a silent
+        # fail-open reads exactly like a clean sweep.
+        logger.info(
+            "rubric: provenance verdict held for %s and the answer does not blame it",
+            ", ".join(sorted(unchanged)),
+        )
+        return True, ""
+    lines = ", ".join(f"{svc} {ver}" for svc, ver in sorted(named.items()))
+    # Logged because this is the number the change exists to move: how often the
+    # prose still had to be corrected after the cluster had already answered.
+    logger.info("rubric: answer blames a version the cluster cleared (%s) — retrying", lines)
+    return False, (
+        f"Your answer names {lines} as the cause, but the cluster's ReplicaSet history "
+        "says those rollouts changed nothing the process runs — at most a version label "
+        "or a restart. A rollback would restore an identical pod template. Rewrite the "
+        "answer so it does not attribute this incident to that version, and say where the "
+        "change actually is (the mounted config named in the provenance block above), or "
+        "say plainly that you have not established what changed."
+    )
+
+
+def _refutation_check(answer: str) -> tuple[bool, str]:
+    """(passed, retry prompt). Fail-open: an answer is never blocked because the
+    case memory was unreachable."""
+    from . import case_memory, refutation
+
+    sc = case_memory.current_scope()
+    if sc is None or not answer:
+        return True, ""
+    # Under the same flag as recall: `case_recall_enabled` selects whether a run
+    # uses the case library at all, and this is now the library's main way of
+    # reaching an answer. Without the gate the A/B has two identical arms.
+    if not settings.case_recall_enabled:
+        return True, ""
+    try:
+        rows = store.case_ruled_out_for([sc.case_key])
+        hit = refutation.find_repeat(answer, rows)
+    except Exception as e:
+        logger.warning("refutation check failed: %s", e)
+        return True, ""
+    if hit is None:
+        return True, ""
+    return False, refutation.retry_prompt(hit)
+
+
+def _prior_rejections(steps: list, params: dict) -> dict[str, dict]:
+    """{action name: the refusal a person wrote}, for this incident only.
+
+    Empty outside a case scope, which is every chat turn and every alert with no
+    service — the same degradation the rest of case memory takes when it cannot
+    tell which incident it is looking at.
+    """
+    from . import case_memory
+    from .runbook import _subst
+
+    sc = case_memory.current_scope()
+    if sc is None:
+        return {}
+    from .action_requests import target_of
+
+    out: dict[str, dict] = {}
+    for step in steps:
+        hit = case_memory.prior_rejection(
+            sc.case_key, step.action, target_of(_subst(step.args, params))
+        )
+        if hit:
+            out[step.action] = hit
+    return out
+
+
+def _runbook_track_record(runbook_id: str) -> str:
+    """One line of the runbook's own execution history, or nothing.
+
+    Nothing is the right output for a procedure with no record: "0 executions"
+    reads as a warning about the runbook, when it is a statement about us.
+    """
+    try:
+        h = store.rb_health(runbook_id)
+    except Exception as e:
+        logger.warning("runbook health lookup failed for %s: %s", runbook_id, e)
+        return ""
+    if h["status"] == store.RB_NO_RECORD:
+        return ""
+    if h["status"] == store.RB_HEALTHY:
+        return f"\n\n_Track record: {h['note']}._"
+    return (
+        f"\n\n**Track record: {h['note']}.** Treat the remediation below as a "
+        "hypothesis, not as the answer — say so if the evidence points elsewhere."
+    )
+
+
+class _NoApplicableRemediation(Exception):
+    """Every remediation step in the matched runbook was branched away."""
+
+    def __init__(self, runbook_id: str) -> None:
+        super().__init__(runbook_id)
+        self.runbook_id = runbook_id
+
+
 async def _inject_runbook(turn_messages: list, labels: dict, annotations: dict):
     """Match a runbook to the alert; inject its rendered guidance (Tier 0) and,
     if enabled, the results of auto-running its read-only diagnostics (Tier 1).
-    Returns the matched Runbook (or None) so the caller can run the governance
-    gate over its remediation steps. Best-effort — never blocks the run."""
+    Returns `(runbook, diagnostic_results)` — or `(None, None)` — so the caller
+    can run the governance gate over the remediation steps *this diagnosis*
+    selects. Best-effort — never blocks the run."""
     try:
         rb = match_runbook(labels, annotations)
         if rb is None:
-            return None
+            return None, None
         params = incident_params(labels, annotations)
-        turn_messages.append(SystemMessage(content=render_runbook(rb, params)))
+        block = render_runbook(rb, params)
+        # What happened the last few times this procedure was actually run. A
+        # runbook is a claim about how to fix something, and until now the claim
+        # was injected with the same authority whether it had worked four times
+        # or failed four times.
+        if settings.runbook_health_enabled:
+            block += _runbook_track_record(rb.id)
+        turn_messages.append(SystemMessage(content=block))
+        results = None
         if settings.runbook_run_diagnostics and rb.diagnostics:
             tool_map = {t.name: t for t in TOOLS}  # all read-only
             results = await run_diagnostics(rb, params, tool_map)
             turn_messages.append(SystemMessage(content=format_diagnostics(rb, results)))
-        return rb
+            # Which fix the diagnostics just chose, and which one they ruled out.
+            # Injected as well as acted on: the answer should be able to say why
+            # the obvious remediation is not the one being proposed.
+            branch = format_remediation_choices(select_remediation(rb, results, params))
+            if branch:
+                turn_messages.append(SystemMessage(content=branch))
+        return rb, results
     except Exception as e:
         logger.warning("runbook injection failed: %s", e)
+        return None, None
+
+
+async def _proposal_footprint(action: str, args: dict) -> dict | None:
+    """The read-only dry-run for a proposal, at the moment it is proposed.
+
+    "Next step" is only a suggestion if it comes with its size. Rolling back two
+    pods in one namespace and rolling back sixty are the same sentence and a very
+    different decision, and the on-call is the one who has to tell them apart.
+    Best-effort: a footprint we cannot compute must not cost the proposal, and
+    the executor re-runs this (fail-closed) before anything actually happens.
+    """
+    from .actions import registry
+
+    spec = registry.get(action)
+    if spec is None or spec.dry_run is None:
         return None
+    try:
+        br = await spec.dry_run(args)
+    except Exception as e:
+        logger.warning("proposal footprint failed for %s: %s", action, e)
+        return None
+    from .blast_radius import evaluate_policy
+
+    ok, reason = evaluate_policy(br)
+    data = br.model_dump()
+    data["policy_ok"] = ok
+    data["policy_reason"] = reason
+    return data
+
+
+def _sufficiency(facts: list[DiagnosticFact], findings: Findings) -> Verdict:
+    """The configured thresholds, in one place, so every call site asks the same
+    question. `findings.evidence` is what the conclusion claims to rest on; the
+    check is only that it cites something, since matching free-text citations
+    back to fact IDs needs the citations to carry IDs, which they do not yet."""
+    return evaluate_sufficiency(
+        facts,
+        findings.evidence,
+        min_sources=settings.sufficiency_min_sources,
+        min_roles=settings.sufficiency_min_causal_roles,
+    )
 
 
 async def run_headless(alert: dict, thread_id: str) -> dict:
     """Run one headless RCA turn for a single firing alert. Returns the final
-    prose answer plus structured Findings for the downstream sink."""
+    prose answer plus structured Findings for the downstream sink.
+
+    The whole turn runs inside one `aiops.investigation` span, so every model
+    call, tool call and datastore round-trip below hangs off a single trace —
+    the one whose id gets stored beside the conclusion."""
+    labels = alert.get("labels") or {}
+    service_hint = labels.get("service_name") or labels.get("service")
+    with investigation_span("alert", service_hint) as inv:
+        return await _run_headless(alert, thread_id, inv)
+
+
+async def _run_headless(alert: dict, thread_id: str, inv: Investigation) -> dict:
     labels = alert.get("labels") or {}
     annotations = alert.get("annotations") or {}
     service = labels.get("service_name") or labels.get("service")
@@ -1024,10 +1584,21 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
     turn_messages: list = []
     if service:
         try:
-            turn_messages.append(SystemMessage(content=await capability_for_services([service])))
+            snapshot = await capability_for_services([service])
+            if snapshot:
+                turn_messages.append(SystemMessage(content=snapshot))
+            else:
+                # Not a failure: the service simply has no live data in this
+                # window (a quiet service, or a fixed dataset that never had it).
+                # Logging it as "failed" sent me hunting for a bug that wasn't there.
+                logger.info(
+                    "headless: no capability snapshot for %s — no live inventory in this window",
+                    service,
+                )
         except Exception as e:
             logger.warning("headless: capability snapshot failed for %s: %s", service, e)
         _inject_signal_context(turn_messages, [service])
+    _inject_label_vocabulary(turn_messages)
 
     # Runbook (v3 §5): if this alert matches a runbook, inject its rendered steps
     # (Tier 0) and auto-run its read-only diagnostics (Tier 1) so the agent
@@ -1037,14 +1608,15 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
     # the agent knows "last time this fired, the root cause was X". Best-effort.
     _inject_past_incidents(turn_messages, service, labels.get("alertname"))
 
-    matched_rb = None
+    matched_rb, rb_diagnostics = None, None
     with now_override(starts_dt):
         if settings.runbook_enabled:
-            matched_rb = await _inject_runbook(turn_messages, labels, annotations)
+            matched_rb, rb_diagnostics = await _inject_runbook(turn_messages, labels, annotations)
         # Dependency health (s4) under the pinned incident clock, so neighbour
         # SLIs are read at the incident time, not real now.
         if service:
             await _inject_dependency_health(turn_messages, [service])
+            await _inject_change_provenance(turn_messages, [service])
 
     turn_messages.append(
         {"role": "user", "content": _alert_to_prompt(labels, annotations, starts_dt)}
@@ -1057,8 +1629,10 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
     agent = await _build_agent()
     config = {"configurable": {"thread_id": thread_id}}
 
-    # Loop engineering (knowledge-loop §4.4): run → extract findings → if
-    # confidence < threshold, pivot to the next untried hypothesis and retry.
+    # Loop engineering (knowledge-loop §4.4): run → extract findings → if the
+    # evidence is not yet sufficient, name the gap and go again. The stopping
+    # rule is computed from the run's own observations (sufficiency.py), not
+    # from the confidence the model states about its own work.
     # Each iteration uses a fresh per-turn budget; MemorySaver preserves the
     # full message history across invocations on the same thread_id, so the
     # agent sees everything it already tried when asked to pivot.
@@ -1067,6 +1641,7 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
         result = await agent.ainvoke(
             {
                 "messages": turn_messages,
+                "facts": [],
                 "tool_calls_used": 0,
                 "budget": settings.webhook_tool_call_budget,
                 "rubric_feedback": "",
@@ -1079,34 +1654,27 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
     answer = _flatten_content(getattr(messages[-1], "content", None)) if messages else ""
 
     findings = await extract_findings(messages)
+    # Evidence accumulates across pivots even though the per-turn ledger resets:
+    # the question this gate answers is whether *the investigation* established
+    # enough, and turn two building on turn one is the loop working as intended.
+    all_facts: list[DiagnosticFact] = list(result.get("facts") or [])
+    verdict = _sufficiency(all_facts, findings)
 
-    while (
-        findings.confidence < settings.confidence_loop_threshold
-        and loop_count < settings.max_hypothesis_loops
-    ):
+    while not verdict.sufficient and loop_count < settings.max_hypothesis_loops:
         loop_count += 1
         logger.info(
-            "headless loop %d/%d: conf=%.2f < %.2f, pivoting to next hypothesis (fp=%s)",
+            "headless loop %d/%d: %s, pivoting on the gap (fp=%s)",
             loop_count,
             settings.max_hypothesis_loops,
-            findings.confidence,
-            settings.confidence_loop_threshold,
+            verdict.summary(),
             thread_id,
         )
-        pivot_msg = (
-            f"Your previous conclusion had confidence {findings.confidence:.0%}, "
-            f"which is below the required threshold ({settings.confidence_loop_threshold:.0%}). "
-            f"The hypothesis you investigated was: {findings.hypothesis!r}.\n\n"
-            "Do NOT repeat the same investigation. From the 2–3 hypotheses you listed "
-            "at the start, pick a DIFFERENT one you have not yet fully explored. "
-            "Investigate it now, actively seeking both confirming AND refuting evidence. "
-            "Then re-evaluate all three confidence dimensions (signal diversity, "
-            "refutation attempt, hypothesis convergence) before concluding."
-        )
+        pivot_msg = pivot_instruction(verdict, all_facts)
         with now_override(starts_dt):
             result = await agent.ainvoke(
                 {
                     "messages": [{"role": "user", "content": pivot_msg}],
+                    "facts": [],
                     "tool_calls_used": 0,
                     "budget": settings.webhook_tool_call_budget,
                     "rubric_feedback": "",
@@ -1117,29 +1685,35 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
         messages = result.get("messages", [])
         answer = _flatten_content(getattr(messages[-1], "content", None)) if messages else ""
         findings = await extract_findings(messages)
+        all_facts.extend(result.get("facts") or [])
+        verdict = _sufficiency(all_facts, findings)
 
     if loop_count > 0:
         logger.info(
-            "headless loop done after %d pivot(s): final conf=%.2f (fp=%s)",
+            "headless loop done after %d pivot(s): %s, stated conf=%.2f (fp=%s)",
             loop_count,
+            verdict.summary(),
             findings.confidence,
             thread_id,
         )
+
+    inv.record(
+        sufficient=verdict.sufficient,
+        pivots=loop_count,
+        confidence=findings.confidence,
+        gaps=[c.name for c in verdict.gaps],
+    )
 
     # Structured Uncertainty (knowledge-loop §4.6): when all loops are exhausted
     # and confidence is still below threshold, produce a structured escalation
     # package so the on-call knows exactly what was tried and what to check next.
     uncertainty: StructuredUncertainty | None = None
-    if (
-        loop_count >= settings.max_hypothesis_loops
-        and findings.confidence < settings.confidence_loop_threshold
-    ):
+    if not verdict.sufficient:
         logger.info(
-            "headless: confidence %.2f still below %.2f after %d loops — "
+            "headless: evidence still not sufficient after %d loop(s) (%s) — "
             "extracting structured uncertainty (fp=%s)",
-            findings.confidence,
-            settings.confidence_loop_threshold,
             loop_count,
+            "; ".join(f"{c.name}: {c.detail}" for c in verdict.gaps),
             thread_id,
         )
         try:
@@ -1154,17 +1728,68 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
     decisions: list = []
     if matched_rb and matched_rb.remediation:
         try:
-            from .calibration import compute_calibration, load_records
-            from .governance import propose_remediations
+            from .calibration import compute_calibration, load_records, production_records
+            from .governance import (
+                inapplicable_by_provenance,
+                propose_remediations,
+                regression_verdict,
+                runbook_health_verdict,
+            )
             from .runbook import _subst, incident_params
+            from .signals.actuation import actuation_verdict, refresh_actuation
             from .signals.dq import dq_verdict
 
-            calib = compute_calibration(load_records())
+            # Ask the cluster whether the write credential still works before
+            # proposing anything that would use it. Read-only, off the agent
+            # budget, cached — same treatment as the env-fit refresh.
+            await refresh_actuation()
+
+            # Only the grading modes whose `correct` means what the calibration
+            # math assumes — see settings.governance_calibration_modes.
+            # Rehearsals are excluded here for the same reason the executor
+            # counts them apart: a drill replayed is one piece of evidence, not
+            # many, and this number decides whether the next action needs a human.
+            calib = compute_calibration(
+                production_records(load_records()),
+                modes=tuple(settings.governance_calibration_modes),
+            )
+            # What a person has already turned down on this incident. Looked up
+            # per (action, target) rather than per action: "don't restart
+            # payment" is not a statement about restarting anything else.
+            params = incident_params(labels, annotations)
+            # The branch: only the steps whose `when` matches what the Tier 1
+            # diagnostics found are eligible to be proposed. A runbook with no
+            # conditions selects everything, as before.
+            choices = select_remediation(matched_rb, rb_diagnostics, params)
+            eligible = [c.step for c in choices if c.applicable]
+            for c in choices:
+                if not c.applicable:
+                    logger.info(
+                        "runbook %s: not proposing %s — %s", matched_rb.id, c.step.action, c.reason
+                    )
+            if not eligible:
+                raise _NoApplicableRemediation(matched_rb.id)
+            step_by_action = {s.action: s for s in eligible}
+            rejected = _prior_rejections(eligible, params)
+
+            # What the change history rules out for this service, regardless of
+            # what the runbook lists. Off the tool budget, like the actuation
+            # refresh above, and it asks the cluster rather than trusting the
+            # run's own prose.
+            inapplicable = await inapplicable_by_provenance(
+                params.get("service_name") or params.get("service")
+            )
+
             decisions = propose_remediations(
-                [s.action for s in matched_rb.remediation],
+                [s.action for s in eligible],
                 findings.confidence,
                 calib,
                 dq_verdict(),
+                actuation_verdict(),
+                runbook_health_verdict(matched_rb.id) if settings.runbook_health_enabled else None,
+                rejected,
+                regression_verdict(),
+                inapplicable,
             )
 
             # Materialize each AUTO/PROPOSE decision as a tracked ActionRequest the
@@ -1174,28 +1799,44 @@ async def run_headless(alert: dict, thread_id: str) -> dict:
             if settings.action_requests_enabled and decisions:
                 from . import action_requests
 
-                params = incident_params(labels, annotations)
-                step_by_action = {s.action: s for s in matched_rb.remediation}
                 for d in decisions:
                     step = step_by_action.get(d.action)
                     if step is None:
                         continue
+                    action_args = _subst(step.args, params)
                     action_requests.create_from_decision(
                         thread_id,
                         d,
-                        args=_subst(step.args, params),
+                        args=action_args,
                         rollback=_subst(step.rollback, params) if step.rollback else None,
                         runbook_id=matched_rb.id,
                         params=params,
+                        blast_radius=await _proposal_footprint(d.action, action_args),
                     )
+        except _NoApplicableRemediation as e:
+            # Not a failure: the runbook has fixes, and none of them is for this
+            # incident. Saying nothing is the correct proposal, and it must not
+            # be logged as the gate breaking.
+            logger.info("runbook %s: no remediation applies to this diagnosis", e.runbook_id)
         except Exception as e:
             logger.warning("governance gate failed: %s", e)
+
+    record_decisions(decisions, service)
 
     return {
         "answer": answer,
         "findings": findings,
         "decisions": decisions,
         "uncertainty": uncertainty,
+        # Why this run stopped, in a form that can be re-read without a model.
+        # The eval harness grades against it, and the on-call view shows the
+        # unmet checks instead of a bare "low confidence".
+        "sufficiency": verdict.as_dict(),
+        # The full message list of the last invocation. The webhook path ignores
+        # it; the eval harness reads it to grade *how* the answer was reached
+        # (which tools, in what order, on what evidence) — a verdict-only grade
+        # can't tell a lucky guess from an investigation.
+        "messages": messages,
     }
 
 
@@ -1245,13 +1886,93 @@ async def suggest_followups(user_message: str, answer: str) -> list[str]:
     return [s.strip() for s in res.suggestions if s.strip()][:3]
 
 
+async def _reconcile_loop() -> None:
+    """Periodically let time advance the action-request state machine. Runs for
+    the life of the process; every iteration is guarded because a reconciler that
+    dies on one bad row stops reconciling everything else, and it would do so
+    silently — which is the exact failure class it exists to prevent."""
+    from . import action_requests
+
+    while True:
+        try:
+            await asyncio.sleep(settings.reconcile_interval_seconds)
+            await asyncio.to_thread(action_requests.reconcile)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("reconcile loop iteration failed: %s", e)
+
+
+async def _actuation_loop() -> None:
+    """Probe write-credential readiness on a timer, for the life of the process.
+
+    Until now the preflight only ran on the RCA path and just before an execute,
+    which means readiness was computed exactly when it was already too late to be
+    useful. On a timer it becomes a standing signal with an age: the question
+    "can we still act" has an answer before an incident asks it, and a credential
+    that dies at 03:00 is visible at 03:05 instead of at the next execution
+    attempt — which, measured on this system, was 46 days later."""
+    from .signals.actuation import check_actuation
+
+    while True:
+        try:
+            await check_actuation(source="loop")
+            await asyncio.sleep(settings.actuation_probe_interval_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("actuation probe loop iteration failed: %s", e)
+            await asyncio.sleep(settings.actuation_probe_interval_seconds)
+
+
+async def _signals_loop() -> None:
+    """Re-measure the two DQ gate inputs on a timer, for the life of the process.
+
+    The same argument `_actuation_loop` above already won for the third one: a
+    gate input is a standing signal with an age, and it has to have an answer
+    before an incident asks. That decision was made for write credentials and
+    never made for these two — env fit was refreshed only from inside an RCA
+    turn, and the topology reconcile was called by nothing at all. Both verdicts
+    expire after an hour, so `data_quality` could only be green in the hour
+    following an alert and went red on its own the rest of the time, with
+    nothing whatsoever wrong with the environment.
+
+    Best-effort per iteration and per probe: a store that will not answer leaves
+    that verdict unproven, which the gate already treats as "do not grant
+    autonomy". One failing probe must not stop the other from being taken.
+    """
+    from .signals.envfit import compute_env_fit
+    from .signals.reconcile import reconcile
+
+    while True:
+        for name, probe in (("env fit", compute_env_fit), ("reconcile", reconcile)):
+            try:
+                await probe()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("%s probe failed; leaving it unproven: %s", name, e)
+        await asyncio.sleep(settings.signals_probe_interval_seconds)
+
+
 @asynccontextmanager
 async def lifespan(app):
     from . import store
 
     store.init()  # schema + one-time legacy JSONL migration (7b-0)
     await _build_agent()
-    yield
+    tasks = []
+    if settings.reconcile_enabled:
+        tasks.append(asyncio.create_task(_reconcile_loop()))
+    if settings.actuation_check_enabled:
+        tasks.append(asyncio.create_task(_actuation_loop()))
+    if settings.signals_probe_enabled:
+        tasks.append(asyncio.create_task(_signals_loop()))
+    try:
+        yield
+    finally:
+        for task in tasks:
+            task.cancel()
 
 
 CLARIFY_PROMPT = "你是指哪一個服務？(Which service do you mean?)"
@@ -1287,6 +2008,64 @@ async def _followups_and_done(message: str, answer_parts: list[str]) -> AsyncIte
     yield {"type": "done"}
 
 
+async def _conclude_chat_investigation(
+    message: str, thread_id: str, config: dict, services: list[str]
+) -> AsyncIterator[dict]:
+    """Extract the structured verdict for a chat investigation, emit it, store it.
+
+    The alert path has done this since it was written; chat threw the transcript
+    away the moment the prose was streamed. That is why a question asked in
+    Grafana produced no confidence score, no row in the investigation list, and
+    nothing to replay later. Best-effort throughout: this runs after the user
+    already has their answer, so nothing here may break the turn."""
+    try:
+        graph = await _build_agent()
+        state = await graph.aget_state(config)
+        messages = state.values.get("messages", []) if state else []
+        if not messages:
+            return
+        findings = await extract_findings(messages)
+        # Same verdict as the headless path, recorded but not enforced: a person
+        # is reading this answer and can ask again, so the gate here is
+        # information rather than control. It still has to be computed, because
+        # "the agent only looked in one place" is worth seeing in Grafana
+        # whoever kicked the run off.
+        verdict = _sufficiency(state.values.get("facts") or [], findings)
+    except Exception as e:
+        logger.warning("chat findings extraction failed (fp=%s): %s", thread_id, e)
+        return
+
+    yield {
+        "type": "findings",
+        "summary": findings.summary,
+        "hypothesis": findings.hypothesis,
+        "confidence": findings.confidence,
+        "services": list(findings.services or []),
+        "suspected_version": findings.suspected_version,
+    }
+
+    try:
+        from .investigations import record_investigation
+
+        answer = _flatten_content(getattr(messages[-1], "content", None))
+        record_investigation(
+            thread_id,
+            {
+                "labels": {"service_name": services[0] if services else None},
+                "annotations": {"summary": message[:200]},
+            },
+            {
+                "answer": answer,
+                "findings": findings,
+                "decisions": [],
+                "sufficiency": verdict.as_dict(),
+            },
+            source="chat",
+        )
+    except Exception as e:
+        logger.warning("chat investigation record failed (fp=%s): %s", thread_id, e)
+
+
 async def stream_chat(
     message: str, thread_id: str, service_hint: str | None = None
 ) -> AsyncIterator[dict]:
@@ -1308,6 +2087,8 @@ async def stream_chat(
     except Exception as e:
         logger.warning("Intent gate failed, refusing (fail-closed): %s", e)
         intent = IntentResult(in_scope=False)
+
+    record_chat_turn(intent.in_scope)
 
     if not intent.in_scope:
         yield {"type": "token", "text": REFUSAL_TEXT}
@@ -1345,9 +2126,20 @@ async def stream_chat(
 
     if snapshot:
         turn_messages.append(SystemMessage(content=snapshot))
+    await _refresh_env_fit()
+    _inject_label_vocabulary(turn_messages)
     if resolved:
         _inject_signal_context(turn_messages, resolved)
         await _inject_dependency_health(turn_messages, resolved)
+        await _inject_change_provenance(turn_messages, resolved)
+    # Closed loop: what did we conclude last time someone asked about this
+    # service? Free (a store read), and it is the one piece of context a human
+    # colleague would definitely have.
+    investigating = intent.mode == "investigate"
+    if investigating and resolved:
+        _inject_past_incidents(turn_messages, resolved[0], None)
+    if investigating:
+        turn_messages.append(SystemMessage(content=_investigation_instructions(resolved)))
     turn_messages.append({"role": "user", "content": message})
 
     # Accumulate the answer text so we can suggest follow-ups from it afterward.
@@ -1378,6 +2170,7 @@ async def stream_chat(
         # append to the thread history (add_messages reducer).
         {
             "messages": turn_messages,
+            "facts": [],
             "tool_calls_used": 0,
             "budget": settings.tool_call_budget,
             "rubric_feedback": "",
@@ -1409,10 +2202,19 @@ async def stream_chat(
                 answer_parts.append(text)
                 yield {"type": "token", "text": text}
 
+        # `id` is the run id LangChain assigns to this tool invocation, and it is
+        # the only thing that ties a result back to its call. The agent fans out
+        # (five `discover_metrics`, one per service, in the same millisecond), so
+        # a UI matching on the tool *name* pairs whichever result lands first
+        # with whichever call is still open — and then shows an input and an
+        # output that never belonged together. A transcript that mismatches
+        # argument and result is worse than no transcript: the whole point of it
+        # is that a human can check the agent's work against it.
         elif kind == "on_tool_start":
             tool_ran = True
             yield {
                 "type": "tool_start",
+                "id": event.get("run_id"),
                 "tool": name,
                 "input": data.get("input"),
             }
@@ -1422,6 +2224,7 @@ async def stream_chat(
             preview = str(output)[:500] if output is not None else ""
             yield {
                 "type": "tool_end",
+                "id": event.get("run_id"),
                 "tool": name,
                 "output_preview": preview,
             }
@@ -1455,6 +2258,10 @@ async def stream_chat(
                     if text:
                         answer_parts.append(text)
                         yield {"type": "final", "text": text}
+
+    if investigating:
+        async for ev in _conclude_chat_investigation(message, thread_id, config, resolved):
+            yield ev
 
     async for ev in _followups_and_done(message, answer_parts):
         yield ev

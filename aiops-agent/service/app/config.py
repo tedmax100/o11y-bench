@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,6 +26,13 @@ class Settings(BaseSettings):
     # clean "unavailable" result rather than crashing the turn.
     k8s_namespace: str = "demo"
     k8s_label_key: str = "app"
+    # Away-field runs (agent on host, telemetry from a *different* stack than
+    # the local kubeconfig's cluster) must not let these tools quietly answer
+    # against the wrong cluster — the agent has no way to tell "empty because
+    # nothing's there" from "empty because this is the home cluster, not the
+    # one the incident is in". Set false to make all four k8s_* tools report
+    # `unavailable` without ever touching the kubernetes client.
+    k8s_enabled: bool = True
 
     # Hard ceiling on tool calls per turn, enforced by the RCA graph's budget
     # guard (not just the system prompt). Matches the prompt's stated ceiling.
@@ -55,6 +64,16 @@ class Settings(BaseSettings):
     runbook_dir: str = "runbooks"
     runbook_enabled: bool = True
     runbook_run_diagnostics: bool = True
+    # How a runbook's own execution history feeds back into the next incident.
+    # `runbook_feedback` has recorded every outcome since 7b-4 and nothing read
+    # it but a report endpoint, so a procedure that had failed verification four
+    # times running was still injected as authoritative guidance.
+    runbook_health_enabled: bool = True
+    runbook_health_window_days: int = 30
+    # Below this many recorded executions a failure rate is a rumour, not a
+    # measurement — the report says so instead of printing a percentage.
+    runbook_health_min_runs: int = 3
+    runbook_health_verify_failed_rate: float = 0.30
 
     # --- Calibration-error (CE) harness (ARE gap-analysis §4.2 step 2) -----
     # Each headless run logs its Findings.confidence here; correctness is filled
@@ -74,6 +93,29 @@ class Settings(BaseSettings):
     investigations_enabled: bool = True
     investigations_log_path: str = "investigations.jsonl"
 
+    # --- Case memory (incident-level, version-free; see doc/aiops-agent-case-memory.md)
+    # Writes only: what was investigated, what a trusted labeler concluded, and
+    # which paths turned out to be dead ends. Off = the write side is inert and
+    # nothing new reaches a prompt, which is the safe default while the recall
+    # format is still being A/B'd against no-recall.
+    case_memory_enabled: bool = True
+    # Nothing here is true forever. A dead end is a fact about an environment
+    # ("that label is not indexed in this Loki"), a rejection is a fact about a
+    # policy ("not during business hours") — both outlive the day they were
+    # recorded and neither outlives the quarter. Explicit `expires_ts` covers
+    # the ones known to be short-lived at write time; this covers the rest,
+    # which is all of the ones a person wrote.
+    case_dead_end_max_age_days: int = 30
+    # A root cause on an incident nobody has seen in this long stops being
+    # recalled. It is still in the table; it is no longer put in front of the
+    # model as what is probably happening now.
+    case_max_age_days: int = 90
+    # Which side of the recall A/B this run is on. True = the case library
+    # (one row per incident, plus the dead ends). False = the pre-case-memory
+    # JOIN, kept as the control arm — swapping the source with nothing to
+    # compare against is how you get a second unprovable "the score moved".
+    case_recall_enabled: bool = True
+
     # --- Governance gate + action registry (ARE Governance plane; v3 §5.2) --
     # Decides per proposed remediation: AUTO / PROPOSE / ESCALATE, from the run's
     # confidence AND measured calibration. `actions_enabled` is the master kill
@@ -91,6 +133,17 @@ class Settings(BaseSettings):
     # Approvals go stale: a request not acted on within this window is expired so
     # its preconditions can't be acted on after the world has moved (TOCTOU).
     approval_ttl_seconds: int = 900
+    # Background reconciliation: without it every transition needs a human to
+    # knock, so proposals expire only when someone tries to approve them and a
+    # request whose executor died stays `executing` forever. The reconciler only
+    # ever makes the record honest — it never retries or rolls back.
+    reconcile_enabled: bool = True
+    reconcile_interval_seconds: int = 60
+    # How long a claimed request may sit in `executing` before it is written off
+    # as abandoned. Must comfortably exceed the whole execute→settle→verify→
+    # rollback path (verify_delay_seconds plus rollout time), or the reconciler
+    # will declare live work dead.
+    executing_timeout_seconds: int = 600
 
     # --- Dry-run + blast-radius policy (step 7 後半 7b-2) -------------------
     # Read-only gates that run before any (kill-switched) execution: re-verify the
@@ -113,9 +166,43 @@ class Settings(BaseSettings):
     breaker_max_actions_per_window: int = 3
     breaker_window_seconds: int = 3600
     breaker_fail_threshold: int = 2  # consecutive failures on a target → trip open
+    # How far back the idempotency probe looks. `idem_key` is action|target|fp and
+    # `fp` is stable across recurrences of the same alert, so without a bound this
+    # gate silently means "this remediation may run once, ever" — a drill was
+    # refused as a duplicate of an execution eight days old. Idempotency is
+    # defending against an alert storm, which happens in minutes; a recurrence
+    # tomorrow is a new incident that deserves the same fix again.
+    idempotency_window_seconds: int = 3600
+
+    # --- Actuation readiness preflight ---------------------------------------
+    # "May we act" was gated; "can we still act" was assumed. A write-SA token
+    # outlived the cluster it was minted against and nothing reported it for 46
+    # days, because a credential is only observed at the instant it is used.
+    # SelfSubjectAccessReview turns permission into a signal that expires.
+    actuation_check_enabled: bool = True
+    actuation_max_age_seconds: int = 900  # older than this → readiness stale
+    # Standing probe interval. Comfortably under actuation_max_age_seconds so a
+    # single missed probe doesn't make readiness stale — a signal that reports
+    # itself broken every time one scrape is late gets ignored like any other
+    # flapping alert.
+    actuation_probe_interval_seconds: int = 300
+
+    # How often to re-measure the other two DQ gate inputs. Both verdicts go
+    # stale after dq_max_*_age_seconds (an hour), and until now nothing re-took
+    # either measurement on its own: env fit was computed only on the RCA path,
+    # and the topology reconcile only when somebody ran it by hand. So DQ could
+    # be green only during the hour after an alert, and red the rest of the time
+    # with nothing wrong. Well under the staleness ceiling on purpose — a probe
+    # that expires between probes is the failure it exists to prevent.
+    signals_probe_enabled: bool = True
+    signals_probe_interval_seconds: int = 900
 
     # --- Verify + rollback (step 7 後半 7b-4) ---------------------------------
-    verify_delay_seconds: int = 60  # settle window between execute and verify query
+    verify_delay_seconds: int = 60  # floor for the settle window; the query can raise it
+    # Added on top of a verify query's own lookback window before checking it, to
+    # cover the time pods actually take to roll. Without this a rollback is graded
+    # while the old ReplicaSet is still serving traffic.
+    verify_rollout_margin_seconds: int = 45
     require_rollback_contract: bool = True  # no rollback contract → executor refuses
 
     # --- Design-alert capability (ARE gap-analysis §4.2 step 6 / v3 §6) -----
@@ -127,12 +214,63 @@ class Settings(BaseSettings):
     # needs grafana_url + grafana_token, else the endpoint refuses.
     governance_conf_low: float = 0.5
     # If measured overconfidence exceeds this, AUTO is downgraded to PROPOSE.
+    # NOTE: this is a *signed mean*, so on its own it is not a gate — two
+    # opposite errors cancel into a passing number. The three settings below
+    # read the reliability bins, where cancellation is impossible.
     governance_max_overconfidence: float = 0.1
+    # Worst single bin: max |accuracy - confidence| over bins with enough rows.
+    # A max over absolute values cannot be averaged away.
+    governance_max_bin_gap: float = 0.25
+    # Bins thinner than this are dropped rather than trusted — one labeled run in
+    # a bin yields an accuracy of exactly 0.0 or 1.0, which is not evidence. Also
+    # the floor for how many labeled runs the decision band must contain.
+    governance_min_bin_count: int = 3
+    # Accuracy required in the confidence band at/above governance_conf_high —
+    # the region where AUTO is actually granted. Being calibrated on questions
+    # that never reach the gate says nothing about the ones that do.
+    governance_min_band_accuracy: float = 0.7
     # AUTO requires at least this many labeled runs — autonomy must be earned.
     governance_min_labeled_runs: int = 20
     # Of those, at least this many must be human/grader labels (source not
     # "remediation-verified/-failed"). Self-produced labels alone cannot unlock AUTO.
     governance_min_human_labeled_runs: int = 20
+    # Which `grading_mode`s may enter the calibration curve the gate reads. The
+    # ECE/overconfidence math assumes `correct=1` means "the claim stated at this
+    # confidence was right", and only `culprit` rows mean that: an `inconclusive`
+    # row's `correct` says "it hedged appropriately", which is a different
+    # question on the same column. Mixing them lets one mode's error cancel the
+    # other's. Rows with no recorded mode are excluded (fail-closed).
+    governance_calibration_modes: list[str] = ["culprit"]
+    # --- the regression gate: the fixture record, kept apart on purpose -------
+    # Production labels answer "is this agent right about live incidents"; the
+    # eval harness answers "has it regressed on the questions we already know
+    # the answers to". Merging the two stores would let 94 grader labels on a
+    # baked stack vouch for a write to a live cluster, and the clock probe
+    # measured what that evidence is worth: the same fixture went 100% to 0%
+    # between two boots with untouched code. So they are counted separately and
+    # AUTO requires both — same bar, two bodies of evidence.
+    governance_regression_gate_enabled: bool = True
+    # A regression gate reads a record with no expiry on it, which is how the
+    # first version of this gate came to read seven weeks of labels pooled into
+    # one number — and the pool was flattering: the same store reports +0.19
+    # mean overconfidence over everything and +0.42 over the last fortnight, so
+    # runs that predate most of the agent's code were voting that it is better
+    # calibrated than it is. DQ and actuation both expire their evidence; this
+    # one now does too.
+    #
+    # 14 days is the shortest window that still clears
+    # governance_min_labeled_runs on the current record (32 labels), and it
+    # drops the June runs. It is a proxy for "labels about *this* agent" — the
+    # honest key would be the code version that produced them, which the
+    # calibration rows do not carry.
+    governance_fixture_max_age_days: int = 14
+    # The committed record the gate reads — not `eval/eval.db`, which is
+    # gitignored and reached the image only because the build happened on a
+    # machine that had one. See app/eval/record.py. Empty string disables the
+    # gate the honest way (no record earns no autonomy).
+    fixture_record_path: str = str(
+        Path(__file__).resolve().parent / "eval" / "fixture_record.jsonl"
+    )
 
     # --- Draft runbook synthesis (knowledge-loop §1 閉環二) ----------------
     # When an investigation is labeled correct=True and no active runbook matched
@@ -146,11 +284,20 @@ class Settings(BaseSettings):
     draft_runbook_repo: str = ""
 
     # --- Loop engineering (knowledge-loop §4.4) ----------------------------
-    # If the extracted Findings.confidence is below this after a headless run,
-    # re-invoke the agent on the same thread asking it to pivot to a different
-    # hypothesis. Gated by max_hypothesis_loops so it can't loop indefinitely.
-    confidence_loop_threshold: float = 0.6
+    # Whether a headless run keeps investigating is decided by `sufficiency.py`
+    # from the run's own evidence, not by the confidence the model states about
+    # its own work. Both thresholds are 2 for reasons written up in that module;
+    # they are settings so a stack with (say) no change feed can be told so
+    # explicitly, rather than having someone quietly lower the bar in the code.
+    sufficiency_min_sources: int = 2
+    sufficiency_min_causal_roles: int = 2
     max_hypothesis_loops: int = 3
+
+    # Retained for the escalation copy and the calibration record, NOT as a gate:
+    # a run whose evidence never became sufficient is reported as low-confidence
+    # to the on-call, and `Findings.confidence` is still what the CE harness
+    # scores. It no longer decides whether to keep looking.
+    confidence_loop_threshold: float = 0.6
 
     # --- Learn 閉環效度約束 (7b-5 §6.2) ------------------------------------
     # Whether remediation verify outcomes are written back as CE correctness labels.
@@ -194,6 +341,13 @@ class Settings(BaseSettings):
     # dangerous as "confidently wrong" — both must earn AUTO.
     dq_min_score: float = 0.9  # declared/observed agreement floor for proven-good
     dq_max_reconcile_age_seconds: int = 3600  # a reconcile older than this → DQ stale
+    # Environment fit (s6): the catalog we inject is knowledge about one
+    # environment. Measured against a twin stack that renames everything and
+    # changes nothing else, the same catalog scored 1.0 at home and 0.0 there.
+    # Below the floor, the knowledge probably belongs somewhere else, so DQ is
+    # not proven-good and AUTO is withheld until someone re-points or re-derives it.
+    dq_min_env_fit: float = 0.9  # fraction of injected knowledge that must resolve
+    dq_max_env_fit_age_seconds: int = 3600  # a fit measurement older than this → stale
     # Dependency-health blame propagation (s4): before the agent loop, run each
     # neighbour's error SLI live (read-only, off the agent budget) so the agent
     # knows whether the symptom is inherited from a failing downstream dep. A

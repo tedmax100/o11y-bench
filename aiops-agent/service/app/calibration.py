@@ -31,7 +31,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from . import store
+from . import case_memory, store
 from .config import settings
 
 logger = logging.getLogger("aiops_agent.calibration")
@@ -57,6 +57,17 @@ class CalibrationRecord(BaseModel):
     # Filled in when correct=False: which part was wrong + human-supplied note.
     error_dimension: str | None = None  # root_cause | scope | action | other
     correction_note: str | None = None
+    # What question `correct` answers for this row. "culprit" = was the blame
+    # right (the only reading the ECE/Brier math assumes); "inconclusive" = did
+    # the run appropriately hedge on a non-incident. None = unknown.
+    grading_mode: str | None = None
+    # A rehearsal, not a live incident. Kept out of the production curve and out
+    # of the gate's human-label floor: replaying one drill six times is one piece
+    # of evidence recorded six times, and the gate would read it as six.
+    drill: bool = False
+    # The alert instance this run belonged to. Distinct from run_id since Day38;
+    # on rows written before that they are the same string.
+    fp: str | None = None
 
 
 # ---- store (durable SQLite via app.store; `path` = db path) -----------------
@@ -72,7 +83,15 @@ def load_records(path: Path | None = None) -> list[CalibrationRecord]:
     return out
 
 
-def record_run(findings: Any, run_id: str, path: Path | None = None) -> CalibrationRecord | None:
+def record_run(
+    findings: Any,
+    run_id: str,
+    path: Path | None = None,
+    *,
+    case_key: str | None = None,
+    fp: str | None = None,
+    drill: bool = False,
+) -> CalibrationRecord | None:
     """Append a pending record for a finished headless run. Best-effort: returns
     None and logs on any failure, never raises into the run."""
     if not settings.calibration_enabled:
@@ -86,6 +105,7 @@ def record_run(findings: Any, run_id: str, path: Path | None = None) -> Calibrat
             hypothesis=getattr(findings, "hypothesis", "") or "",
             suspected_version=getattr(findings, "suspected_version", None),
             services=list(getattr(findings, "services", []) or []),
+            drill=drill,
         )
         store.cal_insert(
             run_id=rec.run_id,
@@ -95,12 +115,89 @@ def record_run(findings: Any, run_id: str, path: Path | None = None) -> Calibrat
             hypothesis=rec.hypothesis,
             suspected_version=rec.suspected_version,
             services=rec.services,
+            case_key=case_key,
+            fp=fp,
+            drill=drill,
             path=path,
         )
         return rec
     except Exception as e:
         logger.warning("record_run failed for %s: %s", run_id, e)
         return None
+
+
+def _backfill_from_investigation(fp: str, path: Path | None = None) -> str | None:
+    """Give a run that was never recorded for calibration a row to be labeled in.
+
+    Chat runs are written to `investigations` and never to `calibration`, so the
+    Todo queue listed them as work waiting on a person and every attempt to do
+    that work 404'd. A queue whose items cannot be actioned trains people to
+    stop reading the queue.
+
+    The row is created pending (correct=NULL) and the caller's verdict lands on
+    it in the usual way, so nothing here decides anything — it only makes the
+    verdict expressible.
+    """
+    try:
+        from .investigations import get_investigation
+
+        inv = get_investigation(fp, path)
+    except Exception as e:
+        logger.warning("label_run: investigation lookup failed for %s: %s", fp, e)
+        return None
+    if inv is None:
+        return None
+    store.cal_insert(
+        run_id=fp,
+        ts=inv.ts,
+        confidence=float(inv.confidence or 0.0),
+        summary=inv.summary or "",
+        hypothesis=inv.hypothesis or "",
+        suspected_version=inv.suspected_version,
+        services=list(inv.services or []),
+        fp=fp,
+        path=path,
+    )
+    logger.info("label_run: backfilled a calibration row for %s (source=%s)", fp, inv.source)
+    return fp
+
+
+def default_grading_mode(fp: str, path: Path | None = None) -> str:
+    """Which ruler this run should be judged with, decided from the run itself.
+
+    A run that named no suspect did not blame anyone, so "was the blame right"
+    has no answer for it — grading it in culprit mode is how a 0.0-confidence
+    refusal becomes a calibration gap of 1.0 (Day29). Deterministic on purpose:
+    the last time this was left to whoever was clicking, the whole pool moved.
+    """
+    try:
+        from .investigations import get_investigation
+
+        inv = get_investigation(fp, path)
+    except Exception:
+        return CULPRIT
+    if inv is None:
+        return CULPRIT
+    blamed = bool(inv.suspected_version) or bool(inv.services)
+    return CULPRIT if blamed else INCONCLUSIVE
+
+
+def _evidence_sufficient(ref: str, path: Path | None = None) -> bool | None:
+    """Did the stopping rule think this run had established anything?
+
+    None when nothing was recorded — rows predate the gate, or the lookup
+    failed — and that must stay distinguishable from False, because the case
+    layer only refuses to build precedent on an explicit False.
+    """
+    try:
+        from .investigations import get_investigation_for
+
+        inv = get_investigation_for(ref, path)
+    except Exception:
+        return None
+    if inv is None or inv.sufficiency is None:
+        return None
+    return bool(inv.sufficiency.sufficient)
 
 
 def label_run(
@@ -111,10 +208,27 @@ def label_run(
     source: str = "manual",
     error_dimension: str | None = None,
     correction_note: str | None = None,
+    grading_mode: str | None = None,
     path: Path | None = None,
 ) -> bool:
     """Fill in the verdict for the most recent record matching run_id (atomic
-    UPDATE in the store). Returns True if a record was updated."""
+    UPDATE in the store). Returns True if a record was updated.
+
+    `grading_mode` says what this verdict is a verdict *about* — see the
+    CalibrationRecord field. Leave it None if you don't know; None never
+    overwrites a mode the row already carries."""
+    # The caller may be holding a run_id (the eval harness, the executor now)
+    # or a fingerprint (the plugin's endpoint). Resolve it once, out loud.
+    resolved = store.cal_resolve_run_id(run_id, path)
+    if resolved is None:
+        resolved = _backfill_from_investigation(run_id, path)
+    if resolved is None:
+        logger.warning("label_run: no record for %s", run_id)
+        return False
+    if resolved != run_id:
+        logger.info("label_run: %s is a fingerprint; labeling its latest run %s", run_id, resolved)
+        run_id = resolved
+
     ok = store.cal_label(
         run_id,
         correct,
@@ -122,10 +236,32 @@ def label_run(
         source=source,
         error_dimension=error_dimension,
         correction_note=correction_note,
+        grading_mode=grading_mode,
         path=path,
     )
     if not ok:
         logger.warning("label_run: no record for run_id=%s", run_id)
+        return False
+
+    # A verdict from someone other than the agent is the only thing that turns a
+    # run into recallable precedent, or into a refutation of one. Reading the
+    # row back rather than trusting the arguments: `cal_label` updates the
+    # *latest* row for this run_id, and that row is where the case_key and the
+    # conclusion actually live.
+    row = store.cal_latest(run_id, path)
+    if row and row.get("case_key"):
+        verdict = case_memory.confirm_from_label(
+            case_key=row["case_key"],
+            correct=correct,
+            source=source,
+            grading_mode=row.get("grading_mode"),
+            root_cause=row.get("summary") or row.get("hypothesis") or "",
+            run_id=run_id,
+            correction_note=row.get("correction_note"),
+            evidence_sufficient=_evidence_sufficient(run_id, path),
+            path=path,
+        )
+        logger.info("case %s after label(%s): %s", row["case_key"], source, verdict)
     return ok
 
 
@@ -163,15 +299,71 @@ def grade_against_truth(findings: Any, truth: dict) -> bool:
 # ---- calibration math (pure) -----------------------------------------------
 
 
-def compute_calibration(records: list[CalibrationRecord], n_bins: int = 10) -> dict[str, Any]:
+CULPRIT = store.CULPRIT
+INCONCLUSIVE = store.INCONCLUSIVE
+
+
+def filter_by_mode(
+    records: list[CalibrationRecord], modes: tuple[str, ...] | None
+) -> list[CalibrationRecord]:
+    """Keep only records whose `grading_mode` is in `modes`. `None` keeps
+    everything; a NULL mode never matches a filter (fail-closed on unknowns)."""
+    if modes is None:
+        return list(records)
+    return [r for r in records if r.grading_mode in modes]
+
+
+def production_records(records: list[CalibrationRecord]) -> list[CalibrationRecord]:
+    """The rows that are evidence about live incidents — everything but drills.
+
+    A rehearsal is a real run and it stays in the store; it just does not get to
+    vouch for autonomy. The demo record makes the reason concrete: six replays of
+    one drill, all at 0.95 and all right about the same seeded fault, would have
+    lifted the decision band on their own. That is one piece of evidence counted
+    six times, which is the mistake `executions.drill` already exists to prevent
+    one layer down.
+    """
+    return [r for r in records if not r.drill]
+
+
+def hedging_rate(records: list[CalibrationRecord]) -> dict[str, Any]:
+    """How often the agent appropriately declined to blame anyone, over the
+    `inconclusive` records. Deliberately *not* a calibration number: on these
+    runs `correct` and `confidence` answer different questions, so ECE over them
+    is a category error (a run that says 0.0 and correctly refuses to guess is
+    scored as a maximal miss). The bare rate is the honest summary."""
+    rows = [r for r in filter_by_mode(records, (INCONCLUSIVE,)) if r.correct is not None]
+    if not rows:
+        return {"labeled": 0, "hedged": 0, "rate": None, "mean_confidence": None}
+    hedged = sum(1 for r in rows if r.correct)
+    return {
+        "labeled": len(rows),
+        "hedged": hedged,
+        "rate": round(hedged / len(rows), 4),
+        "mean_confidence": round(sum(r.confidence for r in rows) / len(rows), 4),
+    }
+
+
+def compute_calibration(
+    records: list[CalibrationRecord],
+    n_bins: int = 10,
+    *,
+    modes: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
     """Expected/Maximum Calibration Error + Brier score + reliability bins over
     the *labeled* records. Equal-width bins on [0,1] by stated confidence.
 
     ECE = Σ_b (n_b/N)·|acc_b − conf_b|   (lower is better; 0 = perfectly calibrated)
     MCE = max_b |acc_b − conf_b|         (worst single bin)
     Brier = mean((conf − correct)²)      (proper score; lower is better)
+
+    All three assume `correct=1` means "the claim stated at confidence c was
+    right". Only `culprit` rows mean that, so `modes` restricts which rows are
+    eligible — see `hedging_rate` for the `inconclusive` ones. `modes=None`
+    computes over everything, which is what the ad-hoc reports want and what the
+    governance gate must not do.
     """
-    labeled = [r for r in records if r.correct is not None]
+    labeled = [r for r in filter_by_mode(records, modes) if r.correct is not None]
     n = len(labeled)
     if n == 0:
         return {"count": 0, "labeled": 0, "ece": None, "mce": None, "brier": None, "bins": []}
@@ -229,6 +421,66 @@ def compute_calibration(records: list[CalibrationRecord], n_bins: int = 10) -> d
     }
 
 
+def bin_evidence(calib: dict[str, Any], *, min_bin_count: int, band_lo: float) -> dict[str, Any]:
+    """Reduce a reliability curve to the facts an autonomy gate needs, which the
+    mean cannot carry.
+
+    `overconfidence` is a *signed mean*, so two opposite errors cancel: a run
+    that underestimates itself by 0.28 on the questions it can do and
+    overestimates by 0.37 on the ones it can't averages out to ~0 and lights the
+    gate green. The bins were always computed; nothing read them. This returns
+    the three things that survive averaging:
+
+      - `max_gap` — the worst |accuracy − confidence| over bins with enough rows
+        to be evidence (MCE, but restricted to eligible bins). Cancellation is
+        impossible here: it is a max over absolute values.
+      - `band_accuracy` — accuracy over the bins at/above `band_lo`, i.e. the
+        confidence region where AUTO is actually granted. Being well calibrated
+        on questions that never reach the gate is not evidence about the ones
+        that do.
+      - `thin_bins` / `thin_runs` — what was excluded for being too thin, so the
+        caller can say so rather than silently narrowing its own evidence.
+
+    Bins under `min_bin_count` are dropped rather than trusted: a single labeled
+    run in a bin gives an accuracy of exactly 0.0 or 1.0, which is a coin toss
+    wearing a decimal point. `available=False` means there is no curve to read
+    at all (an old-shaped calib dict) — callers should treat that as unproven,
+    not as passing.
+    """
+    bins = calib.get("bins")
+    if not isinstance(bins, list):
+        return {"available": False}
+
+    eligible = [b for b in bins if (b.get("count") or 0) >= min_bin_count]
+    thin = [b for b in bins if 0 < (b.get("count") or 0) < min_bin_count]
+
+    max_gap = max_gap_bin = None
+    for b in eligible:
+        if b.get("gap") is None:
+            continue
+        if max_gap is None or b["gap"] > max_gap:
+            max_gap, max_gap_bin = b["gap"], f"[{b['lo']:.1f},{b['hi']:.1f})"
+
+    # A bin counts as "in the decision band" when its whole range sits at or
+    # above the AUTO threshold — a bin straddling it would mix runs the gate
+    # would have let through with runs it would not.
+    band = [b for b in bins if b["lo"] >= band_lo - 1e-9 and (b.get("count") or 0) > 0]
+    band_n = sum(b["count"] for b in band)
+    band_acc = round(sum(b["accuracy"] * b["count"] for b in band) / band_n, 4) if band_n else None
+
+    return {
+        "available": True,
+        "max_gap": max_gap,
+        "max_gap_bin": max_gap_bin,
+        "eligible_bins": len(eligible),
+        "thin_bins": len(thin),
+        "thin_runs": sum(b["count"] for b in thin),
+        "band_lo": band_lo,
+        "band_n": band_n,
+        "band_accuracy": band_acc,
+    }
+
+
 def format_report(calib: dict[str, Any]) -> str:
     if not calib.get("labeled"):
         return (
@@ -272,13 +524,33 @@ def _main(argv: list[str] | None = None) -> int:
     g.add_argument("--wrong", action="store_true")
     pl.add_argument("--score", type=float, default=None)
     pl.add_argument("--source", default="manual")
+    # Without these the CLI could only ever say "the blame was right", so every
+    # verdict it produced was a culprit verdict — including the ones about runs
+    # that never blamed anybody. That is the Day29 MCE 1.0 trap with a shell
+    # prompt in front of it.
+    pl.add_argument(
+        "--grading-mode",
+        choices=[CULPRIT, INCONCLUSIVE],
+        default=None,
+        help=f"{CULPRIT}: was the blame right. {INCONCLUSIVE}: was declining to blame right.",
+    )
+    pl.add_argument("--dimension", default=None, help="root_cause | scope | action | other")
+    pl.add_argument("--note", default=None, help="why — read back when the label is questioned")
 
     args = parser.parse_args(argv)
     if args.cmd == "report":
         print(format_report(compute_calibration(load_records())))
         return 0
     if args.cmd == "label":
-        ok = label_run(args.run_id, correct=args.correct, score=args.score, source=args.source)
+        ok = label_run(
+            args.run_id,
+            correct=args.correct,
+            score=args.score,
+            source=args.source,
+            grading_mode=args.grading_mode,
+            error_dimension=args.dimension,
+            correction_note=args.note,
+        )
         print("updated" if ok else f"no record for run_id={args.run_id}")
         return 0 if ok else 1
     return 2

@@ -16,7 +16,7 @@ nodes:
   - checkout
   git_version: v3.1.2
 - name: payment-service
-  role: charges; has the payment_use_new_validator flag
+  role: charges (authorise / decline / refund) for checkout
   tier: 1
   journeys:
   - checkout

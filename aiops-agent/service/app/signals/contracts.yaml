@@ -4,17 +4,28 @@
 version: 1.0.0
 contracts:
 - service: api-gateway
+  slis:
+  - kind: throughput
+    promql: sum by (upstream) (rate(gateway_upstream_attempts_total[5m]))
+    objective: roughly equal to inbound request rate
+    unit: rps
+  - kind: error
+    promql: (sum(rate(gateway_upstream_attempts_total{retry="true"}[5m])) or vector(0)) / clamp_min(sum(rate(gateway_upstream_attempts_total[5m])) or vector(0), 1)
+    objective: retry_share < 1%
+    unit: ratio
   supported_decisions:
   - rca
   exclusions:
-  - 'No custom application metrics: derive latency/throughput from the auto HTTP server histogram (discover_metrics for the exact name), and errors from Loki event=http.request_failed (carries upstream + status).'
+  - 'Inbound latency has no custom metric: derive it from the auto HTTP server histogram (discover_metrics for the exact name). Inbound errors come from Loki event=http.request_failed (carries upstream + status). The one custom metric here, gateway_upstream_attempts_total, counts OUTBOUND attempts and is not an inbound request count.'
   - It's a thin proxy — a failure here is usually a *symptom* of a failing downstream (user/order/payment), not an api-gateway bug.
+  - 'One caveat to the line above: the gateway may send the same inbound request downstream more than once. A retried call is indistinguishable from a real one at the callee, so downstream call and error counts include the gateway''s retries. `gateway_upstream_attempts_total{retry="true"}` and Loki event="http.request_retried" are the only signals that separate them.'
   logs:
     selector: '{service_name="api-gateway"}'
     error_events:
     - http.request_failed
+    - http.request_retried
     error_query: sum by (upstream, status) (count_over_time({service_name="api-gateway"} | event="http.request_failed" [5m]))
-    note: http.request_failed carries upstream + status + reason. Selector key is service_name (NOT service); the `upstream` field points at the failing downstream.
+    note: http.request_failed carries upstream + status + reason. Selector key is service_name (NOT service); the `upstream` field points at the failing downstream. event="http.request_retried" is a separate event carrying upstream + status + attempt — it is emitted only when the gateway sends the same inbound request downstream again.
 - service: order-service
   slis:
   - kind: error
@@ -56,7 +67,7 @@ contracts:
   - deploy-correlation
   exclusions:
   - No up{} for application services (remote_write, not scraped); judge liveness via rate(payment_charges_total[5m]) > 0.
-  - A declined-rate spike ABOVE the objective is an incident, not normal business — do NOT dismiss declines as expected. Break it down with `sum by (git_version, reason) (rate(payment_charges_total{status="declined"}[5m]))` to find which deploy/reason drives it (e.g. the new_validator flag shipping in a release).
+  - A declined-rate spike ABOVE the objective is an incident, not normal business — do NOT dismiss declines as expected. Break it down with `sum by (git_version, reason) (rate(payment_charges_total{status="declined"}[5m]))` to find which deploy/reason drives it.
   logs:
     selector: '{service_name="payment-service"}'
     error_events:

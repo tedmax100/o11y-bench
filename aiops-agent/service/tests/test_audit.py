@@ -39,3 +39,29 @@ def test_detail_roundtrips_as_dict(tmp_path, monkeypatch):
     row = audit.history(request_id="r1", path=p)[0]
     assert row["detail"]["reason"] == "kill switch off"
     assert row["verdict"] == "refuse"
+
+
+# ---- the link back to the reasoning ----------------------------------------
+
+
+def test_current_trace_id_is_none_when_nothing_is_recording():
+    """Outside `opentelemetry-instrument` there is no trace, and that must be a
+    None rather than an exception — every probe script in this series runs that
+    way."""
+    assert audit.current_trace_id() is None
+
+
+def test_record_attaches_the_trace_id(tmp_path, monkeypatch):
+    p = _db(monkeypatch, tmp_path)
+    monkeypatch.setattr(audit, "current_trace_id", lambda: "f" * 32)
+    audit.record("execute", "ok", request_id="r1", fp="fp1", path=p)
+    entries = audit.history(request_id="r1", path=p)
+    assert entries and entries[0]["detail"]["trace_id"] == "f" * 32
+
+
+def test_record_without_a_trace_still_records(tmp_path, monkeypatch):
+    p = _db(monkeypatch, tmp_path)
+    monkeypatch.setattr(audit, "current_trace_id", lambda: None)
+    audit.record("execute", "ok", request_id="r2", fp="fp2", path=p)
+    entries = audit.history(request_id="r2", path=p)
+    assert entries and "trace_id" not in entries[0]["detail"]

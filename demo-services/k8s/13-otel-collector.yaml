@@ -22,6 +22,35 @@ data:
             from_attribute: service.name
             action: insert
 
+      # --- the twin environment: same telemetry, different names ------------
+      # A second set of pipelines re-labels everything and ships it to the
+      # demo-twin stores. Nothing about the system changes — same services,
+      # same traffic, same incident — only what things are called. That makes
+      # "the agent's schema knowledge belongs to another environment" a
+      # controlled variable instead of a confounded comparison against a
+      # different stack.
+      #
+      # The renames mimic a team that never adopted semconv:
+      #   service.name          -> svc.name   (so Loki indexes svc_name, and
+      #                                        Tempo has no resource.service.name)
+      #   <metric>_total        -> acme_<metric>_count
+      resource/twin:
+        attributes:
+          - key: svc.name
+            from_attribute: service.name
+            action: insert
+          - key: service.name
+            action: delete
+          - key: service
+            action: delete
+      transform/twin:
+        error_mode: ignore
+        metric_statements:
+          - context: metric
+            statements:
+              - replace_pattern(name, "_total$", "_count")
+              - set(name, Concat(["acme", name], "_"))
+
     exporters:
       otlp/tempo:
         endpoint: tempo.demo.svc:4317
@@ -40,6 +69,23 @@ data:
         tls:
           insecure: true
 
+      otlp/tempo-twin:
+        endpoint: tempo.demo-twin.svc:4317
+        tls:
+          insecure: true
+
+      prometheusremotewrite/twin:
+        endpoint: http://prometheus.demo-twin.svc:9090/api/v1/write
+        target_info:
+          enabled: false
+        resource_to_telemetry_conversion:
+          enabled: true
+
+      otlphttp/loki-twin:
+        endpoint: http://loki.demo-twin.svc:3100/otlp
+        tls:
+          insecure: true
+
     service:
       pipelines:
         traces:
@@ -54,6 +100,19 @@ data:
           receivers: [otlp]
           processors: [resource, batch]
           exporters: [otlphttp/loki]
+
+        traces/twin:
+          receivers: [otlp]
+          processors: [resource/twin, batch]
+          exporters: [otlp/tempo-twin]
+        metrics/twin:
+          receivers: [otlp]
+          processors: [resource/twin, transform/twin, batch]
+          exporters: [prometheusremotewrite/twin]
+        logs/twin:
+          receivers: [otlp]
+          processors: [resource/twin, batch]
+          exporters: [otlphttp/loki-twin]
 ---
 apiVersion: apps/v1
 kind: Deployment

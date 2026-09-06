@@ -137,14 +137,66 @@ def _drift(**kw):
 
 
 def test_context_marks_unobserved_declared_edge(monkeypatch):
+    """⚠ only when the caller was actually exercised enough to have shown it."""
     monkeypatch.setattr(ctx_mod, "get_topology", _topo)
     monkeypatch.setattr(
         ctx_mod,
         "get_last_drift",
-        lambda: _drift(unobserved_edges=[Edge(caller="api-gateway", callee="payment-service")]),
+        lambda: _drift(
+            unobserved_edges=[Edge(caller="api-gateway", callee="payment-service")],
+            caller_samples={"api-gateway": 30},
+        ),
     )
     ctx = build_signal_context(["api-gateway"])
-    assert "payment-service (⚠ declared, not seen in recent traces)" in ctx
+    assert "payment-service (⚠ not seen in 30 sampled traces of api-gateway)" in ctx
+
+
+def test_context_withholds_warning_without_evidence(monkeypatch):
+    """The caller barely ran, so its unused edges are silence, not drift."""
+    monkeypatch.setattr(ctx_mod, "get_topology", _topo)
+    monkeypatch.setattr(
+        ctx_mod,
+        "get_last_drift",
+        lambda: _drift(
+            unobserved_edges=[Edge(caller="api-gateway", callee="payment-service")],
+            caller_samples={"api-gateway": 1},
+        ),
+    )
+    ctx = build_signal_context(["api-gateway"])
+    assert "payment-service (not exercised in this sample)" in ctx
+    assert "⚠" not in ctx
+
+
+def test_context_does_not_repeat_the_edge_on_the_callee(monkeypatch):
+    """The same missing edge must be stated once, on the caller's side."""
+    monkeypatch.setattr(ctx_mod, "get_topology", _topo)
+    monkeypatch.setattr(
+        ctx_mod,
+        "get_last_drift",
+        lambda: _drift(
+            unobserved_edges=[Edge(caller="api-gateway", callee="payment-service")],
+            caller_samples={"api-gateway": 30},
+        ),
+    )
+    ctx = build_signal_context(["payment-service"])
+    upstream_line = next(ln for ln in ctx.splitlines() if ln.startswith("- upstream"))
+    assert "⚠" not in upstream_line
+
+
+def test_dq_note_explains_a_100_percent_score_with_unseen_edges(monkeypatch):
+    """The score grades one direction only; the header must not read as 'all fine'."""
+    monkeypatch.setattr(ctx_mod, "get_topology", _topo)
+    monkeypatch.setattr(
+        ctx_mod,
+        "get_last_drift",
+        lambda: _drift(
+            dq_score=1.0,
+            unobserved_edges=[Edge(caller="api-gateway", callee="payment-service")],
+            caller_samples={"api-gateway": 30},
+        ),
+    )
+    ctx = build_signal_context(["api-gateway"])
+    assert "only grades edges seen in traffic" in ctx
 
 
 def test_context_surfaces_undeclared_edge_and_dq(monkeypatch):
@@ -169,3 +221,44 @@ def test_context_no_drift_no_annotation(monkeypatch):
     ctx = build_signal_context(["payment-service"])
     assert "⚠" not in ctx
     assert "data-quality" not in ctx
+
+
+def test_the_reconcile_verdict_outlives_the_process(monkeypatch, tmp_path):
+    """The DQ gate reads this. Held only in a module global, it came back
+    "never reconciled" on every rollout — the same hole env fit had."""
+    from app import store
+    from app.signals import reconcile
+
+    p = tmp_path / "aiops.db"
+    monkeypatch.setattr(store.settings, "store_path", str(p))
+    store.init(p)
+    monkeypatch.setattr(reconcile, "_last_drift", None)
+
+    drift = reconcile.TopologyDrift(
+        topology_version="1",
+        traces_sampled=42,
+        declared_count=5,
+        observed_count=5,
+        dq_score=1.0,
+        computed_ts=1787997101.0,
+    )
+    reconcile.set_last_drift(drift)
+
+    # a fresh process: the cache is empty, the answer is not
+    monkeypatch.setattr(reconcile, "_last_drift", None)
+    back = reconcile.get_last_drift()
+    assert back is not None
+    assert back.traces_sampled == 42
+    assert back.dq_score == 1.0
+    assert back.computed_ts == 1787997101.0
+
+
+def test_no_reconcile_ever_still_reads_as_none(monkeypatch, tmp_path):
+    from app import store
+    from app.signals import reconcile
+
+    p = tmp_path / "aiops.db"
+    monkeypatch.setattr(store.settings, "store_path", str(p))
+    store.init(p)
+    monkeypatch.setattr(reconcile, "_last_drift", None)
+    assert reconcile.get_last_drift() is None

@@ -1,0 +1,192 @@
+# Fixtures that need a real Kubernetes cluster, not the baked stack.
+#
+# `--stack` boots a container of pre-recorded telemetry: there are no Deployments,
+# no ReplicaSets and no ConfigMaps in it, so a fixture whose whole subject is
+# *what changed in the cluster* cannot be graded there. Keeping these in the
+# default suite would mean a fixture that fails for the environment rather than
+# for the agent — the same confusion Tempo's one-hour retention already creates
+# elsewhere, and it reads as a model regression every time.
+#
+# Run against a live k3d stack with the incident triggered:
+#
+#   demo-services/scripts/incident.sh start bad-validator   # flip the flag, restart payment
+#   python -m app.eval --fixtures app/eval/fixtures_live.yaml \
+#       --no-record --store /tmp/eval-live.db
+#
+# CLOSED BOOK. `--store` only says where the *verdicts* go; case recall reads the
+# service's default store, so by default this fixture runs with whatever the
+# production case library already knows — and for payment-service that library
+# contains a confirmed case whose root cause is this incident, injected in full
+# before the run issues a single query. Which is the product working as designed,
+# and useless as a measure of the RCA. To measure without it, point the whole
+# service at an empty store:
+#
+#   STORE_PATH=/tmp/closedbook.db python -m app.eval \
+#       --fixtures app/eval/fixtures_live.yaml --no-record --store /tmp/eval-closed.db
+#
+# Measured 2026-08-29, 20 passes each, incident live:
+#
+#                          open book        closed book
+#   service                20/20            20/20
+#   names the ConfigMap    20/20            20/20
+#   prose blames v2.5.0     3/20             1/20
+#   suspected_version set    0/20             0/20
+#   mean confidence         0.96             0.83
+#   model calls the tool   12/20            19/20
+#   overall `correct`        30%              15%
+#
+# The answer does not come from the recalled case — it survives the library being
+# emptied. What the recall was actually buying is *process*: `discover_before_retry`
+# failed 7 times open-book and 17 times closed-book, which is the whole of the drop
+# in `correct`. That is the dead-end half of case memory doing its documented job —
+# spending the budget on a query that can work here instead of re-issuing one that
+# cannot. Worth stating plainly, because the obvious reading of "30% vs 15%" is that
+# recall knows the answer, and it does not.
+#
+# Re-measured the same evening, closed book and with the stores actually busy,
+# across four 20-pass samples while two tool bugs were fixed: `_selector()` taught
+# to find the stream selector inside a metric-shaped LogQL query (which had made
+# that whole shape exempt from every empty-result diagnostic), then the truncation
+# fallback taught to keep the caller's filters.
+#
+#                              pre-fix   post-selector   post-fallback (x2)
+#   discover_before_retry         16           2              4    6
+#   overall `correct`            20%          65%           35%  55%
+#   prose blames v2.5.0          3/20         3/20          8/20 3/20
+#   service / ConfigMap / field        unchanged throughout (20/20, 20/20, 0/20)
+#
+# Two things to read off that, and only two. `discover_before_retry` moved from
+# 16 to single digits and stayed there — an empty result now says why it is empty,
+# whatever shape the query had. And `correct` swings 35–65% between samples of an
+# identical build, so no single-sample comparison of that column is a result,
+# including a flattering one. The 8/20 prose sample is the same story: the next
+# sample of the same build was 3/20.
+#
+# The fallback fix shows up nowhere in this table, which is the expected shape of
+# a correctness bug in a tool's *output* — nothing here was measuring whether the
+# numbers it summarised were about the question that was asked.
+#
+# The tool-reach row is the uncomfortable one. Handed a confirmed case that names
+# the cause, the model asks the cluster what changed 12 times in 20; with the
+# library empty it asks 19 times in 20. Recall does not make it wrong here, but it
+# does make it stop looking — which is the failure mode to watch for on the day the
+# recalled case is the *wrong* prior.
+#
+# `--no-record` by default here: the committed fixture record is the autonomy
+# gate's evidence, and evidence gathered against a cluster whose state nobody
+# else can reproduce should not vouch for anything.
+
+# ---- config regression, not a deploy regression -----------------------------
+# The failure this exists for happened four times in a row: the alert carries a
+# `git_version` label, the agent reports "a code regression in v2.5.0", and the
+# fault is in the `payment-flags` ConfigMap that an *unchanged* pod template
+# mounts. Revisions 68-71 all run the same image. `rollout undo` restores a
+# template that was never the problem, and the diagnosis being right about the
+# service does not save you.
+#
+# So this fixture grades three separate things that a service-only check cannot
+# tell apart:
+#
+#   truth.service     it still has to land on payment-service
+#   forbid_versions   …without pinning it on the version the label handed it,
+#                     read across the field AND the prose, because that is where
+#                     the error went when only the field was fixed
+#   used_tools        …and how often the *model* reaches for the tool on its own
+#
+# The third one measured 1/20: nineteen runs never thought to ask the cluster,
+# and the two anecdotes behind "it sometimes uses that tool" had happened to be
+# the one that did. So provenance stopped being an offer and became a step every
+# alert run takes (`agent._inject_change_provenance`), off the tool budget.
+#
+# That deliberately does NOT make this check pass. It still counts explicit tool
+# calls, so it keeps reporting model reach — which is now a curiosity rather than
+# the system's capability, and worth watching precisely because nothing depends
+# on it any more. What the run must not do is blame the cleared version, and that
+# is `forbid_versions`, enforced by a rubric check that reads the same verdict
+# the step injected.
+- id: payment-config-regression
+  alert:
+    labels:
+      service_name: payment-service
+      alertname: PaymentHighDeclineRate
+      # The label that does the damage. It is a label on a pod template, not a
+      # statement about what changed — the tool exists to tell those apart.
+      git_version: v2.5.0
+    annotations:
+      summary: "payment-service decline rate elevated"
+      description: >-
+        Charge decline ratio for payment-service is above the SLO threshold.
+        Establish what actually changed before attributing it to anything.
+    startsAt: now
+  truth:
+    service: payment-service
+    # Deliberately no `version`. There is no culprit version here; the template
+    # never changed.
+  forbid_versions:
+    - v2.5.0
+  process:
+    queried_min: 1
+    grounded: true
+    discover_before_retry: true
+    evidence_or_hedge_ceiling: 0.4
+    used_tools:
+      - k8s_change_provenance
+
+# ---- the amplifier is not the fault ------------------------------------------
+# The two scenarios that existed before this one both put the truth DOWNSTREAM of
+# the symptom: bad-validator keeps cause and symptom in the same service,
+# session-cache moves the cause one hop upstream of the alert. Following the
+# signal gets you there in both. So the case library, the calibration pool and
+# the committed fixture record were all one shape, and re-running any of them
+# only recorded that shape again.
+#
+# This one reverses the arrow. `incident.sh start retry-storm` flips a single
+# flag on api-gateway: it begins retrying every non-2xx four times, including
+# the deterministic 404s the load generator produces on purpose. Nothing
+# downstream changes. But a retried call is indistinguishable from a real one at
+# the callee, so every downstream's error COUNT climbs while its error RATIO
+# does not move, and the services that look worst are the ones that did nothing.
+#
+# Measured on the live cluster at 13:31Z on 2026-08-30, ~4 minutes after the
+# flip, 5 rps of load:
+#
+#   retry share of all outbound attempts     12.4%
+#   gateway attempts → order-service         4.01/s
+#   gateway attempts → user-service          1.07/s
+#   order-service error RATIO                0.0     (unmoved)
+#
+# NOT YET MEASURED over 20 passes, and the numbers above are one sample of the
+# amplification, not of the agent. Nothing here has graded a run yet — the
+# fixture is committed so the next session grades rather than re-derives.
+#
+# `forbid_services` is the check that matters and it was DEAD CONFIG on culprit
+# fixtures until this one needed it (same hole `forbid_versions` had, in the
+# other field). Naming api-gateway while also blaming its victims is not a right
+# answer with a cosmetic flaw — it is the failure this scenario exists to catch.
+- id: gateway-retry-amplification
+  alert:
+    labels:
+      service_name: order-service
+      alertname: OrderServiceErrorVolumeHigh
+      git_version: v3.1.2
+    annotations:
+      summary: "order-service error volume elevated"
+      description: >-
+        Error-event volume on order-service has climbed sharply. Establish
+        whether order-service's own failure rate changed before attributing it.
+    startsAt: now
+  truth:
+    service: api-gateway
+    # No version. The pod template did not change; a flag file did.
+  forbid_versions:
+    - v3.1.2
+  forbid_services:
+    - order-service
+    - user-service
+    - payment-service
+  process:
+    queried_min: 1
+    grounded: true
+    discover_before_retry: true
+    used_tools:
+      - k8s_change_provenance

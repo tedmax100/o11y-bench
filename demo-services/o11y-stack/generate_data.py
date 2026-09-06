@@ -53,6 +53,40 @@ VERSION_OLD = "v2.4.1"
 VERSION_NEW = "v2.5.0"
 ROUTE = "/api/payments"
 
+# ---- second incident: the session cache -------------------------------------
+# The first incident keeps its cause, its symptom and its answer inside one
+# service, with the answer sitting on a Prometheus label. An agent can score on
+# it without ever looking past the service the alert named — which is what the
+# day38 control fixture measured it doing. This one alerts on order-service and
+# is caused by user-service, and nothing in order-service's labels names it.
+#
+# It is a *bounded* window rather than something still happening at data-end:
+# two incidents both live at `now` are indistinguishable from any one alert's
+# point of view, because every window contains both. The fixture reaches it with
+# `startsAt: now-6h`.
+ORDER_SERVICE = "order-service"
+USER_SERVICE = "user-service"
+ORDER_VERSION = "v1.8.2"
+USER_VERSION = "v1.3.0"
+ORDER_ROUTE = "/api/orders"
+ORDERS_PER_MIN = 6
+SESSION_INCIDENT_START_H = 7  # hours before data-end
+SESSION_INCIDENT_END_H = 5
+# What the session store costs with nothing cached in front of it, and how often
+# it gives up. Mirrors the live scenario in services/user.
+SESSION_STORE_LATENCY_S = (0.18, 0.42)
+SESSION_STORE_TIMEOUT_RATE = 0.12
+AUTHCHECK_BASELINE_S = (0.0008, 0.004)
+# Zero on purpose, and it is the difference between a fixture and a demo. The
+# live service keeps a 0.5% transient failure rate because that is what a real
+# auth check looks like; the baked stack is graded against, and
+# `user-service-no-incident` asks whether the agent stays uncertain about a
+# service with *nothing wrong with it*. With any baseline failures at all, the
+# agent reads them, says "code regression in v1.3.0 causing transient auth
+# failures" at confidence 0.83, and is not really wrong — the fixture is. A
+# control arm has to be genuinely quiet or it is not a control.
+AUTH_TRANSIENT_RATE = 0.0
+
 # Duration histogram buckets in SECONDS (explicit — avoids the default-ms-bucket
 # constant-quantile artifact noted in memory/histogram_seconds_default_buckets).
 HISTOGRAM_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
@@ -182,6 +216,78 @@ def build_payment_trace(trace_id, ts, version, failed, dur_ms):
     return spans
 
 
+def build_order_trace(trace_id, ts, failed, order_dur_s, auth_dur_s):
+    """webapp -> api-gateway -> order-service -> user-service.
+
+    The error originates on the user-service span. Upstream spans carry a status
+    code and nothing else, which is the whole shape of the scenario: a trace is
+    the only place the two services are joined, and the joining is what the
+    agent has to do.
+    """
+    http_status = 401 if failed else 200
+    start_ns = int(ts.timestamp() * 1e9)
+    order_ns = int(order_dur_s * 1e9)
+    auth_ns = int(auth_dur_s * 1e9)
+    web, gw, order, user = (rand_hex(16) for _ in range(4))
+    spans = [
+        create_span(
+            trace_id,
+            web,
+            None,
+            "webapp",
+            f"POST {ORDER_ROUTE}",
+            start_ns,
+            order_ns + 4_000_000,
+            "v1.0.0",
+            http_status,
+            kind=2,
+        ),
+        create_span(
+            trace_id,
+            gw,
+            web,
+            "api-gateway",
+            f"POST {ORDER_ROUTE}",
+            start_ns + 1_000_000,
+            order_ns + 2_000_000,
+            "v1.2.0",
+            http_status,
+            kind=2,
+        ),
+        create_span(
+            trace_id,
+            order,
+            gw,
+            ORDER_SERVICE,
+            f"POST {ORDER_ROUTE}",
+            start_ns + 2_000_000,
+            order_ns,
+            ORDER_VERSION,
+            http_status,
+            error=failed,
+            kind=2,
+        ),
+        create_span(
+            trace_id,
+            user,
+            order,
+            USER_SERVICE,
+            "GET /api/users/{user_id}/authcheck",
+            start_ns + 3_000_000,
+            auth_ns,
+            USER_VERSION,
+            503 if failed else 200,
+            error=failed,
+            kind=3,
+        ),
+    ]
+    for sp in spans:
+        for attr in sp["attributes"]:
+            if attr["key"] == "http.route" and sp["name"].startswith("GET"):
+                attr["value"]["stringValue"] = "/api/users/{user_id}/authcheck"
+    return spans
+
+
 def push_traces_batch(spans, retries=3):
     if not spans:
         return
@@ -248,16 +354,16 @@ def push_logs_batch(logs):
         log(f"  Loki push error: {exc}")
 
 
-def build_log(ts, version, level, event, fields):
+def build_log(ts, version, level, event, fields, service=SERVICE):
     line = {
         "timestamp": ts.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ts.microsecond // 1000:03d}Z",
         "level": level,
-        "service_name": SERVICE,
+        "service_name": service,
         "git_version": version,
         "event": event,
         **fields,
     }
-    md = {"level": level, "event": event, "service_name": SERVICE}
+    md = {"level": level, "event": event, "service_name": service}
     if "trace_id" in fields:
         md["trace_id"] = fields["trace_id"]
     if "reason" in fields:
@@ -265,7 +371,7 @@ def build_log(ts, version, level, event, fields):
     return {
         "ts_ns": int(ts.timestamp() * 1e9),
         "labels": {
-            "service_name": SERVICE,
+            "service_name": service,
             "git_repo": GIT_REPO,
             "git_version": version,
             "deployment_environment": DEPLOY_ENV,
@@ -349,9 +455,43 @@ def charge_outcome(ts, amount_cents, deploy_time):
     return v, "authorized", None, "INFO", "payment.authorized"
 
 
-def metric_labels(version, status, reason):
+def bump(counters, label_string):
+    counters[label_string] = counters.get(label_string, 0) + 1
+
+
+def record_hist(h, seconds):
+    import bisect
+
+    idx = bisect.bisect_left(HISTOGRAM_BUCKETS, seconds)
+    if idx < len(HISTOGRAM_BUCKETS):
+        h["buckets"][idx] += 1
+    else:
+        h["inf"] += 1
+    h["sum"] += seconds
+    h["n"] += 1
+
+
+def write_histogram(mf, name, labels, h, ts):
+    """One histogram family's cumulative snapshot.
+
+    Buckets are cumulative *and* seconds-scaled. The advisory in the services
+    exists for the same reason: on the SDK's default millisecond boundaries
+    every sub-second sample lands in the first bucket and histogram_quantile
+    returns a constant that reads like a measurement.
+    """
+    cum = 0
+    for i, le in enumerate(HISTOGRAM_BUCKETS):
+        cum += h["buckets"][i]
+        mf.write(f'{name}_bucket{{{labels},le="{le}"}} {cum}{ts}')
+    cum += h["inf"]
+    mf.write(f'{name}_bucket{{{labels},le="+Inf"}} {cum}{ts}')
+    mf.write(f"{name}_sum{{{labels}}} {h['sum']:.3f}{ts}")
+    mf.write(f"{name}_count{{{labels}}} {h['n']}{ts}")
+
+
+def metric_labels(version, status, reason, service=SERVICE):
     base = (
-        f'service_name="{SERVICE}",git_repo="{GIT_REPO}",'
+        f'service_name="{service}",git_repo="{GIT_REPO}",'
         f'deployment_environment="{DEPLOY_ENV}",git_version="{version}"'
     )
     out = f'{base},status="{status}"'
@@ -367,9 +507,12 @@ def generate_all():
     end_time = data_end_time_utc()
     start_time = end_time - timedelta(hours=HOURS_OF_HISTORY)
     deploy_time = end_time - timedelta(hours=3)
+    session_start = end_time - timedelta(hours=SESSION_INCIDENT_START_H)
+    session_end = end_time - timedelta(hours=SESSION_INCIDENT_END_H)
     log(
         f"window {start_time:%Y-%m-%dT%H:%M:%SZ} .. {end_time:%Y-%m-%dT%H:%M:%SZ}; "
-        f"deploy {VERSION_OLD}->{VERSION_NEW} at {deploy_time:%H:%M:%S}"
+        f"deploy {VERSION_OLD}->{VERSION_NEW} at {deploy_time:%H:%M:%S}; "
+        f"session cache off {session_start:%H:%M:%S}..{session_end:%H:%M:%S}"
     )
     wait_for_tempo()
 
@@ -380,15 +523,24 @@ def generate_all():
         VERSION_NEW: {"buckets": [0] * len(HISTOGRAM_BUCKETS), "inf": 0, "sum": 0.0, "n": 0},
     }
 
+    # Second incident's counters. Same shape as the payment ones: cumulative
+    # per label-set, snapshotted on every metric tick.
+    order_counters = {}
+    auth_counters = {}
+    order_hist = {"buckets": [0] * len(HISTOGRAM_BUCKETS), "inf": 0, "sum": 0.0, "n": 0}
+    auth_hist = {"buckets": [0] * len(HISTOGRAM_BUCKETS), "inf": 0, "sum": 0.0, "n": 0}
+
     log_batch, trace_batch = [], []
     metrics_file = "/tmp/metrics.txt"
     total_charges = total_traces = total_logs = 0
-
-    import bisect
+    total_orders = 0
 
     mf = open(metrics_file, "w", buffering=1024 * 1024)
     mf.write(
         "# TYPE payment_charges_total counter\n# TYPE payment_charge_duration_seconds histogram\n"
+        "# TYPE orders_total counter\n# TYPE order_create_duration_seconds histogram\n"
+        "# TYPE user_auth_checks_total counter\n"
+        "# TYPE user_authcheck_duration_seconds histogram\n"
     )
 
     current = start_time
@@ -432,14 +584,7 @@ def generate_all():
                 lbl = metric_labels(version, status, reason)
                 charge_counters[lbl] = charge_counters.get(lbl, 0) + 1
                 # histogram
-                h = hist[version]
-                idx = bisect.bisect_left(HISTOGRAM_BUCKETS, dur_s)
-                if idx < len(HISTOGRAM_BUCKETS):
-                    h["buckets"][idx] += 1
-                else:
-                    h["inf"] += 1
-                h["sum"] += dur_s
-                h["n"] += 1
+                record_hist(hist[version], dur_s)
 
                 # logs: requested + outcome
                 log_batch.append(
@@ -475,23 +620,168 @@ def generate_all():
                     total_traces += 1
                 total_charges += 1
 
+            # ---- second incident: orders, and the auth check behind them ----
+            cache_off = session_start <= current < session_end
+            for _ in range(ORDERS_PER_MIN):
+                req_ts = current + timedelta(seconds=random.uniform(0, 59))
+                trace_id = rand_trace_id()
+                order_id = "o-" + rand_hex(8)
+                user_id = f"u-{random.randint(1, 20)}"
+
+                if cache_off:
+                    auth_s = random.uniform(*SESSION_STORE_LATENCY_S)
+                    timed_out = random.random() < SESSION_STORE_TIMEOUT_RATE
+                else:
+                    auth_s = random.uniform(*AUTHCHECK_BASELINE_S)
+                    # AUTH_TRANSIENT_RATE is 0 today (see the constant). The
+                    # branch stays so the knob is a knob and not a rewrite.
+                    timed_out = random.random() < AUTH_TRANSIENT_RATE
+                auth_reason = (
+                    ("session_store_timeout" if cache_off else "transient") if timed_out else None
+                )
+                auth_status = "error" if timed_out else "authorized"
+                # The order spends the auth check's time plus its own work.
+                order_s = auth_s + random.uniform(0.004, 0.02)
+
+                bump(
+                    auth_counters,
+                    metric_labels(USER_VERSION, auth_status, auth_reason, service=USER_SERVICE),
+                )
+                record_hist(auth_hist, auth_s)
+                bump(
+                    order_counters,
+                    metric_labels(
+                        ORDER_VERSION,
+                        "cancelled" if timed_out else "created",
+                        "auth" if timed_out else None,
+                        service=ORDER_SERVICE,
+                    ),
+                )
+                record_hist(order_hist, order_s)
+
+                # user-service logs. `cache.miss` only exists while the cache is
+                # off, which is what makes it the finding rather than noise.
+                if cache_off:
+                    log_batch.append(
+                        build_log(
+                            req_ts,
+                            USER_VERSION,
+                            "INFO",
+                            "cache.miss",
+                            {
+                                "user_id": user_id,
+                                "cache": "user_session",
+                                "trace_id": trace_id,
+                                "message": (
+                                    f"session cache miss for {user_id}, "
+                                    "falling through to the session store"
+                                ),
+                            },
+                            service=USER_SERVICE,
+                        )
+                    )
+                    total_logs += 1
+                if timed_out:
+                    log_batch.append(
+                        build_log(
+                            req_ts,
+                            USER_VERSION,
+                            "INFO",
+                            "user.auth_failed",
+                            {
+                                "user_id": user_id,
+                                "reason": auth_reason,
+                                "trace_id": trace_id,
+                                "message": (
+                                    f"session store timed out for {user_id}"
+                                    if cache_off
+                                    else f"auth check transient failure for {user_id}"
+                                ),
+                            },
+                            service=USER_SERVICE,
+                        )
+                    )
+                    log_batch.append(
+                        build_log(
+                            req_ts,
+                            ORDER_VERSION,
+                            "INFO",
+                            "order.cancelled",
+                            {
+                                "user_id": user_id,
+                                "reason": "auth_failed",
+                                "upstream_status": 503,
+                                "trace_id": trace_id,
+                                "message": f"auth failed for {user_id}: 503",
+                            },
+                            service=ORDER_SERVICE,
+                        )
+                    )
+                    total_logs += 2
+                else:
+                    log_batch.append(
+                        build_log(
+                            req_ts,
+                            USER_VERSION,
+                            "INFO",
+                            "user.logged_in",
+                            {
+                                "user_id": user_id,
+                                "trace_id": trace_id,
+                                "message": f"auth check passed for {user_id}",
+                            },
+                            service=USER_SERVICE,
+                        )
+                    )
+                    log_batch.append(
+                        build_log(
+                            req_ts,
+                            ORDER_VERSION,
+                            "INFO",
+                            "order.created",
+                            {
+                                "order_id": order_id,
+                                "user_id": user_id,
+                                "amount_cents": random.randint(100, 5000),
+                                "trace_id": trace_id,
+                                "message": f"order {order_id} created for user {user_id}",
+                            },
+                            service=ORDER_SERVICE,
+                        )
+                    )
+                    total_logs += 2
+
+                if timed_out or random.random() < 0.25:
+                    trace_batch.extend(
+                        build_order_trace(trace_id, req_ts, timed_out, order_s, auth_s)
+                    )
+                    total_traces += 1
+                total_orders += 1
+
         # metric snapshot
         ts = f" {ts_epoch}\n"
         for lbl, val in charge_counters.items():
             mf.write(f"payment_charges_total{{{lbl}}} {val}{ts}")
+        for lbl, val in order_counters.items():
+            mf.write(f"orders_total{{{lbl}}} {val}{ts}")
+        for lbl, val in auth_counters.items():
+            mf.write(f"user_auth_checks_total{{{lbl}}} {val}{ts}")
+        order_lbl = (
+            f'service_name="{ORDER_SERVICE}",git_repo="{GIT_REPO}",'
+            f'deployment_environment="{DEPLOY_ENV}",git_version="{ORDER_VERSION}"'
+        )
+        user_lbl = (
+            f'service_name="{USER_SERVICE}",git_repo="{GIT_REPO}",'
+            f'deployment_environment="{DEPLOY_ENV}",git_version="{USER_VERSION}"'
+        )
+        write_histogram(mf, "order_create_duration_seconds", order_lbl, order_hist, ts)
+        write_histogram(mf, "user_authcheck_duration_seconds", user_lbl, auth_hist, ts)
         for version, h in hist.items():
             vlbl = (
                 f'service_name="{SERVICE}",git_repo="{GIT_REPO}",'
                 f'deployment_environment="{DEPLOY_ENV}",git_version="{version}"'
             )
-            cum = 0
-            for i, le in enumerate(HISTOGRAM_BUCKETS):
-                cum += h["buckets"][i]
-                mf.write(f'payment_charge_duration_seconds_bucket{{{vlbl},le="{le}"}} {cum}{ts}')
-            cum += h["inf"]
-            mf.write(f'payment_charge_duration_seconds_bucket{{{vlbl},le="+Inf"}} {cum}{ts}')
-            mf.write(f"payment_charge_duration_seconds_sum{{{vlbl}}} {h['sum']:.3f}{ts}")
-            mf.write(f"payment_charge_duration_seconds_count{{{vlbl}}} {h['n']}{ts}")
+            write_histogram(mf, "payment_charge_duration_seconds", vlbl, h, ts)
 
         if len(trace_batch) >= 200:
             push_traces_batch(trace_batch)
@@ -509,8 +799,8 @@ def generate_all():
         push_logs_batch(log_batch)
 
     log(
-        f"  charges={total_charges} traces={total_traces} logs={total_logs} "
-        f"series={len(charge_counters)}"
+        f"  charges={total_charges} orders={total_orders} traces={total_traces} "
+        f"logs={total_logs} series={len(charge_counters) + len(order_counters) + len(auth_counters)}"
     )
     log("  flushing Tempo + waiting for searchable...")
     flush_tempo()

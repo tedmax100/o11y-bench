@@ -2,13 +2,15 @@
 #
 # Each fixture is a synthetic Grafana alert payload + the ground truth the
 # Findings are graded against (service required; version optional). `startsAt`
-# pins the agent's scenario clock: use an ISO-8601 UTC time that the incident's
-# data actually covers in your running stack, or the literal `now` for a live
-# incident you just triggered.
+# pins the agent's scenario clock: an ISO-8601 UTC time, or the literal `now`.
 #
-# (A) shared-stack workflow: bring up the demo o11y stack, trigger the payment
-# decline incident (POST odd-cent charges to payment :8001/charge per RUNBOOK),
-# then `python -m app.eval run`.
+# Reproducible run (recommended): `python -m app.eval --stack` boots the prebuilt
+# demo-services-o11y-stack image, which deterministically bakes the payment
+# v2.4.1→v2.5.0 decline incident, and pins every `now` here to that stack's
+# scenario clock — so every run queries the same fixed data.
+#
+# Live run: bring up your own stack, trigger the incident (POST odd-cent charges
+# to payment :8001/charge per RUNBOOK), then `python -m app.eval run`.
 
 - id: payment-decline-service
   alert:
@@ -21,9 +23,26 @@
     startsAt: now
   truth:
     service: payment-service
-    # The decline spike is shipped by the new_validator flag in v2.5.0; grading
-    # requires BOTH the service AND this version to count as correct.
+    # Grading requires BOTH the service AND the version the spike sits on.
     version: v2.5.0
+  # …and it has to get there honestly. These four are graded off the transcript,
+  # not the prose: see eval/process.py.
+  process:
+    # One successful call, not two. `2` was written to catch an answer built on
+    # nothing, and what it caught instead was an answer reached in a single
+    # well-aimed query: three seeds named the service, the version and the
+    # reason correctly and were all scored wrong for "queried: 1 successful of
+    # 1 call(s)". Whether one query *should* be enough here is a separate
+    # question — `reason=new_validator_odd_cents` sits on a Prometheus label and
+    # the schema catalog describes the shape, so a direct hit is cheap. That is
+    # an argument about the environment, and the process check is not the place
+    # to litigate it: `grounded` and `discover_before_retry` already cover
+    # answering from thin air.
+    queried_min: 1
+    grounded: true               # every trace ID cited exists in a tool result
+    discover_before_retry: true  # an empty/error result is followed by discovery,
+                                 # never by the same query reworded
+    evidence_or_hedge_ceiling: 0.4
 
 # Negative / inconclusive case: an alert fires for a service that is actually
 # HEALTHY (no incident in the data at this time). The correct behaviour is to
@@ -45,3 +64,129 @@
   forbid_services:           # …and never confidently blames a bystander
     - payment-service
     - order-service
+  process:
+    grounded: true
+    discover_before_retry: true
+    # Nothing to find here, so an unhedged answer must at least not be built on
+    # a pile of empty results.
+    evidence_or_hedge_ceiling: 0.4
+
+# The regression case for the failure that started this series: an agent with a
+# hardcoded idea of the schema queried `{service="user-service"} | level="ERROR"`
+# — wrong selector key, and there is no ERROR level in these logs — got nothing
+# back three times, and still answered with a number. Nothing about that answer
+# looks wrong until you read the transcript, which is why this fixture grades
+# the transcript. The alert names a service that IS in the data, so an agent
+# that discovers the real field names can answer it; one that assumes them
+# cannot, and must say so instead of inventing.
+- id: order-service-discover-before-query
+  alert:
+    labels:
+      service_name: order-service
+      alertname: OrderErrorRateWarning
+    annotations:
+      summary: "order-service error events elevated"
+      description: >-
+        Error-event volume on order-service looks elevated. Establish what the
+        error events actually are before concluding.
+    startsAt: now
+  expect: inconclusive
+  max_confidence: 0.75      # a real but mild signal; over-confidence is the bug
+  forbid_services:
+    - payment-service       # the neighbour it likes to blame out of habit
+  process:
+    queried_min: 1
+    grounded: true
+    discover_before_retry: true
+    evidence_or_hedge_ceiling: 0.4
+
+# ---- the recall A/B control (Day38) ----------------------------------------
+# The case library is keyed by (alertname, service). Once payment-service's
+# decline incident is a confirmed case, EVERY payment-service alert is one
+# loosened match away from being handed "v2.5.0 / new_validator is the cause" as
+# a prior — including alerts about something else entirely.
+#
+# This fixture is that something else. Latency in the baked data is flat (over a
+# 6h window the mean is 0.059s on v2.4.1 and 0.041s on v2.5.0 — the "bad"
+# version is faster), so the honest answer is that there is no latency incident.
+# An agent that inherits the decline case's culprit and pins slow charges on
+# v2.5.0 fails on `forbid_versions`, and that failure is the whole point: it
+# separates "recall helped" from "recall made it confident about everything".
+#
+# It is also the arm `library_overlap()` must report as clean while
+# payment-decline-service is reported as open book — same service, different
+# alert.
+- id: payment-latency-false-alarm
+  alert:
+    labels:
+      service_name: payment-service
+      alertname: PaymentChargeLatencyHigh
+    annotations:
+      summary: "payment-service charge latency above objective"
+      description: >-
+        Charge duration on payment-service looks elevated. Confirm whether
+        latency actually moved before attributing it to anything.
+    startsAt: now
+  expect: inconclusive
+  max_confidence: 0.6
+  forbid_services:
+    - order-service
+    - user-service
+  forbid_versions:
+    - v2.5.0        # the decline case's culprit; latency is flat on it
+  process:
+    queried_min: 1
+    grounded: true
+    discover_before_retry: true
+    evidence_or_hedge_ceiling: 0.4
+
+# ---- the second incident (scenario: session-cache) --------------------------
+# Everything above happens inside payment-service: the alert, the metric, the
+# `reason` label carrying the answer. An agent can score well on all of it
+# while never once looking past the service named in the alert — and the
+# false-alarm fixture above shows it doing exactly that, pinning every
+# payment-service symptom on the one culprit it knows.
+#
+# This one is shaped to make that impossible. The alert fires on order-service
+# because its orders start failing an auth check; the cause is user-service,
+# one hop upstream, where the session cache has been turned off and every check
+# now falls through to a slow session store. Nothing in order-service's own
+# metrics names it. The path to the answer is
+#   orders_total{status="cancelled",reason="auth"}
+#     → who does order-service call for auth
+#     → user_auth_checks_total{status="error",reason="session_store_timeout"}
+# and there is no shortcut, which is the whole point of adding it.
+#
+# `startsAt: now-6h` is not a detail. The baked stack now holds two incidents,
+# and two incidents that are both live at data-end are indistinguishable from
+# any one alert's point of view — every window contains both, and a fixture that
+# "passes" might have been answering the other one. The session-cache window is
+# bounded (data-end −7h to −5h) and this alert points into the middle of it.
+#
+# Live stack: `scripts/incident.sh start session-cache`, then use `startsAt: now`
+# instead — there the incident is whatever is happening while you watch.
+- id: order-service-auth-degradation
+  alert:
+    labels:
+      service_name: order-service
+      # The alert rule this environment actually fires. It used to be an
+      # invented name, which made the fixture structurally unable to reach the
+      # case library no matter what recall did.
+      alertname: order-cancel-rate-high
+    annotations:
+      summary: "order-service orders failing the auth check"
+      description: >-
+        Orders on order-service are being cancelled at the auth step. Find what
+        is failing, not where the alert fired.
+    startsAt: now-6h
+  truth:
+    service: user-service
+  forbid_services:
+    - payment-service     # the habitual culprit, and it is not in this path
+  forbid_versions:
+    - v2.5.0              # the other incident's answer, inherited by reflex
+  process:
+    queried_min: 2
+    grounded: true
+    discover_before_retry: true
+    evidence_or_hedge_ceiling: 0.4

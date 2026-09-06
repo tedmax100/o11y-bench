@@ -21,6 +21,19 @@ diagnostics:
     check:
       nonempty: true
 
+  # The branch point. Deliberately carries no `check`: this step exists to tell
+  # two incidents apart, not to assert a precondition, and a `check` that fails
+  # on purpose in one branch would abort the fix that is right for the other
+  # (execution.py aborts an approved action on any failed diagnostic check).
+  - id: provenance
+    desc: What the last rollouts actually changed — a template change, or only a restart
+    action: k8s_change_provenance
+    args:
+      service: payment-service
+    expect: >-
+      "changed image/env" means a real deploy; "changed nothing the process runs"
+      means the fault is in the mounted config and a rollback cannot help
+
   - desc: The running pod is healthy (rules out an infra/OOM cause)
     action: k8s_deployment_status
     args:
@@ -33,6 +46,14 @@ remediation:
   # Shown to the on-call; requires human approval. Executed only by the Tier 2
   # action registry (step 7), never by this layer.
   - desc: Roll back payment-service to the previous version
+    # Only when the cluster says the pod template genuinely changed. The alert
+    # carries a `git_version` label either way, and that label is the single
+    # most misleading thing in this incident: four times in a row it produced a
+    # correct-sounding "code regression in v2.5.0" and a rollback that restored
+    # an identical template.
+    when:
+      diagnostic: provenance
+      output_contains: "restores a genuinely different pod template"
     action: k8s.rollout_undo
     args:
       deployment: payment-service
@@ -47,6 +68,54 @@ remediation:
         namespace: demo
     # Post-execute verify (7b-4): confirm the decline rate dropped. Runs after
     # verify_delay_seconds settle window. Failure triggers auto-rollback.
+    verify:
+      action: query_prometheus
+      args:
+        expr: 'sum(rate(payment_charges_total{status="declined"}[2m]))'
+        queryType: instant
+      check:
+        max_value: 0.01
+
+  # The other shape of the same page: nothing shipped, someone flipped a flag in
+  # the mounted ConfigMap and the pods restarted. `rollout undo` is a no-op here;
+  # the flag is the change, so putting it back is the fix.
+  # payment-service reads its flags once at process start, so the flip alone
+  # changes nothing that is running — `restart_deployment` is what makes this
+  # fix a fix. (user-service re-reads per request, which is why the same action
+  # carries no restart in session-cache-timeout.) Without it this branch would be
+  # today's mistake wearing the other hat: the right diagnosis, an action that
+  # cannot take effect.
+  - desc: >-
+      Turn the new payment validator back off and restart payment-service
+      (the change is in the mounted config, not in the image)
+    action: k8s.configmap_flag_set
+    args:
+      configmap: payment-flags
+      namespace: demo
+      key: flags.json
+      flag: payment_use_new_validator
+      value: false
+      restart_deployment: payment-service
+    when:
+      diagnostic: provenance
+      output_contains: "the cause is outside the template"
+    reversible: true
+    requires_approval: true
+    # The undo restarts too. A rollback that puts the flag back but leaves the
+    # pods running the value they were started with returns the system to a
+    # third state — the file saying one thing and the process doing another —
+    # which is worse than either of the two states anybody has seen.
+    rollback:
+      action: k8s.configmap_flag_set
+      args:
+        configmap: payment-flags
+        namespace: demo
+        key: flags.json
+        flag: payment_use_new_validator
+        value: true
+        restart_deployment: payment-service
+    # Verified against the decline rate, after the pods have come back. The
+    # settle window has to outlast the rollout here, unlike the flag-only case.
     verify:
       action: query_prometheus
       args:

@@ -98,3 +98,84 @@ def test_correctness_merged_from_calibration(tmp_path, monkeypatch):
 
     rows = inv.list_investigations(path=p)
     assert rows[0]["correct"] is True
+
+
+# ---- the chat entry point ---------------------------------------------------
+
+
+def test_investigation_instructions_carry_the_same_playbook():
+    """A question asked in Grafana must get the method an alert gets, or the two
+    entry points are not the same agent."""
+    from app.agent import _RCA_PLAYBOOK, _investigation_instructions
+
+    text = _investigation_instructions(["payment-service"])
+    assert _RCA_PLAYBOOK in text
+    assert "payment-service" in text
+    assert "same language" in text  # the rule the model drops first
+    assert "internally" in text  # the tree is for thinking, not for printing
+
+
+def test_record_investigation_marks_the_source(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+
+    from app import investigations as inv
+
+    monkeypatch.setattr(inv.settings, "investigations_enabled", True)
+    findings = NS(summary="s", hypothesis="h", confidence=0.7, suspected_version=None, services=[])
+    inv.record_investigation(
+        "fp-chat",
+        {"labels": {"service_name": "payment-service"}, "annotations": {}},
+        {"answer": "a", "findings": findings, "decisions": []},
+        path=tmp_path / "aiops.db",
+        source="chat",
+    )
+    rows = inv.list_investigations(limit=5, path=tmp_path / "aiops.db")
+    assert rows and rows[0]["source"] == "chat"
+
+
+def test_record_investigation_defaults_to_alert(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+
+    from app import investigations as inv
+
+    monkeypatch.setattr(inv.settings, "investigations_enabled", True)
+    findings = NS(summary="s", hypothesis="h", confidence=0.7, suspected_version=None, services=[])
+    inv.record_investigation(
+        "fp-alert",
+        {"labels": {"service_name": "payment-service"}, "annotations": {}},
+        {"answer": "a", "findings": findings, "decisions": []},
+        path=tmp_path / "aiops.db",
+    )
+    rows = inv.list_investigations(limit=5, path=tmp_path / "aiops.db")
+    assert rows and rows[0]["source"] == "alert"
+
+
+def test_the_stopping_verdict_is_stored_with_the_run(tmp_path, monkeypatch):
+    p = tmp_path / "aiops.db"
+    monkeypatch.setattr(inv.settings, "store_path", str(p))
+    monkeypatch.setattr(inv.settings, "investigations_enabled", True)
+
+    from app.facts import classify
+    from app.sufficiency import evaluate_sufficiency
+
+    facts = [classify("query_prometheus", {"result": [{"last": 1.3}]}, 1)]
+    result = _result() | {"sufficiency": evaluate_sufficiency(facts, ["rate 1.3"]).as_dict()}
+    inv.record_investigation("fp-suff", _alert(), result)
+
+    row = inv.list_investigations(path=p)[0]
+    assert row["sufficiency"]["sufficient"] is False
+    gaps = [c for c in row["sufficiency"]["checks"] if not c["passed"]]
+    # The row carries what was missing, not just that something was.
+    assert {c["name"] for c in gaps} == {"independent_sources", "causal_roles"}
+    assert "needs 2" in next(c["detail"] for c in gaps if c["name"] == "independent_sources")
+
+
+def test_a_row_written_before_the_gate_existed_is_not_a_pass(tmp_path, monkeypatch):
+    # None, not sufficient=False and not sufficient=True: "we never recorded
+    # this" must not render as either verdict.
+    p = tmp_path / "aiops.db"
+    monkeypatch.setattr(inv.settings, "store_path", str(p))
+    monkeypatch.setattr(inv.settings, "investigations_enabled", True)
+
+    inv.record_investigation("fp-old", _alert(), _result())  # no sufficiency key
+    assert inv.list_investigations(path=p)[0]["sufficiency"] is None

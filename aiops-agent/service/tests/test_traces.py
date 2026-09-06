@@ -320,3 +320,40 @@ def test_normalize_trace_tool_kind():
     assert tree["rollup"]["tool_calls"] == 1
     assert node["payload"]["tool_name"] == "query_prometheus"
     assert node["payload"]["arguments"] == {"expr": "up"}
+
+
+# ---- where the cost number came from ---------------------------------------
+
+
+def _attr(key, value):
+    if isinstance(value, int):
+        return {"key": key, "value": {"intValue": str(value)}}
+    return {"key": key, "value": {"stringValue": value}}
+
+
+def test_rollup_carries_its_cost_basis():
+    """A price table nobody reconciles is a declaration nobody checks. The number
+    travels with a note saying so, the same way a signal travels with its query."""
+    from app.traces import PRICES_AS_OF
+
+    span = _make_span(
+        "a",
+        None,
+        "ChatGoogleGenerativeAI.chat",
+        0,
+        1_000_000_000,
+        attrs=[
+            _attr("gen_ai.operation.name", "chat"),
+            _attr("gen_ai.request.model", "gemini-2.5-flash"),
+            _attr("gen_ai.usage.input_tokens", 1000),
+            _attr("gen_ai.usage.output_tokens", 100),
+        ],
+    )
+    rollup = _normalize_trace(_make_raw_trace([span]))["rollup"]
+    assert rollup["cost"] is not None
+    assert rollup["cost_basis"] == PRICES_AS_OF
+
+
+def test_rollup_without_llm_calls_has_no_cost_basis():
+    rollup = _normalize_trace(_make_raw_trace([_make_span("a", None, "GET", 0, 1)]))["rollup"]
+    assert rollup["cost"] is None and rollup["cost_basis"] is None

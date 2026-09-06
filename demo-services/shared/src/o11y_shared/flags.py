@@ -33,7 +33,11 @@ class FeatureFlags:
         try:
             self._cache = json.loads(self._path.read_text())
             self._mtime = mtime
-        except json.JSONDecodeError, OSError:
+        # Parenthesized on purpose. Unparenthesized `except A, B:` is valid from
+        # Python 3.14 (PEP 758) and a SyntaxError before it, and this repo runs
+        # 3.14 while the service images are built on 3.12 — so the bare form
+        # passes every check here and crashes the container on import.
+        except (json.JSONDecodeError, OSError):
             self._cache = {}
 
     def get(self, name: str, default: Any = None) -> Any:

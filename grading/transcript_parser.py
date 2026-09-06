@@ -103,7 +103,10 @@ def _parse_atif_steps(steps: list[dict[str, Any]]) -> list[Message]:
     for step in steps:
         source = step.get("source", "")
         message_text = step.get("message", "")
-        tool_calls_data = step.get("tool_calls", [])
+        # `or []`, not `.get(..., [])`: a step with `"tool_calls": null` (an
+        # explicit key some emitters write instead of omitting it) has the key
+        # present, so the `.get` default never applies and this iterates None.
+        tool_calls_data = step.get("tool_calls") or []
         observation = step.get("observation")
 
         if source == "user":
@@ -240,7 +243,10 @@ def parse_transcript(logs_dir: Path) -> Transcript:
         if f.is_file() and f.stat().st_size > 0:
             try:
                 return parse_atif_trajectory(logs_dir)
-            except Exception:
-                pass
+            except Exception as e:
+                # A parse bug here used to disappear into "Found 0 messages"
+                # and a quiet 0.0 score, indistinguishable from an agent that
+                # genuinely produced no transcript. Surface it instead.
+                print(f"  parse_atif_trajectory({logs_dir}) failed: {e!r}")
 
     return Transcript(messages=[])

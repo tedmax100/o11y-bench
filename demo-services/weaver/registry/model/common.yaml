@@ -79,6 +79,14 @@ groups:
               value: http.request_failed
               brief: An upstream HTTP call failed or returned 5xx.
               stability: development
+            - id: http_request_retried
+              value: http.request_retried
+              brief: >-
+                An edge/proxy service sent the same inbound request downstream
+                again. Deliberately not a failure event: the retry is a decision
+                the caller made, and it is invisible from the callee, where a
+                retried call is indistinguishable from a real one.
+              stability: development
             - id: cache_miss
               value: cache.miss
               brief: A cache lookup missed.
@@ -102,7 +110,7 @@ groups:
               stability: development
             - id: authorized
               value: authorized
-              brief: Payment authorized.
+              brief: The subject was authorized — a payment charge, or an auth check.
               stability: development
             - id: declined
               value: declined
@@ -177,6 +185,44 @@ groups:
               value: transient
               brief: Simulated transient failure.
               stability: development
+            - id: session_store_timeout
+              value: session_store_timeout
+              brief: >-
+                The auth check had to reach the session store and it timed out.
+                Only produced while the session cache is off, so the value is
+                also the signal that it is off.
+              stability: development
+
+      - id: app.cache.name
+        stability: development
+        brief: >-
+          Which cache missed. Low-cardinality by construction — a cache is a
+          named piece of infrastructure, not a key.
+        note: "Flat key in current code: `cache`."
+        type:
+          members:
+            - id: user_session
+              value: user_session
+              brief: The user-service session cache in front of the session store.
+              stability: development
+
+      - id: app.upstream
+        stability: development
+        brief: >-
+          The downstream service an edge/proxy call was addressed to. Service
+          name only — never a URL or a path, which would make this unbounded.
+        note: "Flat key in current code: `upstream`."
+        type: string
+        examples: [payment-service, order-service, user-service]
+
+      - id: app.retry
+        stability: development
+        brief: >-
+          Whether this outbound attempt was a retry of an earlier one. The
+          attribute exists so retry-amplified load can be separated from real
+          load at the caller, which is the only place that distinction survives.
+        note: "Flat key in current code: `retry` (string \"true\"/\"false\")."
+        type: boolean
 
       - id: app.user.operation
         stability: development
@@ -291,6 +337,31 @@ groups:
     display_name: Deploy provenance
     brief: Resource attributes identifying which build emitted the telemetry.
     attributes:
+      - id: service.name
+        type: string
+        stability: development
+        brief: >-
+          The service that emitted the telemetry. This is the label everything
+          is grouped and filtered by, on all three stores.
+        note: >-
+          Flat key in current code: `service_name` (resource attr). NOT
+          `service` — `sum by (service)` is valid PromQL that silently collapses
+          every service into one unlabelled series, and `{service="x"}` matches
+          no Loki stream at all. In Tempo the same identity is
+          `resource.service.name`.
+        examples: ["payment-service", "order-service"]
+      - id: service.namespace
+        type: string
+        stability: development
+        brief: The Kubernetes namespace the service runs in.
+        note: "Flat key in current code: `service_namespace` (resource attr)."
+        examples: ["demo"]
+      - id: deployment.environment
+        type: string
+        stability: development
+        brief: The deployment environment the telemetry came from.
+        note: "Flat key in current code: `deployment_environment` (resource attr)."
+        examples: ["demo"]
       - id: vcs.repository.url.full
         type: string
         stability: development
@@ -311,6 +382,12 @@ groups:
     stability: development
     brief: Resource conventions for every demo-service process.
     attributes:
+      - ref: service.name
+        requirement_level: required
+      - ref: service.namespace
+        requirement_level: required
+      - ref: deployment.environment
+        requirement_level: required
       - ref: vcs.repository.url.full
         requirement_level: required
       - ref: service.version

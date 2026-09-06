@@ -74,7 +74,54 @@ groups:
     type: metric
     metric_name: app.user.auth_checks.count
     stability: development
-    brief: Total auth checks performed by user-service.
-    note: "Current code metric: `user_auth_checks_total`. Carries no attributes."
+    brief: Total auth checks performed by user-service, by outcome.
+    note: >-
+      Current code metric: `user_auth_checks_total`. It used to carry no
+      attributes at all, which made "auth checks are failing" a statement
+      nobody could make from the metric alone — the only way to see it was to
+      correlate order-service's cancellations against user-service's logs.
     instrument: counter
     unit: "{check}"
+    attributes:
+      - ref: app.outcome
+        requirement_level: required
+      - ref: app.fail_reason
+        requirement_level:
+          conditionally_required: when the check did not pass.
+
+  - id: metric.app.user.authcheck.duration
+    type: metric
+    metric_name: app.user.authcheck.duration
+    stability: development
+    brief: Auth-check handler duration in user-service.
+    note: >-
+      Current code metric: `user_authcheck_duration_seconds`. Recorded in
+      SECONDS with an explicit bucket advisory — the SDK's default boundaries
+      are millisecond-scaled and collapse every sub-second sample into the
+      first bucket, where `histogram_quantile` then returns a constant that
+      looks like a real number.
+    instrument: histogram
+    unit: s
+    attributes:
+      - ref: app.outcome
+        requirement_level: required
+
+  - id: metric.app.gateway.upstream.attempts.count
+    type: metric
+    metric_name: app.gateway.upstream.attempts.count
+    stability: development
+    brief: Downstream call attempts made by the gateway, retries included.
+    note: >-
+      Current code metric: `gateway_upstream_attempts_total`. Attempts, not
+      inbound requests: the two are equal until the gateway retries, and the gap
+      between them is the only signal that separates amplified load from real
+      load — at the callee the two are indistinguishable.
+    instrument: counter
+    unit: "{attempt}"
+    attributes:
+      - ref: app.upstream
+        requirement_level: required
+      - ref: app.outcome
+        requirement_level: required
+      - ref: app.retry
+        requirement_level: required

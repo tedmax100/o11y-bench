@@ -70,10 +70,15 @@ async def test_query_none_is_unavailable(monkeypatch):
     assert h.verdict == "unavailable"
 
 
-async def test_neighbor_without_contract_is_skipped(monkeypatch):
-    # api-gateway declares no SLIs → nothing to judge it by.
+async def test_neighbor_without_contract_is_unjudgeable_not_dropped(monkeypatch):
+    # webapp declares no SLIs. Dropping it silently used to let the verdict line
+    # claim it was healthy, so it now comes back as an explicit verdict. (This
+    # was api-gateway until it grew a retry-share SLI for the retry-storm
+    # scenario — the subject is "a service with no error SLI", not the gateway.)
     monkeypatch.setattr(health, "_instant_scalar", _fake_scalar({}))
-    assert await health._evaluate("api-gateway", "upstream") is None
+    h = await health._evaluate("webapp", "upstream")
+    assert h is not None
+    assert h.verdict == "unjudgeable"
 
 
 # ---- blame propagation across the real demo topology -----------------------
@@ -141,20 +146,22 @@ async def test_downstream_unhealthy_impact_rising_is_symptom(monkeypatch):
 
 
 async def test_downstream_unhealthy_no_attribution_falls_back(monkeypatch):
-    # api-gateway declares no attribution edges, so impact can't be measured →
-    # fall back to s4.1 cautious wording (confirm before claiming symptom).
+    # webapp declares no attribution edges, so impact can't be measured → fall
+    # back to s4.1 cautious wording (confirm before claiming symptom).
     monkeypatch.setattr(
         health,
         "_instant_scalar",
         _fake_scalar(
             {
-                "payment_charges_total": 0.12,  # payment unhealthy
+                "gateway_upstream_attempts_total": 0.12,  # api-gateway unhealthy
             }
         ),
     )
-    block = await evaluate_dependency_health(["api-gateway"])
-    assert "downstream payment-service: error 12.0% — UNHEALTHY" in block
-    assert "HEALTHY SLIs themselves" in block
+    block = await evaluate_dependency_health(["webapp"])
+    assert "downstream api-gateway: error 12.0% — UNHEALTHY" in block
+    # webapp has no SLI of its own: the verdict must NOT claim it is healthy.
+    assert "HEALTHY SLIs themselves" not in block
+    assert "could NOT be judged from metrics" in block
     assert "CONFIRM they actually see failures attributed to that dependency" in block
 
 
@@ -176,11 +183,41 @@ async def test_self_and_downstream_both_unhealthy_is_cascade(monkeypatch):
     assert "order-service" in block and "payment-service" in block
 
 
-async def test_all_healthy(monkeypatch):
+async def test_all_healthy_says_only_what_it_could_judge(monkeypatch):
     monkeypatch.setattr(health, "_instant_scalar", _fake_scalar({}))  # all 0.0
     block = await evaluate_dependency_health(["order-service"])
-    assert "Neither the service(s)" in block
+    assert "No unhealthy SLI among the services this walk could judge" in block
+    # user-service is throughput-only, so the all-clear must be qualified.
+    assert "could NOT be judged (no error SLI)" in block
+    assert "user-service" in block
     assert "SYMPTOM" not in block and "ROOT CAUSE" not in block
+
+
+# ---- what the walk could not reach -----------------------------------------
+
+
+async def test_service_without_sli_is_stated_not_dropped(monkeypatch):
+    """webapp and its only dependency both lack an SLI. The walk used to return
+    nothing at all; it must now say that it could not judge either of them."""
+    monkeypatch.setattr(health, "_instant_scalar", _fake_scalar({}))
+    block = await evaluate_dependency_health(["webapp"])
+    assert block is not None
+    assert "this service webapp: no error SLI declared — CANNOT be judged" in block
+
+
+async def test_root_cause_verdict_does_not_clear_unjudgeable_deps(monkeypatch):
+    """order breaching, payment healthy, user-service throughput-only. Calling
+    order the root cause is fine; claiming its dependencies are healthy is not."""
+    monkeypatch.setattr(
+        health,
+        "_instant_scalar",
+        _fake_scalar({"orders_total": 0.3, "user_lookups_total": 4.7}),
+    )
+    block = await evaluate_dependency_health(["order-service"])
+    assert "LIKELY ROOT CAUSE" in block
+    assert "its downstream dependencies are healthy" not in block
+    assert "none of its judgeable downstream dependencies is unhealthy" in block
+    assert "a fault inherited from them is not ruled out" in block
 
 
 async def test_disabled_returns_none(monkeypatch):
@@ -223,3 +260,19 @@ def test_fmt_throughput_liveness():
             verdict="unknown",
         )
     )
+
+
+async def test_block_states_the_clock_it_read_at(monkeypatch):
+    """Inside an alert investigation the clock is pinned to the alert's startsAt,
+    so the block must state that time rather than claim it read "just now"."""
+    from datetime import UTC, datetime
+
+    from app.tools.query import now_override
+
+    monkeypatch.setattr(health, "_instant_scalar", _fake_scalar({"declined": 0.41}))
+    pinned = datetime(2026, 8, 5, 15, 30, 0, tzinfo=UTC)
+    with now_override(pinned):
+        block = await evaluate_dependency_health(["payment-service"])
+    assert "read at 2026-08-05T15:30:00Z" in block
+    assert "not necessarily wall-clock now" in block
+    assert "just now" not in block

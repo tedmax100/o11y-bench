@@ -29,8 +29,10 @@ from .query import _epoch_ns, _epoch_s, _get_json, _parse_dt
 
 logger = logging.getLogger("aiops_agent.discovery")
 
-# Resource/identity labels present on every series — not interesting as the
-# "extra" dimensions of a metric.
+# Resource/identity labels present on every series. They are stripped from each
+# metric's label list (repeating them per metric is pure token cost) but the set
+# is reported ONCE per response — see `discover_metrics`. Dropping them outright
+# is what let the model conclude they did not exist and reach for `service`.
 _COMMON_LABELS = frozenset(
     {
         "__name__",
@@ -114,18 +116,30 @@ async def discover_metrics(service: str, lookback: str = "now-1h") -> dict[str, 
     )
     series = data.get("data", []) if isinstance(data, dict) else []
     families: dict[tuple[str, str], set[str]] = {}
+    identity: set[str] = set()
     for s in series:
         name = s.get("__name__")
         if not name or name.startswith("otel_sdk_") or name == "target_info":
             continue  # SDK internals, not application signal
         key = _metric_family(name)
         labels = {k for k in s if k not in _COMMON_LABELS and k not in _NOISE_LABELS}
+        identity |= {k for k in s if k in _COMMON_LABELS and k != "__name__"}
         families.setdefault(key, set()).update(labels)
     metrics = [
         {"name": base, "type": mtype, "labels": sorted(labels)}
         for (base, mtype), labels in sorted(families.items())
     ]
-    return {"service": service, "metric_count": len(metrics), "metrics": metrics}
+    return {
+        "service": service,
+        "metric_count": len(metrics),
+        # Reported once, not per metric. Leaving them out entirely made this
+        # tool answer "which labels can I use?" with a list that omitted the one
+        # every query groups by, and the model filled the gap from its prior
+        # (`service`) — a label that does not exist, in a query that does not
+        # error: Prometheus just sums every service into one unlabelled series.
+        "identity_labels": sorted(identity),
+        "metrics": metrics,
+    }
 
 
 # ---- Tempo span names ------------------------------------------------------

@@ -50,9 +50,13 @@ def test_contract_for_unknown_is_none():
 
 
 def test_edge_services_have_no_slis_but_caveats():
+    # webapp is the remaining no-SLI edge. api-gateway used to be one too, until
+    # the retry-storm scenario gave it the one metric a proxy genuinely owns —
+    # its own outbound attempt count, which no downstream can see.
+    wa = contract_for("webapp")
+    assert wa is not None
+    assert wa.slis == []
     gw = contract_for("api-gateway")
-    assert gw is not None
-    assert gw.slis == []
     assert any("symptom" in ex for ex in gw.exclusions)
 
 

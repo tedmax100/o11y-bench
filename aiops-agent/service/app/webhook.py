@@ -15,8 +15,10 @@ import time
 
 import httpx
 
+from .action_requests import is_drill
 from .agent import run_headless
 from .calibration import record_run
+from .case_memory import case_scope
 from .config import settings
 from .investigations import record_investigation
 
@@ -45,8 +47,25 @@ def fingerprint(labels: dict) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
 
-def _in_cooldown(fp: str) -> bool:
-    last = _last_run.get(fp)
+def _cooldown_key(fp: str, labels: dict) -> str:
+    """What counts as "the same alert, again" for suppression purposes.
+
+    The fingerprint on its own conflates a rehearsal with the incident it
+    rehearses, and the cooldown is ten minutes wide — so a drill silently ate
+    the real alert that followed it four minutes later, and the RCA never ran.
+    The execution plane learned this same lesson one layer down (`idem_key`);
+    this is the gate in front of it.
+
+    The suffix goes on the drill side, so a production alert's key is exactly
+    what it has always been. `fp` itself is left alone on purpose: it is also
+    the LangGraph thread id and the key past cases are retrieved by, and
+    splitting it would hide a rehearsal's findings from the incident it is
+    about."""
+    return f"{fp}|drill" if is_drill(labels) else fp
+
+
+def _in_cooldown(key: str) -> bool:
+    last = _last_run.get(key)
     return last is not None and (time.monotonic() - last) < settings.alert_cooldown_seconds
 
 
@@ -103,12 +122,36 @@ async def _sink_findings(alert: dict, fp: str, result: dict) -> None:
 
 
 async def _investigate_and_sink(alert: dict, fp: str) -> None:
+    labels = alert.get("labels") or {}
+    # Opened around the whole run, not just the recording: the dead ends worth
+    # remembering are discovered inside the tools, and asyncio copies the
+    # context into the tasks the graph spawns.
+    with case_scope(
+        fp=fp,
+        alertname=labels.get("alertname"),
+        service=labels.get("service_name") or labels.get("service"),
+    ) as scope:
+        await _run_and_sink(alert, fp, scope)
+
+
+async def _run_and_sink(alert: dict, fp: str, scope) -> None:
     try:
         result = await run_headless(alert, thread_id=fp)
         # Log the run's confidence for CE measurement (correctness is labeled
-        # offline). Best-effort inside record_run; fp doubles as the run_id so a
-        # later `label <fp>` ties the verdict back to this investigation.
-        record_run(result["findings"], run_id=fp)
+        # offline). The row is keyed by the run, and carries `fp` so a labeler
+        # holding only the fingerprint can still resolve to it — the fingerprint
+        # used to *be* the run_id, which is why one verdict silently covered
+        # every run of an alert and the rest stayed unlabeled forever.
+        record_run(
+            result["findings"],
+            run_id=scope.run_id if scope else fp,
+            case_key=scope.case_key if scope else None,
+            fp=fp,
+            # A rehearsal says so in its alert labels, and this is where that
+            # fact has to be written down: nothing downstream can tell a drill
+            # from an incident by looking at the run.
+            drill=is_drill(alert.get("labels") or {}),
+        )
         for d in result.get("decisions") or []:
             logger.info(
                 "governance fp=%s action=%s -> %s (%s)", fp, d.action, d.autonomy.value, d.reason
@@ -169,11 +212,12 @@ async def handle_alert(payload: dict) -> dict:
 
         labels = alert.get("labels") or {}
         fp = fingerprint(labels)
-        if _in_cooldown(fp):
+        cooldown_key = _cooldown_key(fp, labels)
+        if _in_cooldown(cooldown_key):
             skipped.append({"fingerprint": fp, "reason": "cooldown"})
             continue
 
-        _last_run[fp] = time.monotonic()
+        _last_run[cooldown_key] = time.monotonic()
         task = asyncio.create_task(_investigate_and_sink(alert, fp))
         _tasks.add(task)
         task.add_done_callback(_tasks.discard)

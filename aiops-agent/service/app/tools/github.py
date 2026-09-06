@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 from langchain_core.tools import tool
 
+from .. import case_memory
 from ..config import settings
 
 GH_API = "https://api.github.com"
@@ -65,7 +66,24 @@ async def github_compare(repo: str, base: str, head: str) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=20.0) as client:
         r = await client.get(url, headers=_headers())
     if r.status_code == 404:
-        return {"error": f"repo or refs not found: {repo} {base}...{head}"}
+        # Which repo and refs exist is a property of this environment, not of
+        # the incident, so it is worth remembering against the case. Two of four
+        # eval runs on the session-cache incident spent turns here and then
+        # cited the failure as a reason they could not conclude — the version
+        # labels in this demo are pod-template labels, not GitHub refs, so no
+        # rewording of the call will ever resolve them.
+        case_memory.remember_dead_end(
+            "query",
+            f"github_compare on {repo} ({base}...{head})",
+            disproved_by="tool_result",
+            evidence="repo or refs not found from here",
+        )
+        return {
+            "error": f"repo or refs not found: {repo} {base}...{head}",
+            "hint": "These refs do not resolve from this environment — a version "
+            "label is not necessarily a git ref. Use k8s_change_provenance to see "
+            "what the rollout actually changed instead of retrying this.",
+        }
     if r.status_code == 401 or r.status_code == 403:
         return {"error": f"github auth/rate-limit ({r.status_code}): {r.text[:200]}"}
     r.raise_for_status()

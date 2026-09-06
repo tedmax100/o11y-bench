@@ -214,6 +214,21 @@ def test_selector_extracts_first_braces_with_pipeline():
     assert sel == '{service_name="x"}'
 
 
+def test_selector_found_inside_a_metric_query():
+    """`sum(count_over_time({...} [5m]))` is the shape the schema catalog teaches,
+    and anchoring at the start of the string excluded all of it — which silently
+    disabled every empty-result diagnostic on exactly that shape."""
+    sel = q._selector(
+        'sum(count_over_time({service_name="payment-service"} | event="payment.declined" [5m]))'
+    )
+    assert sel == '{service_name="payment-service"}'
+
+
+def test_selector_found_inside_a_grouped_metric_query():
+    sel = q._selector('sum by (git_version) (count_over_time({service_name="x"}[5m]))')
+    assert sel == '{service_name="x"}'
+
+
 def test_selector_none_when_no_braces():
     assert q._selector("not a logql expression") is None
 
@@ -249,10 +264,242 @@ def test_tempo_hint_injects_traceql_syntax():
     assert "braces" in str(result) or "predicates" in str(result)
 
 
-def test_tempo_hint_non_parse_passthrough():
+def test_tempo_hint_names_the_prom_loki_label_it_used():
+    """The agent writes `service_name` because that is the name everywhere else;
+    Tempo answers "unexpected IDENTIFIER", which says nothing about that."""
+    exc = ToolException("returned 400: parse error at line 1, col 2: unexpected IDENTIFIER")
+    hint = str(q._tempo_query_hint('{service_name="payment-service"}', exc))
+    assert "`service_name` -> `resource.service.name`" in hint
+
+
+def test_tempo_hint_calls_out_quoted_status():
+    exc = ToolException("returned 500: binary operations must operate on the same type")
+    hint = str(q._tempo_query_hint('{resource.service.name="p" && status="error"}', exc))
+    assert "no quotes" in hint
+
+
+def test_tempo_hint_keeps_the_original_error_text():
     exc = ToolException("connection refused")
-    result = q._tempo_query_hint("{ status=error }", exc)
-    assert str(result) == str(exc)
+    hint = str(q._tempo_query_hint("{ status=error }", exc))
+    assert hint.startswith("connection refused")
+
+
+# ---- an empty trace search, and which kind of empty it is -------------------
+
+
+@pytest.mark.asyncio
+async def test_tempo_empty_window_says_the_query_was_fine(monkeypatch):
+    """Zero traces has two meanings and only one extra request tells them apart."""
+    calls = []
+
+    async def mock_get_json(base, path, params):
+        calls.append(params)
+        # first call is the model's narrow window, second is the 24h probe
+        return {"traces": [] if len(calls) == 1 else [{"traceID": "abc"}]}
+
+    monkeypatch.setattr(q, "_get_json", mock_get_json)
+    result = await q._query_tempo_traces('{ resource.service.name="order-service" }', start="now-1h")
+    assert result["count"] == 0
+    assert "the query is fine" in result["note"]
+    assert 'start="now-24h"' in result["note"]
+
+
+@pytest.mark.asyncio
+async def test_tempo_empty_everywhere_points_at_the_query(monkeypatch):
+    async def mock_get_json(base, path, params):
+        return {"traces": []}
+
+    monkeypatch.setattr(q, "_get_json", mock_get_json)
+    result = await q._query_tempo_traces('{ resource.service.name="nope" }', start="now-1h")
+    assert "widening will not help" in result["note"]
+
+
+@pytest.mark.asyncio
+async def test_tempo_wide_empty_window_is_not_probed_again(monkeypatch):
+    """No point re-asking 24h when the caller already asked for a week."""
+    calls = []
+
+    async def mock_get_json(base, path, params):
+        calls.append(params)
+        return {"traces": []}
+
+    monkeypatch.setattr(q, "_get_json", mock_get_json)
+    result = await q._query_tempo_traces("{ status=error }", start="now-7d")
+    assert len(calls) == 1
+    assert "already wide" in result["note"]
+
+
+# ---- TraceQL that is wrong without being wrong -----------------------------
+
+
+def test_traceql_bare_predicate_gets_braces():
+    """`status = error` is a 400, and it ended the task in every round."""
+    query, notes = q._normalize_traceql("status = error")
+    assert query == "{ status = error }"
+    assert notes
+
+
+def test_traceql_bare_dotted_attributes_are_scoped():
+    """Tempo answers an unscoped `http.route` with "unknown identifier: http".
+
+    `.http.route` is TraceQL's own unscoped lookup and returns the same traces
+    as `span.http.route` -- checked against a live Tempo, not assumed.
+    """
+    query, notes = q._normalize_traceql('{http.method="POST" && http.status_code=500}')
+    assert query == '{.http.method="POST" && .http.status_code=500}'
+    assert notes
+
+
+def test_traceql_already_scoped_and_intrinsics_are_left_alone():
+    original = '{ resource.service.name="payment" && span.http.route="/x" && status=error }'
+    assert q._normalize_traceql(original) == (original, [])
+
+
+def test_traceql_values_inside_quotes_are_not_mistaken_for_attributes():
+    """`"payment.declined"` looks exactly like a dotted attribute name."""
+    original = '{ resource.service.name="p" && span.event.name="payment.declined" }'
+    query, _ = q._normalize_traceql(original)
+    assert '"payment.declined"' in query
+
+
+# ---- the Loki series limit ------------------------------------------------
+
+
+def test_loki_series_limit_hint_writes_the_sum_wrapper():
+    """A count with no sum() around it is one series per label combination.
+
+    The generic pipeline hint already contains the word sum(), and it was not
+    enough: on the home-field bench the model read the 400, apologised, and
+    asked the user how to narrow the question -- three rounds out of three. So
+    the limit gets its own branch, with the rewritten query in it.
+    """
+    exc = ToolException("returned 400: maximum of series (500) reached for a single query")
+    logql = 'count_over_time({service_name="payment-service"} | event="payment.declined"[15m])'
+    hint = str(q._loki_query_hint(logql, exc))
+    assert f"sum({logql})" in hint
+    assert "sum by (<label>)" in hint
+
+
+def test_loki_series_limit_hint_falls_back_when_there_is_nothing_to_wrap():
+    exc = ToolException("returned 400: maximum of series (500) reached for a single query")
+    hint = str(q._loki_query_hint('{service_name="payment-service"}', exc))
+    assert "sum(count_over_time(" in hint
+
+
+# ---- a Tempo call whose filters came in as keywords ------------------------
+
+
+@pytest.mark.asyncio
+async def test_tempo_kwarg_filters_are_answered_with_the_traceql_they_meant():
+    """The model calls this tool the way the Loki one takes filters.
+
+    A required `traceql` field would make pydantic reject the call before any of
+    our code sees it, and "traceql: Field required" ended the task every time it
+    happened on the away-field bench. So the call is accepted and answered with
+    the query it was trying to write.
+    """
+    with pytest.raises(ToolException) as excinfo:
+        await q._query_tempo_traces(service_name="order-service", limit=1)
+    msg = str(excinfo.value)
+    assert 'traceql="{ resource.service.name="order-service" }"' in msg
+    assert "`service_name`" in msg
+
+
+@pytest.mark.asyncio
+async def test_tempo_kwarg_filters_are_joined_not_guessed_at():
+    with pytest.raises(ToolException) as excinfo:
+        await q._query_tempo_traces(service="payment-service", status="error")
+    assert 'resource.service.name="payment-service" && status=error' in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_tempo_missing_traceql_with_no_filters_falls_back_to_the_syntax_hint():
+    with pytest.raises(ToolException) as excinfo:
+        await q._query_tempo_traces(traceql="  ")
+    assert "TraceQL predicates go inside braces" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_tempo_args_schema_accepts_the_mis_shaped_call(monkeypatch):
+    """The rewrite is only reachable if the args schema lets the call through."""
+    args = q.TempoArgs(service_name="order-service")
+    assert args.traceql is None
+    assert args.model_dump()["service_name"] == "order-service"
+
+
+# ---- empty-result notes ----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_prom_empty_names_the_metric_that_does_not_exist(monkeypatch):
+    async def mock_get_json(base, path, params):
+        if path == "/api/v1/label/__name__/values":
+            return {"data": ["payment_charges_total"]}
+        return {"resultType": "matrix", "result": []}
+
+    monkeypatch.setattr(q, "_get_json", mock_get_json)
+    result = await q._query_prometheus("sum(rate(payment_declines_total[5m]))")
+    assert "payment_declines_total" in result["note"]
+    assert "discover_metrics" in result["hint"]
+
+
+@pytest.mark.asyncio
+async def test_prom_empty_with_real_metric_points_at_the_matchers(monkeypatch):
+    async def mock_get_json(base, path, params):
+        if path == "/api/v1/label/__name__/values":
+            return {"data": ["payment_charges_total"]}
+        return {"resultType": "matrix", "result": []}
+
+    monkeypatch.setattr(q, "_get_json", mock_get_json)
+    result = await q._query_prometheus('sum(rate(payment_charges_total{status="nope"}[5m]))')
+    assert "label matchers" in result["note"]
+    assert "hint" not in result
+
+
+@pytest.mark.asyncio
+async def test_loki_empty_names_the_unindexed_selector_key(monkeypatch):
+    async def mock_get_json(base, path, params):
+        if path == "/loki/api/v1/labels":
+            return {"data": ["service_name", "git_version"]}
+        return {"resultType": "streams", "result": []}
+
+    monkeypatch.setattr(q, "_get_json", mock_get_json)
+    result = await q._query_loki_logs('{service="payment-service"}')
+    assert "Not an indexable stream label: service" in result["note"]
+    assert "discover_log_fields" in result["hint"]
+
+
+@pytest.mark.asyncio
+async def test_loki_empty_note_fails_open(monkeypatch):
+    """A hint is never worth an exception: if the label call fails, the empty
+    result still comes back as an empty result."""
+
+    async def mock_get_json(base, path, params):
+        if path == "/loki/api/v1/labels":
+            raise ToolException("labels endpoint down")
+        return {"resultType": "streams", "result": []}
+
+    monkeypatch.setattr(q, "_get_json", mock_get_json)
+    result = await q._query_loki_logs('{service="payment-service"}')
+    assert result["result"] == []
+    assert "note" not in result
+
+
+@pytest.mark.asyncio
+async def test_loki_strips_the_stats_block(monkeypatch):
+    monkeypatch.setattr(
+        q,
+        "_get_json",
+        AsyncMock(
+            return_value={
+                "resultType": "streams",
+                "result": [{"stream": {"service_name": "x"}, "values": [["1", "line"]]}],
+                "stats": {"summary": {"totalBytesProcessed": 0}},
+            }
+        ),
+    )
+    result = await q._query_loki_logs('{service_name="x"}')
+    assert "stats" not in result
 
 
 # ---- async query functions (httpx mocked) ----------------------------------
@@ -339,6 +586,36 @@ async def test_query_loki_raw_uses_range(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_query_loki_forced_instant_on_raw_selector_is_refused_with_a_rewrite(monkeypatch):
+    """Loki cannot run a raw stream selector as an instant query, and demoting it
+    to a range query silently caps the line count — so the tool refuses and hands
+    back the metric-shaped rewrite that answers the question it was really asked."""
+    mock = AsyncMock()
+    monkeypatch.setattr(q, "_get_json", mock)
+
+    with pytest.raises(ToolException) as exc:
+        await q._query_loki_logs(
+            '{service_name="payment-service"} | event="payment.declined"', queryType="instant"
+        )
+    assert "count_over_time" in str(exc.value)
+    mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_query_loki_forced_instant_kept_for_metric_logql(monkeypatch):
+    fake_resp = {
+        "status": "success",
+        "data": {"resultType": "vector", "result": [{"metric": {}, "value": [1000, "5"]}]},
+    }
+    mock = AsyncMock(return_value=fake_resp)
+    monkeypatch.setattr(q, "_get_json", mock)
+
+    await q._query_loki_logs('sum(count_over_time({service_name="x"} [5m]))', queryType="instant")
+    _, path, _ = mock.call_args[0]
+    assert path == "/loki/api/v1/query"
+
+
+@pytest.mark.asyncio
 async def test_query_loki_parse_error_gets_hint(monkeypatch):
     monkeypatch.setattr(
         q,
@@ -410,3 +687,74 @@ async def test_query_loki_byte_cap_triggers_fallback(monkeypatch):
     result = await q._query_loki_logs('{service_name="x"} | json')
     assert result.get("truncated") is True
     assert "fallback" in result or "original_query" in result
+
+
+# ---- metric-name extraction: labels are not metrics -------------------------
+
+
+def test_metric_names_ignores_grouping_labels():
+    """A live drill wrote five dead ends named `reason` — a label, not a metric —
+    into the recall block, which then told the next run not to query the labels
+    the answer is written in."""
+    from app.tools.query import _metric_names
+
+    assert _metric_names('sum by (reason) (rate(orders_total{status="cancelled"}[5m]))') == {
+        "orders_total"
+    }
+    assert _metric_names("sum without (le, reason) (rate(x_total[5m]))") == {"x_total"}
+
+
+def test_metric_names_ignores_label_matchers():
+    from app.tools.query import _metric_names
+
+    expr = 'sum(rate(user_auth_checks_total{status="error", reason="session_store_timeout"}[2m]))'
+    assert _metric_names(expr) == {"user_auth_checks_total"}
+
+
+def test_metric_names_keeps_both_sides_of_a_join():
+    from app.tools.query import _metric_names
+
+    expr = "sum(rate(a_total[5m])) / on(job) group_left(pod) sum(rate(b_total[5m]))"
+    assert _metric_names(expr) == {"a_total", "b_total"}
+
+
+# ---- truncation fallback ----------------------------------------------------
+
+
+def test_fallback_keeps_the_filter_that_was_asked_about():
+    """The bug: `|= "declined"` came back as counts of every event on the service,
+    top bucket `payment.authorized`, under a key labelled `original_query`."""
+    logql = '{service_name="payment-service"} |= "declined"'
+    sel = q._selector(logql)
+    pipe = q._loki_pipeline(logql, sel)
+    assert pipe == '|= "declined"'
+    fb = q._loki_fallback(sel, pipe)
+    assert '|= "declined"' in fb
+    assert "detected_level" in fb
+    assert " level," not in fb  # the field these services never emitted
+
+
+def test_fallback_keeps_a_label_filter_too():
+    logql = '{service_name="payment-service"} | event="payment.declined"'
+    sel = q._selector(logql)
+    assert q._loki_pipeline(logql, sel) == '| event="payment.declined"'
+
+
+def test_a_stage_that_cannot_be_counted_is_left_out():
+    """`line_format` rewrites the line rather than selecting lines; counting it
+    is meaningless, so the caller falls back to the selector and says so."""
+    logql = '{service_name="x"} | json | line_format "{{.msg}}"'
+    sel = q._selector(logql)
+    assert q._loki_pipeline(logql, sel) == ""
+
+
+def test_a_bare_selector_has_no_pipeline():
+    logql = '{service_name="x"}'
+    assert q._loki_pipeline(logql, q._selector(logql)) == ""
+
+
+def test_a_metric_query_contributes_no_pipeline_tail():
+    """Its range and closing parens are not a filter; taking them would be
+    nonsense — and its result was small enough never to reach here anyway."""
+    logql = 'sum(count_over_time({service_name="x"} | event="e" [5m]))'
+    assert q._loki_pipeline(logql, q._selector(logql)) == '| event="e"'

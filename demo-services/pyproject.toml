@@ -14,3 +14,13 @@ o11y-shared = { workspace = true }
 dev = [
     "ruff>=0.6",
 ]
+
+[tool.ruff]
+# Inherit the repo's rules, then correct the one thing that is not true here:
+# the root config targets 3.14 because that is what the repo runs on, while
+# these services are built on `python3.12-bookworm-slim`. With py314 the
+# formatter rewrites `except (A, B):` into the PEP 758 form, which is a
+# SyntaxError on 3.12 — the container then crashes on import, having passed
+# every check on the way in.
+extend = "../pyproject.toml"
+target-version = "py312"

@@ -23,10 +23,27 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from . import store
+from . import case_memory, store
+from .audit import current_trace_id
 from .config import settings
 
 logger = logging.getLogger("aiops_agent.investigations")
+
+
+class SufficiencyCheck(BaseModel):
+    name: str
+    passed: bool
+    detail: str
+
+
+class SufficiencyRow(BaseModel):
+    """Why the run stopped. Stored whole rather than as a boolean: a future
+    reader needs to know what the investigation was still missing when it gave
+    up, and re-deriving that from the transcript is exactly the work this was
+    supposed to save."""
+
+    sufficient: bool = False
+    checks: list[SufficiencyCheck] = Field(default_factory=list)
 
 
 class DecisionRow(BaseModel):
@@ -53,14 +70,37 @@ class InvestigationRecord(BaseModel):
     correct: bool | None = None
     # original alert payload — needed to re-run investigation on Wrong label
     alert: dict = Field(default_factory=dict)
+    # "alert" (the webhook fired it) or "chat" (a human asked in Grafana). Both
+    # go through the same graph; only the kickoff differs, and the plugin wants
+    # to show which is which.
+    source: str = "alert"
+    # The trace of the run that produced this row. The reasoning was always
+    # recorded (auto-instrumentation traces every node, tool call and prompt);
+    # without this field there was no way to find it from the conclusion.
+    trace_id: str | None = None
+    # Identity of this invocation. `fp` groups by alert *instance*, so N runs of
+    # one alert shared it — which is how a single verdict ended up attached to
+    # nine different conclusions. New rows carry their own id.
+    run_id: str | None = None
+    # Which incident this run belongs to: alertname + service, no version. See
+    # store.case_key().
+    case_key: str | None = None
+    # The deterministic stopping rule's verdict (sufficiency.py). None on rows
+    # written before the gate existed, which is why it is optional rather than
+    # defaulted to a passing verdict — "we did not record this" and "the
+    # evidence was sufficient" must not look the same on screen.
+    sufficiency: SufficiencyRow | None = None
 
 
-def record_investigation(fp: str, alert: dict, result: dict, path: Path | None = None) -> None:
+def record_investigation(
+    fp: str, alert: dict, result: dict, path: Path | None = None, source: str = "alert"
+) -> None:
     """Append a row for a finished headless run. Best-effort — never raises."""
     if not settings.investigations_enabled:
         return
     try:
         labels = alert.get("labels") or {}
+        scope = case_memory.current_scope()
         findings = result.get("findings")
         decisions = result.get("decisions") or []
         rec = InvestigationRecord(
@@ -85,8 +125,24 @@ def record_investigation(fp: str, alert: dict, result: dict, path: Path | None =
             ],
             answer=(result.get("answer") or "")[:2000],
             alert={k: v for k, v in alert.items() if k != "_correction_hint"},
+            trace_id=current_trace_id(),
+            source=source,
+            run_id=scope.run_id if scope else None,
+            case_key=scope.case_key if scope else None,
+            sufficiency=result.get("sufficiency"),
         )
-        store.inv_insert(rec.fp, rec.ts, rec.model_dump_json(), path)
+        store.inv_insert(
+            rec.fp,
+            rec.ts,
+            rec.model_dump_json(),
+            path,
+            run_id=rec.run_id,
+            case_key=rec.case_key,
+        )
+        # Count the attention, not the knowledge: a finished investigation is an
+        # occurrence of the case, never a conclusion about it.
+        if scope:
+            case_memory.observe(scope, path=path)
     except Exception as e:
         logger.warning("record_investigation failed for %s: %s", fp, e)
 
@@ -108,6 +164,23 @@ def get_investigation(fp: str, path: Path | None = None) -> InvestigationRecord 
     return matches[-1] if matches else None
 
 
+def get_investigation_for(ref: str, path: Path | None = None) -> InvestigationRecord | None:
+    """Look a run up by whichever id the caller happens to be holding.
+
+    `fp` groups by alert instance, so several runs share it and
+    `get_investigation` deliberately returns the newest of them. A caller that
+    already resolved a specific `run_id` — the labeling path does — must not be
+    handed a sibling run's evidence, so run_id is tried first and fp is only
+    the fallback.
+    """
+    records = _load(path)
+    by_run = [r for r in records if r.run_id and r.run_id == ref]
+    if by_run:
+        return by_run[-1]
+    by_fp = [r for r in records if r.fp == ref]
+    return by_fp[-1] if by_fp else None
+
+
 def list_investigations(limit: int = 50, path: Path | None = None) -> list[dict[str, Any]]:
     """Most-recent-first list, with the CE correctness verdict merged in. The
     same fp can appear once per run; we keep the latest per fp."""
@@ -118,12 +191,15 @@ def list_investigations(limit: int = 50, path: Path | None = None) -> list[dict[
         by_fp[r.fp] = r  # later lines win (file is append order = chronological)
     latest = sorted(by_fp.values(), key=lambda r: r.ts, reverse=True)[:limit]
 
-    # merge correctness from the CE harness (single source of truth)
+    # Merge correctness from the CE harness (single source of truth). `path` is
+    # threaded through deliberately: reading the rows from one store and the
+    # verdicts from another is the same seam that made the past-incident JOIN
+    # silently empty — the tables were fine, they just lived in different files.
     try:
         from .calibration import load_records
 
         verdict = {}
-        for cr in load_records():
+        for cr in load_records(path):
             if cr.correct is not None:
                 verdict[cr.run_id] = cr.correct
     except Exception:
@@ -132,6 +208,11 @@ def list_investigations(limit: int = 50, path: Path | None = None) -> list[dict[
     out = []
     for r in latest:
         d = r.model_dump()
-        d["correct"] = verdict.get(r.fp)
+        # By run first, by fingerprint only for rows written before runs had
+        # their own id. The fallback is what the old code did for everything,
+        # which is how a verdict on one run showed up on eight others.
+        d["correct"] = verdict.get(r.run_id) if r.run_id else None
+        if d["correct"] is None:
+            d["correct"] = verdict.get(r.fp)
         out.append(d)
     return out

@@ -153,6 +153,32 @@ def build_alert_rule(spec: AlertSpec) -> dict:
     }
 
 
+async def _ensure_folder(client: httpx.AsyncClient, uid: str, headers: dict) -> None:
+    """Make sure the rule's folder exists, creating it if it does not.
+
+    Grafana refuses a rule whose folder is missing with `invalid alert rule:
+    folder does not exist` — technically correct, and useless to the person who
+    just clicked "Create alert" in a chat window. They did not choose the folder,
+    the AlertSpec's default did. Anything the caller could not have got wrong is
+    ours to fix, so we create it (idempotent) instead of handing back a chore.
+    """
+    base = settings.grafana_url.rstrip("/")
+    resp = await client.get(f"{base}/api/folders/{uid}", headers=headers)
+    if resp.status_code == 200:
+        return
+    if resp.status_code != 404:
+        resp.raise_for_status()
+    logger.warning("alert folder %r missing — creating it", uid)
+    created = await client.post(
+        f"{base}/api/folders",
+        json={"uid": uid, "title": uid},
+        headers=headers,
+    )
+    # 409 = someone else created it between the GET and the POST; that is fine.
+    if created.status_code not in (200, 409, 412):
+        created.raise_for_status()
+
+
 async def provision_alert(spec: AlertSpec) -> dict:
     """Write the proposed rule to Grafana. The single side-effecting call in this
     capability; reached only from a human button click (see /alerts/provision).
@@ -169,24 +195,31 @@ async def provision_alert(spec: AlertSpec) -> dict:
 
     payload = build_alert_rule(spec)
     logger.warning("provisioning alert rule title=%r service=%s", spec.title, spec.service_name)
+    headers = {
+        "Authorization": f"Bearer {settings.grafana_token}",
+        # The rule is meant to be editable in the UI afterwards, not a
+        # file-managed object the operator can't touch.
+        "X-Disable-Provenance": "true",
+    }
     async with httpx.AsyncClient(timeout=10) as client:
+        await _ensure_folder(client, spec.folder_uid, headers)
         resp = await client.post(
             f"{settings.grafana_url.rstrip('/')}/api/v1/provisioning/alert-rules",
             json=payload,
-            headers={
-                "Authorization": f"Bearer {settings.grafana_token}",
-                # The rule is meant to be editable in the UI afterwards, not a
-                # file-managed object the operator can't touch.
-                "X-Disable-Provenance": "true",
-            },
+            headers=headers,
         )
         resp.raise_for_status()
         body = resp.json()
     return {"uid": body.get("uid"), "title": body.get("title", spec.title)}
 
 
-# group 1: optional info line, group 2: body (JSON AlertSpec)
-_ALERT_BLOCK_RE = re.compile(r"```alert([^\n]*)\n?([\s\S]*?)```", re.MULTILINE)
+# group 1: fence language, group 2: optional info line, group 3: body (JSON AlertSpec).
+# `json` is accepted alongside `alert` on purpose: the model gets the JSON right
+# far more often than it gets the fence tag right, and a proposal that renders as
+# a code block instead of a button is a proposal the user has to hand-carry into
+# Grafana. Asking for ```alert``` stays in the prompt; accepting ```json``` that
+# validates as an AlertSpec is what makes the contract hold in practice.
+_ALERT_BLOCK_RE = re.compile(r"```(alert|json)([^\n]*)\n?([\s\S]*?)```", re.MULTILINE)
 
 
 def parse_alert_blocks(text: str) -> list[AlertSpec]:
@@ -196,9 +229,12 @@ def parse_alert_blocks(text: str) -> list[AlertSpec]:
     if not text:
         return []
     out: list[AlertSpec] = []
-    for _info, body in _ALERT_BLOCK_RE.findall(text):
+    for _lang, _info, body in _ALERT_BLOCK_RE.findall(text):
         try:
             out.append(AlertSpec.model_validate(json.loads(body)))
         except Exception as e:
-            logger.warning("skipping malformed ```alert``` block: %s", e)
+            # A ```json``` block that is not an alert spec is just JSON the model
+            # wanted to show; only complain about the ones that claimed to be alerts.
+            if _lang == "alert":
+                logger.warning("skipping malformed ```alert``` block: %s", e)
     return out

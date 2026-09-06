@@ -1,3 +1,4 @@
 {
-  "payment_use_new_validator": false
+  "payment_use_new_validator": false,
+  "user_session_cache_disabled": false
 }

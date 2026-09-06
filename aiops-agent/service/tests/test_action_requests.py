@@ -91,3 +91,83 @@ def test_approve_after_ttl_expires(tmp_path, monkeypatch):
 def test_approve_missing_request(tmp_path, monkeypatch):
     p = _db(monkeypatch, tmp_path)
     assert approve("does-not-exist", actor="alice", path=p) is None
+
+
+# ---- the proposal carries its own size -------------------------------------
+
+
+def test_create_from_decision_stores_the_footprint(tmp_path, monkeypatch):
+    """A suggestion whose size is only known after you approve it is a surprise,
+    not a suggestion — so the dry-run result is stored with the proposal."""
+    p = _db(monkeypatch, tmp_path)
+    footprint = {
+        "action": "k8s.rollout_undo",
+        "target": "demo/payment-service",
+        "namespace": "demo",
+        "affected_pods": 2,
+        "policy_ok": True,
+        "policy_reason": "within policy (affected 2 pod(s), ns demo)",
+    }
+    req = create_from_decision(
+        "fp1",
+        _decision(Autonomy.PROPOSE),
+        args={"namespace": "demo", "deployment": "payment-service"},
+        blast_radius=footprint,
+        path=p,
+    )
+    assert req is not None
+    stored = get(req.request_id, path=p)
+    assert stored.blast_radius["affected_pods"] == 2
+    assert stored.blast_radius["policy_ok"] is True
+
+
+def test_create_from_decision_without_a_footprint_still_proposes(tmp_path, monkeypatch):
+    """Best-effort: a footprint we could not compute must not cost the proposal."""
+    p = _db(monkeypatch, tmp_path)
+    req = create_from_decision("fp2", _decision(Autonomy.PROPOSE), args={}, path=p)
+    assert req is not None
+    assert get(req.request_id, path=p).blast_radius is None
+
+
+def test_a_drill_and_a_real_incident_do_not_share_an_idempotency_key(tmp_path, monkeypatch):
+    """The rehearsal must not spend the real incident's one allowed action.
+
+    Day41: a drill flipped the flag, and the real execution ten minutes later
+    aborted as a duplicate of it — which also cost the only chance the case had
+    to record a resolution, since drills deliberately write none."""
+    p = _db(monkeypatch, tmp_path)
+    args = {"namespace": "demo", "configmap": "user-flags", "flag": "user_session_cache_disabled"}
+    drill = create_from_decision("fp1", _decision(), args=args, params={"drill": "True"}, path=p)
+    real = create_from_decision("fp1", _decision(), args=args, params={"drill": "False"}, path=p)
+    assert drill.idem_key != real.idem_key
+    assert drill.idem_key == real.idem_key + "|drill"
+
+
+def test_production_idempotency_keys_keep_their_historical_shape(tmp_path, monkeypatch):
+    """Real requests must hash exactly as they did before the drill suffix
+    existed, or every key already in the ledger stops matching itself."""
+    p = _db(monkeypatch, tmp_path)
+    for params in ({}, None, {"drill": "no"}):
+        req = create_from_decision(
+            "fp1", _decision(), args={"deployment": "payment-service"}, params=params, path=p
+        )
+        assert req.idem_key == "k8s.rollout_undo|demo/payment-service|fp1"
+
+
+def test_two_drills_on_one_incident_still_deduplicate(tmp_path, monkeypatch):
+    """Separating drills from production is not the same as exempting them: an
+    alert storm during a rehearsal is still a storm."""
+    p = _db(monkeypatch, tmp_path)
+    args = {"deployment": "payment-service"}
+    a = create_from_decision("fp1", _decision(), args=args, params={"drill": "1"}, path=p)
+    b = create_from_decision("fp1", _decision(), args=args, params={"drill": "yes"}, path=p)
+    assert a.idem_key == b.idem_key
+
+
+def test_is_drill_reads_the_alert_label_the_way_the_ledger_does(tmp_path, monkeypatch):
+    assert arq.is_drill({"drill": "True"}) is True
+    assert arq.is_drill({"drill": "1"}) is True
+    assert arq.is_drill({"drill": "yes"}) is True
+    assert arq.is_drill({"drill": "false"}) is False
+    assert arq.is_drill({}) is False
+    assert arq.is_drill(None) is False

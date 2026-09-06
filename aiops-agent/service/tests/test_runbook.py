@@ -187,3 +187,51 @@ async def test_run_diagnostics_records_tool_error():
     tools = {"query_prometheus": _FakeTool("query_prometheus", raises=RuntimeError("boom"))}
     res = await run_diagnostics(book, {}, tools)
     assert res[0].status == "error" and "boom" in res[0].detail
+
+
+# ---- alertname spelling ----------------------------------------------------
+
+
+def test_match_runbook_falls_back_to_a_normalized_alertname(caplog):
+    """`PaymentDeclineRateHigh` is the same alert as `payment-decline-rate-high`
+    to everyone except a string comparison, and a miss here silently kills the
+    whole diagnostics → proposal chain."""
+    books = [
+        Runbook(
+            id="payment-bad-deploy",
+            title="t",
+            trigger=Trigger(
+                alertname="payment-decline-rate-high", labels={"service_name": "payment-service"}
+            ),
+        )
+    ]
+    labels = {"alertname": "PaymentDeclineRateHigh", "service_name": "payment-service"}
+    with caplog.at_level("WARNING"):
+        got = match_runbook(labels, {}, books)
+    assert got is not None and got.id == "payment-bad-deploy"
+    assert "only after normalization" in caplog.text
+
+
+def test_match_runbook_says_something_when_only_the_labels_differ(caplog):
+    books = [
+        Runbook(
+            id="payment-bad-deploy",
+            title="t",
+            trigger=Trigger(
+                alertname="payment-decline-rate-high", labels={"service_name": "payment-service"}
+            ),
+        )
+    ]
+    labels = {"alertname": "PaymentDeclineRateHigh", "service_name": "order-service"}
+    with caplog.at_level("WARNING"):
+        assert match_runbook(labels, {}, books) is None
+    assert "trigger labels" in caplog.text
+
+
+def test_match_runbook_still_returns_none_for_an_unrelated_alert(caplog):
+    books = [
+        Runbook(id="rb", title="t", trigger=Trigger(alertname="disk-full", labels={})),
+    ]
+    with caplog.at_level("WARNING"):
+        assert match_runbook({"alertname": "PaymentDeclineRateHigh"}, {}, books) is None
+    assert caplog.text == ""

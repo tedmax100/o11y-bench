@@ -29,6 +29,11 @@ class BizEvent(StrEnum):
     # gateway / webapp
     REQUEST_RECEIVED = "http.request_received"
     REQUEST_FAILED = "http.request_failed"
+    # A retry is not a failure and not a success — it is the gateway deciding to
+    # send the same inbound request downstream again. It gets its own event
+    # because it is the only place that decision is recorded: downstream, the
+    # extra call is indistinguishable from a real one.
+    REQUEST_RETRIED = "http.request_retried"
 
     # infrastructure-ish but still biz-flavored
     CACHE_MISS = "cache.miss"

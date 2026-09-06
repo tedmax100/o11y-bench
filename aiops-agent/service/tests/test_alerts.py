@@ -135,6 +135,20 @@ def test_parse_skips_block_failing_validation():
     assert parse_alert_blocks(text) == []
 
 
+def test_parse_accepts_a_json_fence_that_validates():
+    """The model gets the JSON right far more often than the fence tag. A
+    proposal rendered as a code block instead of a button is one the user has to
+    hand-carry into Grafana, so the receiver is the lenient side."""
+    text = '```json\n{"title": "x", "expr": "sum(rate(y[5m]))", "threshold": 0.1}\n```'
+    specs = parse_alert_blocks(text)
+    assert len(specs) == 1 and specs[0].title == "x"
+
+
+def test_parse_ignores_json_that_is_not_an_alert():
+    text = '```json\n{"some": "other payload"}\n```'
+    assert parse_alert_blocks(text) == []
+
+
 def test_parse_empty_and_no_blocks():
     assert parse_alert_blocks("") == []
     assert parse_alert_blocks("just prose, no fences") == []
@@ -167,6 +181,8 @@ async def test_provision_posts_to_grafana(monkeypatch):
     captured = {}
 
     class _Resp:
+        status_code = 200
+
         def raise_for_status(self):
             pass
 
@@ -180,6 +196,10 @@ async def test_provision_posts_to_grafana(monkeypatch):
         async def __aexit__(self, *a):
             return False
 
+        async def get(self, url, headers):
+            captured["folder_get"] = url
+            return _Resp()  # 200 → the folder is already there
+
         async def post(self, url, json, headers):
             captured["url"] = url
             captured["json"] = json
@@ -190,7 +210,50 @@ async def test_provision_posts_to_grafana(monkeypatch):
 
     result = await provision_alert(_spec(title="t"))
     assert result == {"uid": "abc123", "title": "t"}
+    assert captured["folder_get"].endswith("/api/folders/aiops")
     # rstrip('/') on the base url, hits the provisioning endpoint with bearer auth
     assert captured["url"] == "http://grafana:3000/api/v1/provisioning/alert-rules"
     assert captured["headers"]["Authorization"] == "Bearer tok"
     assert captured["json"]["condition"] == "C"
+
+
+@pytest.mark.asyncio
+async def test_provision_creates_the_folder_when_it_is_missing(monkeypatch):
+    """Grafana refuses a rule whose folder is missing, and the person who clicked
+    the button never chose that folder — so the folder is ours to create."""
+    monkeypatch.setattr(alerts_mod.settings, "alert_provisioning_enabled", True)
+    monkeypatch.setattr(alerts_mod.settings, "grafana_url", "http://grafana:3000/")
+    monkeypatch.setattr(alerts_mod.settings, "grafana_token", "tok")
+
+    posts: list[str] = []
+
+    class _Resp:
+        def __init__(self, status_code=200, body=None):
+            self.status_code = status_code
+            self._body = body or {"uid": "abc123", "title": "t"}
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._body
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, headers):
+            return _Resp(status_code=404, body={})
+
+        async def post(self, url, json, headers):
+            posts.append(url)
+            return _Resp()
+
+    monkeypatch.setattr(alerts_mod.httpx, "AsyncClient", lambda **kw: _Client())
+
+    await provision_alert(_spec(title="t"))
+    assert posts[0].endswith("/api/folders")  # folder first
+    assert posts[1].endswith("/api/v1/provisioning/alert-rules")

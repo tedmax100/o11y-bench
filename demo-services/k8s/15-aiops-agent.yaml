@@ -25,6 +25,12 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "events"]
     verbs: ["get", "list", "watch"]
+  # ConfigMaps are read so the flag action's dry-run can report the flag's
+  # current value and list the workloads that mount the map. Read only, and only
+  # here — the write role below reaches the two flag maps and nothing else.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
     resources: ["deployments", "replicasets"]
     verbs: ["get", "list", "watch"]
@@ -62,6 +68,16 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments", "replicasets"]
     verbs: ["get", "list", "watch", "patch", "update"]
+  # Feature-flag remediation (k8s.configmap_flag_set). resourceNames pins this
+  # to the two flag maps: a blanket "patch configmaps" in this namespace would
+  # also hand over prometheus-config, loki-config and the collector's pipeline —
+  # a far larger grant than the action needs. resourceNames cannot scope
+  # list/watch, so those verbs stay out: the action reads through the read SA
+  # above and only patches here.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["payment-flags", "user-flags", "gateway-flags"]
+    verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -151,6 +167,17 @@ spec:
             # 7b-0). Survives the rollout restarts the execution plane triggers.
             - name: STORE_PATH
               value: /data/aiops.db
+            # Chat-path tool budget (the alert path keeps its own, lower one).
+            # Raised from the code default of 4 because a question like "RED for
+            # every service" is 5 services x 3 dimensions: the budget ran out
+            # during discovery, so the turn ended at `force_answer` with the
+            # model writing queries it had not verified. Deliberately in the
+            # manifest and not a `kubectl set env`: an autonomy-adjacent knob
+            # that can be changed without a diff is a knob nobody can audit.
+            # Cost: each extra call is an LLM round trip, so this trades latency
+            # for the model getting to finish discovering before it answers.
+            - name: TOOL_CALL_BUDGET
+              value: "10"
             # ---- Self-observability (zero-code OTel) -----------------------
             # The agent runs under `opentelemetry-instrument`; these env vars
             # configure the SDK + exporters the same way the demo services do,
@@ -178,6 +205,16 @@ spec:
               value: otlp
             - name: OTEL_PYTHON_LOG_CORRELATION
               value: "true"
+            # Stable HTTP semconv: `http.server.request.duration` /
+            # `http.client.request.duration` in **seconds**, with the spec's
+            # explicit bucket boundaries. Without this the instrumentation
+            # falls back to the old names in milliseconds against the SDK's
+            # default buckets (0, 5, 10, 25, ...), which is where the constant
+            # p95 = 4.75 artifact came from — that number was the bucket
+            # layout, not the latency. `http` emits the new names only;
+            # `http/dup` would emit both during a migration.
+            - name: OTEL_SEMCONV_STABILITY_OPT_IN
+              value: http
             # Browser loads the plugin UI from Grafana (:3001) and fetches the
             # agent NodePort (:8000) — so the page Origin is the Grafana one.
             - name: CORS_ALLOW_ORIGINS

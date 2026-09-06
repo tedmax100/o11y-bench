@@ -32,6 +32,15 @@ else
   docker exec "${NODE_CONTAINER}" mkdir -p /aiops-plugin/tedmax100-aiops-app
 fi
 
+echo "[up] provisioning grafana dashboards"
+# The dashboard JSON lives in k8s/dashboards/ so it stays reviewable as JSON
+# instead of as an indented blob inside a ConfigMap. The namespace has to exist
+# first, and the ConfigMap has to exist before the grafana Deployment mounts it.
+kubectl apply -f "${ROOT}/k8s/00-namespace.yaml"
+kubectl -n demo create configmap grafana-dashboards \
+  --from-file="${ROOT}/k8s/dashboards" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
 echo "[up] applying manifests"
 # Apply in numeric prefix order: 00-namespace then everything else.
 # cluster.yaml is a k3d config, not a k8s resource — skip it.

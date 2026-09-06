@@ -24,7 +24,7 @@ Not here yet (Phase 2+):
 
 - The other 4 services (webapp, api-gateway, user, order)
 - Inter-service traffic + load generator
-- More incident scenarios
+- More incident scenarios (two exist: see "Incident scenarios" below)
 
 ## Layout
 
@@ -176,7 +176,68 @@ mirror) — confirm with:
 sum by (service_version) (rate(payment_charges_total[5m]))
 ```
 
-## Triggering the "bad deploy" demo
+## Incident scenarios
+
+Two, and they are deliberately different shapes. Use `scripts/incident.sh`:
+
+```bash
+./scripts/incident.sh status
+./scripts/incident.sh start session-cache
+./scripts/incident.sh stop  session-cache
+```
+
+| scenario | what breaks | where the alert fires | where the cause is |
+| --- | --- | --- | --- |
+| `bad-validator` | payment-service declines odd-cent charges | payment-service | payment-service |
+| `session-cache` | user-service's auth check falls through to a slow session store | **order-service** | **user-service** |
+
+The second one exists because of what the first one lets you get away with.
+In `bad-validator` the cause, the symptom and the answer all live in the same
+service, and the answer is sitting on a Prometheus label (`reason=
+new_validator_odd_cents`) — so an agent can score well on it without ever
+looking past the service named in the alert. Measured on our own agent, that
+is exactly what it learned to do: it started attributing every payment-service
+symptom to the same culprit, including ones where the metric said otherwise.
+
+`session-cache` has no such shortcut. order-service's orders start failing at
+the auth step; nothing in order-service's own metrics says why. The path is:
+
+```promql
+# 1. the symptom, on the service that alerted
+sum by (reason) (increase(orders_total{status="cancelled"}[15m]))
+#    → reason="auth"
+
+# 2. who does order-service call for auth? (traces, or the service graph)
+
+# 3. the cause, one hop upstream
+sum by (status, reason) (increase(user_auth_checks_total[15m]))
+#    → status="error", reason="session_store_timeout"
+
+# and the latency it drags with it
+histogram_quantile(0.95, sum by (le) (rate(user_authcheck_duration_seconds_bucket[10m])))
+```
+
+Measured on a live cluster: auth-check p95 goes from roughly a millisecond to
+**0.48s**, order-service's p95 follows it to **0.48s**, and about 12% of auth
+checks fail outright. In Loki the same window carries `cache.miss` and
+`user.auth_failed` with `reason="session_store_timeout"`.
+
+Two details worth knowing before you use it:
+
+- **The flag is read per request**, and user-service mounts it from the
+  `user-flags` ConfigMap, so no restart is involved. A rollout in the same
+  minute as the fault would hand every latency chart a second explanation.
+  The cost is that kubelet takes up to about a minute to project the change —
+  wait for `kubectl -n demo exec deploy/user-service -- cat /etc/demo/flags.json`
+  to show it before you start reading charts.
+- **api-gateway swallows upstream status codes** (it proxies the body and
+  returns 200 regardless), so a client hitting webapp sees slow responses, not
+  failed ones. The failures are all there in order-service's metrics and logs;
+  they just do not reach the caller. That is pre-existing behaviour, noted here
+  because it surprises you the first time you check whether the incident is
+  "working".
+
+## Triggering the "bad deploy" demo by hand
 
 Two changes — flip the flag, bump `git_version`:
 
